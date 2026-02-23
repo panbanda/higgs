@@ -524,19 +524,19 @@ pub fn load_phi3_model<P: AsRef<Path>>(model_dir: P) -> Result<Phi3CausalLM, Mod
     let model_path = model_dir.as_ref();
     let args = load_phi3_model_args(model_path)?;
 
-    tracing::info!(
-        model_type = %args.model_type,
-        hidden_size = args.hidden_size,
-        num_layers = args.num_hidden_layers,
-        num_heads = args.num_attention_heads,
-        num_kv_heads = args.num_key_value_heads,
-        head_dim = args.head_dim(),
-        vocab_size = args.vocab_size,
-        "Loading Phi-3 model"
-    );
-
     let quantization = args.quantization.clone();
     let raw_model = Phi3CausalLM::new(args)?;
+
+    tracing::info!(
+        model_type = %raw_model.args.model_type,
+        hidden_size = raw_model.args.hidden_size,
+        num_layers = raw_model.args.num_hidden_layers,
+        num_heads = raw_model.args.num_attention_heads,
+        num_kv_heads = raw_model.args.num_key_value_heads,
+        head_dim = raw_model.args.head_dim(),
+        vocab_size = raw_model.args.vocab_size,
+        "Loading Phi-3 model"
+    );
 
     let mut model = if let Some(ref qc) = quantization {
         tracing::info!(

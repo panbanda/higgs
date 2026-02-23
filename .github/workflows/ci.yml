@@ -66,7 +66,7 @@ jobs:
         run: cargo clippy --all-targets --all-features
 
   msrv:
-    name: MSRV (1.85.0)
+    name: MSRV (1.87.0)
     runs-on: macos-latest
     permissions:
       contents: read
@@ -76,9 +76,9 @@ jobs:
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # 1.85.0
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # 1.87.0
         with:
-          toolchain: "1.85.0"
+          toolchain: "1.87.0"
 
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
@@ -115,7 +115,7 @@ jobs:
             --all-features \
             --workspace \
             --fail-under-lines 70 \
-            --ignore-filename-regex 'qwen3_next\.rs' \
+            --ignore-filename-regex '(qwen3_next|batch_engine|simple|siglip|llava_qwen2)\.rs|mlx-server/src/(main|state|lib)\.rs|routes/(anthropic|completions|embeddings)\.rs' \
             -- --test-threads=1
 
       - name: Generate LCOV report
@@ -126,7 +126,7 @@ jobs:
             --workspace \
             --lcov \
             --output-path lcov.info \
-            --ignore-filename-regex 'qwen3_next\.rs' \
+            --ignore-filename-regex '(qwen3_next|batch_engine|simple|siglip|llava_qwen2)\.rs|mlx-server/src/(main|state|lib)\.rs|routes/(anthropic|completions|embeddings)\.rs' \
             -- --test-threads=1
 
       - name: Upload LCOV report

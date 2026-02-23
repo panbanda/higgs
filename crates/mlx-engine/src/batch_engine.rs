@@ -395,6 +395,8 @@ fn prefill_request(
                 .get(matched.prefix_len..)
                 .unwrap_or_default();
             if suffix.is_empty() {
+                // Exact prefix match. Currently falls back to full prefill
+                // because we don't store logits alongside the cache.
                 (req.prompt_tokens.clone(), model.make_cache())
             } else {
                 (suffix.to_vec(), matched.cache)
@@ -458,7 +460,7 @@ fn prefill_request(
             return Ok(None); // Client disconnected
         }
 
-        let logprob_top_n = if req.logprobs { req.top_logprobs } else { None };
+        let logprob_top_n = req.logprobs.then(|| req.top_logprobs.unwrap_or(0));
 
         Ok(Some(ActiveRequest {
             cache,

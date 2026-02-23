@@ -46,7 +46,7 @@ brew tap panbanda/mlx-server
 brew install mlx-server
 ```
 
-**Build from source** (requires Rust 1.85.0+, Xcode Command Line Tools, and `huggingface-cli`):
+**Build from source** (requires Rust 1.87.0+, Xcode Command Line Tools, and `huggingface-cli`):
 
 ```bash
 cargo build --release

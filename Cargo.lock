@@ -1436,7 +1436,7 @@ dependencies = [
 
 [[package]]
 name = "mlx-engine"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "minijinja",
  "minijinja-contrib",
@@ -1478,7 +1478,7 @@ dependencies = [
 
 [[package]]
 name = "mlx-models"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "image",
  "mlx-rs",

@@ -36,7 +36,7 @@ impl Engine {
         }
     }
 
-    pub const fn tokenizer(&self) -> &Tokenizer {
+    pub fn tokenizer(&self) -> &Tokenizer {
         match self {
             Self::Simple(e) => e.tokenizer(),
             Self::Batch(e) => e.tokenizer(),

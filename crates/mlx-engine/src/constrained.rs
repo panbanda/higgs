@@ -111,10 +111,9 @@ impl ConstrainedGenerator {
             i32::try_from(self.vocab_size).map_err(|_| Exception::custom("vocab_size overflow"))?;
         let mask_array = Array::from_slice(&mask_vec, &[vocab_i32]);
 
-        // Reshape to match logits shape (broadcast along batch dims)
-        let logits_shape = logits.shape();
-        let reshaped = if logits_shape.len() > 1 {
-            mask_array.reshape(logits_shape)?
+        // Reshape for broadcasting: [1, vocab_size] broadcasts across batch dim.
+        let reshaped = if logits.ndim() > 1 {
+            mask_array.reshape(&[1, vocab_i32])?
         } else {
             mask_array
         };

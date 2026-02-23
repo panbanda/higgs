@@ -6,7 +6,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-rust-version = "1.85.0"
+rust-version = "1.87.0"
 repository = "https://github.com/panbanda/mlx-server"
 homepage = "https://github.com/panbanda/mlx-server"
 
@@ -19,7 +19,7 @@ non_ascii_idents = "forbid"
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 
-# MSRV compat: these suggest features stabilized after 1.85.0
+# MSRV compat: these suggest features stabilized after 1.87.0
 collapsible_if = "allow"
 manual_is_multiple_of = "allow"
 

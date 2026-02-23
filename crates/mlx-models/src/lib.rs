@@ -266,19 +266,28 @@ pub fn apply_penalties(
     let shape: Vec<i32> = logits.shape().to_vec();
     let mut result = logits.clone();
 
-    // Repetition penalty: divide logits of seen tokens by the penalty factor.
-    // Simplified variant (does not depend on logit sign).
+    // Repetition penalty: for seen tokens, divide positive logits and multiply
+    // negative logits by the penalty factor. This pushes both toward zero,
+    // making seen tokens uniformly less likely regardless of logit sign.
     if let Some(rep_penalty) = params.repetition_penalty {
         if rep_penalty != 1.0 {
             let inv = 1.0 / rep_penalty;
-            let mut factors = vec![1.0f32; vocab_size];
+            let mut pos_factors = vec![1.0f32; vocab_size];
+            let mut neg_factors = vec![1.0f32; vocab_size];
             for &tid in counts.keys() {
-                if let Some(slot) = factors.get_mut(usize::try_from(tid).unwrap_or(usize::MAX)) {
+                let idx = usize::try_from(tid).unwrap_or(usize::MAX);
+                if let Some(slot) = pos_factors.get_mut(idx) {
                     *slot = inv;
                 }
+                if let Some(slot) = neg_factors.get_mut(idx) {
+                    *slot = rep_penalty;
+                }
             }
-            let factor_array = Array::from_slice(&factors, &[vocab_size_i32]).reshape(&shape)?;
-            result = result.multiply(factor_array)?;
+            let pos_arr = Array::from_slice(&pos_factors, &[vocab_size_i32]).reshape(&shape)?;
+            let neg_arr = Array::from_slice(&neg_factors, &[vocab_size_i32]).reshape(&shape)?;
+            let is_positive = result.gt(Array::from_f32(0.0))?;
+            let factor = mlx_rs::ops::r#where(&is_positive, &pos_arr, &neg_arr)?;
+            result = result.multiply(factor)?;
         }
     }
 
@@ -357,9 +366,9 @@ fn sample_filtered(logits: &Array, params: &SamplingParams) -> Result<Array, Exc
     let sorted_probs = probs.take_along_axis(&sorted_indices, -1)?;
 
     // --- Top-k mask (CPU): zero out positions beyond rank k ---
-    let k = params
-        .top_k
-        .map_or(n_vocab, |k| usize::try_from(k).unwrap_or(0).min(n_vocab));
+    let k = params.top_k.map_or(n_vocab, |k| {
+        usize::try_from(k).unwrap_or(1).clamp(1, n_vocab)
+    });
     let mut rank_mask_vec = vec![1.0f32; n_vocab];
     for slot in rank_mask_vec.get_mut(k..).into_iter().flatten() {
         *slot = 0.0;
@@ -459,11 +468,13 @@ impl LogprobArrays {
 
         // Top-N logprobs
         let (top_indices, top_values) = if let Some(n) = top_n {
-            let n_i32 =
-                i32::try_from(n).map_err(|_| Exception::custom("top_n overflow for i32"))?;
+            let vocab_size = *log_probs.shape().last().unwrap_or(&0);
+            let clamped = i32::try_from(n)
+                .map_err(|_| Exception::custom("top_n overflow for i32"))?
+                .min(vocab_size);
             let neg = log_probs.negative()?;
             let sorted_idx = argsort_axis(&neg, -1)?;
-            let top_idx = sorted_idx.index((.., ..n_i32));
+            let top_idx = sorted_idx.index((.., ..clamped));
             let top_vals = log_probs.take_along_axis(&top_idx, -1)?;
             (Some(top_idx), Some(top_vals))
         } else {
@@ -1084,12 +1095,30 @@ mod tests {
         let result = apply_penalties(&logits, &[0, 2], &p).unwrap();
         mlx_rs::transforms::eval([&result]).unwrap();
         let vals = result.as_slice::<f32>();
-        // token 0: 4.0 / 2.0 = 2.0
-        // token 1: 2.0 (unchanged)
-        // token 2: 6.0 / 2.0 = 3.0
+        // token 0 (positive, seen): 4.0 / 2.0 = 2.0
+        // token 1 (positive, unseen): 2.0 (unchanged)
+        // token 2 (positive, seen): 6.0 / 2.0 = 3.0
         assert!((vals[0] - 2.0).abs() < 1e-5);
         assert!((vals[1] - 2.0).abs() < 1e-5);
         assert!((vals[2] - 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn apply_repetition_penalty_negative_logits() {
+        let logits = Array::from_slice(&[-4.0_f32, 2.0, -6.0], &[1, 3]);
+        let p = SamplingParams {
+            repetition_penalty: Some(2.0),
+            ..SamplingParams::default()
+        };
+        let result = apply_penalties(&logits, &[0, 2], &p).unwrap();
+        mlx_rs::transforms::eval([&result]).unwrap();
+        let vals = result.as_slice::<f32>();
+        // token 0 (negative, seen): -4.0 * 2.0 = -8.0 (more negative = less likely)
+        // token 1 (positive, unseen): 2.0 (unchanged)
+        // token 2 (negative, seen): -6.0 * 2.0 = -12.0 (more negative = less likely)
+        assert!((vals[0] - (-8.0)).abs() < 1e-5);
+        assert!((vals[1] - 2.0).abs() < 1e-5);
+        assert!((vals[2] - (-12.0)).abs() < 1e-5);
     }
 
     #[test]

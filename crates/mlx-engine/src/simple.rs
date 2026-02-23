@@ -436,7 +436,7 @@ impl SimpleEngine {
         mut constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
     ) -> Result<GenerationOutput, EngineError> {
-        let logprob_top_n = if logprobs { top_logprobs } else { None };
+        let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
 
         let mut prepared = self.prepare_generation(prompt_tokens, pixel_values)?;
         let prompt_len = prepared.prompt_len;
@@ -722,7 +722,7 @@ impl SimpleEngine {
         mut constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
     ) -> Result<(), EngineError> {
-        let logprob_top_n = if logprobs { top_logprobs } else { None };
+        let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
 
         let mut prepared = self.prepare_generation(prompt_tokens, pixel_values)?;
         let prompt_len = prepared.prompt_len;

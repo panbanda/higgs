@@ -141,8 +141,9 @@ impl RadixNode {
             .retain(|_, child| child.cached.is_some() || !child.children.is_empty());
 
         // Compress: if this node has no cache and exactly one child,
-        // merge the child into this node.
-        if self.cached.is_none() && self.children.len() == 1 {
+        // merge the child into this node. Skip root (empty edge) because
+        // find_deepest_match does not check the root's edge.
+        if self.cached.is_none() && self.children.len() == 1 && !self.edge.is_empty() {
             let Some(key) = self.children.keys().next().copied() else {
                 return;
             };

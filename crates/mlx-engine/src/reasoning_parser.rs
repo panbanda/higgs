@@ -44,7 +44,7 @@ pub fn parse_reasoning(text: &str) -> ReasoningParseResult {
             if let Some(end_pos) = after_open.find(THINK_CLOSE) {
                 let think_content = after_open.get(..end_pos).unwrap_or_default().trim();
                 if !think_content.is_empty() {
-                    if found_thinking {
+                    if !reasoning.is_empty() {
                         reasoning.push('\n');
                     }
                     reasoning.push_str(think_content);
@@ -58,7 +58,7 @@ pub fn parse_reasoning(text: &str) -> ReasoningParseResult {
                 // Unclosed <think> tag -- treat remaining as reasoning
                 let unclosed = after_open.trim();
                 if !unclosed.is_empty() {
-                    if found_thinking {
+                    if !reasoning.is_empty() {
                         reasoning.push('\n');
                     }
                     reasoning.push_str(unclosed);
