@@ -11,6 +11,8 @@ pub struct CreateMessageRequest {
     #[serde(default)]
     pub top_p: Option<f32>,
     #[serde(default)]
+    pub top_k: Option<u32>,
+    #[serde(default)]
     pub stream: Option<bool>,
     #[serde(default)]
     pub system: Option<String>,

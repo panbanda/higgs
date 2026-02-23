@@ -49,6 +49,31 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError>
                 .map_err(EngineError::Model)?;
             Ok(AnyModel::Qwen3Moe(model))
         }
+        "gemma2" => {
+            let model = mlx_models::gemma2::load_gemma2_model(&config.model_dir)
+                .map_err(EngineError::Model)?;
+            Ok(AnyModel::Gemma2(model))
+        }
+        "phi3" => {
+            let model =
+                mlx_models::phi3::load_phi3_model(&config.model_dir).map_err(EngineError::Model)?;
+            Ok(AnyModel::Phi3(model))
+        }
+        "starcoder2" => {
+            let model = mlx_models::starcoder2::load_starcoder2_model(&config.model_dir)
+                .map_err(EngineError::Model)?;
+            Ok(AnyModel::Starcoder2(model))
+        }
+        "llava-qwen2" => {
+            let model = mlx_models::llava_qwen2::load_llava_qwen2_model(&config.model_dir)
+                .map_err(EngineError::Model)?;
+            Ok(AnyModel::LlavaQwen2(model))
+        }
+        "deepseek_v2" => {
+            let model = mlx_models::deepseek_v2::load_deepseek_v2_model(&config.model_dir)
+                .map_err(EngineError::Model)?;
+            Ok(AnyModel::DeepSeekV2(model))
+        }
         other => Err(EngineError::Model(
             mlx_models::error::ModelError::UnsupportedModel(other.to_owned()),
         )),
@@ -124,6 +149,30 @@ mod tests {
     fn model_config_from_dir_qwen3_moe() {
         let (_dir, result) = config_for_model("qwen3_moe");
         assert_eq!(result.unwrap().model_type, "qwen3_moe");
+    }
+
+    #[test]
+    fn model_config_from_dir_gemma2() {
+        let (_dir, result) = config_for_model("gemma2");
+        assert_eq!(result.unwrap().model_type, "gemma2");
+    }
+
+    #[test]
+    fn model_config_from_dir_phi3() {
+        let (_dir, result) = config_for_model("phi3");
+        assert_eq!(result.unwrap().model_type, "phi3");
+    }
+
+    #[test]
+    fn model_config_from_dir_starcoder2() {
+        let (_dir, result) = config_for_model("starcoder2");
+        assert_eq!(result.unwrap().model_type, "starcoder2");
+    }
+
+    #[test]
+    fn model_config_from_dir_deepseek_v2() {
+        let (_dir, result) = config_for_model("deepseek_v2");
+        assert_eq!(result.unwrap().model_type, "deepseek_v2");
     }
 
     #[test]

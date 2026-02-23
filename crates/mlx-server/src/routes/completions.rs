@@ -14,10 +14,12 @@ use crate::{
     error::ServerError,
     state::SharedState,
     types::openai::{
-        CompletionChoice, CompletionChunk, CompletionChunkChoice, CompletionRequest,
-        CompletionResponse, CompletionUsage, StopSequence,
+        ChoiceLogprobs, CompletionChoice, CompletionChunk, CompletionChunkChoice,
+        CompletionRequest, CompletionResponse, CompletionUsage, StopSequence, TokenLogprob,
+        TopLogprob,
     },
 };
+use mlx_models::SamplingParams;
 
 pub async fn completions(
     State(state): State<SharedState>,
@@ -48,9 +50,10 @@ async fn completions_non_streaming(
         .ok_or_else(|| ServerError::ModelNotFound(req.model.clone()))?;
 
     let max_tokens = req.max_tokens.unwrap_or(state.config.max_tokens);
-    let temperature = req.temperature.unwrap_or(1.0);
-    let top_p = req.top_p.unwrap_or(1.0);
+    let sampling = build_sampling_params(&req);
     let stop_sequences = StopSequence::extract(req.stop);
+    let want_logprobs = req.logprobs.unwrap_or(false);
+    let top_logprobs = req.top_logprobs;
 
     let encoding = engine
         .tokenizer()
@@ -58,13 +61,17 @@ async fn completions_non_streaming(
         .map_err(|e| ServerError::BadRequest(format!("Tokenization error: {e}")))?;
     let prompt_tokens = encoding.get_ids().to_vec();
 
+    let tokenizer = engine.tokenizer().clone();
     let output = tokio::task::spawn_blocking(move || {
         engine.generate(
             &prompt_tokens,
             max_tokens,
-            temperature,
-            top_p,
+            &sampling,
             &stop_sequences,
+            want_logprobs,
+            top_logprobs,
+            None,
+            None,
         )
     })
     .await
@@ -72,6 +79,11 @@ async fn completions_non_streaming(
     .map_err(ServerError::Engine)?;
 
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
+
+    let logprobs_response = output
+        .token_logprobs
+        .as_ref()
+        .map(|lps| logprobs_to_response(lps, &tokenizer));
 
     Ok(CompletionResponse {
         id: request_id,
@@ -82,6 +94,7 @@ async fn completions_non_streaming(
             index: 0,
             text: output.text,
             finish_reason: output.finish_reason,
+            logprobs: logprobs_response,
         }],
         usage: CompletionUsage {
             prompt_tokens: output.prompt_tokens,
@@ -101,9 +114,10 @@ fn completions_stream(
         .ok_or_else(|| ServerError::ModelNotFound(req.model.clone()))?;
 
     let max_tokens = req.max_tokens.unwrap_or(state.config.max_tokens);
-    let temperature = req.temperature.unwrap_or(1.0);
-    let top_p = req.top_p.unwrap_or(1.0);
+    let sampling = build_sampling_params(&req);
     let stop_sequences = StopSequence::extract(req.stop);
+    let want_logprobs = req.logprobs.unwrap_or(false);
+    let top_logprobs = req.top_logprobs;
 
     let encoding = engine
         .tokenizer()
@@ -121,10 +135,13 @@ fn completions_stream(
         let result = engine.generate_streaming(
             &prompt_tokens,
             max_tokens,
-            temperature,
-            top_p,
+            &sampling,
             &stop_sequences,
+            want_logprobs,
+            top_logprobs,
             &tx,
+            None,
+            None,
         );
         if let Err(e) = result {
             tracing::error!(error = %e, "Generation error during streaming");
@@ -154,4 +171,47 @@ fn completions_stream(
     };
 
     Ok(stream)
+}
+
+fn build_sampling_params(req: &CompletionRequest) -> SamplingParams {
+    SamplingParams {
+        temperature: req.temperature.unwrap_or(1.0),
+        top_p: req.top_p.unwrap_or(1.0),
+        top_k: req.top_k,
+        min_p: req.min_p,
+        repetition_penalty: req.repetition_penalty,
+        frequency_penalty: req.frequency_penalty,
+        presence_penalty: req.presence_penalty,
+    }
+}
+
+fn logprobs_to_response(
+    infos: &[mlx_models::TokenLogprobInfo],
+    tokenizer: &mlx_engine::tokenizers::Tokenizer,
+) -> ChoiceLogprobs {
+    let content = infos
+        .iter()
+        .map(|info| {
+            let token_str = tokenizer
+                .decode(&[info.token_id], false)
+                .unwrap_or_default();
+            let top = info
+                .top_logprobs
+                .iter()
+                .map(|e| {
+                    let t = tokenizer.decode(&[e.token_id], false).unwrap_or_default();
+                    TopLogprob {
+                        token: t,
+                        logprob: e.logprob,
+                    }
+                })
+                .collect();
+            TokenLogprob {
+                token: token_str,
+                logprob: info.logprob,
+                top_logprobs: top,
+            }
+        })
+        .collect();
+    ChoiceLogprobs { content }
 }

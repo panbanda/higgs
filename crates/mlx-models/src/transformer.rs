@@ -26,6 +26,30 @@ const fn default_rope_theta() -> f32 {
     10000.0
 }
 
+/// Deserialize an `Option<i32>` that may appear as the string `"None"` in
+/// some `HuggingFace` configs (e.g., `nanoLLaVA`'s `sliding_window`).
+fn deserialize_optional_i32<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: serde_json::Value = Deserialize::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .and_then(|v| i32::try_from(v).ok())
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom("invalid number for i32")),
+        serde_json::Value::String(ref s) if s == "None" || s == "null" => Ok(None),
+        serde_json::Value::String(_)
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Array(_)
+        | serde_json::Value::Object(_) => Err(serde::de::Error::custom(format!(
+            "expected i32 or null, got {value}"
+        ))),
+    }
+}
+
 /// Quantization parameters from config.json.
 #[derive(Debug, Clone, Deserialize)]
 pub struct QuantizationConfig {
@@ -58,7 +82,7 @@ pub struct ModelArgs {
     pub attention_bias: Option<bool>,
     #[serde(default)]
     pub use_sliding_window: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_i32")]
     pub sliding_window: Option<i32>,
     #[serde(default)]
     pub rope_scaling: Option<serde_json::Value>,
@@ -544,6 +568,20 @@ impl Model {
         &self.args.model_type
     }
 
+    /// Run a forward pass returning hidden states before the LM head.
+    pub fn forward_hidden<C: KeyValueCache>(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<C>>,
+    ) -> Result<Array, Exception> {
+        self.model.forward(ModelInput {
+            inputs,
+            mask,
+            cache: kv_cache,
+        })
+    }
+
     /// Run a forward pass producing logits.
     pub fn forward<C: KeyValueCache>(
         &mut self,
@@ -551,17 +589,74 @@ impl Model {
         mask: Option<&Array>,
         kv_cache: &mut Vec<Option<C>>,
     ) -> Result<Array, Exception> {
-        let out = self.model.forward(ModelInput {
-            inputs,
-            mask,
-            cache: kv_cache,
-        })?;
+        let out = self.forward_hidden(inputs, mask, kv_cache)?;
+        self.apply_lm_head(&out)
+    }
 
+    /// Get the hidden size.
+    pub const fn hidden_size(&self) -> i32 {
+        self.args.hidden_size
+    }
+
+    /// Number of transformer layers.
+    pub const fn num_layers(&self) -> i32 {
+        self.args.num_hidden_layers
+    }
+
+    /// Look up token embeddings without running the transformer.
+    pub fn embed_tokens(&mut self, input_ids: &Array) -> Result<Array, Exception> {
+        self.model.embed_tokens.forward(input_ids)
+    }
+
+    /// Forward pass starting from pre-computed embeddings (skips embedding lookup).
+    /// Used by VLMs that merge text + image embeddings before running the transformer.
+    pub fn forward_from_embeddings<C: KeyValueCache>(
+        &mut self,
+        embeddings: &Array,
+        mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<C>>,
+    ) -> Result<Array, Exception> {
+        let computed_mask = match mask {
+            Some(m) => Some(m.clone()),
+            None => match create_attention_mask(embeddings, kv_cache, Some(true))? {
+                Some(AttentionMask::Array(a)) => Some(a),
+                Some(AttentionMask::Causal) => {
+                    return Err(Exception::custom("Only Array mask is supported"));
+                }
+                None => None,
+            },
+        };
+
+        if kv_cache.is_empty() {
+            *kv_cache = (0..self.model.layers.len()).map(|_| None).collect();
+        } else if kv_cache.len() != self.model.layers.len() {
+            return Err(Exception::custom(format!(
+                "kv_cache length ({}) must match num layers ({})",
+                kv_cache.len(),
+                self.model.layers.len()
+            )));
+        }
+
+        let mut h = embeddings.clone();
+        for (layer, layer_cache) in self.model.layers.iter_mut().zip(kv_cache.iter_mut()) {
+            h = layer.forward(AttentionInput {
+                x: &h,
+                mask: computed_mask.as_ref(),
+                cache: layer_cache.as_mut(),
+            })?;
+        }
+
+        let out = self.model.norm.forward(&h)?;
+        self.apply_lm_head(&out)
+    }
+
+    /// Apply the LM head to hidden states.
+    fn apply_lm_head(&mut self, hidden: &Array) -> Result<Array, Exception> {
         match self.lm_head.as_mut() {
-            Some(head) => head.forward(&out),
+            Some(head) => head.forward(hidden),
             None => match &mut self.model.embed_tokens {
-                MaybeQuantized::Original(embed) => embed.as_linear(&out),
-                MaybeQuantized::Quantized(q_embed) => q_embed.as_linear(&out),
+                MaybeQuantized::Original(embed) => embed.as_linear(hidden),
+                MaybeQuantized::Quantized(q_embed) => q_embed.as_linear(hidden),
             },
         }
     }
@@ -574,6 +669,77 @@ pub fn load_model_args<P: AsRef<Path>>(model_dir: P) -> Result<ModelArgs, ModelE
     let config_path = model_dir.as_ref().join("config.json");
     let file = std::fs::File::open(config_path)?;
     Ok(serde_json::from_reader(file)?)
+}
+
+/// Load model args from the `text_config` section of config.json (used by VLMs).
+pub fn load_text_config_args<P: AsRef<Path>>(model_dir: P) -> Result<ModelArgs, ModelError> {
+    let config_path = model_dir.as_ref().join("config.json");
+    let file = std::fs::File::open(config_path)?;
+    let config: serde_json::Value = serde_json::from_reader(file)?;
+
+    let text_config = config
+        .get("text_config")
+        .ok_or_else(|| ModelError::UnsupportedModel("missing text_config in config.json".into()))?;
+
+    // Merge top-level quantization config into text_config
+    let mut text_obj = text_config.clone();
+    if let Some(quant) = config.get("quantization") {
+        if let Some(obj) = text_obj.as_object_mut() {
+            obj.insert("quantization".to_owned(), quant.clone());
+        }
+    }
+    // Also merge tie_word_embeddings from top level if not in text_config
+    if text_obj.get("tie_word_embeddings").is_none() {
+        if let Some(tie) = config.get("tie_word_embeddings") {
+            if let Some(obj) = text_obj.as_object_mut() {
+                obj.insert("tie_word_embeddings".to_owned(), tie.clone());
+            }
+        }
+    }
+
+    Ok(serde_json::from_value(text_obj)?)
+}
+
+/// Load a language model for a VLM.
+///
+/// Reads `text_config` from config.json and loads weights from safetensors
+/// files, stripping the `language_model.` prefix from weight keys.
+pub fn load_vlm_language_model<P: AsRef<Path>>(model_dir: P) -> Result<Model, ModelError> {
+    let model_path = model_dir.as_ref();
+    let args = load_text_config_args(model_path)?;
+
+    tracing::info!(
+        model_type = %args.model_type,
+        hidden_size = args.hidden_size,
+        num_layers = args.num_hidden_layers,
+        "Loading VLM language model"
+    );
+
+    let quantization = args.quantization.clone();
+    let raw_model = Model::new(args)?;
+
+    let mut model = if let Some(ref qc) = quantization {
+        tracing::info!(
+            group_size = qc.group_size,
+            bits = qc.bits,
+            "Applying quantization structure"
+        );
+        mlx_rs::nn::quantize(raw_model, qc.group_size, qc.bits).map_err(|e| {
+            ModelError::ShapeMismatch(format!("Failed to quantize model structure: {e}"))
+        })?
+    } else {
+        raw_model
+    };
+
+    crate::load_quantized_safetensors_weights_with_prefix(
+        &mut model,
+        model_path,
+        quantization.is_some(),
+        "language_model.",
+    )?;
+
+    tracing::info!("VLM language model loaded successfully");
+    Ok(model)
 }
 
 /// Load a model from a directory containing safetensors + config.json.

@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
-use mlx_models::{AnyCache, AnyModel, sample};
+use mlx_models::{AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample};
 use mlx_rs::{
     Array, Stream,
     ops::indexing::{IndexOp, NewAxis},
@@ -23,7 +23,7 @@ const DEFAULT_PREFIX_CACHE_SIZE: usize = 8;
 
 /// Pin model weights in GPU memory to prevent OS eviction.
 #[allow(unsafe_code)]
-fn set_wired_limit_to_max() {
+pub(crate) fn set_wired_limit_to_max() {
     unsafe {
         let mut info = mlx_sys::mlx_device_info_new();
         let mut dev = mlx_sys::mlx_device_new();
@@ -66,6 +66,7 @@ struct PreparedGeneration<'a> {
     cache: AnyCache,
     prompt_array: Array,
     prompt_len: u32,
+    pixel_values: Option<Array>,
 }
 
 impl SimpleEngine {
@@ -110,6 +111,11 @@ impl SimpleEngine {
         &self.tokenizer
     }
 
+    /// Get the model's EOS token IDs.
+    pub fn eos_token_ids(&self) -> &[u32] {
+        &self.eos_token_ids
+    }
+
     /// Apply chat template and tokenize messages.
     pub fn prepare_chat_prompt(
         &self,
@@ -122,6 +128,39 @@ impl SimpleEngine {
             .encode(prompt.as_str(), false)
             .map_err(|e| EngineError::Tokenization(e.to_string()))?;
         Ok(encoding.get_ids().to_vec())
+    }
+
+    /// Whether the loaded model is a vision-language model.
+    pub fn is_vlm(&self) -> bool {
+        let model = self
+            .model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        model.is_vlm()
+    }
+
+    /// The expected image size for the VLM's vision encoder, or `None`.
+    pub fn vlm_image_size(&self) -> Option<i32> {
+        let model = self
+            .model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        model.image_size()
+    }
+
+    /// Replace image placeholder tokens with `IMAGE_TOKEN_INDEX` in the token
+    /// sequence. The `<image>` token ID is looked up from the tokenizer.
+    #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
+    pub fn replace_image_tokens(&self, tokens: &mut [u32]) {
+        let Some(image_token_id) = self.tokenizer.token_to_id("<image>") else {
+            return;
+        };
+        let image_token_u32 = mlx_models::llava_qwen2::IMAGE_TOKEN_INDEX as u32;
+        for token in tokens.iter_mut() {
+            if *token == image_token_id {
+                *token = image_token_u32;
+            }
+        }
     }
 
     /// Convert prompt length to u32, returning a descriptive error on overflow.
@@ -137,10 +176,16 @@ impl SimpleEngine {
     fn prepare_generation(
         &self,
         prompt_tokens: &[u32],
+        pixel_values: Option<Array>,
     ) -> Result<PreparedGeneration<'_>, EngineError> {
         let prompt_len = Self::prompt_len(prompt_tokens)?;
+        let has_images = pixel_values.is_some();
 
-        let prefix_match = {
+        // Skip prefix caching for multimodal requests: different images
+        // produce different KV states even with identical token sequences.
+        let prefix_match = if has_images {
+            None
+        } else {
             let mut pc = self
                 .prefix_cache
                 .lock()
@@ -176,51 +221,94 @@ impl SimpleEngine {
             cache,
             prompt_array,
             prompt_len,
+            pixel_values,
         })
     }
 
     /// Run the prefill forward pass and sample the first token. Stores the
-    /// post-prefill KV state back into the prefix cache.
+    /// post-prefill KV state back into the prefix cache (skipped for multimodal).
     fn run_prefill(
         &self,
         prompt_tokens: &[u32],
         prepared: &mut PreparedGeneration<'_>,
-        temperature: f32,
-        top_p: f32,
+        params: &SamplingParams,
     ) -> Result<Array, EngineError> {
-        let logits = prepared
-            .model
-            .forward(&prepared.prompt_array, None, &mut prepared.cache)
-            .map_err(EngineError::Mlx)?;
+        let logits = if let Some(ref pixel_values) = prepared.pixel_values {
+            prepared
+                .model
+                .forward_multimodal(&prepared.prompt_array, pixel_values, &mut prepared.cache)
+                .map_err(EngineError::Mlx)?
+        } else {
+            prepared
+                .model
+                .forward(&prepared.prompt_array, None, &mut prepared.cache)
+                .map_err(EngineError::Mlx)?
+        };
         let current_token =
-            sample(&logits.index((.., -1, ..)), temperature, top_p).map_err(EngineError::Mlx)?;
+            sample(&logits.index((.., -1, ..)), params).map_err(EngineError::Mlx)?;
         eval([&current_token]).map_err(EngineError::Mlx)?;
 
-        // Cache the state right after prefill
-        {
+        // Skip prefix cache for multimodal (image-specific KV states)
+        if prepared.pixel_values.is_none() {
             let mut pc = self
                 .prefix_cache
                 .lock()
                 .map_err(|e| EngineError::Generation(format!("Cache lock poisoned: {e}")))?;
-            pc.store(prompt_tokens.to_vec(), prepared.cache.clone());
+            pc.store(prompt_tokens, prepared.cache.clone());
         }
 
         Ok(current_token)
     }
 
-    /// Decode a single step: forward pass on the current token and sample the next.
+    /// Decode a single step: forward pass on the current token, apply penalties
+    /// and optional constraint mask, then sample. Returns `(next_token, Option<LogprobArrays>)`.
     fn decode_step(
         current_token: &Array,
         model: &mut AnyModel,
         cache: &mut AnyCache,
-        temperature: f32,
-        top_p: f32,
-    ) -> Result<Array, EngineError> {
+        params: &SamplingParams,
+        generated_tokens: &[u32],
+        logprob_top_n: Option<u32>,
+        constraint: Option<&crate::constrained::ConstrainedGenerator>,
+    ) -> Result<(Array, Option<LogprobArrays>), EngineError> {
         let decode_input = current_token.index((.., NewAxis));
         let logits = model
             .forward(&decode_input, None, cache)
             .map_err(EngineError::Mlx)?;
-        sample(&logits.index((.., -1, ..)), temperature, top_p).map_err(EngineError::Mlx)
+        let sliced = logits.index((.., -1, ..));
+
+        let penalized =
+            apply_penalties(&sliced, generated_tokens, params).map_err(EngineError::Mlx)?;
+
+        // Apply constraint mask if structured output is requested
+        let constrained = if let Some(cg) = constraint {
+            cg.apply_mask(&penalized).map_err(EngineError::Mlx)?
+        } else {
+            penalized
+        };
+
+        let next_token = sample(&constrained, params).map_err(EngineError::Mlx)?;
+
+        let logprob_data = if let Some(top_n) = logprob_top_n {
+            // Compute logprobs from the same distribution we sampled from.
+            // Temperature is already accounted for inside `sample`, so we
+            // replicate the scaling here for the logprob computation.
+            let scaled = if params.temperature == 0.0 {
+                constrained
+            } else {
+                constrained
+                    .multiply(mlx_rs::array!(1.0 / params.temperature))
+                    .map_err(EngineError::Mlx)?
+            };
+            Some(
+                LogprobArrays::compute(&scaled, &next_token, Some(top_n))
+                    .map_err(EngineError::Mlx)?,
+            )
+        } else {
+            None
+        };
+
+        Ok((next_token, logprob_data))
     }
 
     /// Decode the token buffer and return the text, mapping tokenizer errors.
@@ -228,6 +316,54 @@ impl SimpleEngine {
         self.tokenizer
             .decode(tokens, true)
             .map_err(|e| EngineError::Tokenization(e.to_string()))
+    }
+
+    /// The model's hidden dimension (embedding output size).
+    pub fn hidden_size(&self) -> i32 {
+        let model = self
+            .model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        model.hidden_size()
+    }
+
+    /// Compute embeddings for a sequence of token IDs.
+    ///
+    /// Runs a single forward pass through the model to get hidden states,
+    /// mean-pools across the sequence dimension, and L2-normalizes.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn embed(&self, token_ids: &[u32]) -> Result<Vec<f32>, EngineError> {
+        if token_ids.is_empty() {
+            return Err(EngineError::Generation("Input is empty".to_owned()));
+        }
+
+        with_new_default_stream(Stream::new(), || {
+            let input = Array::from(token_ids).index(NewAxis);
+            let mut model = self
+                .model
+                .lock()
+                .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
+            let mut cache = model.make_cache();
+
+            // Forward pass to get hidden states [1, seq_len, hidden_size]
+            let hidden = model
+                .forward_hidden(&input, None, &mut cache)
+                .map_err(EngineError::Mlx)?;
+
+            // Mean-pool across seq_len (axis 1), producing [1, hidden_size]
+            let pooled = hidden.mean_axes(&[1], false).map_err(EngineError::Mlx)?;
+
+            eval([&pooled]).map_err(EngineError::Mlx)?;
+
+            // L2-normalize on CPU
+            let values = pooled.as_slice::<f32>().to_vec();
+            let norm = values.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                Ok(values.iter().map(|x| x / norm).collect())
+            } else {
+                Ok(values)
+            }
+        })
     }
 
     /// Convert a token count to u32, with an overflow error.
@@ -239,14 +375,21 @@ impl SimpleEngine {
     }
 
     /// Generate a complete response from a token prompt.
-    #[allow(clippy::significant_drop_tightening)]
+    ///
+    /// For multimodal requests, pass `pixel_values` with preprocessed image
+    /// data and ensure `prompt_tokens` contains `IMAGE_TOKEN_INDEX` at image
+    /// positions.
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_arguments)]
     pub fn generate(
         &self,
         prompt_tokens: &[u32],
         max_tokens: u32,
-        temperature: f32,
-        top_p: f32,
+        params: &SamplingParams,
         stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        constraint: Option<crate::constrained::ConstrainedGenerator>,
+        pixel_values: Option<Array>,
     ) -> Result<GenerationOutput, EngineError> {
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
@@ -257,6 +400,7 @@ impl SimpleEngine {
                 finish_reason: "length".to_owned(),
                 prompt_tokens: Self::prompt_len(prompt_tokens)?,
                 completion_tokens: 0,
+                token_logprobs: None,
             });
         }
 
@@ -266,29 +410,42 @@ impl SimpleEngine {
             self.generate_inner(
                 prompt_tokens,
                 max_tokens,
-                temperature,
-                top_p,
+                params,
                 stop_sequences,
+                logprobs,
+                top_logprobs,
+                constraint,
+                pixel_values,
             )
         })
     }
 
-    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        clippy::too_many_lines,
+        clippy::too_many_arguments
+    )]
     fn generate_inner(
         &self,
         prompt_tokens: &[u32],
         max_tokens: u32,
-        temperature: f32,
-        top_p: f32,
+        params: &SamplingParams,
         stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        mut constraint: Option<crate::constrained::ConstrainedGenerator>,
+        pixel_values: Option<Array>,
     ) -> Result<GenerationOutput, EngineError> {
-        let mut prepared = self.prepare_generation(prompt_tokens)?;
+        let logprob_top_n = if logprobs { top_logprobs } else { None };
+
+        let mut prepared = self.prepare_generation(prompt_tokens, pixel_values)?;
         let prompt_len = prepared.prompt_len;
-        let current_token = self.run_prefill(prompt_tokens, &mut prepared, temperature, top_p)?;
+        let current_token = self.run_prefill(prompt_tokens, &mut prepared, params)?;
 
         // Capture T1 (already eval'd inside run_prefill).
         let first_token_id: u32 = current_token.item();
         let mut tokens: Vec<u32> = vec![first_token_id];
+        let mut all_logprobs: Option<Vec<mlx_models::TokenLogprobInfo>> = logprobs.then(Vec::new);
         let has_stop_sequences = !stop_sequences.is_empty();
 
         // Handle T1 termination before entering the pipeline.
@@ -298,6 +455,7 @@ impl SimpleEngine {
                 finish_reason: "stop".to_owned(),
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
+                token_logprobs: all_logprobs,
             });
         }
         if has_stop_sequences {
@@ -308,6 +466,7 @@ impl SimpleEngine {
                     finish_reason: "stop".to_owned(),
                     prompt_tokens: prompt_len,
                     completion_tokens: 1,
+                    token_logprobs: all_logprobs,
                 });
             }
         }
@@ -317,18 +476,27 @@ impl SimpleEngine {
                 finish_reason: "length".to_owned(),
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
+                token_logprobs: all_logprobs,
             });
         }
 
         // Pipelined decode: build step N+2's graph while GPU computes step N+1.
-        let mut next_token = Self::decode_step(
+        let (mut next_token, mut next_logprob_data) = Self::decode_step(
             &current_token,
             &mut prepared.model,
             &mut prepared.cache,
-            temperature,
-            top_p,
+            params,
+            &tokens,
+            logprob_top_n,
+            constraint.as_ref(),
         )?;
-        async_eval([&next_token]).map_err(EngineError::Mlx)?;
+        {
+            let mut eval_targets: Vec<&Array> = vec![&next_token];
+            if let Some(ref lp) = next_logprob_data {
+                eval_targets.extend(lp.eval_targets());
+            }
+            async_eval(eval_targets).map_err(EngineError::Mlx)?;
+        }
 
         let mut total_forward_ns: u128 = 0;
         let mut total_eval_ns: u128 = 0;
@@ -338,18 +506,37 @@ impl SimpleEngine {
 
         loop {
             let t0 = std::time::Instant::now();
-            let following = Self::decode_step(
+            let (following, following_logprob_data) = Self::decode_step(
                 &next_token,
                 &mut prepared.model,
                 &mut prepared.cache,
-                temperature,
-                top_p,
+                params,
+                &tokens,
+                logprob_top_n,
+                constraint.as_ref(),
             )?;
             let t1 = std::time::Instant::now();
-            async_eval([&following]).map_err(EngineError::Mlx)?;
+            {
+                let mut eval_targets: Vec<&Array> = vec![&following];
+                if let Some(ref lp) = following_logprob_data {
+                    eval_targets.extend(lp.eval_targets());
+                }
+                async_eval(eval_targets).map_err(EngineError::Mlx)?;
+            }
             let t2 = std::time::Instant::now();
 
             let token_id: u32 = next_token.item();
+
+            // Advance constrained generator state
+            if let Some(ref mut cg) = constraint {
+                cg.advance(token_id);
+            }
+
+            // Materialize logprobs for the token we just extracted
+            if let (Some(all_lp), Some(lp_data)) = (&mut all_logprobs, &next_logprob_data) {
+                all_lp.push(lp_data.materialize(token_id));
+            }
+
             let t3 = std::time::Instant::now();
 
             tokens.push(token_id);
@@ -361,6 +548,27 @@ impl SimpleEngine {
             total_item_ns += (t3 - t2).as_nanos();
             total_other_ns += (t4 - t3).as_nanos();
             step_count += 1;
+
+            // Check if constraint is in final state
+            if constraint
+                .as_ref()
+                .is_some_and(crate::constrained::ConstrainedGenerator::is_finished)
+            {
+                Self::log_decode_timing(
+                    step_count,
+                    total_forward_ns,
+                    total_eval_ns,
+                    total_item_ns,
+                    total_other_ns,
+                );
+                return Ok(GenerationOutput {
+                    text: self.decode_tokens(&tokens)?,
+                    finish_reason: "stop".to_owned(),
+                    prompt_tokens: prompt_len,
+                    completion_tokens: completion_len,
+                    token_logprobs: all_logprobs,
+                });
+            }
 
             if self.eos_token_ids.contains(&token_id) {
                 Self::log_decode_timing(
@@ -375,6 +583,7 @@ impl SimpleEngine {
                     finish_reason: "stop".to_owned(),
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
+                    token_logprobs: all_logprobs,
                 });
             }
 
@@ -393,6 +602,7 @@ impl SimpleEngine {
                         finish_reason: "stop".to_owned(),
                         prompt_tokens: prompt_len,
                         completion_tokens: completion_len,
+                        token_logprobs: all_logprobs,
                     });
                 }
             }
@@ -410,10 +620,12 @@ impl SimpleEngine {
                     finish_reason: "length".to_owned(),
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
+                    token_logprobs: all_logprobs,
                 });
             }
 
             next_token = following;
+            next_logprob_data = following_logprob_data;
         }
     }
 
@@ -445,15 +657,22 @@ impl SimpleEngine {
     /// Generate tokens one at a time, sending each via the provided channel.
     ///
     /// If the receiver is dropped (client disconnected), generation stops early.
-    #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::too_many_arguments,
+        clippy::significant_drop_tightening
+    )]
     pub fn generate_streaming(
         &self,
         prompt_tokens: &[u32],
         max_tokens: u32,
-        temperature: f32,
-        top_p: f32,
+        params: &SamplingParams,
         stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        constraint: Option<crate::constrained::ConstrainedGenerator>,
+        pixel_values: Option<Array>,
     ) -> Result<(), EngineError> {
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
@@ -466,6 +685,7 @@ impl SimpleEngine {
                 finish_reason: Some("length".to_owned()),
                 prompt_tokens: prompt_len,
                 completion_tokens: 0,
+                token_logprob: None,
             });
             return Ok(());
         }
@@ -474,27 +694,39 @@ impl SimpleEngine {
             self.generate_streaming_inner(
                 prompt_tokens,
                 max_tokens,
-                temperature,
-                top_p,
+                params,
                 stop_sequences,
+                logprobs,
+                top_logprobs,
                 sender,
+                constraint,
+                pixel_values,
             )
         })
     }
 
-    #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::too_many_arguments,
+        clippy::significant_drop_tightening
+    )]
     fn generate_streaming_inner(
         &self,
         prompt_tokens: &[u32],
         max_tokens: u32,
-        temperature: f32,
-        top_p: f32,
+        params: &SamplingParams,
         stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        mut constraint: Option<crate::constrained::ConstrainedGenerator>,
+        pixel_values: Option<Array>,
     ) -> Result<(), EngineError> {
-        let mut prepared = self.prepare_generation(prompt_tokens)?;
+        let logprob_top_n = if logprobs { top_logprobs } else { None };
+
+        let mut prepared = self.prepare_generation(prompt_tokens, pixel_values)?;
         let prompt_len = prepared.prompt_len;
-        let current_token = self.run_prefill(prompt_tokens, &mut prepared, temperature, top_p)?;
+        let current_token = self.run_prefill(prompt_tokens, &mut prepared, params)?;
 
         let mut all_tokens: Vec<u32> = Vec::new();
         let first_token_id: u32 = current_token.item();
@@ -527,6 +759,7 @@ impl SimpleEngine {
                 },
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
+                token_logprob: None,
             })
             .is_err()
         {
@@ -538,26 +771,52 @@ impl SimpleEngine {
         }
 
         // Pipelined decode loop: build step N+2 while GPU computes step N+1
-        let mut next_token = Self::decode_step(
+        let (mut next_token, mut next_logprob_data) = Self::decode_step(
             &current_token,
             &mut prepared.model,
             &mut prepared.cache,
-            temperature,
-            top_p,
+            params,
+            &all_tokens,
+            logprob_top_n,
+            constraint.as_ref(),
         )?;
-        async_eval([&next_token]).map_err(EngineError::Mlx)?;
+        {
+            let mut eval_targets: Vec<&Array> = vec![&next_token];
+            if let Some(ref lp) = next_logprob_data {
+                eval_targets.extend(lp.eval_targets());
+            }
+            async_eval(eval_targets).map_err(EngineError::Mlx)?;
+        }
 
         loop {
-            let following = Self::decode_step(
+            let (following, following_logprob_data) = Self::decode_step(
                 &next_token,
                 &mut prepared.model,
                 &mut prepared.cache,
-                temperature,
-                top_p,
+                params,
+                &all_tokens,
+                logprob_top_n,
+                constraint.as_ref(),
             )?;
-            async_eval([&following]).map_err(EngineError::Mlx)?;
+            {
+                let mut eval_targets: Vec<&Array> = vec![&following];
+                if let Some(ref lp) = following_logprob_data {
+                    eval_targets.extend(lp.eval_targets());
+                }
+                async_eval(eval_targets).map_err(EngineError::Mlx)?;
+            }
 
             let token_id: u32 = next_token.item();
+
+            // Advance constrained generator state
+            if let Some(ref mut cg) = constraint {
+                cg.advance(token_id);
+            }
+
+            let token_logprob = next_logprob_data
+                .as_ref()
+                .map(|lp_data| lp_data.materialize(token_id));
+
             all_tokens.push(token_id);
 
             let completion_len = Self::completion_len(&all_tokens)?;
@@ -587,9 +846,12 @@ impl SimpleEngine {
 
             let is_eos = self.eos_token_ids.contains(&token_id);
             let is_max = completion_len >= max_tokens;
-            let step_finished = is_eos || is_max || hit_stop_seq;
+            let constraint_done = constraint
+                .as_ref()
+                .is_some_and(crate::constrained::ConstrainedGenerator::is_finished);
+            let step_finished = is_eos || is_max || hit_stop_seq || constraint_done;
 
-            let finish_reason = if is_eos || hit_stop_seq {
+            let finish_reason = if is_eos || hit_stop_seq || constraint_done {
                 Some("stop".to_owned())
             } else if is_max {
                 Some("length".to_owned())
@@ -604,6 +866,7 @@ impl SimpleEngine {
                     finish_reason,
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
+                    token_logprob,
                 })
                 .is_err()
             {
@@ -615,6 +878,7 @@ impl SimpleEngine {
             }
 
             next_token = following;
+            next_logprob_data = following_logprob_data;
         }
 
         Ok(())
@@ -638,7 +902,7 @@ fn check_stop_sequences(text: &str, stop_sequences: &[String]) -> Option<String>
 /// Detects `HuggingFace` cache paths (`models--<org>--<name>/snapshots/<hash>`)
 /// and extracts `<org>/<name>` instead of using the hash as the name.
 /// Falls back to the directory's file name.
-fn derive_model_name(model_dir: &Path) -> String {
+pub(crate) fn derive_model_name(model_dir: &Path) -> String {
     // HuggingFace cache: .../models--<org>--<name>/snapshots/<hash>
     if let (Some(leaf), Some(parent)) = (model_dir.file_name(), model_dir.parent()) {
         let leaf_str = leaf.to_string_lossy();
@@ -668,7 +932,7 @@ fn derive_model_name(model_dir: &Path) -> String {
 }
 
 /// Extract EOS token IDs from config.json.
-fn extract_eos_tokens(model_dir: &Path) -> Vec<u32> {
+pub(crate) fn extract_eos_tokens(model_dir: &Path) -> Vec<u32> {
     let config_path = model_dir.join("config.json");
     let config_str = match std::fs::read_to_string(&config_path) {
         Ok(s) => s,

@@ -1459,9 +1459,9 @@ impl Qwen3NextCausalLM {
             .collect()
     }
 
-    /// Forward pass producing logits.
+    /// Forward pass returning hidden states before the LM head.
     #[allow(non_snake_case)]
-    pub fn forward(
+    pub fn forward_hidden(
         &mut self,
         inputs: &Array,
         _mask: Option<&Array>,
@@ -1544,9 +1544,19 @@ impl Qwen3NextCausalLM {
             h = h2.add(mlp_out)?;
         }
 
-        h = self.model.norm.forward(&h)?;
+        self.model.norm.forward(&h)
+    }
 
-        // LM head
+    /// Forward pass producing logits.
+    #[allow(non_snake_case)]
+    pub fn forward(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+    ) -> Result<Array, Exception> {
+        let h = self.forward_hidden(inputs, mask, kv_cache)?;
+
         match self.lm_head.as_ref() {
             Some(head) => head.forward(&h),
             None => self.model.embed_tokens.as_linear(&h),

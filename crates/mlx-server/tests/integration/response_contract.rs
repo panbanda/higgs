@@ -20,7 +20,7 @@ use mlx_server::types::openai::{
     ChatCompletionChoice, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionDelta,
     ChatCompletionMessage, ChatCompletionResponse, CompletionChoice, CompletionChunk,
     CompletionChunkChoice, CompletionResponse, CompletionUsage, EmbeddingObject, EmbeddingResponse,
-    EmbeddingUsage, ModelList, ModelObject, ToolCall, ToolCallFunction,
+    EmbeddingUsage, MessageContent, ModelList, ModelObject, ToolCall, ToolCallFunction,
 };
 
 const fn make_usage(prompt: u32, completion: u32) -> CompletionUsage {
@@ -52,6 +52,7 @@ fn make_chat_chunk(
             index: 0,
             delta,
             finish_reason,
+            logprobs: None,
         }],
     }
 }
@@ -62,6 +63,7 @@ fn make_empty_delta_chunk(id: &str, finish_reason: Option<String>) -> ChatComple
         ChatCompletionDelta {
             role: None,
             content: None,
+            reasoning_content: None,
             tool_calls: None,
         },
         finish_reason,
@@ -100,11 +102,13 @@ fn chat_completion_response_has_required_fields() {
             index: 0,
             message: ChatCompletionMessage {
                 role: "assistant".to_owned(),
-                content: Some("Hello!".to_owned()),
+                content: Some(MessageContent::Text("Hello!".to_owned())),
+                reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: None,
             },
             finish_reason: "stop".to_owned(),
+            logprobs: None,
         }],
         usage: make_usage(10, 5),
     };
@@ -128,7 +132,8 @@ fn chat_completion_response_has_required_fields() {
 fn chat_completion_response_omits_null_optional_fields() {
     let msg = ChatCompletionMessage {
         role: "assistant".to_owned(),
-        content: Some("hi".to_owned()),
+        content: Some(MessageContent::Text("hi".to_owned())),
+        reasoning_content: None,
         tool_calls: None,
         tool_call_id: None,
     };
@@ -144,6 +149,7 @@ fn chat_completion_response_includes_tool_calls() {
     let msg = ChatCompletionMessage {
         role: "assistant".to_owned(),
         content: None,
+        reasoning_content: None,
         tool_calls: Some(vec![make_tool_call(
             "call_001",
             "get_weather",
@@ -171,6 +177,7 @@ fn chat_chunk_has_correct_object_type() {
         ChatCompletionDelta {
             role: Some("assistant".to_owned()),
             content: None,
+            reasoning_content: None,
             tool_calls: None,
         },
         None,
@@ -189,6 +196,7 @@ fn chat_chunk_content_delta() {
         ChatCompletionDelta {
             role: None,
             content: Some("Hello".to_owned()),
+            reasoning_content: None,
             tool_calls: None,
         },
         None,
@@ -222,6 +230,7 @@ fn completion_response_has_required_fields() {
             index: 0,
             text: "once upon a time".to_owned(),
             finish_reason: "stop".to_owned(),
+            logprobs: None,
         }],
         usage: make_usage(3, 4),
     };
@@ -442,6 +451,7 @@ fn chat_chunk_serializes_as_valid_sse_data() {
         ChatCompletionDelta {
             role: None,
             content: Some("word".to_owned()),
+            reasoning_content: None,
             tool_calls: None,
         },
         None,
@@ -496,6 +506,7 @@ fn chat_completion_response_with_tool_calls_in_choices() {
             message: ChatCompletionMessage {
                 role: "assistant".to_owned(),
                 content: None,
+                reasoning_content: None,
                 tool_calls: Some(vec![
                     make_tool_call("call_1", "get_weather", r#"{"city":"London"}"#),
                     make_tool_call("call_2", "get_time", r#"{"timezone":"UTC"}"#),
@@ -503,6 +514,7 @@ fn chat_completion_response_with_tool_calls_in_choices() {
                 tool_call_id: None,
             },
             finish_reason: "tool_calls".to_owned(),
+            logprobs: None,
         }],
         usage: make_usage(10, 20),
     };
@@ -535,11 +547,13 @@ fn completion_response_with_multiple_choices() {
                 index: 0,
                 text: "first completion".to_owned(),
                 finish_reason: "stop".to_owned(),
+                logprobs: None,
             },
             CompletionChoice {
                 index: 1,
                 text: "second completion".to_owned(),
                 finish_reason: "length".to_owned(),
+                logprobs: None,
             },
         ],
         usage: make_usage(5, 10),

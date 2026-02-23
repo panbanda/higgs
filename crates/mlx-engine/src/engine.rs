@@ -1,3 +1,5 @@
+pub use mlx_models::{TokenLogprobInfo, TopLogprobEntry};
+
 /// Output from a generation request.
 #[derive(Debug, Clone)]
 pub struct GenerationOutput {
@@ -5,6 +7,7 @@ pub struct GenerationOutput {
     pub finish_reason: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    pub token_logprobs: Option<Vec<TokenLogprobInfo>>,
 }
 
 /// Output from a streaming generation step.
@@ -15,6 +18,7 @@ pub struct StreamingOutput {
     pub finish_reason: Option<String>,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    pub token_logprob: Option<TokenLogprobInfo>,
 }
 
 #[cfg(test)]
@@ -29,6 +33,7 @@ mod tests {
             finish_reason: "stop".to_owned(),
             prompt_tokens: 10,
             completion_tokens: 5,
+            token_logprobs: None,
         };
         assert_eq!(output.text, "Hello world");
         assert_eq!(output.finish_reason, "stop");
@@ -43,6 +48,7 @@ mod tests {
             finish_reason: "length".to_owned(),
             prompt_tokens: 0,
             completion_tokens: 0,
+            token_logprobs: None,
         };
         assert!(output.text.is_empty());
         assert_eq!(output.prompt_tokens, 0);
@@ -57,6 +63,7 @@ mod tests {
             finish_reason: Some("stop".to_owned()),
             prompt_tokens: 20,
             completion_tokens: 15,
+            token_logprob: None,
         };
         assert!(output.finished);
         assert_eq!(output.finish_reason.as_deref(), Some("stop"));
@@ -71,6 +78,7 @@ mod tests {
             finish_reason: None,
             prompt_tokens: 20,
             completion_tokens: 3,
+            token_logprob: None,
         };
         assert!(!output.finished);
         assert!(output.finish_reason.is_none());
@@ -84,6 +92,7 @@ mod tests {
             finish_reason: Some("length".to_owned()),
             prompt_tokens: 0,
             completion_tokens: 0,
+            token_logprob: None,
         };
         assert!(output.new_text.is_empty());
         assert_eq!(output.prompt_tokens, 0);
@@ -97,6 +106,7 @@ mod tests {
             finish_reason: "stop".to_owned(),
             prompt_tokens: 5,
             completion_tokens: 3,
+            token_logprobs: None,
         };
         let cloned = output.clone();
         assert_eq!(cloned.text, output.text);
@@ -111,6 +121,7 @@ mod tests {
             finish_reason: None,
             prompt_tokens: 10,
             completion_tokens: 2,
+            token_logprob: None,
         };
         let cloned = output.clone();
         assert_eq!(cloned.new_text, output.new_text);
@@ -125,6 +136,7 @@ mod tests {
             finish_reason: "stop".to_owned(),
             prompt_tokens: 1,
             completion_tokens: 1,
+            token_logprobs: None,
         };
         let debug_str = format!("{output:?}");
         assert!(debug_str.contains("GenerationOutput"));
@@ -139,9 +151,38 @@ mod tests {
             finish_reason: Some("stop".to_owned()),
             prompt_tokens: 5,
             completion_tokens: 10,
+            token_logprob: None,
         };
         let debug_str = format!("{output:?}");
         assert!(debug_str.contains("StreamingOutput"));
         assert!(debug_str.contains("token"));
+    }
+
+    #[test]
+    fn generation_output_with_logprobs() {
+        let output = GenerationOutput {
+            text: "hello".to_owned(),
+            finish_reason: "stop".to_owned(),
+            prompt_tokens: 5,
+            completion_tokens: 1,
+            token_logprobs: Some(vec![TokenLogprobInfo {
+                token_id: 42,
+                logprob: -0.5,
+                top_logprobs: vec![
+                    TopLogprobEntry {
+                        token_id: 42,
+                        logprob: -0.5,
+                    },
+                    TopLogprobEntry {
+                        token_id: 99,
+                        logprob: -1.2,
+                    },
+                ],
+            }]),
+        };
+        let lps = output.token_logprobs.unwrap();
+        assert_eq!(lps.len(), 1);
+        assert_eq!(lps[0].token_id, 42);
+        assert_eq!(lps[0].top_logprobs.len(), 2);
     }
 }

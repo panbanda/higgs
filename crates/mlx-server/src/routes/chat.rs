@@ -15,10 +15,12 @@ use crate::{
     state::SharedState,
     types::openai::{
         ChatCompletionChoice, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionDelta,
-        ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse, CompletionUsage,
-        StopSequence, ToolCall, ToolCallFunction,
+        ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse, ChoiceLogprobs,
+        CompletionUsage, MessageContent, StopSequence, TokenLogprob, ToolCall, ToolCallFunction,
+        TopLogprob,
     },
 };
+use mlx_models::SamplingParams;
 
 pub async fn chat_completions(
     State(state): State<SharedState>,
@@ -28,10 +30,6 @@ pub async fn chat_completions(
         return Err(ServerError::BadRequest(
             "messages array must not be empty".to_owned(),
         ));
-    }
-
-    if req.response_format.is_some() {
-        tracing::warn!("response_format is not yet enforced");
     }
 
     if req.stream == Some(true) {
@@ -44,6 +42,7 @@ pub async fn chat_completions(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn chat_completions_non_streaming(
     state: SharedState,
     req: ChatCompletionRequest,
@@ -53,24 +52,56 @@ async fn chat_completions_non_streaming(
         .ok_or_else(|| ServerError::ModelNotFound(req.model.clone()))?;
 
     let max_tokens = req.max_tokens.unwrap_or(state.config.max_tokens);
-    let temperature = req.temperature.unwrap_or(1.0);
-    let top_p = req.top_p.unwrap_or(1.0);
+    let sampling = build_sampling_params(&req);
     let stop_sequences = StopSequence::extract(req.stop);
+    let want_logprobs = req.logprobs.unwrap_or(false);
+    let top_logprobs = req.top_logprobs;
 
-    let messages = convert_messages(&req.messages);
+    // Extract images and inject <image> placeholders for VLMs
+    let images = extract_images(&req.messages);
+    let effective_messages = if images.is_empty() {
+        req.messages.clone()
+    } else {
+        inject_image_placeholders(&req.messages)
+    };
+
+    let messages = convert_messages(&effective_messages);
     let tools = req.tools.as_deref();
 
-    let prompt_tokens = engine
+    let mut prompt_tokens = engine
         .prepare_chat_prompt(&messages, tools)
         .map_err(ServerError::Engine)?;
 
+    // Preprocess images for VLM
+    let pixel_values = if !images.is_empty() && engine.is_vlm() {
+        engine.replace_image_tokens(&mut prompt_tokens);
+        let image_size = engine.vlm_image_size().unwrap_or(384);
+        #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
+        let size = image_size as u32;
+        let first_image = images
+            .into_iter()
+            .next()
+            .ok_or_else(|| ServerError::BadRequest("Image data is empty".to_owned()))?;
+        let pv = mlx_models::siglip::preprocess_image(&first_image, size)
+            .map_err(|e| ServerError::InternalError(format!("Image preprocessing failed: {e}")))?;
+        Some(pv)
+    } else {
+        None
+    };
+
+    let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
+
+    let tokenizer = engine.tokenizer().clone();
     let output = tokio::task::spawn_blocking(move || {
         engine.generate(
             &prompt_tokens,
             max_tokens,
-            temperature,
-            top_p,
+            &sampling,
             &stop_sequences,
+            want_logprobs,
+            top_logprobs,
+            constraint,
+            pixel_values,
         )
     })
     .await
@@ -80,10 +111,28 @@ async fn chat_completions_non_streaming(
     let request_id = generate_request_id();
     let has_tools = req.tools.is_some();
 
+    let logprobs_response = output
+        .token_logprobs
+        .as_ref()
+        .map(|lps| logprobs_to_response(lps, &tokenizer));
+
+    // Parse reasoning (think tags) from the output
+    let reasoning_result = mlx_engine::reasoning_parser::parse_reasoning(&output.text);
+    let raw_text = if reasoning_result.reasoning.is_some() {
+        reasoning_result.text
+    } else {
+        output.text
+    };
+    let reasoning_content = reasoning_result.reasoning;
+
     let (content, tool_calls, finish_reason) = if has_tools {
-        let parsed = mlx_engine::tool_parser::parse_tool_calls(&output.text);
+        let parsed = mlx_engine::tool_parser::parse_tool_calls(&raw_text);
         if parsed.tool_calls.is_empty() {
-            (Some(output.text), None, output.finish_reason)
+            (
+                Some(MessageContent::Text(raw_text)),
+                None,
+                output.finish_reason,
+            )
         } else {
             let calls: Vec<ToolCall> = parsed
                 .tool_calls
@@ -101,12 +150,16 @@ async fn chat_completions_non_streaming(
             let text = if parsed.text.is_empty() {
                 None
             } else {
-                Some(parsed.text)
+                Some(MessageContent::Text(parsed.text))
             };
             (text, Some(calls), "tool_calls".to_owned())
         }
     } else {
-        (Some(output.text), None, output.finish_reason)
+        (
+            Some(MessageContent::Text(raw_text)),
+            None,
+            output.finish_reason,
+        )
     };
 
     Ok(ChatCompletionResponse {
@@ -119,10 +172,12 @@ async fn chat_completions_non_streaming(
             message: ChatCompletionMessage {
                 role: "assistant".to_owned(),
                 content,
+                reasoning_content,
                 tool_calls,
                 tool_call_id: None,
             },
             finish_reason,
+            logprobs: logprobs_response,
         }],
         usage: CompletionUsage {
             prompt_tokens: output.prompt_tokens,
@@ -148,31 +203,63 @@ fn chat_completions_stream(
         .ok_or_else(|| ServerError::ModelNotFound(req.model.clone()))?;
 
     let max_tokens = req.max_tokens.unwrap_or(state.config.max_tokens);
-    let temperature = req.temperature.unwrap_or(1.0);
-    let top_p = req.top_p.unwrap_or(1.0);
+    let sampling = build_sampling_params(&req);
     let stop_sequences = StopSequence::extract(req.stop);
+    let want_logprobs = req.logprobs.unwrap_or(false);
+    let top_logprobs = req.top_logprobs;
 
-    let messages = convert_messages(&req.messages);
+    // Extract images and inject <image> placeholders for VLMs
+    let images = extract_images(&req.messages);
+    let effective_messages = if images.is_empty() {
+        req.messages.clone()
+    } else {
+        inject_image_placeholders(&req.messages)
+    };
+
+    let messages = convert_messages(&effective_messages);
     let tools = req.tools.as_deref();
 
-    let prompt_tokens = engine
+    let mut prompt_tokens = engine
         .prepare_chat_prompt(&messages, tools)
         .map_err(ServerError::Engine)?;
+
+    // Preprocess images for VLM
+    let pixel_values = if !images.is_empty() && engine.is_vlm() {
+        engine.replace_image_tokens(&mut prompt_tokens);
+        let image_size = engine.vlm_image_size().unwrap_or(384);
+        #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
+        let size = image_size as u32;
+        let first_image = images
+            .into_iter()
+            .next()
+            .ok_or_else(|| ServerError::BadRequest("Image data is empty".to_owned()))?;
+        let pv = mlx_models::siglip::preprocess_image(&first_image, size)
+            .map_err(|e| ServerError::InternalError(format!("Image preprocessing failed: {e}")))?;
+        Some(pv)
+    } else {
+        None
+    };
+
+    let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
 
     let request_id = generate_request_id();
     let created = current_unix_timestamp();
     let model = req.model;
 
+    let tokenizer = engine.tokenizer().clone();
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
 
     tokio::task::spawn_blocking(move || {
         let result = engine.generate_streaming(
             &prompt_tokens,
             max_tokens,
-            temperature,
-            top_p,
+            &sampling,
             &stop_sequences,
+            want_logprobs,
+            top_logprobs,
             &tx,
+            constraint,
+            pixel_values,
         );
         if let Err(e) = result {
             tracing::error!(error = %e, "Generation error during streaming");
@@ -191,9 +278,11 @@ fn chat_completions_stream(
                 delta: ChatCompletionDelta {
                     role: Some("assistant".to_owned()),
                     content: None,
+                    reasoning_content: None,
                     tool_calls: None,
                 },
                 finish_reason: None,
+                logprobs: None,
             }],
         };
         match serde_json::to_string(&role_chunk) {
@@ -201,8 +290,94 @@ fn chat_completions_stream(
             Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
         }
 
+        let mut reasoning_tracker = mlx_engine::reasoning_parser::StreamingReasoningTracker::new();
+
         while let Some(output) = rx.recv().await {
-            let chunk = ChatCompletionChunk {
+            let chunk_logprobs = output
+                .token_logprob
+                .as_ref()
+                .map(|lp| logprobs_to_response(std::slice::from_ref(lp), &tokenizer));
+
+            let (visible, reasoning) = reasoning_tracker.process(&output.new_text);
+
+            // Emit reasoning chunk if there's reasoning content
+            if !reasoning.is_empty() {
+                let reas_chunk = ChatCompletionChunk {
+                    id: request_id.clone(),
+                    object: "chat.completion.chunk",
+                    created,
+                    model: model.clone(),
+                    choices: vec![ChatCompletionChunkChoice {
+                        index: 0,
+                        delta: ChatCompletionDelta {
+                            role: None,
+                            content: None,
+                            reasoning_content: Some(reasoning),
+                            tool_calls: None,
+                        },
+                        finish_reason: None,
+                        logprobs: None,
+                    }],
+                };
+                match serde_json::to_string(&reas_chunk) {
+                    Ok(json) => yield Ok(Event::default().data(json)),
+                    Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
+                }
+            }
+
+            // Emit visible content chunk
+            if !visible.is_empty() {
+                let chunk = ChatCompletionChunk {
+                    id: request_id.clone(),
+                    object: "chat.completion.chunk",
+                    created,
+                    model: model.clone(),
+                    choices: vec![ChatCompletionChunkChoice {
+                        index: 0,
+                        delta: ChatCompletionDelta {
+                            role: None,
+                            content: Some(visible),
+                            reasoning_content: None,
+                            tool_calls: None,
+                        },
+                        finish_reason: output.finish_reason.clone(),
+                        logprobs: chunk_logprobs,
+                    }],
+                };
+                match serde_json::to_string(&chunk) {
+                    Ok(json) => yield Ok(Event::default().data(json)),
+                    Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
+                }
+            } else if output.finish_reason.is_some() {
+                // Even if no visible text, still emit the finish_reason
+                let chunk = ChatCompletionChunk {
+                    id: request_id.clone(),
+                    object: "chat.completion.chunk",
+                    created,
+                    model: model.clone(),
+                    choices: vec![ChatCompletionChunkChoice {
+                        index: 0,
+                        delta: ChatCompletionDelta {
+                            role: None,
+                            content: None,
+                            reasoning_content: None,
+                            tool_calls: None,
+                        },
+                        finish_reason: output.finish_reason,
+                        logprobs: chunk_logprobs,
+                    }],
+                };
+                match serde_json::to_string(&chunk) {
+                    Ok(json) => yield Ok(Event::default().data(json)),
+                    Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
+                }
+            }
+        }
+
+        // Flush any remaining buffered content from the reasoning tracker
+        let (flush_vis, flush_reas) = reasoning_tracker.flush();
+        if !flush_reas.is_empty() {
+            let reas_chunk = ChatCompletionChunk {
                 id: request_id.clone(),
                 object: "chat.completion.chunk",
                 created,
@@ -211,13 +386,38 @@ fn chat_completions_stream(
                     index: 0,
                     delta: ChatCompletionDelta {
                         role: None,
-                        content: Some(output.new_text),
+                        content: None,
+                        reasoning_content: Some(flush_reas),
                         tool_calls: None,
                     },
-                    finish_reason: output.finish_reason,
+                    finish_reason: None,
+                    logprobs: None,
                 }],
             };
-            match serde_json::to_string(&chunk) {
+            match serde_json::to_string(&reas_chunk) {
+                Ok(json) => yield Ok(Event::default().data(json)),
+                Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
+            }
+        }
+        if !flush_vis.is_empty() {
+            let vis_chunk = ChatCompletionChunk {
+                id: request_id.clone(),
+                object: "chat.completion.chunk",
+                created,
+                model: model.clone(),
+                choices: vec![ChatCompletionChunkChoice {
+                    index: 0,
+                    delta: ChatCompletionDelta {
+                        role: None,
+                        content: Some(flush_vis),
+                        reasoning_content: None,
+                        tool_calls: None,
+                    },
+                    finish_reason: None,
+                    logprobs: None,
+                }],
+            };
+            match serde_json::to_string(&vis_chunk) {
                 Ok(json) => yield Ok(Event::default().data(json)),
                 Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
             }
@@ -242,13 +442,163 @@ fn convert_messages(
                     .filter_map(|tc| serde_json::to_value(tc).ok())
                     .collect()
             });
+            let content = m
+                .content
+                .as_ref()
+                .map_or_else(String::new, MessageContent::text);
             mlx_engine::chat_template::ChatMessage {
                 role: m.role.clone(),
-                content: m.content.clone().unwrap_or_default(),
+                content,
                 tool_calls: tool_calls_json,
             }
         })
         .collect()
+}
+
+/// Extract image bytes from base64 data URIs in message content parts.
+/// Returns decoded image bytes for each image found across all messages.
+fn extract_images(messages: &[ChatCompletionMessage]) -> Vec<Vec<u8>> {
+    use base64::Engine as _;
+    let mut images = Vec::new();
+    for msg in messages {
+        let Some(content) = &msg.content else {
+            continue;
+        };
+        for url in content.image_urls() {
+            if let Some(data) = url.strip_prefix("data:") {
+                // data:[<mediatype>];base64,<data>
+                if let Some(base64_start) = data.find(";base64,") {
+                    let encoded = &data[base64_start + 8..];
+                    match base64::engine::general_purpose::STANDARD.decode(encoded) {
+                        Ok(bytes) => images.push(bytes),
+                        Err(e) => tracing::warn!(error = %e, "Failed to decode base64 image"),
+                    }
+                }
+            }
+            // HTTP/HTTPS URLs are not supported yet; could be fetched in the future
+        }
+    }
+    images
+}
+
+/// Build text content with `<image>` placeholders injected for each image.
+/// For VLMs, each image in a message gets a `<image>\n` prefix before the text.
+fn inject_image_placeholders(messages: &[ChatCompletionMessage]) -> Vec<ChatCompletionMessage> {
+    messages
+        .iter()
+        .map(|m| {
+            let Some(content) = &m.content else {
+                return m.clone();
+            };
+            if !content.has_images() {
+                return m.clone();
+            }
+
+            let image_count = content.image_urls().len();
+            let text = content.text();
+            let prefix = "<image>\n".repeat(image_count);
+            let combined = format!("{prefix}{text}");
+
+            ChatCompletionMessage {
+                role: m.role.clone(),
+                content: Some(MessageContent::Text(combined)),
+                reasoning_content: m.reasoning_content.clone(),
+                tool_calls: m.tool_calls.clone(),
+                tool_call_id: m.tool_call_id.clone(),
+            }
+        })
+        .collect()
+}
+
+fn build_sampling_params(req: &ChatCompletionRequest) -> SamplingParams {
+    SamplingParams {
+        temperature: req.temperature.unwrap_or(1.0),
+        top_p: req.top_p.unwrap_or(1.0),
+        top_k: req.top_k,
+        min_p: req.min_p,
+        repetition_penalty: req.repetition_penalty,
+        frequency_penalty: req.frequency_penalty,
+        presence_penalty: req.presence_penalty,
+    }
+}
+
+/// Build a constrained generator from the request's `response_format`.
+///
+/// Returns `None` if no constraint is needed (text mode or absent).
+fn build_constraint(
+    response_format: Option<&crate::types::openai::ResponseFormat>,
+    engine: &std::sync::Arc<crate::state::Engine>,
+) -> Result<Option<mlx_engine::constrained::ConstrainedGenerator>, ServerError> {
+    let Some(fmt) = response_format else {
+        return Ok(None);
+    };
+
+    match fmt.r#type.as_str() {
+        "text" => Ok(None),
+        "json_object" | "json_schema" => {
+            let eos_id = engine.eos_token_ids().first().copied().unwrap_or(0);
+            let vocab = mlx_engine::constrained::build_vocabulary(engine.tokenizer(), eos_id)
+                .map_err(ServerError::Engine)?;
+            let vocab_size = engine.tokenizer().get_vocab_size(true);
+
+            let constraint = if fmt.r#type == "json_schema" {
+                if let Some(ref schema) = fmt.json_schema {
+                    let schema_str = schema.to_string();
+                    mlx_engine::constrained::ConstrainedGenerator::from_json_schema(
+                        &schema_str,
+                        &vocab,
+                        vocab_size,
+                    )
+                    .map_err(ServerError::Engine)?
+                } else {
+                    // json_schema mode without a schema -- fall back to json_object
+                    mlx_engine::constrained::ConstrainedGenerator::for_json_object(
+                        &vocab, vocab_size,
+                    )
+                    .map_err(ServerError::Engine)?
+                }
+            } else {
+                mlx_engine::constrained::ConstrainedGenerator::for_json_object(&vocab, vocab_size)
+                    .map_err(ServerError::Engine)?
+            };
+
+            Ok(Some(constraint))
+        }
+        other => Err(ServerError::BadRequest(format!(
+            "Unsupported response_format type: {other}"
+        ))),
+    }
+}
+
+fn logprobs_to_response(
+    infos: &[mlx_models::TokenLogprobInfo],
+    tokenizer: &mlx_engine::tokenizers::Tokenizer,
+) -> ChoiceLogprobs {
+    let content = infos
+        .iter()
+        .map(|info| {
+            let token_str = tokenizer
+                .decode(&[info.token_id], false)
+                .unwrap_or_default();
+            let top = info
+                .top_logprobs
+                .iter()
+                .map(|e| {
+                    let t = tokenizer.decode(&[e.token_id], false).unwrap_or_default();
+                    TopLogprob {
+                        token: t,
+                        logprob: e.logprob,
+                    }
+                })
+                .collect();
+            TokenLogprob {
+                token: token_str,
+                logprob: info.logprob,
+                top_logprobs: top,
+            }
+        })
+        .collect();
+    ChoiceLogprobs { content }
 }
 
 fn generate_request_id() -> String {
@@ -267,7 +617,8 @@ mod tests {
     fn simple_message(role: &str, content: Option<&str>) -> ChatCompletionMessage {
         ChatCompletionMessage {
             role: role.to_owned(),
-            content: content.map(str::to_owned),
+            content: content.map(|s| MessageContent::Text(s.to_owned())),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }
@@ -288,6 +639,7 @@ mod tests {
         ChatCompletionMessage {
             role: role.to_owned(),
             content: None,
+            reasoning_content: None,
             tool_calls: Some(calls),
             tool_call_id: None,
         }

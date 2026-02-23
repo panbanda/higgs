@@ -9,6 +9,18 @@ OpenAI and Anthropic-compatible inference server for Apple Silicon, built in Rus
 
 Runs quantized LLMs locally using the Metal GPU with no Python runtime.
 
+### Features
+
+- **OpenAI + Anthropic API** -- chat completions, text completions, embeddings, messages
+- **Advanced sampling** -- top-k, min-p, repetition/frequency/presence penalties, logprobs
+- **Structured output** -- `response_format` with JSON mode and JSON schema constraints
+- **Reasoning models** -- `<think>` tag parsing with `reasoning_content` in responses
+- **Continuous batching** -- concurrent request processing with shared decode loop
+- **Radix tree prefix cache** -- shared prefix reuse across requests
+- **Vision** -- multimodal image+text via LLaVA-Qwen2 (nanoLLaVA)
+- **10 architectures** -- LLaMA, Mistral, Qwen2/3, Gemma 2, Phi-3, Starcoder2, DeepSeek-V2, LLaVA-Qwen2
+- **Zero dependencies** -- single static Rust binary, no Python runtime
+
 ### Comparison
 
 | | mlx-server (Rust) | [vllm-mlx](https://github.com/waybarrios/vllm-mlx) (Python) | mlx_lm (Python) |
@@ -16,11 +28,12 @@ Runs quantized LLMs locally using the Metal GPU with no Python runtime.
 | **Install** | `brew install mlx-server` | `pip install` + Python + mlx ecosystem | `pip install mlx-lm` + Python |
 | **Run** | `mlx-server --model org/name` | `vllm-mlx --model org/name` | Write a script |
 | **Deploy** | Single static binary | Ship a Python environment | Ship a Python environment |
-| **Modalities** | Text | Text + image + video + audio | Text |
-| **Batching** | Single request | Continuous batching | Single request |
+| **Modalities** | Text + image | Text + image + video + audio | Text |
+| **Batching** | Continuous batching | Continuous batching | Single request |
+| **Structured output** | JSON mode + JSON schema | JSON mode + JSON schema | No |
 | **Text perf** | ~450 tok/s (1B) | Built on mlx_lm | ~453 tok/s (1B) |
 
-Text inference performance is near-identical to Python `mlx_lm` (within 1-2%) since both use the same MLX Metal kernels. If you need multimodal or concurrent batching, [vllm-mlx](https://github.com/waybarrios/vllm-mlx) is the more feature-rich option. If you want a zero-dependency binary for text inference, mlx-server is the simpler choice.
+Text inference performance is near-identical to Python `mlx_lm` (within 1-2%) since both use the same MLX Metal kernels. vllm-mlx supports more modalities (video, audio). mlx-server ships as a zero-dependency binary with structured output and vision support.
 
 ## Requirements
 
@@ -112,13 +125,38 @@ Log level is controlled via `RUST_LOG` (e.g., `RUST_LOG=debug`).
 ### Example
 
 ```bash
-# Chat completion (specify model by name)
+# Chat completion
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "mlx-community/Llama-3.1-8B-Instruct-4bit",
     "messages": [{"role": "user", "content": "Hello!"}],
     "max_tokens": 256
+  }'
+
+# Structured output (JSON schema)
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Llama-3.1-8B-Instruct-4bit",
+    "messages": [{"role": "user", "content": "List 3 colors"}],
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "colors",
+        "schema": {"type": "object", "properties": {"colors": {"type": "array", "items": {"type": "string"}}}}
+      }
+    }
+  }'
+
+# With logprobs
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Llama-3.1-8B-Instruct-4bit",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "logprobs": true,
+    "top_logprobs": 5
   }'
 
 # List all loaded models
@@ -135,6 +173,11 @@ curl http://localhost:8000/v1/models
 | Qwen3 | `qwen3` | Qwen3 |
 | Qwen3-Next | `qwen3_next` | Qwen3-Coder (hybrid SSM/attention + MoE) |
 | Qwen3-MoE | `qwen3_moe` | Qwen3-30B-A3B, Qwen3-235B-A22B (sparse MoE) |
+| Gemma 2 | `gemma2` | Gemma 2 2B/9B/27B (logit soft-capping, sliding window) |
+| Phi-3 | `phi3` | Phi-3 Mini/Small/Medium (SuRoPE) |
+| Starcoder2 | `starcoder2` | Starcoder2 3B/7B/15B (sliding window, MQA) |
+| DeepSeek-V2 | `deepseek_v2` | DeepSeek-V2-Lite, DeepSeek-V2 (MLA + MoE) |
+| LLaVA-Qwen2 | `llava-qwen2` | nanoLLaVA-1.5 (vision-language, SigLIP + Qwen2) |
 
 ## Performance
 

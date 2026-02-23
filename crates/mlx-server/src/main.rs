@@ -3,10 +3,11 @@ use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use mlx_engine::simple::SimpleEngine;
-
 use mlx_server::{
-    build_router, config::ServerConfig, model_download, model_resolver, state::AppState,
+    build_router,
+    config::ServerConfig,
+    model_download, model_resolver,
+    state::{AppState, Engine},
 };
 
 #[tokio::main]
@@ -52,7 +53,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(err) => return Err(err.into()),
         };
         tracing::info!(model = %model_path, resolved = %resolved.display(), "Loading model");
-        let engine = SimpleEngine::load(&resolved)?;
+        let engine = if config.batch {
+            Engine::load_batch(&resolved)?
+        } else {
+            Engine::load_simple(&resolved)?
+        };
         let name = engine.model_name().to_owned();
         tracing::info!(model_name = %name, "Model loaded");
         if engines.insert(name.clone(), Arc::new(engine)).is_some() {

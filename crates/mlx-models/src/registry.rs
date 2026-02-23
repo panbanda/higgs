@@ -19,7 +19,17 @@ pub fn detect_model_type<P: AsRef<Path>>(model_dir: P) -> Result<String, ModelEr
 pub fn is_supported(model_type: &str) -> bool {
     matches!(
         model_type,
-        "qwen2" | "qwen3" | "llama" | "mistral" | "qwen3_next" | "qwen3_moe"
+        "qwen2"
+            | "qwen3"
+            | "llama"
+            | "mistral"
+            | "qwen3_next"
+            | "qwen3_moe"
+            | "gemma2"
+            | "phi3"
+            | "starcoder2"
+            | "llava-qwen2"
+            | "deepseek_v2"
     )
 }
 
@@ -139,6 +149,50 @@ mod tests {
     fn test_detect_model_type_qwen3_moe() {
         let dir = write_model_type_config("qwen3_moe");
         assert_eq!(detect_model_type(dir.path()).unwrap(), "qwen3_moe");
+    }
+
+    #[test]
+    fn test_is_supported_gemma2() {
+        assert!(is_supported("gemma2"));
+    }
+
+    #[test]
+    fn test_detect_model_type_gemma2() {
+        let dir = write_model_type_config("gemma2");
+        assert_eq!(detect_model_type(dir.path()).unwrap(), "gemma2");
+    }
+
+    #[test]
+    fn test_is_supported_phi3() {
+        assert!(is_supported("phi3"));
+    }
+
+    #[test]
+    fn test_detect_model_type_phi3() {
+        let dir = write_model_type_config("phi3");
+        assert_eq!(detect_model_type(dir.path()).unwrap(), "phi3");
+    }
+
+    #[test]
+    fn test_is_supported_starcoder2() {
+        assert!(is_supported("starcoder2"));
+    }
+
+    #[test]
+    fn test_detect_model_type_starcoder2() {
+        let dir = write_model_type_config("starcoder2");
+        assert_eq!(detect_model_type(dir.path()).unwrap(), "starcoder2");
+    }
+
+    #[test]
+    fn test_is_supported_deepseek_v2() {
+        assert!(is_supported("deepseek_v2"));
+    }
+
+    #[test]
+    fn test_detect_model_type_deepseek_v2() {
+        let dir = write_model_type_config("deepseek_v2");
+        assert_eq!(detect_model_type(dir.path()).unwrap(), "deepseek_v2");
     }
 
     #[test]

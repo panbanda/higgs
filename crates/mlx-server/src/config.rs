@@ -40,6 +40,10 @@ struct CliArgs {
     /// Default request timeout in seconds.
     #[arg(long)]
     timeout: Option<f64>,
+
+    /// Use batch engine for interleaved concurrent request processing.
+    #[arg(long)]
+    batch: bool,
 }
 
 /// Resolved server configuration.
@@ -57,6 +61,7 @@ pub struct ServerConfig {
     pub api_key: Option<String>,
     pub rate_limit: u32,
     pub timeout: f64,
+    pub batch: bool,
 }
 
 impl Default for ServerConfig {
@@ -69,6 +74,7 @@ impl Default for ServerConfig {
             api_key: None,
             rate_limit: 0,
             timeout: 300.0,
+            batch: false,
         }
     }
 }
@@ -103,6 +109,9 @@ impl ServerConfig {
         }
         if let Some(timeout) = cli.timeout {
             figment = figment.merge(Serialized::default("timeout", timeout));
+        }
+        if cli.batch {
+            figment = figment.merge(Serialized::default("batch", true));
         }
 
         let config: Self = figment.extract().map_err(Box::new)?;

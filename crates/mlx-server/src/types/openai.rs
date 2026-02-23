@@ -12,6 +12,16 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub top_p: Option<f32>,
     #[serde(default)]
+    pub top_k: Option<u32>,
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
     pub stream: Option<bool>,
     #[serde(default)]
     pub stop: Option<StopSequence>,
@@ -19,6 +29,10 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
+    #[serde(default)]
+    pub logprobs: Option<bool>,
+    #[serde(default)]
+    pub top_logprobs: Option<u32>,
 }
 
 /// Response format specification.
@@ -29,12 +43,74 @@ pub struct ResponseFormat {
     pub json_schema: Option<serde_json::Value>,
 }
 
+/// Message content: either a plain string or an array of content parts (for multimodal).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl MessageContent {
+    /// Extract the concatenated text from all text parts.
+    pub fn text(&self) -> String {
+        match self {
+            Self::Text(s) => s.clone(),
+            Self::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    ContentPart::ImageUrl { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
+
+    /// Extract image URLs from content parts (base64 data URIs or HTTP URLs).
+    pub fn image_urls(&self) -> Vec<&str> {
+        match self {
+            Self::Text(_) => vec![],
+            Self::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::ImageUrl { image_url } => Some(image_url.url.as_str()),
+                    ContentPart::Text { .. } => None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether this content contains any images.
+    pub fn has_images(&self) -> bool {
+        matches!(self, Self::Parts(parts) if parts.iter().any(|p| matches!(p, ContentPart::ImageUrl { .. })))
+    }
+}
+
+/// A content part in a multimodal message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrl },
+}
+
+/// An image URL reference (base64 data URI or HTTP URL).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageUrl {
+    pub url: String,
+}
+
 /// A message in a chat conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionMessage {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<MessageContent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,6 +171,29 @@ pub struct ChatCompletionChoice {
     pub index: u32,
     pub message: ChatCompletionMessage,
     pub finish_reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChoiceLogprobs>,
+}
+
+/// Logprob data for a completion choice.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChoiceLogprobs {
+    pub content: Vec<TokenLogprob>,
+}
+
+/// Logprob information for a single generated token.
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenLogprob {
+    pub token: String,
+    pub logprob: f32,
+    pub top_logprobs: Vec<TopLogprob>,
+}
+
+/// A top-logprob entry (one of the most likely tokens at a given position).
+#[derive(Debug, Clone, Serialize)]
+pub struct TopLogprob {
+    pub token: String,
+    pub logprob: f32,
 }
 
 /// Streaming chunk for /v1/chat/completions.
@@ -113,6 +212,8 @@ pub struct ChatCompletionChunkChoice {
     pub index: u32,
     pub delta: ChatCompletionDelta,
     pub finish_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChoiceLogprobs>,
 }
 
 /// Delta content in a streaming chunk.
@@ -122,6 +223,8 @@ pub struct ChatCompletionDelta {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallDelta>>,
 }
@@ -159,9 +262,23 @@ pub struct CompletionRequest {
     #[serde(default)]
     pub top_p: Option<f32>,
     #[serde(default)]
+    pub top_k: Option<u32>,
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
     pub stream: Option<bool>,
     #[serde(default)]
     pub stop: Option<StopSequence>,
+    #[serde(default)]
+    pub logprobs: Option<bool>,
+    #[serde(default)]
+    pub top_logprobs: Option<u32>,
 }
 
 /// POST /v1/completions response (non-streaming).
@@ -181,6 +298,8 @@ pub struct CompletionChoice {
     pub index: u32,
     pub text: String,
     pub finish_reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChoiceLogprobs>,
 }
 
 /// Streaming chunk for /v1/completions.
@@ -295,6 +414,7 @@ mod tests {
                 index: 0,
                 delta,
                 finish_reason,
+                logprobs: None,
             }],
         }
     }
@@ -305,6 +425,7 @@ mod tests {
             ChatCompletionDelta {
                 role: None,
                 content: None,
+                reasoning_content: None,
                 tool_calls: None,
             },
             finish_reason,
@@ -363,11 +484,13 @@ mod tests {
                 index: 0,
                 message: ChatCompletionMessage {
                     role: "assistant".to_owned(),
-                    content: Some("Hello!".to_owned()),
+                    content: Some(MessageContent::Text("Hello!".to_owned())),
+                    reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: None,
                 },
                 finish_reason: "stop".to_owned(),
+                logprobs: None,
             }],
             usage: make_usage(5, 1),
         };
@@ -421,6 +544,7 @@ mod tests {
         let msg = ChatCompletionMessage {
             role: "assistant".to_owned(),
             content: None,
+            reasoning_content: None,
             tool_calls: Some(vec![ToolCall {
                 id: "call_123".to_owned(),
                 r#type: "function".to_owned(),
@@ -514,6 +638,7 @@ mod tests {
             ChatCompletionDelta {
                 role: Some("assistant".to_owned()),
                 content: Some("Hi".to_owned()),
+                reasoning_content: None,
                 tool_calls: None,
             },
             None,
@@ -544,6 +669,7 @@ mod tests {
         let delta = ChatCompletionDelta {
             role: None,
             content: None,
+            reasoning_content: None,
             tool_calls: None,
         };
         let json = serde_json::to_string(&delta).unwrap();
@@ -683,6 +809,7 @@ mod tests {
                 message: ChatCompletionMessage {
                     role: "assistant".to_owned(),
                     content: None,
+                    reasoning_content: None,
                     tool_calls: Some(vec![ToolCall {
                         id: "call_1".to_owned(),
                         r#type: "function".to_owned(),
@@ -694,6 +821,7 @@ mod tests {
                     tool_call_id: None,
                 },
                 finish_reason: "tool_calls".to_owned(),
+                logprobs: None,
             }],
             usage: make_usage(10, 5),
         };
@@ -708,5 +836,102 @@ mod tests {
         let chunk = make_empty_delta_chunk("chatcmpl-fin", Some("stop".to_owned()));
         let json_val: serde_json::Value = serde_json::to_value(&chunk).unwrap();
         assert_eq!(json_val["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn test_message_content_string_deserialization() {
+        let json = r#"{"role": "user", "content": "hello"}"#;
+        let msg: ChatCompletionMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg.content, Some(MessageContent::Text(ref s)) if s == "hello"));
+    }
+
+    #[test]
+    fn test_message_content_parts_deserialization() {
+        let json = r#"{"role": "user", "content": [
+            {"type": "text", "text": "What is in this image?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBOR"}}
+        ]}"#;
+        let msg: ChatCompletionMessage = serde_json::from_str(json).unwrap();
+        match &msg.content {
+            Some(MessageContent::Parts(parts)) => {
+                assert_eq!(parts.len(), 2);
+                assert!(
+                    matches!(&parts[0], ContentPart::Text { text } if text == "What is in this image?")
+                );
+                assert!(
+                    matches!(&parts[1], ContentPart::ImageUrl { image_url } if image_url.url.starts_with("data:"))
+                );
+            }
+            other => panic!("expected Parts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_message_content_text_method() {
+        let text_content = MessageContent::Text("hello".to_owned());
+        assert_eq!(text_content.text(), "hello");
+
+        let parts_content = MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "What is ".to_owned(),
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,abc".to_owned(),
+                },
+            },
+            ContentPart::Text {
+                text: "this?".to_owned(),
+            },
+        ]);
+        assert_eq!(parts_content.text(), "What is this?");
+    }
+
+    #[test]
+    fn test_message_content_image_urls() {
+        let content = MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "describe".to_owned(),
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,abc".to_owned(),
+                },
+            },
+        ]);
+        let urls = content.image_urls();
+        assert_eq!(urls.len(), 1);
+        assert!(urls[0].starts_with("data:"));
+    }
+
+    #[test]
+    fn test_message_content_has_images() {
+        let text = MessageContent::Text("no images".to_owned());
+        assert!(!text.has_images());
+
+        let text_parts = MessageContent::Parts(vec![ContentPart::Text {
+            text: "no images".to_owned(),
+        }]);
+        assert!(!text_parts.has_images());
+
+        let with_image = MessageContent::Parts(vec![ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "data:image/png;base64,abc".to_owned(),
+            },
+        }]);
+        assert!(with_image.has_images());
+    }
+
+    #[test]
+    fn test_message_content_text_serializes_as_string() {
+        let msg = ChatCompletionMessage {
+            role: "assistant".to_owned(),
+            content: Some(MessageContent::Text("hello".to_owned())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""content":"hello""#));
     }
 }

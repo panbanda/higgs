@@ -469,9 +469,9 @@ impl Qwen3MoeCausalLM {
         })
     }
 
-    /// Forward pass producing logits.
+    /// Forward pass returning hidden states before the LM head.
     #[allow(non_snake_case)]
-    pub fn forward(
+    pub fn forward_hidden(
         &mut self,
         inputs: &Array,
         mask: Option<&Array>,
@@ -506,7 +506,18 @@ impl Qwen3MoeCausalLM {
             h = layer.forward(&h, computed_mask.as_ref(), layer_cache.as_mut())?;
         }
 
-        h = self.model.norm.forward(&h)?;
+        self.model.norm.forward(&h)
+    }
+
+    /// Forward pass producing logits.
+    #[allow(non_snake_case)]
+    pub fn forward(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<SteppingKeyValueCache>>,
+    ) -> Result<Array, Exception> {
+        let h = self.forward_hidden(inputs, mask, kv_cache)?;
 
         match self.lm_head.as_ref() {
             Some(head) => head.forward(&h),

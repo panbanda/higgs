@@ -21,6 +21,7 @@ use crate::{
         MessageStartEvent, MessageStartPayload, MessageStopEvent, TextDelta,
     },
 };
+use mlx_models::SamplingParams;
 
 pub async fn create_message(
     State(state): State<SharedState>,
@@ -51,8 +52,12 @@ async fn create_message_non_streaming(
         .ok_or_else(|| ServerError::ModelNotFound(req.model.clone()))?;
 
     let max_tokens = req.max_tokens;
-    let temperature = req.temperature.unwrap_or(1.0);
-    let top_p = req.top_p.unwrap_or(1.0);
+    let sampling = SamplingParams {
+        temperature: req.temperature.unwrap_or(1.0),
+        top_p: req.top_p.unwrap_or(1.0),
+        top_k: req.top_k,
+        ..SamplingParams::default()
+    };
     let stop_sequences = req.stop_sequences.unwrap_or_default();
 
     let engine_messages = anthropic_messages_to_engine(&req.messages, req.system.as_deref());
@@ -66,9 +71,12 @@ async fn create_message_non_streaming(
         engine.generate(
             &prompt_tokens,
             max_tokens,
-            temperature,
-            top_p,
+            &sampling,
             &stop_sequences,
+            false,
+            None,
+            None,
+            None,
         )
     })
     .await
@@ -105,8 +113,12 @@ fn create_message_stream(
         .ok_or_else(|| ServerError::ModelNotFound(req.model.clone()))?;
 
     let max_tokens = req.max_tokens;
-    let temperature = req.temperature.unwrap_or(1.0);
-    let top_p = req.top_p.unwrap_or(1.0);
+    let sampling = SamplingParams {
+        temperature: req.temperature.unwrap_or(1.0),
+        top_p: req.top_p.unwrap_or(1.0),
+        top_k: req.top_k,
+        ..SamplingParams::default()
+    };
     let stop_sequences = req.stop_sequences.unwrap_or_default();
 
     let engine_messages = anthropic_messages_to_engine(&req.messages, req.system.as_deref());
@@ -128,10 +140,13 @@ fn create_message_stream(
         let result = engine.generate_streaming(
             &prompt_tokens,
             max_tokens,
-            temperature,
-            top_p,
+            &sampling,
             &stop_sequences,
+            false,
+            None,
             &tx,
+            None,
+            None,
         );
         if let Err(e) = result {
             tracing::error!(error = %e, "Generation error during Anthropic streaming");
