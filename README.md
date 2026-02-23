@@ -11,7 +11,8 @@ Runs quantized LLMs locally using the Metal GPU with no Python runtime.
 
 ## Features
 
-- **OpenAI + Anthropic API** -- chat completions, text completions, embeddings, messages
+- **OpenAI API** -- chat completions, text completions, embeddings
+- **Anthropic API** -- messages
 - **Advanced sampling** -- top-k, min-p, repetition/frequency/presence penalties, logprobs
 - **Structured output** -- `response_format` with JSON mode and JSON schema constraints
 - **Reasoning models** -- `<think>` tag parsing with `reasoning_content` in responses

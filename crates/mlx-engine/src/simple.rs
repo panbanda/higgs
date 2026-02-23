@@ -3,7 +3,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use mlx_models::{AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample};
 use mlx_rs::{
-    Array, Stream,
+    Array, Dtype, Stream,
     ops::indexing::{IndexOp, NewAxis},
     transforms::{async_eval, eval},
     with_new_default_stream,
@@ -378,10 +378,12 @@ impl SimpleEngine {
             // Mean-pool across seq_len (axis 1), producing [1, hidden_size]
             let pooled = hidden.mean_axes(&[1], false).map_err(EngineError::Mlx)?;
 
-            eval([&pooled]).map_err(EngineError::Mlx)?;
+            // Cast to f32 before extracting values (model may use bfloat16)
+            let pooled_f32 = pooled.as_dtype(Dtype::Float32).map_err(EngineError::Mlx)?;
+            eval([&pooled_f32]).map_err(EngineError::Mlx)?;
 
             // L2-normalize on CPU
-            let values = pooled.as_slice::<f32>().to_vec();
+            let values = pooled_f32.as_slice::<f32>().to_vec();
             let norm = values.iter().map(|x| x * x).sum::<f32>().sqrt();
             if norm > 0.0 {
                 Ok(values.iter().map(|x| x / norm).collect())
