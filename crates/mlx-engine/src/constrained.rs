@@ -145,7 +145,7 @@ pub fn build_vocabulary(
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 

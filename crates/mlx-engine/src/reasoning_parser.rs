@@ -172,7 +172,7 @@ impl StreamingReasoningTracker {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::shadow_unrelated)]
 mod tests {
     use super::*;
 

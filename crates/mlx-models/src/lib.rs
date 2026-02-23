@@ -663,7 +663,7 @@ fn remap_quantized_key(key: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
