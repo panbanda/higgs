@@ -136,6 +136,17 @@ Decode throughput on M4 Max 128GB. Prompt: long-form technical design document (
 
 Quantization: MLX models use 4-bit (8-bit for MoE). llama.cpp/Ollama use Q4_K_M (Q8_0 for MoE).
 
+Peak RSS memory (MB) after 500-token generation:
+
+| Model | Rust | Python mlx_lm |
+|---|---|---|
+| Llama-3.2-1B-Instruct-4bit | 883 | 1,094 |
+| Mistral-7B-Instruct-v0.3-4bit | 3,953 | 4,062 |
+| Qwen3-1.7B-4bit | 1,089 | 1,316 |
+| Qwen3-30B-A3B-8bit (MoE) | 31,095 | 31,348 |
+
+Model weights (in unified GPU memory) dominate RSS. Rust saves ~200 MB on small models by eliminating the Python runtime.
+
 ## Development
 
 ```bash
