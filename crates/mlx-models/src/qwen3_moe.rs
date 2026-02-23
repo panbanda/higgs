@@ -820,9 +820,8 @@ mod tests {
     fn test_forward_preserves_pre_initialized_cache() {
         let args = small_moe_args();
         let mut model = Qwen3MoeCausalLM::new(args).unwrap();
-        let mut cache: Vec<Option<SteppingKeyValueCache>> = (0..2)
-            .map(|_| Some(SteppingKeyValueCache::new()))
-            .collect();
+        let mut cache: Vec<Option<SteppingKeyValueCache>> =
+            (0..2).map(|_| Some(SteppingKeyValueCache::new())).collect();
 
         let input = Array::from_slice(&[1_i32, 2, 3], &[1, 3]);
         // Forward errors on unloaded quantized weights, but the
