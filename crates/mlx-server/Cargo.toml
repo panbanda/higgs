@@ -1,6 +1,6 @@
 [package]
 name = "mlx-server"
-version = "0.1.8"
+version = "0.1.9"
 description = "OpenAI and Anthropic-compatible inference server for Apple Silicon, built on mlx-rs"
 edition.workspace = true
 license.workspace = true

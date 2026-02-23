@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.9](https://github.com/panbanda/mlx-server/compare/mlx-models-v0.1.5...mlx-models-v0.1.9) (2026-02-23)
+
+
+### Features
+
+* add Qwen3-MoE architecture support ([#29](https://github.com/panbanda/mlx-server/issues/29)) ([bf36aee](https://github.com/panbanda/mlx-server/commit/bf36aeeaeebb2d3355f048d6dc698fa2e0c94250))
+* feature parity with vllm-mlx ([#32](https://github.com/panbanda/mlx-server/issues/32)) ([cd71a42](https://github.com/panbanda/mlx-server/commit/cd71a42db4bc0034c93f0412a155b165f5130dda))
+
 ## [0.1.5](https://github.com/panbanda/mlx-server/compare/mlx-models-v0.1.4...mlx-models-v0.1.5) (2026-02-22)
 
 

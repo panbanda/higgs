@@ -1,6 +1,6 @@
 [package]
 name = "mlx-models"
-version = "0.1.5"
+version = "0.1.9"
 description = "Model architectures and weight loading for mlx-server (LLaMA, Mistral, Qwen2/3)"
 edition.workspace = true
 license.workspace = true
