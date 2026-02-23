@@ -125,9 +125,12 @@ impl StreamingReasoningTracker {
                     self.inside_think = false;
                 } else if self.buffer.len() > THINK_CLOSE.len() {
                     // Flush all but the last few chars (which could be a partial </think>)
-                    let safe_len = self.buffer.len() - THINK_CLOSE.len();
-                    reasoning.push_str(self.buffer.get(..safe_len).unwrap_or_default());
-                    self.buffer = self.buffer.get(safe_len..).unwrap_or_default().to_owned();
+                    let mut safe_len = self.buffer.len() - THINK_CLOSE.len();
+                    while safe_len > 0 && !self.buffer.is_char_boundary(safe_len) {
+                        safe_len -= 1;
+                    }
+                    reasoning.push_str(&self.buffer[..safe_len]);
+                    self.buffer = self.buffer[safe_len..].to_owned();
                     break;
                 } else {
                     break;
@@ -143,9 +146,12 @@ impl StreamingReasoningTracker {
                 self.started = true;
             } else if self.buffer.len() > THINK_OPEN.len() {
                 // Flush all but the last few chars (which could be a partial <think>)
-                let safe_len = self.buffer.len() - THINK_OPEN.len();
-                visible.push_str(self.buffer.get(..safe_len).unwrap_or_default());
-                self.buffer = self.buffer.get(safe_len..).unwrap_or_default().to_owned();
+                let mut safe_len = self.buffer.len() - THINK_OPEN.len();
+                while safe_len > 0 && !self.buffer.is_char_boundary(safe_len) {
+                    safe_len -= 1;
+                }
+                visible.push_str(&self.buffer[..safe_len]);
+                self.buffer = self.buffer[safe_len..].to_owned();
                 break;
             } else {
                 break;
@@ -158,7 +164,10 @@ impl StreamingReasoningTracker {
     /// Flush any remaining buffered content. Call when generation is complete.
     pub fn flush(&mut self) -> (String, String) {
         let buf = std::mem::take(&mut self.buffer);
-        if self.inside_think {
+        let was_inside = self.inside_think;
+        self.inside_think = false;
+        self.started = false;
+        if was_inside {
             (String::new(), buf)
         } else {
             (buf, String::new())

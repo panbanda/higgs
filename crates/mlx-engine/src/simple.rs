@@ -227,12 +227,14 @@ impl SimpleEngine {
 
     /// Run the prefill forward pass and sample the first token. Stores the
     /// post-prefill KV state back into the prefix cache (skipped for multimodal).
+    /// Optionally computes logprobs for the first token.
     fn run_prefill(
         &self,
         prompt_tokens: &[u32],
         prepared: &mut PreparedGeneration<'_>,
         params: &SamplingParams,
-    ) -> Result<Array, EngineError> {
+        logprob_top_n: Option<u32>,
+    ) -> Result<(Array, Option<LogprobArrays>), EngineError> {
         let logits = if let Some(ref pixel_values) = prepared.pixel_values {
             prepared
                 .model
@@ -244,9 +246,32 @@ impl SimpleEngine {
                 .forward(&prepared.prompt_array, None, &mut prepared.cache)
                 .map_err(EngineError::Mlx)?
         };
-        let current_token =
-            sample(&logits.index((.., -1, ..)), params).map_err(EngineError::Mlx)?;
-        eval([&current_token]).map_err(EngineError::Mlx)?;
+        let last_logits = logits.index((.., -1, ..));
+        let current_token = sample(&last_logits, params).map_err(EngineError::Mlx)?;
+
+        let logprob_data = if let Some(top_n) = logprob_top_n {
+            let scaled = if params.temperature == 0.0 {
+                last_logits
+            } else {
+                last_logits
+                    .multiply(Array::from_f32(1.0 / params.temperature))
+                    .map_err(EngineError::Mlx)?
+            };
+            Some(
+                LogprobArrays::compute(&scaled, &current_token, Some(top_n))
+                    .map_err(EngineError::Mlx)?,
+            )
+        } else {
+            None
+        };
+
+        {
+            let mut eval_targets: Vec<&Array> = vec![&current_token];
+            if let Some(ref lp) = logprob_data {
+                eval_targets.extend(lp.eval_targets());
+            }
+            eval(eval_targets).map_err(EngineError::Mlx)?;
+        }
 
         // Skip prefix cache for multimodal (image-specific KV states)
         if prepared.pixel_values.is_none() {
@@ -257,7 +282,7 @@ impl SimpleEngine {
             pc.store(prompt_tokens, prepared.cache.clone());
         }
 
-        Ok(current_token)
+        Ok((current_token, logprob_data))
     }
 
     /// Decode a single step: forward pass on the current token, apply penalties
@@ -440,12 +465,16 @@ impl SimpleEngine {
 
         let mut prepared = self.prepare_generation(prompt_tokens, pixel_values)?;
         let prompt_len = prepared.prompt_len;
-        let current_token = self.run_prefill(prompt_tokens, &mut prepared, params)?;
+        let (current_token, first_logprob_data) =
+            self.run_prefill(prompt_tokens, &mut prepared, params, logprob_top_n)?;
 
         // Capture T1 (already eval'd inside run_prefill).
         let first_token_id: u32 = current_token.item();
         let mut tokens: Vec<u32> = vec![first_token_id];
         let mut all_logprobs: Option<Vec<mlx_models::TokenLogprobInfo>> = logprobs.then(Vec::new);
+        if let (Some(all_lp), Some(lp_data)) = (&mut all_logprobs, &first_logprob_data) {
+            all_lp.push(lp_data.materialize(first_token_id));
+        }
         let has_stop_sequences = !stop_sequences.is_empty();
 
         // Handle T1 termination before entering the pipeline.
@@ -726,7 +755,8 @@ impl SimpleEngine {
 
         let mut prepared = self.prepare_generation(prompt_tokens, pixel_values)?;
         let prompt_len = prepared.prompt_len;
-        let current_token = self.run_prefill(prompt_tokens, &mut prepared, params)?;
+        let (current_token, first_logprob_data) =
+            self.run_prefill(prompt_tokens, &mut prepared, params, logprob_top_n)?;
 
         let mut all_tokens: Vec<u32> = Vec::new();
         let first_token_id: u32 = current_token.item();
@@ -746,6 +776,10 @@ impl SimpleEngine {
         let first_is_eos = self.eos_token_ids.contains(&first_token_id);
         let finished = first_is_eos || first_hit_stop || 1 >= max_tokens;
 
+        let first_logprob = first_logprob_data
+            .as_ref()
+            .map(|lp| lp.materialize(first_token_id));
+
         if sender
             .blocking_send(StreamingOutput {
                 new_text: first_text,
@@ -759,7 +793,7 @@ impl SimpleEngine {
                 },
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
-                token_logprob: None,
+                token_logprob: first_logprob,
             })
             .is_err()
         {

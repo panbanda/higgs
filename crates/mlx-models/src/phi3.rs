@@ -461,6 +461,11 @@ pub struct Phi3CausalLM {
 
 impl Phi3CausalLM {
     pub fn new(args: Phi3ModelArgs) -> Result<Self, Exception> {
+        if args.rope_scaling.is_some() {
+            return Err(Exception::custom(
+                "Phi-3 rope_scaling (SuRoPE/longrope) is not yet supported",
+            ));
+        }
         let model = Phi3Model::new(&args)?;
         let lm_head = if args.tie_word_embeddings {
             None

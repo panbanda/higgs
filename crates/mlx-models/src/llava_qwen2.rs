@@ -151,7 +151,13 @@ impl LlavaQwen2Model {
         cache: &mut Vec<Option<C>>,
     ) -> Result<Array, Exception> {
         let image_features = self.encode_image(pixel_values)?;
-        let text_embeddings = self.language_model.embed_tokens(input_ids)?;
+        // Replace IMAGE_TOKEN_INDEX sentinel with 0 before embedding lookup to
+        // avoid out-of-bounds access. merge_embeddings overwrites these positions.
+        let sentinel = Array::from_slice(&[IMAGE_TOKEN_INDEX], &[1]);
+        let is_sentinel = input_ids.eq(&sentinel)?;
+        let zero = Array::from_slice(&[0_i32], &[1]);
+        let safe_ids = mlx_rs::ops::r#where(&is_sentinel, &zero, input_ids)?;
+        let text_embeddings = self.language_model.embed_tokens(&safe_ids)?;
         let combined = merge_embeddings(input_ids, &text_embeddings, &image_features)?;
         self.language_model
             .forward_from_embeddings(&combined, None, cache)
