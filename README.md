@@ -9,6 +9,17 @@ OpenAI and Anthropic-compatible inference server for Apple Silicon, built in Rus
 
 Runs quantized LLMs locally using the Metal GPU with no Python runtime.
 
+### Why not Python?
+
+Performance is near-identical to Python `mlx_lm` (within 1-2%). The difference is operational:
+
+| | Rust (mlx-server) | Python (mlx_lm) |
+|---|---|---|
+| **Install** | `brew install mlx-server` | Python 3.x + pip + venv + `mlx` + `mlx-lm` + transformers + tokenizers + numpy + ... |
+| **Run** | `mlx-server --model org/name` | Write a script or install a wrapper server |
+| **Upgrade** | `brew upgrade mlx-server` | Resolve dependency conflicts between mlx, numpy, torch |
+| **Deploy** | Single static binary | Ship a Python environment |
+
 ## Requirements
 
 - macOS 14+ on Apple Silicon (M1/M2/M3/M4)
