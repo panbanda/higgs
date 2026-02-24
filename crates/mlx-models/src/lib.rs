@@ -182,7 +182,13 @@ impl AnyModel {
 
         match self {
             Self::Transformer(m) => m.forward_batched(inputs, &mut kv_refs),
-            _ => Err(Exception::custom(
+            Self::Qwen3Moe(_)
+            | Self::Qwen3Next(_)
+            | Self::Gemma2(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::LlavaQwen2(_)
+            | Self::DeepSeekV2(_) => Err(Exception::custom(
                 "Batched forward only supported for Transformer models",
             )),
         }

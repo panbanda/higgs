@@ -573,15 +573,13 @@ impl SimpleEngine {
             // When constrained, extract the sampled token and advance the FSM
             // before building the next step, so the mask is always applied at the
             // correct FSM state.
-            let token_id: u32 = if constraint.is_some() {
+            let constrained_token_id: Option<u32> = constraint.is_some().then(|| {
                 let id: u32 = next_token.item();
                 if let Some(ref mut cg) = constraint {
                     cg.advance(id);
                 }
                 id
-            } else {
-                0 // placeholder; extracted after building following in pipelined path
-            };
+            });
 
             let (following, following_logprob_data) = Self::decode_step(
                 &next_token,
@@ -607,11 +605,7 @@ impl SimpleEngine {
             let t2 = std::time::Instant::now();
 
             // In the unconstrained pipeline, extract the token here (after building following).
-            let token_id: u32 = if constraint.is_none() {
-                next_token.item()
-            } else {
-                token_id
-            };
+            let token_id: u32 = constrained_token_id.unwrap_or_else(|| next_token.item());
 
             // Materialize logprobs for the token we just extracted
             if let (Some(all_lp), Some(lp_data)) = (&mut all_logprobs, &next_logprob_data) {

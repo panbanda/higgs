@@ -507,7 +507,7 @@ impl SharedExperts {
         })
     }
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+    fn forward(&self, x: &Array) -> Result<Array, Exception> {
         let activated = swiglu(&self.gate_proj.forward(x)?, &self.up_proj.forward(x)?)?;
         self.down_proj.forward(&activated)
     }
@@ -628,8 +628,8 @@ impl DeepSeekV2MlpBlock {
             .sum_axes(&[-2], false)?;
 
         // Add shared experts
-        if self.shared_experts.is_some() {
-            let shared_out = self.shared_experts.as_mut().unwrap().forward(x)?;
+        if let Some(ref shared) = self.shared_experts {
+            let shared_out = shared.forward(x)?;
             result = result.add(shared_out)?;
         }
 

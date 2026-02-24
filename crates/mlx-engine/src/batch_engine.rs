@@ -379,14 +379,14 @@ fn worker_loop(
                 )
             });
         } else {
-            let _: Result<(), EngineError> = with_new_default_stream(Stream::new(), || {
+            with_new_default_stream(Stream::new(), || {
                 run_pipelined_decode_round(
                     &mut model,
                     &mut active,
                     tokenizer,
                     eos_token_ids,
                     &mut finished_indices,
-                )
+                );
             });
         }
 
@@ -397,7 +397,7 @@ fn worker_loop(
     }
 }
 
-/// Pipelined decode: build each request's computation graph with async_eval,
+/// Pipelined decode: build each request's computation graph with `async_eval`,
 /// then materialize all results. GPU processes request N while CPU builds
 /// request N+1's graph.
 fn run_pipelined_decode_round(
@@ -406,7 +406,7 @@ fn run_pipelined_decode_round(
     tokenizer: &Tokenizer,
     eos_token_ids: &[u32],
     finished_indices: &mut Vec<usize>,
-) -> Result<(), EngineError> {
+) {
     // Phase 1: Build computation graphs and submit to GPU.
     let mut graphs: Vec<Option<DecodeGraphResult>> = Vec::with_capacity(active.len());
     for (i, ar) in active.iter_mut().enumerate() {
@@ -436,17 +436,10 @@ fn run_pipelined_decode_round(
     // Phase 2: Materialize results.
     for (i, (ar, graph)) in active.iter_mut().zip(graphs).enumerate() {
         let Some(result) = graph else { continue };
-        match materialize_decode_step(ar, result, tokenizer, eos_token_ids) {
-            Ok(true) => finished_indices.push(i),
-            Ok(false) => {}
-            Err(e) => {
-                tracing::error!(error = %e, "Decode step failed");
-                finished_indices.push(i);
-            }
+        if materialize_decode_step(ar, result, tokenizer, eos_token_ids) {
+            finished_indices.push(i);
         }
     }
-
-    Ok(())
 }
 
 /// Batched decode: single forward pass for all active requests.
@@ -484,7 +477,8 @@ fn run_batched_decode_round(
     // Per-request: apply penalties, sample, compute logprobs, async_eval
     let mut results: Vec<Option<DecodeGraphResult>> = Vec::with_capacity(n);
     for (i, ar) in active.iter_mut().enumerate() {
-        let req_logits = batched_last.index((i as i32..i as i32 + 1, ..));
+        let idx = i32::try_from(i).unwrap_or(i32::MAX);
+        let req_logits = batched_last.index((idx..idx + 1, ..));
 
         let penalized = apply_penalties(&req_logits, &ar.generated_tokens, &ar.params)
             .map_err(EngineError::Mlx)?;
@@ -527,13 +521,8 @@ fn run_batched_decode_round(
     // Materialize all results
     for (i, (ar, result)) in active.iter_mut().zip(results).enumerate() {
         let Some(r) = result else { continue };
-        match materialize_decode_step(ar, r, tokenizer, eos_token_ids) {
-            Ok(true) => finished_indices.push(i),
-            Ok(false) => {}
-            Err(e) => {
-                tracing::error!(error = %e, "Decode step failed in batched decode");
-                finished_indices.push(i);
-            }
+        if materialize_decode_step(ar, r, tokenizer, eos_token_ids) {
+            finished_indices.push(i);
         }
     }
 
@@ -723,14 +712,14 @@ fn build_decode_graph(
     })
 }
 
-/// Materialize a decode step's results after async_eval has completed.
+/// Materialize a decode step's results after `async_eval` has completed.
 /// Returns `true` if the request is finished, `false` to continue.
 fn materialize_decode_step(
     ar: &mut ActiveRequest,
     result: DecodeGraphResult,
     tokenizer: &Tokenizer,
     eos_token_ids: &[u32],
-) -> Result<bool, EngineError> {
+) -> bool {
     let token_id: u32 = result.next_token.item();
 
     // Advance constrained generator
@@ -800,7 +789,7 @@ fn materialize_decode_step(
         })
         .is_err();
 
-    Ok(finished || disconnected)
+    finished || disconnected
 }
 
 /// Check if any stop sequence appears in the text.

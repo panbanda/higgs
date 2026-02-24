@@ -657,9 +657,9 @@ impl Model {
     /// Batched decode: one forward pass for N requests each with 1 token.
     ///
     /// Heavy ops (projections, MLP, LM head) run batched. Per-request ops
-    /// (RoPE, KV cache update) loop over individual requests since each has
+    /// (`RoPE`, KV cache update) loop over individual requests since each has
     /// a different position offset and cache state.
-    #[allow(clippy::indexing_slicing)]
+    #[allow(clippy::too_many_lines, clippy::indexing_slicing)]
     pub fn forward_batched(
         &mut self,
         inputs: &Array,
@@ -687,15 +687,18 @@ impl Model {
         // Per-request offsets (from layer 0's cache, all layers have the same offset)
         let offsets: Vec<i32> = kv_caches
             .iter()
-            .map(|c| c.first().and_then(|c| c.as_ref()).map_or(0, |c| c.offset()))
+            .map(|req| {
+                req.first()
+                    .and_then(Option::as_ref)
+                    .map_or(0, KeyValueCache::offset)
+            })
             .collect();
         let max_kv_len = offsets.iter().map(|&o| o + 1).max().unwrap_or(1);
         let kv_lengths: Vec<i32> = offsets.iter().map(|&o| o + 1).collect();
 
         let mut h = self.model.embed_tokens.forward(inputs)?;
 
-        for layer_idx in 0..num_layers {
-            let layer = &mut self.model.layers[layer_idx];
+        for (layer_idx, layer) in self.model.layers.iter_mut().enumerate() {
             let n_heads = layer.self_attn.n_heads;
             let n_kv_heads = layer.self_attn.n_kv_heads;
             let scale = layer.self_attn.scale;
@@ -737,12 +740,13 @@ impl Model {
             let k_flat = keys.reshape(&[n, n_kv_heads * head_dim])?;
             let v_flat = values.reshape(&[n, n_kv_heads * head_dim])?;
 
-            let mut all_queries = Vec::with_capacity(n as usize);
-            let mut all_keys = Vec::with_capacity(n as usize);
-            let mut all_values = Vec::with_capacity(n as usize);
+            let mut all_queries = Vec::with_capacity(n_usize);
+            let mut all_keys = Vec::with_capacity(n_usize);
+            let mut all_values = Vec::with_capacity(n_usize);
 
-            for req_idx in 0..n as usize {
-                let i = req_idx as i32;
+            for (req_idx, &offset) in offsets.iter().enumerate() {
+                let i = i32::try_from(req_idx)
+                    .map_err(|_| Exception::custom("request index overflow"))?;
 
                 let q_i = q_flat
                     .index((i..i + 1, ..))
@@ -761,7 +765,7 @@ impl Model {
                     rope_traditional,
                     rope_base,
                     rope_scale,
-                    offsets[req_idx],
+                    offset,
                     None,
                 )?;
                 let k_rope = mlx_rs::fast::rope(
@@ -770,7 +774,7 @@ impl Model {
                     rope_traditional,
                     rope_base,
                     rope_scale,
-                    offsets[req_idx],
+                    offset,
                     None,
                 )?;
 

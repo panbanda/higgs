@@ -16,53 +16,37 @@ use crate::error::EngineError;
 pub struct ConstrainedGenerator {
     index: Index,
     state: outlines_core::primitives::StateId,
-    vocab_size: usize,
 }
 
 impl ConstrainedGenerator {
-    /// Build from a pre-computed `Index` and vocab size.
-    fn new(index: Index, vocab_size: usize) -> Self {
+    /// Build from a pre-computed `Index`.
+    fn new(index: Index) -> Self {
         let state = index.initial_state();
-        Self {
-            index,
-            state,
-            vocab_size,
-        }
+        Self { index, state }
     }
 
     /// Build from a JSON schema string.
     ///
     /// Converts the schema to a regex via `outlines-core`, then builds the
     /// FSM index against the given vocabulary.
-    pub fn from_json_schema(
-        schema: &str,
-        vocabulary: &Vocabulary,
-        vocab_size: usize,
-    ) -> Result<Self, EngineError> {
+    pub fn from_json_schema(schema: &str, vocabulary: &Vocabulary) -> Result<Self, EngineError> {
         let regex = json_schema::regex_from_str(schema, None, None)
             .map_err(|e| EngineError::Generation(format!("Invalid JSON schema: {e}")))?;
         let index = Index::new(&regex, vocabulary)
             .map_err(|e| EngineError::Generation(format!("Failed to build FSM index: {e}")))?;
-        Ok(Self::new(index, vocab_size))
+        Ok(Self::new(index))
     }
 
     /// Build for `json_object` mode (any valid JSON object).
-    pub fn for_json_object(
-        vocabulary: &Vocabulary,
-        vocab_size: usize,
-    ) -> Result<Self, EngineError> {
-        Self::from_json_schema(r#"{"type": "object"}"#, vocabulary, vocab_size)
+    pub fn for_json_object(vocabulary: &Vocabulary) -> Result<Self, EngineError> {
+        Self::from_json_schema(r#"{"type": "object"}"#, vocabulary)
     }
 
     /// Build from a regex pattern directly.
-    pub fn from_regex(
-        pattern: &str,
-        vocabulary: &Vocabulary,
-        vocab_size: usize,
-    ) -> Result<Self, EngineError> {
+    pub fn from_regex(pattern: &str, vocabulary: &Vocabulary) -> Result<Self, EngineError> {
         let index = Index::new(pattern, vocabulary)
             .map_err(|e| EngineError::Generation(format!("Failed to build FSM index: {e}")))?;
-        Ok(Self::new(index, vocab_size))
+        Ok(Self::new(index))
     }
 
     /// Get the set of allowed token IDs at the current state.
@@ -101,8 +85,7 @@ impl ConstrainedGenerator {
 
         // Use the actual logits vocab dimension, not the tokenizer's count.
         // Models often pad their embedding table beyond the tokenizer vocabulary.
-        let logit_vocab = *logits.shape().last().unwrap_or(&0) as usize;
-        let vocab_size = logit_vocab;
+        let vocab_size = usize::try_from(*logits.shape().last().unwrap_or(&0)).unwrap_or(0);
 
         // Build a mask: -inf for disallowed, 0 for allowed
         let mut mask_vec = vec![f32::NEG_INFINITY; vocab_size];
@@ -130,10 +113,10 @@ impl ConstrainedGenerator {
 /// Build an `outlines-core` [`Vocabulary`] from a `tokenizers` tokenizer.
 ///
 /// Replicates the token processing that outlines-core's `TokenProcessor` does internally:
-/// - ByteLevel tokenizers (GPT-2, Llama 3): each character is decoded via a CHAR_MAP
+/// - `ByteLevel` tokenizers (GPT-2, Llama 3): each character is decoded via a `CHAR_MAP`
 ///   that maps Unicode surrogates (U+0100–U+017E, U+00A1–U+00FF) back to the raw byte
 ///   they represent.
-/// - ByteFallback tokenizers (Llama 2): `▁` → space, `<0x__>` → single byte.
+/// - `ByteFallback` tokenizers (Llama 2): `▁` -> space, `<0x__>` -> single byte.
 /// - Others: pass UTF-8 bytes as-is.
 pub fn build_vocabulary(
     tokenizer: &tokenizers::Tokenizer,
@@ -159,7 +142,7 @@ pub fn build_vocabulary(
                             let pat = v.get("pattern")?.get("String")?.as_str()?;
                             let mut chars = pat.chars();
                             let first = chars.next()?;
-                            chars.next().is_none().then_some(first.to_string())
+                            chars.next().is_none().then_some(String::from(first))
                         } else {
                             None
                         }
@@ -167,7 +150,7 @@ pub fn build_vocabulary(
                         None
                     }
                 })
-                .unwrap_or_else(|| "▁".to_string());
+                .unwrap_or_else(|| String::from("▁"));
             if has_byte_fallback {
                 TokenKind::ByteFallback { spacechar }
             } else {
@@ -207,22 +190,28 @@ pub fn build_vocabulary(
 
 #[derive(Debug)]
 enum TokenKind {
-    /// GPT-2 / Llama 3 style: each char in the token string maps to a byte via CHAR_MAP.
+    /// GPT-2 / Llama 3 style: each char in the token string maps to a byte via `CHAR_MAP`.
     Byte,
-    /// Llama 2 / SentencePiece style: replace spacechar with 0x20, handle `<0x__>`.
+    /// Llama 2 / `SentencePiece` style: replace spacechar with 0x20, handle `<0x__>`.
     ByteFallback { spacechar: String },
     /// No special decoding needed; use UTF-8 bytes directly.
     Raw,
 }
 
 impl TokenKind {
+    #[allow(clippy::indexing_slicing)]
     fn process(&self, token: &str) -> Vec<u8> {
         match self {
-            TokenKind::Byte => token
+            Self::Byte => token
                 .chars()
-                .map(|c| *BYTE_CHAR_MAP.get(&c).unwrap_or(&(c as u8)))
+                .map(|c| {
+                    BYTE_CHAR_MAP
+                        .get(&c)
+                        .copied()
+                        .unwrap_or_else(|| u8::try_from(c).unwrap_or(0))
+                })
                 .collect(),
-            TokenKind::ByteFallback { spacechar } => {
+            Self::ByteFallback { spacechar } => {
                 if token.len() == 6 && token.starts_with("<0x") && token.ends_with('>') {
                     if let Ok(byte) = u8::from_str_radix(&token[3..5], 16) {
                         return vec![byte];
@@ -230,19 +219,19 @@ impl TokenKind {
                 }
                 token.replace(spacechar.as_str(), " ").into_bytes()
             }
-            TokenKind::Raw => token.as_bytes().to_vec(),
+            Self::Raw => token.as_bytes().to_vec(),
         }
     }
 }
 
-/// Maps Unicode surrogate characters used by ByteLevel tokenizers back to their
+/// Maps Unicode surrogate characters used by `ByteLevel` tokenizers back to their
 /// raw byte values (the same table as outlines-core's `CHAR_MAP`).
 static BYTE_CHAR_MAP: std::sync::LazyLock<std::collections::HashMap<char, u8>> =
     std::sync::LazyLock::new(|| {
         let mut map = std::collections::HashMap::with_capacity(256);
         let mut key = 0x100u32;
         for byte in 0..=255u8 {
-            let ch = byte as char;
+            let ch = char::from(byte);
             if matches!(ch, '!'..='~' | '\u{00A1}'..='\u{00AC}' | '\u{00AE}'..='\u{00FF}') {
                 map.insert(ch, byte);
             } else if let Some(c) = char::from_u32(key) {
@@ -313,7 +302,7 @@ mod tests {
         vocab.try_insert("b", 2).unwrap();
 
         // Simple regex: one or more 'a' characters
-        let result = ConstrainedGenerator::from_regex("a+", &vocab, 3);
+        let result = ConstrainedGenerator::from_regex("a+", &vocab);
         if let Ok(cg) = result {
             assert!(!cg.is_finished());
             let allowed = cg.allowed_token_ids();

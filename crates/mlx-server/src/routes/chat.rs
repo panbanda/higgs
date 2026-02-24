@@ -539,8 +539,6 @@ fn build_constraint(
             let eos_id = engine.eos_token_ids().first().copied().unwrap_or(0);
             let vocab = mlx_engine::constrained::build_vocabulary(engine.tokenizer(), eos_id)
                 .map_err(ServerError::Engine)?;
-            let vocab_size = engine.tokenizer().get_vocab_size(true);
-
             let constraint = if fmt.r#type == "json_schema" {
                 if let Some(ref schema) = fmt.json_schema {
                     // OpenAI spec wraps the actual schema under a `schema` key:
@@ -554,18 +552,14 @@ fn build_constraint(
                     mlx_engine::constrained::ConstrainedGenerator::from_json_schema(
                         &schema_str,
                         &vocab,
-                        vocab_size,
                     )
                     .map_err(ServerError::Engine)?
                 } else {
-                    // json_schema mode without a schema -- fall back to json_object
-                    mlx_engine::constrained::ConstrainedGenerator::for_json_object(
-                        &vocab, vocab_size,
-                    )
-                    .map_err(ServerError::Engine)?
+                    mlx_engine::constrained::ConstrainedGenerator::for_json_object(&vocab)
+                        .map_err(ServerError::Engine)?
                 }
             } else {
-                mlx_engine::constrained::ConstrainedGenerator::for_json_object(&vocab, vocab_size)
+                mlx_engine::constrained::ConstrainedGenerator::for_json_object(&vocab)
                     .map_err(ServerError::Engine)?
             };
 
