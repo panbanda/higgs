@@ -459,11 +459,8 @@ impl DeepSeekV2Attention {
         )?;
 
         // Repeat k_pe for all heads: [B, 1, L, D] -> [B, num_heads, L, D]
-        let k_pe_expanded = {
-            let refs: Vec<Array> = (0..self.num_heads).map(|_| k_pe.clone()).collect();
-            let ref_refs: Vec<&Array> = refs.iter().collect();
-            ops::concatenate_axis(&ref_refs, 1)?
-        };
+        let k_pe_expanded =
+            ops::broadcast_to(&k_pe, &[B, self.num_heads, L, self.qk_rope_head_dim])?;
 
         // Combine nope + pe components
         let keys_combined = ops::concatenate_axis(&[&k_nope, &k_pe_expanded], -1)?;

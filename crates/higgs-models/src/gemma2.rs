@@ -114,34 +114,7 @@ impl Gemma2ModelArgs {
 }
 
 // ---------------------------------------------------------------------------
-// Repeat KV heads for manual GQA attention
-// ---------------------------------------------------------------------------
-
-fn repeat_kv(x: &Array, n_rep: i32) -> Result<Array, Exception> {
-    if n_rep == 1 {
-        return Ok(x.clone());
-    }
-    let shape = x.shape();
-    let b = *shape
-        .first()
-        .ok_or_else(|| Exception::custom("repeat_kv: empty shape"))?;
-    let n_kv = *shape
-        .get(1)
-        .ok_or_else(|| Exception::custom("repeat_kv: need 4D input"))?;
-    let s = *shape
-        .get(2)
-        .ok_or_else(|| Exception::custom("repeat_kv: need 4D input"))?;
-    let d = *shape
-        .get(3)
-        .ok_or_else(|| Exception::custom("repeat_kv: need 4D input"))?;
-
-    let expanded = x.reshape(&[b, n_kv, 1, s, d])?;
-    let repeated = ops::broadcast_to(&expanded, &[b, n_kv, n_rep, s, d])?;
-    repeated.reshape(&[b, n_kv * n_rep, s, d])
-}
-
-// ---------------------------------------------------------------------------
-// Attention (manual with soft-capping)
+// Attention (manual with soft-capping, 5D broadcast GQA)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
@@ -152,6 +125,12 @@ struct Gemma2Attention {
     scale: f32,
     attn_logit_softcapping: Option<f32>,
     sliding_window: Option<i32>,
+
+    // Pre-cast scalars to avoid f32 dtype promotion in bfloat16 models
+    cached_scale: Option<Array>,
+    cached_inv_cap: Option<Array>,
+    cached_cap: Option<Array>,
+    cached_neg_inf: Option<Array>,
 
     #[quantizable]
     #[param]
@@ -210,6 +189,10 @@ impl Gemma2Attention {
             scale,
             attn_logit_softcapping: args.attn_logit_softcapping,
             sliding_window: window,
+            cached_scale: None,
+            cached_inv_cap: None,
+            cached_cap: None,
+            cached_neg_inf: None,
             q_proj: MaybeQuantized::Original(q_proj),
             k_proj: MaybeQuantized::Original(k_proj),
             v_proj: MaybeQuantized::Original(v_proj),
@@ -232,7 +215,7 @@ where
     type Output = Array;
     type Error = Exception;
 
-    #[allow(non_snake_case)]
+    #[allow(non_snake_case, clippy::too_many_lines)]
     fn forward(&mut self, input: Gemma2AttentionInput<'_, C>) -> Result<Self::Output, Self::Error> {
         let Gemma2AttentionInput { x, mask, mut cache } = input;
 
@@ -272,20 +255,49 @@ where
             keys = apply_rope(&keys, &self.rope, 0)?;
         }
 
-        // Expand KV heads for GQA
-        keys = repeat_kv(&keys, self.n_rep)?;
-        values = repeat_kv(&values, self.n_rep)?;
+        // GQA via 5D broadcast: avoids physically copying KV heads.
+        // queries: [B, n_heads, L, D] -> [B, n_kv, n_rep, L, D]
+        // keys/values: [B, n_kv, S, D] -> [B, n_kv, 1, S, D]
+        let kv_s = *keys
+            .shape()
+            .get(2)
+            .ok_or_else(|| Exception::custom("keys must be 4D"))?;
+        let head_d = *queries
+            .shape()
+            .get(3)
+            .ok_or_else(|| Exception::custom("queries must be 4D"))?;
+        let q5 = queries.reshape(&[B, self.n_kv_heads, self.n_rep, L, head_d])?;
+        let k5 = keys.reshape(&[B, self.n_kv_heads, 1, kv_s, head_d])?;
+        let v5 = values.reshape(&[B, self.n_kv_heads, 1, kv_s, head_d])?;
 
         // Manual attention with soft-capping
-        // scores: [B, n_heads, L, S]
-        let mut scores = queries
-            .matmul(&keys.transpose_axes(&[0, 1, 3, 2])?)?
-            .multiply(array!(self.scale))?;
+        // scores: [B, n_kv, n_rep, L, S]
+        if self.cached_scale.is_none() {
+            self.cached_scale = Some(array!(self.scale).as_dtype(q5.dtype())?);
+        }
+        let scale = self
+            .cached_scale
+            .as_ref()
+            .ok_or_else(|| Exception::custom("cached_scale not initialized"))?;
+        let mut scores = q5
+            .matmul(&k5.transpose_axes(&[0, 1, 2, 4, 3])?)?
+            .multiply(scale)?;
 
         // Soft-capping: tanh(scores / cap) * cap
         if let Some(cap) = self.attn_logit_softcapping {
-            let inv_cap = 1.0 / cap;
-            scores = ops::tanh(&scores.multiply(array!(inv_cap))?)?.multiply(array!(cap))?;
+            if self.cached_inv_cap.is_none() {
+                self.cached_inv_cap = Some(array!(1.0 / cap).as_dtype(scores.dtype())?);
+                self.cached_cap = Some(array!(cap).as_dtype(scores.dtype())?);
+            }
+            let inv_cap = self
+                .cached_inv_cap
+                .as_ref()
+                .ok_or_else(|| Exception::custom("cached_inv_cap not initialized"))?;
+            let cap_arr = self
+                .cached_cap
+                .as_ref()
+                .ok_or_else(|| Exception::custom("cached_cap not initialized"))?;
+            scores = ops::tanh(&scores.multiply(inv_cap)?)?.multiply(cap_arr)?;
         }
 
         // Apply sliding window mask (additive: -inf for out-of-window positions)
@@ -295,19 +307,35 @@ where
                 .last()
                 .ok_or_else(|| Exception::custom("scores must have >= 1 dim"))?;
             if s_len > window {
+                if self.cached_neg_inf.is_none() {
+                    self.cached_neg_inf = Some(array!(f32::NEG_INFINITY).as_dtype(scores.dtype())?);
+                }
                 let window_mask = create_sliding_window_mask(L, s_len, window)?;
-                scores = ops::r#where(&window_mask, &scores, &array!(f32::NEG_INFINITY))?;
+                let neg_inf = self
+                    .cached_neg_inf
+                    .as_ref()
+                    .ok_or_else(|| Exception::custom("cached_neg_inf not initialized"))?;
+                scores = ops::r#where(&window_mask, &scores, neg_inf)?;
             }
         }
 
         // Apply causal mask (boolean: true = attend, false = mask out)
         if let Some(m) = mask {
-            scores = ops::r#where(m, &scores, &array!(f32::NEG_INFINITY))?;
+            if self.cached_neg_inf.is_none() {
+                self.cached_neg_inf = Some(array!(f32::NEG_INFINITY).as_dtype(scores.dtype())?);
+            }
+            let neg_inf = self
+                .cached_neg_inf
+                .as_ref()
+                .ok_or_else(|| Exception::custom("cached_neg_inf not initialized"))?;
+            scores = ops::r#where(m, &scores, neg_inf)?;
         }
 
         let weights = ops::softmax_axis(&scores, -1, None)?;
+        // [B, n_kv, n_rep, L, D] -> [B, n_heads, L, D] -> [B, L, n_heads*D]
         let output = weights
-            .matmul(&values)?
+            .matmul(&v5)?
+            .reshape(&[B, self.n_heads, L, head_d])?
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[B, L, -1])?;
 
@@ -505,6 +533,7 @@ struct Gemma2Model {
     norm: nn::RmsNorm,
 
     hidden_size: i32,
+    cached_embed_scale: Option<Array>,
 }
 
 struct Gemma2ModelInput<'a, C> {
@@ -536,6 +565,7 @@ impl Gemma2Model {
                 .eps(args.rms_norm_eps)
                 .build()?,
             hidden_size: args.hidden_size,
+            cached_embed_scale: None,
         })
     }
 }
@@ -555,14 +585,19 @@ where
         } = input;
 
         // Gemma 2 scales embeddings by sqrt(hidden_size)
-        let hidden_size_f32 = f32::from(
-            i16::try_from(self.hidden_size)
-                .map_err(|_| Exception::custom("hidden_size out of i16 range"))?,
-        );
-        let mut h = self
-            .embed_tokens
-            .forward(inputs)?
-            .multiply(array!(hidden_size_f32.sqrt()))?;
+        let mut h = self.embed_tokens.forward(inputs)?;
+        if self.cached_embed_scale.is_none() {
+            let hidden_size_f32 = f32::from(
+                i16::try_from(self.hidden_size)
+                    .map_err(|_| Exception::custom("hidden_size out of i16 range"))?,
+            );
+            self.cached_embed_scale = Some(array!(hidden_size_f32.sqrt()).as_dtype(h.dtype())?);
+        }
+        let embed_scale = self
+            .cached_embed_scale
+            .as_ref()
+            .ok_or_else(|| Exception::custom("cached_embed_scale not initialized"))?;
+        h = h.multiply(embed_scale)?;
 
         let computed_mask = match mask {
             Some(m) => Some(m.clone()),
@@ -620,6 +655,9 @@ pub struct Gemma2CausalLM {
     #[quantizable]
     #[param]
     lm_head: Option<MaybeQuantized<nn::Linear>>,
+
+    cached_final_inv_cap: Option<Array>,
+    cached_final_cap: Option<Array>,
 }
 
 impl Gemma2CausalLM {
@@ -639,6 +677,8 @@ impl Gemma2CausalLM {
             args,
             model,
             lm_head,
+            cached_final_inv_cap: None,
+            cached_final_cap: None,
         })
     }
 
@@ -660,8 +700,19 @@ impl Gemma2CausalLM {
 
         // Final logit soft-capping
         if let Some(cap) = self.args.final_logit_softcapping {
-            let inv_cap = 1.0 / cap;
-            logits = ops::tanh(&logits.multiply(array!(inv_cap))?)?.multiply(array!(cap))?;
+            if self.cached_final_inv_cap.is_none() {
+                self.cached_final_inv_cap = Some(array!(1.0 / cap).as_dtype(logits.dtype())?);
+                self.cached_final_cap = Some(array!(cap).as_dtype(logits.dtype())?);
+            }
+            let final_inv_cap = self
+                .cached_final_inv_cap
+                .as_ref()
+                .ok_or_else(|| Exception::custom("cached_final_inv_cap not initialized"))?;
+            let final_cap = self
+                .cached_final_cap
+                .as_ref()
+                .ok_or_else(|| Exception::custom("cached_final_cap not initialized"))?;
+            logits = ops::tanh(&logits.multiply(final_inv_cap)?)?.multiply(final_cap)?;
         }
 
         Ok(logits)
@@ -895,20 +946,6 @@ mod tests {
         let mut args = default_gemma2_args();
         args.num_hidden_layers = 0;
         assert!(Gemma2CausalLM::new(args).is_err());
-    }
-
-    #[test]
-    fn repeat_kv_no_op_for_n_rep_1() {
-        let x = Array::ones::<f32>(&[1, 4, 3, 8]).unwrap();
-        let result = repeat_kv(&x, 1).unwrap();
-        assert_eq!(result.shape(), &[1, 4, 3, 8]);
-    }
-
-    #[test]
-    fn repeat_kv_doubles_heads() {
-        let x = Array::ones::<f32>(&[1, 2, 3, 8]).unwrap();
-        let result = repeat_kv(&x, 2).unwrap();
-        assert_eq!(result.shape(), &[1, 4, 3, 8]);
     }
 
     #[test]
