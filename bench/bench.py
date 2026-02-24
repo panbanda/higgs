@@ -24,6 +24,7 @@ import asyncio
 import base64
 import json
 import math
+import os
 import signal
 import subprocess
 import sys
@@ -123,6 +124,9 @@ def mlx_server(model: str, extra_args: list[str] | None = None):
         time.sleep(2)
 
 
+VLLM_DIR = str(Path.home() / "dev" / "vllm-mlx")
+
+
 @contextmanager
 def vllm_server(model: str, extra_args: list[str] | None = None):
     """Context manager: start vllm-mlx, yield (port, model_id, proc), stop on exit."""
@@ -130,7 +134,9 @@ def vllm_server(model: str, extra_args: list[str] | None = None):
             "--port", str(VLLM_PORT)]
     if extra_args:
         args.extend(extra_args)
-    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    env = {**os.environ, "PYTHONPATH": VLLM_DIR}
+    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            env=env)
     try:
         if not wait_ready(VLLM_PORT):
             raise RuntimeError("vllm-mlx failed to start")

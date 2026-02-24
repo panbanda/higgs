@@ -1,0 +1,194 @@
+[
+  {
+    "name": "throughput_Llama-3.2-1B-Instruct-4bit",
+    "mlx": {
+      "tok_s": 448.4,
+      "rss_mb": 974
+    },
+    "vllm": {
+      "tok_s": 432.8,
+      "rss_mb": 1380
+    },
+    "notes": ""
+  },
+  {
+    "name": "throughput_Qwen3-1.7B-4bit",
+    "mlx": {
+      "tok_s": 305.2,
+      "rss_mb": 1126
+    },
+    "vllm": {
+      "tok_s": 299.6,
+      "rss_mb": 1641
+    },
+    "notes": ""
+  },
+  {
+    "name": "throughput_Qwen3-30B-A3B-8bit",
+    "mlx": {
+      "tok_s": 74.5,
+      "rss_mb": 31139
+    },
+    "vllm": {
+      "tok_s": 86.8,
+      "rss_mb": 31658
+    },
+    "notes": ""
+  },
+  {
+    "name": "batching",
+    "mlx": {
+      "n1_tok_s": 279.6,
+      "n1_ttft_ms": 134,
+      "n2_tok_s": 585.1,
+      "n2_ttft_ms": 43,
+      "n4_tok_s": 698.2,
+      "n4_ttft_ms": 81,
+      "n8_tok_s": 754.8,
+      "n8_ttft_ms": 126
+    },
+    "vllm": {
+      "n1_tok_s": 249.7,
+      "n1_ttft_ms": 41,
+      "n2_tok_s": 458.9,
+      "n2_ttft_ms": 16,
+      "n4_tok_s": 509.6,
+      "n4_ttft_ms": 24,
+      "n8_tok_s": 645.8,
+      "n8_ttft_ms": 49
+    },
+    "notes": ""
+  },
+  {
+    "name": "structured_output",
+    "mlx": {
+      "valid": 10,
+      "total": 10,
+      "pct": 100.0
+    },
+    "vllm": {
+      "valid": 0,
+      "total": 10,
+      "pct": 0.0
+    },
+    "notes": ""
+  },
+  {
+    "name": "logprobs",
+    "mlx": {
+      "top1_agreement_pct": 0,
+      "mean_logprob_mae": null
+    },
+    "vllm": {
+      "top1_agreement_pct": 0,
+      "mean_logprob_mae": null
+    },
+    "notes": "Both use same MLX weights; diff measures impl divergence only."
+  },
+  {
+    "name": "reasoning",
+    "mlx": {
+      "reasoning_extracted": 5,
+      "correct": 5,
+      "total": 5
+    },
+    "vllm": {
+      "reasoning_extracted": 4,
+      "correct": 5,
+      "total": 5
+    },
+    "notes": ""
+  },
+  {
+    "name": "embeddings",
+    "mlx": {
+      "spearman": 0.357,
+      "mean_l2_norm": 1.0,
+      "dim": 2048
+    },
+    "vllm": {
+      "spearman": 0.833,
+      "mean_l2_norm": 1.0,
+      "dim": 384
+    },
+    "notes": ""
+  },
+  {
+    "name": "vision",
+    "mlx": {
+      "correct": 0,
+      "total": 5,
+      "pct": 0.0
+    },
+    "vllm": {
+      "correct": 0,
+      "total": 5,
+      "pct": 0.0
+    },
+    "notes": ""
+  },
+  {
+    "name": "arch_gemma2",
+    "mlx": {
+      "tok_s": 121.7,
+      "rss_mb": 1633,
+      "coherent": true,
+      "sample": "Hello!  I am a large language model, trained to generate text, and I am here to "
+    },
+    "vllm": {
+      "tok_s": 91.0,
+      "rss_mb": 2350,
+      "coherent": true,
+      "sample": "I am Gemma, a large language model created by the Gemma team, here to assist you"
+    },
+    "notes": ""
+  },
+  {
+    "name": "arch_phi3",
+    "mlx": {
+      "tok_s": 133.9,
+      "rss_mb": 2124,
+      "coherent": true,
+      "sample": "I am an advanced AI developed to assist with a wide range of tasks and provide i"
+    },
+    "vllm": {
+      "tok_s": 95.0,
+      "rss_mb": 2573,
+      "coherent": true,
+      "sample": "I am an advanced AI developed to assist with a wide range of tasks and provide i"
+    },
+    "notes": ""
+  },
+  {
+    "name": "arch_starcoder2",
+    "mlx": {
+      "tok_s": 104.5,
+      "rss_mb": 1907,
+      "coherent": true,
+      "sample": " if n == 0:\n         return 0\n     elif n == 1:\n         return 1\n     else:\n   "
+    },
+    "vllm": {
+      "tok_s": 164.7,
+      "rss_mb": 2342,
+      "coherent": true,
+      "sample": "if n == 0:\n         return 0\n     elif n == 1:\n         return 1\n     else:\n    "
+    },
+    "notes": ""
+  },
+  {
+    "name": "arch_deepseek_v2",
+    "mlx": {
+      "tok_s": 100.3,
+      "rss_mb": 8524,
+      "coherent": true,
+      "sample": " Hello! I'm an AI language model designed to assist with answering questions, pr"
+    },
+    "vllm": {
+      "tok_s": 99.0,
+      "rss_mb": 8998,
+      "coherent": true,
+      "sample": "Hello! I'm an AI assistant designed to provide information, answer questions, an"
+    },
+    "notes": ""
+  }
+]

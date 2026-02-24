@@ -1,0 +1,154 @@
+[
+  {
+    "arch": "llama",
+    "repo": "mlx-community/Llama-3.2-1B-Instruct-4bit",
+    "mode": "chat",
+    "python": {
+      "tok_s": 420.9,
+      "rss_mb": 1356,
+      "text": "Gravitational waves are ripples in the fabric of spacetime that are produced when massive objects, like stars or black holes, move or rotate. These waves were first predicted by Albert Einstein in 1915, but it wasn't until 2015 that the first direct detection of gravitational waves was made.\n\nImagine you're standing on a trampoline. If you place a heavy object, like a bowling ball, on the trampoline, it will create a dent or a depression. Now, if you roll a marble nearby, it will also create a dent on the trampoline. But if you roll another marble nearby, it will create a new dent, and another one, and another one. This is because the trampoline is a bit like spacetime, and the heavy object is like a massive object.\n\nWhen a massive object moves or rotates, it creates a disturbance in spacetime, which is what we call a gravitational wave. These waves travel through spacetime at the speed of light,",
+      "elapsed": 0.48,
+      "gen_tokens": 200
+    },
+    "rust": {
+      "tok_s": 454.6,
+      "rss_mb": 974,
+      "text": "Gravitational waves are a way that the universe communicates with us. They're like ripples in a pond, but instead of water, it's space and time.\n\nImagine you're standing by a pond. You throw a stone into the water, and it creates a ripple that travels outward. Now, imagine there's a massive object, like a mountain or a star, sitting on the surface of the pond. If you were to throw another stone into the water, it would create another ripple, just like the first one.\n\nThat's basically what gravitational waves are. They're the ripples in space and time that get created when massive objects, like stars or black holes, move around. These ripples are like a message from the universe, saying \"Hey, I'm moving!\" or \"I'm getting bigger!\"\n\nGravitational waves were first predicted by Albert Einstein in 1915, and they were first detected in 2015 by a team of scientists using a powerful machine called L",
+      "elapsed": 0.44,
+      "gen_tokens": 200
+    }
+  },
+  {
+    "arch": "mistral",
+    "repo": "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
+    "mode": "chat",
+    "python": {
+      "tok_s": 102.9,
+      "rss_mb": 4384,
+      "text": "Gravitational waves are ripples in the fabric of space-time, the mathematical description of the geometry of the universe, caused by the acceleration of massive objects, such as black holes or neutron stars, during their interaction.\n\nImagine a large, heavy ball placed on a trampoline. If you push the ball hard enough, it will cause the trampoline to stretch and compress in waves that move outward from the ball. Gravitational waves are similar to these waves, but instead of affecting a trampoline, they affect the very fabric of space and time.\n\nThese waves were first predicted by Albert Einstein in his theory of general relativity, but they were not directly observed until 2015 by the LIGO (Laser Interferometer Gravitational-Wave Observatory) collaboration. The detection of gravitational waves has opened a new way to observe the universe, allowing us to study some of the most violent and energet",
+      "elapsed": 1.94,
+      "gen_tokens": 200
+    },
+    "rust": {
+      "tok_s": 103.3,
+      "rss_mb": 3965,
+      "text": "Gravitational waves are ripples in the fabric of space-time caused by the acceleration of massive objects, such as black holes or neutron stars, during events like collisions or mergers. These waves propagate outward at the speed of light, carrying with them information about the original source. They are a type of disturbance in the gravitational field, and they were first predicted by Albert Einstein in his theory of general relativity. When two massive objects orbit each other, they cause a periodic distortion in space-time, which creates a wave-like disturbance that travels outward from the source. These waves can be detected by highly sensitive instruments, such as the Laser Interferometer Gravitational-Wave Observatory (LIGO) and the Virgo detector, which measure the tiny changes in the distance between two points caused by the passage of a gravitational wave. The detection of gravitational waves provides a new way to observe the universe and study",
+      "elapsed": 1.94,
+      "gen_tokens": 200
+    }
+  },
+  {
+    "arch": "qwen2",
+    "repo": "mlx-community/Qwen3-1.7B-4bit",
+    "mode": "chat",
+    "python": {
+      "tok_s": 292.8,
+      "rss_mb": 1609,
+      "text": "<think>\nOkay, the user is asking for a simple explanation of gravitational waves. Let me think about how to break this down. First, I need to recall what gravitational waves are. They're ripples in the fabric of spacetime caused by massive objects accelerating. But how to explain that in simple terms?\n\nMaybe start with the basics. Like, Einstein's theory of general relativity. Oh right, he predicted that massive objects like stars or black holes moving would create waves in the universe's fabric. But how to make that relatable?\n\nI should mention that these waves are like vibrations. Maybe compare them to a heavy object moving in a medium, creating ripples. But in space-time, so they're not just water waves. Also, they travel at the speed of light, so they can be detected even if they're far away.\n\nWait, but how do we detect them? Maybe mention that they need sensitive instruments like LIGO. Oh right, they're so tiny that they stretch",
+      "elapsed": 0.68,
+      "gen_tokens": 200
+    },
+    "rust": {
+      "tok_s": 307.1,
+      "rss_mb": 1127,
+      "text": "",
+      "elapsed": 0.65,
+      "gen_tokens": 200
+    }
+  },
+  {
+    "arch": "qwen3_moe",
+    "repo": "mlx-community/Qwen3-30B-A3B-8bit",
+    "mode": "chat",
+    "python": {
+      "tok_s": 85.7,
+      "rss_mb": 31640,
+      "text": "<think>\nOkay, so I need to explain gravitational waves in simple terms. Let me start by recalling what I know. Gravitational waves are ripples in spacetime, right? They were predicted by Einstein's theory of general relativity. But how do I make that simple?\n\nFirst, maybe I should compare them to something familiar. Like ripples in a pond when you throw a stone. But instead of water, it's spacetime. But wait, spacetime is a bit abstract. Maybe I can say that when massive objects move, they create waves in the fabric of space and time.\n\nBut what are these massive objects? Like black holes or neutron stars. When they collide or orbit each other, they create these waves. The LIGO experiment detected them, I think. But how to explain that without getting too technical?\n\nAlso, the key point is that they're not just disturbances in space, but in both space and time. So when a gravitational wave passes, it stretches and",
+      "elapsed": 2.33,
+      "gen_tokens": 200
+    },
+    "rust": {
+      "tok_s": 75.1,
+      "rss_mb": 31138,
+      "text": "",
+      "elapsed": 2.66,
+      "gen_tokens": 200
+    }
+  },
+  {
+    "arch": "gemma2",
+    "repo": "mlx-community/gemma-2-2b-it-4bit",
+    "mode": "chat",
+    "python": {
+      "tok_s": 184.8,
+      "rss_mb": 2307,
+      "text": "Imagine a big, heavy bowling ball on a trampoline.  When you roll a marble across the trampoline, it creates ripples, right?  Those ripples are like gravitational waves!\n\n**Here's the breakdown:**\n\n* **Gravity is like a force that bends space and time.**  Think of it like a big, invisible fabric that everything in the universe is draped over.\n* **Massive objects like stars and black holes warp this fabric.**  They create these ripples in the fabric of space and time, kind of like a bowling ball on a trampoline.\n* **These ripples are called gravitational waves.**  They travel at the speed of light and can affect things like light and even time itself!\n* **We can detect these waves because they cause tiny changes in the fabric of space and time.**  It's like a tiny, subtle ripple in the fabric of the universe.\n\n**Think of it like this:**\n\n* Imagine a giant, invisible ocean of space and time",
+      "elapsed": 1.08,
+      "gen_tokens": 200
+    },
+    "rust": {
+      "tok_s": 157.9,
+      "rss_mb": 1639,
+      "text": "Imagine a giant, cosmic, wave that's caused by something that's happening in space.  That's a gravitational wave.  \n\nHere's a breakdown:\n\n* **Space:**  The universe is filled with things that are happening, like stars and planets.\n* **Waves:**  Just like water waves, these waves are caused by something happening in space.\n* **Gravity:**  The force that pulls things together, like stars and planets, is called gravity.\n* **Gravitational Waves:**  These are waves that are caused by something happening in space, like stars and planets, that are pulling things together.\n\n\nThink of it like this:\n* **Space:**  The universe is like a giant, cosmic, playground.\n* **Waves:**  The waves are like the waves on a beach.\n* **Gravity:**  The force that pulls things together, like stars and planets, is called gravity.\n* **Gravitational Waves:**",
+      "elapsed": 1.27,
+      "gen_tokens": 200
+    }
+  },
+  {
+    "arch": "phi3",
+    "repo": "mlx-community/Phi-3-mini-4k-instruct-4bit",
+    "mode": "chat",
+    "python": {
+      "tok_s": 170.0,
+      "rss_mb": 2548,
+      "text": "Gravitational waves are ripples in the fabric of space-time that travel outward from the source that created them, much like waves on a pond. These waves were first predicted by Albert Einstein in 1916 as part of his general theory of relativity. According to Einstein, when massive objects like black holes or neutron stars orbit each other or collide, they can create waves that spread out across the universe. These waves carry information about the events that created them, such as the mass and speed of the colliding objects. Detecting these waves requires incredibly sensitive instruments because the distortions they cause in space-time are minuscule. The first direct detection of gravitational waves was announced by the LIGO and Virgo collaborations in 2016, confirming Einstein's century-old prediction and opening a new window for observing the universe.<|end|>",
+      "elapsed": 1.13,
+      "gen_tokens": 192
+    },
+    "rust": {
+      "tok_s": 170.9,
+      "rss_mb": 2126,
+      "text": "Gravitational waves are ripples in the fabric of space-time that travel outward from the source that created them, much like waves on a pond. These waves were first predicted by Albert Einstein in 1916 as part of his general theory of relativity. According to Einstein, when massive objects like black holes or neutron stars orbit each other or collide, they can create waves that spread out across the universe. These waves carry information about the events that created them, such as the mass and speed of the colliding objects. Detecting these waves is a major goal in modern astrophysics because it would provide a whole new way to observe and understand the universe.",
+      "elapsed": 0.86,
+      "gen_tokens": 147
+    }
+  },
+  {
+    "arch": "starcoder2",
+    "repo": "mlx-community/starcoder2-3b-4bit",
+    "mode": "completion",
+    "python": {
+      "tok_s": 176.2,
+      "rss_mb": 2318,
+      "text": "if len(arr) > 1:\n         mid = len(arr) // 2\n         left = arr[:mid]\n         right = arr[mid:]\n\n         merge_sort(left)\n         merge_sort(right)\n\n         i = 0\n         j = 0\n         k = 0\n         while i < len(left) and j < len(right):\n             if left[i] < right[j]:\n                 arr[k] = left[i]\n                 i += 1\n             else:\n                 arr[k] = right[j]\n                 j += 1\n             k += 1\n\n         while i < len(left):\n             arr[k] = left[i]\n             i += 1\n             k += 1\n\n         while j < len(right):\n             arr[k] = right[j]\n             j += 1\n             k += 1\n\ndef main():\n    arr = [12, 11, 1",
+      "elapsed": 1.14,
+      "gen_tokens": 200
+    },
+    "rust": {
+      "tok_s": 107.3,
+      "rss_mb": 1908,
+      "text": " if len(arr) > 1:\n         mid = len(arr) // 2\n         left = arr[:mid]\n         right = arr[mid:]\n\n         merge_sort(left)\n         merge_sort(right)\n\n         i = 0\n         j = 0\n         k = 0\n         while i < len(left) and j < len(right):\n             if left[i] < right[j]:\n                 arr[k] = left[i]\n                 i += 1\n             else:\n                 arr[k] = right[j]\n                 j += 1\n             k += 1\n\n         while i < len(left):\n             arr[k] = left[i]\n             i += 1\n             k += 1\n\n         while j < len(right):\n             arr[k] = right[j]\n             j += 1\n             k += 1\n\ndef main():\n    arr = [12, 11, 1",
+      "elapsed": 1.86,
+      "gen_tokens": 200
+    }
+  },
+  {
+    "arch": "deepseek_v2",
+    "repo": "mlx-community/DeepSeek-V2-Lite-Chat-4bit-mlx",
+    "mode": "chat",
+    "python": {
+      "tok_s": 173.7,
+      "rss_mb": 8972,
+      "text": "Gravitational waves are ripples in the fabric of spacetime, caused by some of the most violent and energetic processes in the Universe, such as merging black holes or supernova explosions. They were first predicted by Albert Einstein in 1916, as a consequence of his General Theory of Relativity.\n\nTo put it simply, imagine you throw a stone into a pond. The stone hits the water and causes ripples to spread out from the point of impact. Similarly, when massive objects move through space, they create ripples in the fabric of spacetime, which we call gravitational waves. These waves travel through space at the speed of light, and they can be detected by highly sensitive instruments.\n\nWhen two black holes merge, for example, they create a huge amount of energy, which sends out a powerful burst of gravitational waves. These waves travel through space, and when they reach Earth, they are picked up by extremely sensitive instruments, like LIGO (Laser Interferometer Grav",
+      "elapsed": 1.15,
+      "gen_tokens": 200
+    },
+    "rust": {
+      "tok_s": 137.3,
+      "rss_mb": 8528,
+      "text": " Gravitational waves are ripples in the fabric of space-time, caused by some of the most violent and energetic processes in the universe. They were first predicted by Albert Einstein in 1916, as a direct consequence of his theory of General Relativity.\n\nEinstein's theory describes how massive objects, like planets or stars, can cause space-time to curve. If another massive object comes close to this curved space-time, it will cause the space-time to ripple or vibrate, much like when you throw a stone into a pond, causing ripples to spread out from the point of impact.\n\nThese ripples in space-time, or gravitational waves, travel at the speed of light and carry energy away from their source. They can be detected on Earth by their tiny effects on the distance between two points on Earth, or on the time it takes for light to travel between two points.\n\nThe first direct detection of gravitational waves was announced in",
+      "elapsed": 1.46,
+      "gen_tokens": 200
+    }
+  }
+]
