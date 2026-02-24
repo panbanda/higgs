@@ -102,7 +102,7 @@ impl ConstrainedGenerator {
         // Use the actual logits vocab dimension, not the tokenizer's count.
         // Models often pad their embedding table beyond the tokenizer vocabulary.
         let logit_vocab = *logits.shape().last().unwrap_or(&0) as usize;
-        let vocab_size = logit_vocab.max(self.vocab_size);
+        let vocab_size = logit_vocab;
 
         // Build a mask: -inf for disallowed, 0 for allowed
         let mut mask_vec = vec![f32::NEG_INFINITY; vocab_size];

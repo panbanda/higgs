@@ -665,8 +665,23 @@ impl Model {
         inputs: &Array,
         kv_caches: &mut [&mut Vec<Option<SteppingKeyValueCache>>],
     ) -> Result<Array, Exception> {
-        let n = inputs.shape()[0];
+        let n = *inputs
+            .shape()
+            .first()
+            .ok_or_else(|| Exception::custom("inputs must have batch dimension"))?;
         let num_layers = self.model.layers.len();
+        let n_usize = usize::try_from(n).map_err(|_| Exception::custom("batch size overflow"))?;
+        if kv_caches.len() != n_usize {
+            return Err(Exception::custom("kv_caches length must match batch size"));
+        }
+        for (i, cache) in kv_caches.iter().enumerate() {
+            if cache.len() != num_layers {
+                return Err(Exception::custom(format!(
+                    "kv_cache[{i}] length ({}) must match num layers ({num_layers})",
+                    cache.len()
+                )));
+            }
+        }
         let head_dim = self.args.head_dim();
 
         // Per-request offsets (from layer 0's cache, all layers have the same offset)

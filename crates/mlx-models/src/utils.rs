@@ -109,7 +109,7 @@ where
 /// Create a boolean attention mask for batched decode.
 ///
 /// Each request attends only to its own valid KV positions (not padding).
-/// Returns shape `[N, 1, max_kv_len]` where `mask[i, 0, j]` is true when
+/// Returns shape `[N, 1, 1, max_kv_len]` where `mask[i, 0, 0, j]` is true when
 /// `j < kv_lengths[i]`.
 pub(crate) fn create_batched_decode_mask(
     kv_lengths: &[i32],
