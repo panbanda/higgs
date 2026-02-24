@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
-use mlx_models::{AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample};
+use higgs_models::{AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample};
 use mlx_rs::{
     Array, Dtype, Stream,
     ops::indexing::{IndexOp, NewAxis},
@@ -163,7 +163,7 @@ impl SimpleEngine {
         let Some(image_token_id) = self.tokenizer.token_to_id("<image>") else {
             return;
         };
-        let image_token_u32 = mlx_models::llava_qwen2::IMAGE_TOKEN_INDEX as u32;
+        let image_token_u32 = higgs_models::llava_qwen2::IMAGE_TOKEN_INDEX as u32;
         for token in tokens.iter_mut() {
             if *token == image_token_id {
                 *token = image_token_u32;
@@ -498,7 +498,7 @@ impl SimpleEngine {
             cg.advance(first_token_id);
         }
         let mut tokens: Vec<u32> = vec![first_token_id];
-        let mut all_logprobs: Option<Vec<mlx_models::TokenLogprobInfo>> = logprobs.then(Vec::new);
+        let mut all_logprobs: Option<Vec<higgs_models::TokenLogprobInfo>> = logprobs.then(Vec::new);
         if let (Some(all_lp), Some(lp_data)) = (&mut all_logprobs, &first_logprob_data) {
             all_lp.push(lp_data.materialize(first_token_id));
         }

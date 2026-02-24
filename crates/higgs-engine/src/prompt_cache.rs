@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::time::Instant;
 
-use mlx_models::AnyCache;
+use higgs_models::AnyCache;
 
 /// Minimum prefix length (in tokens) to consider a cache match useful.
 const MIN_PREFIX_LEN: usize = 16;
@@ -314,8 +314,8 @@ impl PrefixCache {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use mlx_models::AnyCache;
-    use mlx_models::cache::SteppingKeyValueCache;
+    use higgs_models::AnyCache;
+    use higgs_models::cache::SteppingKeyValueCache;
 
     fn make_dummy_cache(num_layers: usize) -> AnyCache {
         let kv: Vec<Option<SteppingKeyValueCache>> = (0..num_layers)

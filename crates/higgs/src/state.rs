@@ -2,13 +2,13 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use mlx_engine::batch_engine::BatchEngine;
-use mlx_engine::chat_template::ChatMessage;
-use mlx_engine::engine::{GenerationOutput, StreamingOutput};
-use mlx_engine::error::EngineError;
-use mlx_engine::simple::SimpleEngine;
-use mlx_engine::tokenizers::Tokenizer;
-use mlx_models::SamplingParams;
+use higgs_engine::batch_engine::BatchEngine;
+use higgs_engine::chat_template::ChatMessage;
+use higgs_engine::engine::{GenerationOutput, StreamingOutput};
+use higgs_engine::error::EngineError;
+use higgs_engine::simple::SimpleEngine;
+use higgs_engine::tokenizers::Tokenizer;
+use higgs_models::SamplingParams;
 use mlx_rs::Array;
 
 use crate::config::ServerConfig;
@@ -98,7 +98,7 @@ impl Engine {
         stop_sequences: &[String],
         logprobs: bool,
         top_logprobs: Option<u32>,
-        constraint: Option<mlx_engine::constrained::ConstrainedGenerator>,
+        constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
     ) -> Result<GenerationOutput, EngineError> {
         match self {
@@ -135,7 +135,7 @@ impl Engine {
         logprobs: bool,
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
-        constraint: Option<mlx_engine::constrained::ConstrainedGenerator>,
+        constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
     ) -> Result<(), EngineError> {
         match self {

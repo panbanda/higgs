@@ -47,7 +47,7 @@ But mlx-rs `QuantizedLinear` uses nested parameter names:
 - `layer.scales`
 - `layer.biases`
 
-The `remap_quantized_key()` function in `mlx-models/src/lib.rs` handles this
+The `remap_quantized_key()` function in `higgs-models/src/lib.rs` handles this
 by retrying `.weight` -> `.inner.weight` and `.bias` (singular) -> `.inner.bias`.
 Note that `.biases` (plural) is a quantization parameter and is not remapped.
 

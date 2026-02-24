@@ -21,7 +21,7 @@ use crate::{
         MessageStartEvent, MessageStartPayload, MessageStopEvent, TextDelta,
     },
 };
-use mlx_models::SamplingParams;
+use higgs_models::SamplingParams;
 
 pub async fn create_message(
     State(state): State<SharedState>,

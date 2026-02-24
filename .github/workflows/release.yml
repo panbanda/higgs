@@ -21,8 +21,8 @@ jobs:
       pull-requests: write
 
     outputs:
-      release_created: ${{ steps.release.outputs['crates/mlx-server--release_created'] }}
-      tag_name: ${{ steps.release.outputs['crates/mlx-server--tag_name'] }}
+      release_created: ${{ steps.release.outputs['crates/higgs--release_created'] }}
+      tag_name: ${{ steps.release.outputs['crates/higgs--tag_name'] }}
 
     steps:
       - name: Release Please
@@ -70,13 +70,13 @@ jobs:
       - name: Create archive
         run: |
           TAG="${{ needs.release-please.outputs.tag_name }}"
-          VERSION="${TAG#mlx-server-v}"
-          ARCHIVE_NAME="mlx-server_${VERSION}_${{ matrix.target }}"
+          VERSION="${TAG#higgs-v}"
+          ARCHIVE_NAME="higgs_${VERSION}_${{ matrix.target }}"
 
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/mlx-server dist/
+          cp target/${{ matrix.target }}/release/higgs dist/
           cd dist
-          tar -czvf "${ARCHIVE_NAME}.tar.gz" mlx-server
+          tar -czvf "${ARCHIVE_NAME}.tar.gz" higgs
           shasum -a 256 "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
 
       - name: Upload release assets
@@ -109,29 +109,29 @@ jobs:
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
 
-      - name: Publish mlx-models
+      - name: Publish higgs-models
         run: |
-          out=$(cargo publish -p mlx-models --token ${{ secrets.CARGO_REGISTRY_TOKEN }} 2>&1) && echo "$out" || {
+          out=$(cargo publish -p higgs-models --token ${{ secrets.CARGO_REGISTRY_TOKEN }} 2>&1) && echo "$out" || {
             echo "$out"
             echo "$out" | grep -q "already exists" || exit 1
           }
 
-      - name: Wait for crates.io to index mlx-models
+      - name: Wait for crates.io to index higgs-models
         run: sleep 30
 
-      - name: Publish mlx-engine
+      - name: Publish higgs-engine
         run: |
-          out=$(cargo publish -p mlx-engine --token ${{ secrets.CARGO_REGISTRY_TOKEN }} 2>&1) && echo "$out" || {
+          out=$(cargo publish -p higgs-engine --token ${{ secrets.CARGO_REGISTRY_TOKEN }} 2>&1) && echo "$out" || {
             echo "$out"
             echo "$out" | grep -q "already exists" || exit 1
           }
 
-      - name: Wait for crates.io to index mlx-engine
+      - name: Wait for crates.io to index higgs-engine
         run: sleep 30
 
-      - name: Publish mlx-server
+      - name: Publish higgs
         run: |
-          out=$(cargo publish -p mlx-server --token ${{ secrets.CARGO_REGISTRY_TOKEN }} 2>&1) && echo "$out" || {
+          out=$(cargo publish -p higgs --token ${{ secrets.CARGO_REGISTRY_TOKEN }} 2>&1) && echo "$out" || {
             echo "$out"
             echo "$out" | grep -q "already exists" || exit 1
           }
@@ -173,14 +173,14 @@ jobs:
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
         run: |
           TAG="${{ needs.release-please.outputs.tag_name }}"
-          VERSION="${TAG#mlx-server-v}"
+          VERSION="${TAG#higgs-v}"
 
-          DARWIN_ARM64_SHA=$(cat dist/mlx-server_${VERSION}_aarch64-apple-darwin.tar.gz.sha256 | cut -d' ' -f1)
+          DARWIN_ARM64_SHA=$(cat dist/higgs_${VERSION}_aarch64-apple-darwin.tar.gz.sha256 | cut -d' ' -f1)
 
-          cat > mlx-server.rb << EOF
-          class MlxServer < Formula
+          cat > higgs.rb << EOF
+          class Higgs < Formula
             desc "Local LLM inference server for Apple Silicon using MLX"
-            homepage "https://github.com/panbanda/mlx-server"
+            homepage "https://github.com/panbanda/higgs"
             version "${VERSION}"
             license "MIT OR Apache-2.0"
 
@@ -188,28 +188,28 @@ jobs:
             depends_on arch: :arm64
             depends_on "huggingface-cli"
 
-            url "https://github.com/panbanda/mlx-server/releases/download/${TAG}/mlx-server_${VERSION}_aarch64-apple-darwin.tar.gz"
+            url "https://github.com/panbanda/higgs/releases/download/${TAG}/higgs_${VERSION}_aarch64-apple-darwin.tar.gz"
             sha256 "${DARWIN_ARM64_SHA}"
 
             def install
-              bin.install "mlx-server"
+              bin.install "higgs"
             end
 
             test do
-              system "#{bin}/mlx-server", "--help"
+              system "#{bin}/higgs", "--help"
             end
           end
           EOF
 
           if [ -n "$HOMEBREW_TAP_GITHUB_TOKEN" ]; then
-            git clone "https://x-access-token:${HOMEBREW_TAP_GITHUB_TOKEN}@github.com/panbanda/homebrew-mlx-server.git" tap
+            git clone "https://x-access-token:${HOMEBREW_TAP_GITHUB_TOKEN}@github.com/panbanda/homebrew-brews.git" tap
             mkdir -p tap/Formula
-            cp mlx-server.rb tap/Formula/mlx-server.rb
+            cp higgs.rb tap/Formula/higgs.rb
 
             cd tap
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add Formula/mlx-server.rb
-            git commit -m "Update mlx-server to ${VERSION}"
+            git add Formula/higgs.rb
+            git commit -m "Update higgs to ${VERSION}"
             git push
           fi

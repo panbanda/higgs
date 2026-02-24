@@ -8,18 +8,18 @@
     {
       "type": "linked-versions",
       "groupName": "workspace",
-      "components": ["mlx-models", "mlx-engine", "mlx-server"]
+      "components": ["higgs-models", "higgs-engine", "higgs"]
     }
   ],
   "packages": {
-    "crates/mlx-models": {
-      "component": "mlx-models"
+    "crates/higgs-models": {
+      "component": "higgs-models"
     },
-    "crates/mlx-engine": {
-      "component": "mlx-engine"
+    "crates/higgs-engine": {
+      "component": "higgs-engine"
     },
-    "crates/mlx-server": {
-      "component": "mlx-server"
+    "crates/higgs": {
+      "component": "higgs"
     }
   }
 }

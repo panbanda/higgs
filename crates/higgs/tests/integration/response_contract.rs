@@ -10,13 +10,13 @@
     clippy::tests_outside_test_module
 )]
 
-use mlx_server::types::anthropic::{
+use higgs::types::anthropic::{
     AnthropicUsage, ContentBlockDeltaEvent, ContentBlockResponse, ContentBlockStartEvent,
     ContentBlockStartPayload, ContentBlockStopEvent, CountTokensResponse, CreateMessageResponse,
     MessageDelta, MessageDeltaEvent, MessageStartEvent, MessageStartPayload, MessageStopEvent,
     TextDelta,
 };
-use mlx_server::types::openai::{
+use higgs::types::openai::{
     ChatCompletionChoice, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionDelta,
     ChatCompletionMessage, ChatCompletionResponse, CompletionChoice, CompletionChunk,
     CompletionChunkChoice, CompletionResponse, CompletionUsage, EmbeddingObject, EmbeddingResponse,

@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use mlx_models::{AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample};
+use higgs_models::{AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample};
 use mlx_rs::{
     Array, Stream,
     ops::indexing::{IndexOp, NewAxis},
@@ -210,7 +210,7 @@ impl BatchEngine {
         let mut full_text = String::new();
         let mut finish_reason = "length".to_owned();
         let mut completion_tokens: u32 = 0;
-        let mut all_logprobs: Option<Vec<mlx_models::TokenLogprobInfo>> = logprobs.then(Vec::new);
+        let mut all_logprobs: Option<Vec<higgs_models::TokenLogprobInfo>> = logprobs.then(Vec::new);
 
         while let Some(output) = internal_rx.blocking_recv() {
             full_text.push_str(&output.new_text);
@@ -494,7 +494,7 @@ fn run_batched_decode_round(
     let batched_input = mlx_rs::ops::concatenate_axis(&token_refs, 0).map_err(EngineError::Mlx)?;
 
     // Collect mutable cache references
-    let mut cache_refs: Vec<&mut mlx_models::AnyCache> =
+    let mut cache_refs: Vec<&mut higgs_models::AnyCache> =
         active.iter_mut().map(|ar| &mut ar.cache).collect();
 
     // Batched forward pass: [N, 1] -> [N, 1, vocab_size]

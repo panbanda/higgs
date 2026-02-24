@@ -10,8 +10,8 @@
 
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use higgs::error::ServerError;
 use http_body_util::BodyExt;
-use mlx_server::error::ServerError;
 
 async fn extract_response(error: ServerError) -> (StatusCode, serde_json::Value, String) {
     let response = error.into_response();
@@ -65,7 +65,7 @@ async fn internal_error_returns_500_with_masked_message() {
 #[tokio::test]
 async fn engine_error_returns_500_with_masked_message() {
     let engine_err =
-        mlx_engine::error::EngineError::Generation("detailed internal stack trace".to_owned());
+        higgs_engine::error::EngineError::Generation("detailed internal stack trace".to_owned());
     assert_masked_500(
         ServerError::Engine(engine_err),
         "detailed internal stack trace",
@@ -75,15 +75,16 @@ async fn engine_error_returns_500_with_masked_message() {
 
 #[tokio::test]
 async fn engine_tokenization_error_masked() {
-    let engine_err =
-        mlx_engine::error::EngineError::Tokenization("invalid byte 0xFF at position 42".to_owned());
+    let engine_err = higgs_engine::error::EngineError::Tokenization(
+        "invalid byte 0xFF at position 42".to_owned(),
+    );
     assert_masked_500(ServerError::Engine(engine_err), "0xFF").await;
 }
 
 #[tokio::test]
 async fn engine_template_error_masked() {
     let engine_err =
-        mlx_engine::error::EngineError::Template("missing variable 'content'".to_owned());
+        higgs_engine::error::EngineError::Template("missing variable 'content'".to_owned());
     assert_masked_500(ServerError::Engine(engine_err), "missing variable").await;
 }
 

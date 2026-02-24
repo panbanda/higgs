@@ -1,7 +1,7 @@
 [package]
-name = "mlx-engine"
+name = "higgs-engine"
 version = "0.1.9"
-description = "Inference engine (tokenization, generation loop, prompt caching) for mlx-server"
+description = "Inference engine (tokenization, generation loop, prompt caching) for higgs"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -11,7 +11,7 @@ homepage.workspace = true
 workspace = true
 
 [dependencies]
-mlx-models.workspace = true
+higgs-models.workspace = true
 mlx-rs.workspace = true
 mlx-sys.workspace = true
 serde.workspace = true

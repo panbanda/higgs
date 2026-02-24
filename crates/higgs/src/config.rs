@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 #[command(
     author,
     version,
-    about = "MLX Server - OpenAI and Anthropic-compatible inference server for Apple Silicon"
+    about = "Higgs - OpenAI and Anthropic-compatible inference server for Apple Silicon"
 )]
 struct CliArgs {
     /// Path to a model directory or `HuggingFace` model ID. May be repeated to serve multiple models.
@@ -50,7 +50,7 @@ struct CliArgs {
 ///
 /// Layered resolution order (later wins):
 /// 1. Built-in defaults
-/// 2. `MLX_SERVER_*` environment variables
+/// 2. `HIGGS_*` environment variables
 /// 3. CLI arguments
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -86,7 +86,7 @@ impl ServerConfig {
 
         let mut figment = Figment::new()
             .merge(Serialized::defaults(Self::default()))
-            .merge(Env::prefixed("MLX_SERVER_"));
+            .merge(Env::prefixed("HIGGS_"));
 
         // Overlay CLI args (only non-empty values)
         if !cli.models.is_empty() {
@@ -182,7 +182,7 @@ mod tests {
     #[test]
     fn test_config_layered_override() {
         // Verifies that later figment layers override earlier ones,
-        // which is the same mechanism used by Env::prefixed("MLX_SERVER_").
+        // which is the same mechanism used by Env::prefixed("HIGGS_").
         let config: ServerConfig = test_figment()
             .merge(Serialized::default("port", 9000_u16))
             .merge(Serialized::default("host", "127.0.0.1"))

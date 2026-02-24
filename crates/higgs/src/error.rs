@@ -23,7 +23,7 @@ pub struct ErrorDetail {
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
     #[error("Engine error: {0}")]
-    Engine(#[from] mlx_engine::error::EngineError),
+    Engine(#[from] higgs_engine::error::EngineError),
 
     #[error("Bad request: {0}")]
     BadRequest(String),
@@ -111,7 +111,7 @@ mod tests {
     #[tokio::test]
     async fn test_engine_error_returns_500_with_masked_message() {
         let engine_err =
-            mlx_engine::error::EngineError::Generation("sensitive internal details".to_owned());
+            higgs_engine::error::EngineError::Generation("sensitive internal details".to_owned());
         assert_masked_500(
             ServerError::Engine(engine_err),
             "sensitive internal details",
@@ -157,7 +157,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_engine_tokenization_error_masked() {
-        let engine_err = mlx_engine::error::EngineError::Tokenization(
+        let engine_err = higgs_engine::error::EngineError::Tokenization(
             "tokenizer failed on byte 0xFF".to_owned(),
         );
         assert_masked_500(ServerError::Engine(engine_err), "0xFF").await;
@@ -166,7 +166,7 @@ mod tests {
     #[tokio::test]
     async fn test_engine_template_error_masked() {
         let engine_err =
-            mlx_engine::error::EngineError::Template("template parse failed".to_owned());
+            higgs_engine::error::EngineError::Template("template parse failed".to_owned());
         assert_masked_500(ServerError::Engine(engine_err), "template parse failed").await;
     }
 

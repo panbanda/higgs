@@ -10,10 +10,10 @@
     clippy::tests_outside_test_module
 )]
 
-use mlx_server::types::anthropic::{
+use higgs::types::anthropic::{
     AnthropicContent, AnthropicMessage, ContentBlock, CountTokensRequest, CreateMessageRequest,
 };
-use mlx_server::types::openai::{
+use higgs::types::openai::{
     ChatCompletionMessage, ChatCompletionRequest, CompletionRequest, EmbeddingInput,
     EmbeddingRequest, StopSequence,
 };
@@ -378,7 +378,7 @@ fn anthropic_request_with_stop_sequences() {
 
 #[test]
 fn anthropic_finish_reason_mapping() {
-    use mlx_server::anthropic_adapter::openai_finish_to_anthropic_stop;
+    use higgs::anthropic_adapter::openai_finish_to_anthropic_stop;
 
     assert_eq!(openai_finish_to_anthropic_stop("stop"), "end_turn");
     assert_eq!(openai_finish_to_anthropic_stop("length"), "max_tokens");
@@ -395,7 +395,7 @@ fn make_single_user_message() -> Vec<AnthropicMessage> {
 
 #[test]
 fn anthropic_messages_to_engine_without_system() {
-    use mlx_server::anthropic_adapter::anthropic_messages_to_engine;
+    use higgs::anthropic_adapter::anthropic_messages_to_engine;
 
     let messages = make_single_user_message();
     let result = anthropic_messages_to_engine(&messages, None);
@@ -406,7 +406,7 @@ fn anthropic_messages_to_engine_without_system() {
 
 #[test]
 fn anthropic_messages_to_engine_with_system() {
-    use mlx_server::anthropic_adapter::anthropic_messages_to_engine;
+    use higgs::anthropic_adapter::anthropic_messages_to_engine;
 
     let messages = make_single_user_message();
     let result = anthropic_messages_to_engine(&messages, Some("be helpful"));
@@ -418,7 +418,7 @@ fn anthropic_messages_to_engine_with_system() {
 
 #[test]
 fn anthropic_messages_to_engine_concatenates_text_blocks() {
-    use mlx_server::anthropic_adapter::anthropic_messages_to_engine;
+    use higgs::anthropic_adapter::anthropic_messages_to_engine;
 
     let messages = vec![AnthropicMessage {
         role: "user".to_owned(),
@@ -437,7 +437,7 @@ fn anthropic_messages_to_engine_concatenates_text_blocks() {
 
 #[test]
 fn anthropic_messages_to_engine_ignores_tool_blocks() {
-    use mlx_server::anthropic_adapter::anthropic_messages_to_engine;
+    use higgs::anthropic_adapter::anthropic_messages_to_engine;
 
     let messages = vec![AnthropicMessage {
         role: "assistant".to_owned(),

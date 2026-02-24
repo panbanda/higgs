@@ -21,16 +21,16 @@
 )]
 
 use axum::http::{Request, StatusCode};
+use higgs::build_router;
+use higgs::state::AppState;
 use http_body_util::BodyExt;
-use mlx_server::build_router;
-use mlx_server::state::AppState;
 use std::sync::Arc;
 use tower::ServiceExt;
 
 /// Build a minimal router with just the health endpoint for testing.
 fn build_health_only_router() -> axum::Router {
     use axum::routing::get;
-    axum::Router::new().route("/health", get(mlx_server::routes::health::health))
+    axum::Router::new().route("/health", get(higgs::routes::health::health))
 }
 
 /// Send a request to the health-only router and return the response.

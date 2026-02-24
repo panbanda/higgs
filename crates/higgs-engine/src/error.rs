@@ -1,4 +1,4 @@
-use mlx_models::error::ModelError;
+use higgs_models::error::ModelError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -43,7 +43,7 @@ mod tests {
 
     #[test]
     fn test_engine_error_display_model() {
-        let model_err = mlx_models::error::ModelError::UnsupportedModel("gpt5".to_owned());
+        let model_err = higgs_models::error::ModelError::UnsupportedModel("gpt5".to_owned());
         let err = EngineError::Model(model_err);
         assert!(err.to_string().contains("gpt5"));
         assert!(err.to_string().contains("Model error"));
@@ -59,7 +59,7 @@ mod tests {
 
     #[test]
     fn test_from_model_error_to_engine_error() {
-        let model_err = mlx_models::error::ModelError::MissingWeight("layer.0".to_owned());
+        let model_err = higgs_models::error::ModelError::MissingWeight("layer.0".to_owned());
         let engine_err: EngineError = model_err.into();
         assert!(matches!(engine_err, EngineError::Model(_)));
         assert!(engine_err.to_string().contains("layer.0"));
@@ -76,7 +76,7 @@ mod tests {
     #[test]
     fn test_error_message_content_preserved_through_model_conversion() {
         let specific_msg = "very specific: layer 42, head 7, dim mismatch [128] vs [256]";
-        let model_err = mlx_models::error::ModelError::ShapeMismatch(specific_msg.to_owned());
+        let model_err = higgs_models::error::ModelError::ShapeMismatch(specific_msg.to_owned());
         let engine_err: EngineError = model_err.into();
         assert!(engine_err.to_string().contains(specific_msg));
     }

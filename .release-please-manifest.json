@@ -1,5 +1,5 @@
 {
-  "crates/mlx-models": "0.1.9",
-  "crates/mlx-engine": "0.1.9",
-  "crates/mlx-server": "0.1.9"
+  "crates/higgs-models": "0.1.9",
+  "crates/higgs-engine": "0.1.9",
+  "crates/higgs": "0.1.9"
 }

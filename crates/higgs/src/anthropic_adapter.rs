@@ -14,11 +14,11 @@ pub fn openai_finish_to_anthropic_stop(finish_reason: &str) -> String {
 pub fn anthropic_messages_to_engine(
     messages: &[AnthropicMessage],
     system: Option<&str>,
-) -> Vec<mlx_engine::chat_template::ChatMessage> {
+) -> Vec<higgs_engine::chat_template::ChatMessage> {
     let mut result = Vec::new();
 
     if let Some(sys) = system {
-        result.push(mlx_engine::chat_template::ChatMessage {
+        result.push(higgs_engine::chat_template::ChatMessage {
             role: "system".to_owned(),
             content: sys.to_owned(),
             tool_calls: None,
@@ -39,7 +39,7 @@ pub fn anthropic_messages_to_engine(
                 .join(""),
         };
 
-        result.push(mlx_engine::chat_template::ChatMessage {
+        result.push(higgs_engine::chat_template::ChatMessage {
             role: msg.role.clone(),
             content,
             tool_calls: None,

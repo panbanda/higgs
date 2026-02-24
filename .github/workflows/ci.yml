@@ -115,7 +115,7 @@ jobs:
             --all-features \
             --workspace \
             --fail-under-lines 70 \
-            --ignore-filename-regex '(qwen3_next|batch_engine|simple|siglip|llava_qwen2)\.rs|mlx-server/src/(main|state|lib)\.rs|routes/(anthropic|completions|embeddings)\.rs' \
+            --ignore-filename-regex '(qwen3_next|batch_engine|simple|siglip|llava_qwen2)\.rs|higgs/src/(main|state|lib)\.rs|routes/(anthropic|completions|embeddings)\.rs' \
             -- --test-threads=1
 
       - name: Generate LCOV report
@@ -126,7 +126,7 @@ jobs:
             --workspace \
             --lcov \
             --output-path lcov.info \
-            --ignore-filename-regex '(qwen3_next|batch_engine|simple|siglip|llava_qwen2)\.rs|mlx-server/src/(main|state|lib)\.rs|routes/(anthropic|completions|embeddings)\.rs' \
+            --ignore-filename-regex '(qwen3_next|batch_engine|simple|siglip|llava_qwen2)\.rs|higgs/src/(main|state|lib)\.rs|routes/(anthropic|completions|embeddings)\.rs' \
             -- --test-threads=1
 
       - name: Upload LCOV report

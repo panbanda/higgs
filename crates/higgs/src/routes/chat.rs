@@ -20,7 +20,7 @@ use crate::{
         TopLogprob,
     },
 };
-use mlx_models::SamplingParams;
+use higgs_models::SamplingParams;
 
 pub async fn chat_completions(
     State(state): State<SharedState>,
@@ -82,7 +82,7 @@ async fn chat_completions_non_streaming(
             .into_iter()
             .next()
             .ok_or_else(|| ServerError::BadRequest("Image data is empty".to_owned()))?;
-        let pv = mlx_models::siglip::preprocess_image(&first_image, size)
+        let pv = higgs_models::siglip::preprocess_image(&first_image, size)
             .map_err(|e| ServerError::InternalError(format!("Image preprocessing failed: {e}")))?;
         Some(pv)
     } else {
@@ -117,7 +117,7 @@ async fn chat_completions_non_streaming(
         .map(|lps| logprobs_to_response(lps, &tokenizer));
 
     // Parse reasoning (think tags) from the output
-    let reasoning_result = mlx_engine::reasoning_parser::parse_reasoning(&output.text);
+    let reasoning_result = higgs_engine::reasoning_parser::parse_reasoning(&output.text);
     let raw_text = if reasoning_result.reasoning.is_some() {
         reasoning_result.text
     } else {
@@ -126,7 +126,7 @@ async fn chat_completions_non_streaming(
     let reasoning_content = reasoning_result.reasoning;
 
     let (content, tool_calls, finish_reason) = if has_tools {
-        let parsed = mlx_engine::tool_parser::parse_tool_calls(&raw_text);
+        let parsed = higgs_engine::tool_parser::parse_tool_calls(&raw_text);
         if parsed.tool_calls.is_empty() {
             (
                 Some(MessageContent::Text(raw_text)),
@@ -233,7 +233,7 @@ fn chat_completions_stream(
             .into_iter()
             .next()
             .ok_or_else(|| ServerError::BadRequest("Image data is empty".to_owned()))?;
-        let pv = mlx_models::siglip::preprocess_image(&first_image, size)
+        let pv = higgs_models::siglip::preprocess_image(&first_image, size)
             .map_err(|e| ServerError::InternalError(format!("Image preprocessing failed: {e}")))?;
         Some(pv)
     } else {
@@ -290,7 +290,7 @@ fn chat_completions_stream(
             Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
         }
 
-        let mut reasoning_tracker = mlx_engine::reasoning_parser::StreamingReasoningTracker::new();
+        let mut reasoning_tracker = higgs_engine::reasoning_parser::StreamingReasoningTracker::new();
 
         while let Some(output) = rx.recv().await {
             let chunk_logprobs = output
@@ -432,7 +432,7 @@ fn chat_completions_stream(
 
 fn convert_messages(
     messages: &[ChatCompletionMessage],
-) -> Vec<mlx_engine::chat_template::ChatMessage> {
+) -> Vec<higgs_engine::chat_template::ChatMessage> {
     messages
         .iter()
         .map(|m| {
@@ -446,7 +446,7 @@ fn convert_messages(
                 .content
                 .as_ref()
                 .map_or_else(String::new, MessageContent::text);
-            mlx_engine::chat_template::ChatMessage {
+            higgs_engine::chat_template::ChatMessage {
                 role: m.role.clone(),
                 content,
                 tool_calls: tool_calls_json,
@@ -528,7 +528,7 @@ fn build_sampling_params(req: &ChatCompletionRequest) -> SamplingParams {
 fn build_constraint(
     response_format: Option<&crate::types::openai::ResponseFormat>,
     engine: &std::sync::Arc<crate::state::Engine>,
-) -> Result<Option<mlx_engine::constrained::ConstrainedGenerator>, ServerError> {
+) -> Result<Option<higgs_engine::constrained::ConstrainedGenerator>, ServerError> {
     let Some(fmt) = response_format else {
         return Ok(None);
     };
@@ -537,7 +537,7 @@ fn build_constraint(
         "text" => Ok(None),
         "json_object" | "json_schema" => {
             let eos_id = engine.eos_token_ids().first().copied().unwrap_or(0);
-            let vocab = mlx_engine::constrained::build_vocabulary(engine.tokenizer(), eos_id)
+            let vocab = higgs_engine::constrained::build_vocabulary(engine.tokenizer(), eos_id)
                 .map_err(ServerError::Engine)?;
             let constraint = if fmt.r#type == "json_schema" {
                 if let Some(ref schema) = fmt.json_schema {
@@ -549,17 +549,17 @@ fn build_constraint(
                         .cloned()
                         .unwrap_or_else(|| schema.clone());
                     let schema_str = inner.to_string();
-                    mlx_engine::constrained::ConstrainedGenerator::from_json_schema(
+                    higgs_engine::constrained::ConstrainedGenerator::from_json_schema(
                         &schema_str,
                         &vocab,
                     )
                     .map_err(ServerError::Engine)?
                 } else {
-                    mlx_engine::constrained::ConstrainedGenerator::for_json_object(&vocab)
+                    higgs_engine::constrained::ConstrainedGenerator::for_json_object(&vocab)
                         .map_err(ServerError::Engine)?
                 }
             } else {
-                mlx_engine::constrained::ConstrainedGenerator::for_json_object(&vocab)
+                higgs_engine::constrained::ConstrainedGenerator::for_json_object(&vocab)
                     .map_err(ServerError::Engine)?
             };
 
@@ -572,8 +572,8 @@ fn build_constraint(
 }
 
 fn logprobs_to_response(
-    infos: &[mlx_models::TokenLogprobInfo],
-    tokenizer: &mlx_engine::tokenizers::Tokenizer,
+    infos: &[higgs_models::TokenLogprobInfo],
+    tokenizer: &higgs_engine::tokenizers::Tokenizer,
 ) -> ChoiceLogprobs {
     let content = infos
         .iter()

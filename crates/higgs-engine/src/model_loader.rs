@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use mlx_models::{AnyModel, load_tokenizer as shared_load_tokenizer, registry, transformer};
+use higgs_models::{AnyModel, load_tokenizer as shared_load_tokenizer, registry, transformer};
 
 use crate::error::EngineError;
 
@@ -19,7 +19,7 @@ impl ModelConfig {
 
         if !registry::is_supported(&model_type) {
             return Err(EngineError::Model(
-                mlx_models::error::ModelError::UnsupportedModel(model_type),
+                higgs_models::error::ModelError::UnsupportedModel(model_type),
             ));
         }
 
@@ -40,42 +40,42 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError>
             Ok(AnyModel::Transformer(model))
         }
         "qwen3_next" => {
-            let model = mlx_models::qwen3_next::load_qwen3_next_model(&config.model_dir)
+            let model = higgs_models::qwen3_next::load_qwen3_next_model(&config.model_dir)
                 .map_err(EngineError::Model)?;
             Ok(AnyModel::Qwen3Next(model))
         }
         "qwen3_moe" => {
-            let model = mlx_models::qwen3_moe::load_qwen3_moe_model(&config.model_dir)
+            let model = higgs_models::qwen3_moe::load_qwen3_moe_model(&config.model_dir)
                 .map_err(EngineError::Model)?;
             Ok(AnyModel::Qwen3Moe(model))
         }
         "gemma2" => {
-            let model = mlx_models::gemma2::load_gemma2_model(&config.model_dir)
+            let model = higgs_models::gemma2::load_gemma2_model(&config.model_dir)
                 .map_err(EngineError::Model)?;
             Ok(AnyModel::Gemma2(model))
         }
         "phi3" => {
-            let model =
-                mlx_models::phi3::load_phi3_model(&config.model_dir).map_err(EngineError::Model)?;
+            let model = higgs_models::phi3::load_phi3_model(&config.model_dir)
+                .map_err(EngineError::Model)?;
             Ok(AnyModel::Phi3(model))
         }
         "starcoder2" => {
-            let model = mlx_models::starcoder2::load_starcoder2_model(&config.model_dir)
+            let model = higgs_models::starcoder2::load_starcoder2_model(&config.model_dir)
                 .map_err(EngineError::Model)?;
             Ok(AnyModel::Starcoder2(model))
         }
         "llava-qwen2" => {
-            let model = mlx_models::llava_qwen2::load_llava_qwen2_model(&config.model_dir)
+            let model = higgs_models::llava_qwen2::load_llava_qwen2_model(&config.model_dir)
                 .map_err(EngineError::Model)?;
             Ok(AnyModel::LlavaQwen2(model))
         }
         "deepseek_v2" => {
-            let model = mlx_models::deepseek_v2::load_deepseek_v2_model(&config.model_dir)
+            let model = higgs_models::deepseek_v2::load_deepseek_v2_model(&config.model_dir)
                 .map_err(EngineError::Model)?;
             Ok(AnyModel::DeepSeekV2(model))
         }
         other => Err(EngineError::Model(
-            mlx_models::error::ModelError::UnsupportedModel(other.to_owned()),
+            higgs_models::error::ModelError::UnsupportedModel(other.to_owned()),
         )),
     }
 }
@@ -89,7 +89,7 @@ pub fn load_tokenizer<P: AsRef<Path>>(model_dir: P) -> Result<tokenizers::Tokeni
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use mlx_models::error::ModelError;
+    use higgs_models::error::ModelError;
 
     /// Create a temp dir with a config.json containing the given `model_type` and
     /// return the `ModelConfig` result.

@@ -3,7 +3,7 @@ use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use mlx_server::{
+use higgs::{
     build_router,
     config::ServerConfig,
     model_download, model_resolver,

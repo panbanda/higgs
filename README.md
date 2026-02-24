@@ -1,8 +1,8 @@
-# mlx-server
+# higgs
 
-[![CI](https://github.com/panbanda/mlx-server/actions/workflows/ci.yml/badge.svg)](https://github.com/panbanda/mlx-server/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/panbanda/mlx-server)](https://github.com/panbanda/mlx-server/releases)
-[![Crates.io](https://img.shields.io/crates/v/mlx-server)](https://crates.io/crates/mlx-server)
+[![CI](https://github.com/panbanda/higgs/actions/workflows/ci.yml/badge.svg)](https://github.com/panbanda/higgs/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/panbanda/higgs)](https://github.com/panbanda/higgs/releases)
+[![Crates.io](https://img.shields.io/crates/v/higgs)](https://crates.io/crates/higgs)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#license)
 
 OpenAI and Anthropic-compatible inference server for Apple Silicon, built in Rust on top of [mlx-rs](https://github.com/oxideai/mlx-rs).
@@ -24,17 +24,17 @@ Runs quantized LLMs locally using the Metal GPU with no Python runtime.
 
 ### Comparison
 
-| | mlx-server (Rust) | [vllm-mlx](https://github.com/waybarrios/vllm-mlx) (Python) | mlx_lm (Python) |
+| | higgs (Rust) | [vllm-mlx](https://github.com/waybarrios/vllm-mlx) (Python) | mlx_lm (Python) |
 |---|---|---|---|
-| **Install** | `brew install mlx-server` | `pip install` + Python + mlx ecosystem | `pip install mlx-lm` + Python |
-| **Run** | `mlx-server --model org/name` | `vllm-mlx --model org/name` | Write a script |
+| **Install** | `brew install higgs` | `pip install` + Python + mlx ecosystem | `pip install mlx-lm` + Python |
+| **Run** | `higgs --model org/name` | `vllm-mlx --model org/name` | Write a script |
 | **Deploy** | Single static binary | Ship a Python environment | Ship a Python environment |
 | **Modalities** | Text + image | Text + image + video + audio | Text |
 | **Batching** | Continuous batching | Continuous batching | Single request |
 | **Structured output** | JSON mode + JSON schema | JSON mode + JSON schema | No |
 | **Text perf** | ~450 tok/s (1B) | Built on mlx_lm | ~453 tok/s (1B) |
 
-Text inference performance is near-identical to Python `mlx_lm` (within 1-2%) since both use the same MLX Metal kernels. vllm-mlx supports more modalities (video, audio). mlx-server ships as a zero-dependency binary with structured output and vision support.
+Text inference performance is near-identical to Python `mlx_lm` (within 1-2%) since both use the same MLX Metal kernels. vllm-mlx supports more modalities (video, audio). higgs ships as a zero-dependency binary with structured output and vision support.
 
 ## Requirements
 
@@ -43,8 +43,8 @@ Text inference performance is near-identical to Python `mlx_lm` (within 1-2%) si
 ## Install
 
 ```bash
-brew tap panbanda/mlx-server
-brew install mlx-server
+brew tap panbanda/brews
+brew install higgs
 ```
 
 **Build from source** (requires Rust 1.87.0+, Xcode Command Line Tools, and `huggingface-cli`):
@@ -57,13 +57,13 @@ cargo build --release
 
 ```bash
 # HuggingFace model ID (resolved from local HF cache)
-mlx-server --model mlx-community/Llama-3.1-8B-Instruct-4bit
+higgs --model mlx-community/Llama-3.1-8B-Instruct-4bit
 
 # Local MLX model directory
-mlx-server --model ~/dev/models/My-Custom-Model
+higgs --model ~/dev/models/My-Custom-Model
 
 # Multiple models
-mlx-server --model mlx-community/Llama-3.1-8B-Instruct-4bit --model mlx-community/Qwen3-Coder-Next-4bit
+higgs --model mlx-community/Llama-3.1-8B-Instruct-4bit --model mlx-community/Qwen3-Coder-Next-4bit
 ```
 
 The `--model` flag accepts HuggingFace model IDs (`org/name`) or local directory paths. HuggingFace IDs are resolved from the local cache at `~/.cache/huggingface/hub/` (or `$HF_HUB_CACHE` if set, else `$HF_HOME/hub`).
@@ -89,13 +89,13 @@ Settings are resolved in order (later wins): defaults, environment variables, CL
 
 | CLI Flag | Env Variable | Default | Description |
 |---|---|---|---|
-| `--model` | `MLX_SERVER_MODELS` | *(required)* | Model path or HF model ID (repeatable; env uses JSON array `'["a","b"]'`) |
-| `--host` | `MLX_SERVER_HOST` | `0.0.0.0` | Bind address |
-| `--port` | `MLX_SERVER_PORT` | `8000` | Bind port |
-| `--max-tokens` | `MLX_SERVER_MAX_TOKENS` | `32768` | Default max generation tokens |
-| `--api-key` | `MLX_SERVER_API_KEY` | *(none)* | Bearer token for auth (disabled if unset) |
-| `--rate-limit` | `MLX_SERVER_RATE_LIMIT` | `0` | Requests per minute per client (0 = disabled) |
-| `--timeout` | `MLX_SERVER_TIMEOUT` | `300` | Request timeout in seconds |
+| `--model` | `HIGGS_MODELS` | *(required)* | Model path or HF model ID (repeatable; env uses JSON array `'["a","b"]'`) |
+| `--host` | `HIGGS_HOST` | `0.0.0.0` | Bind address |
+| `--port` | `HIGGS_PORT` | `8000` | Bind port |
+| `--max-tokens` | `HIGGS_MAX_TOKENS` | `32768` | Default max generation tokens |
+| `--api-key` | `HIGGS_API_KEY` | *(none)* | Bearer token for auth (disabled if unset) |
+| `--rate-limit` | `HIGGS_RATE_LIMIT` | `0` | Requests per minute per client (0 = disabled) |
+| `--timeout` | `HIGGS_TIMEOUT` | `300` | Request timeout in seconds |
 
 Log level is controlled via `RUST_LOG` (e.g., `RUST_LOG=debug`).
 

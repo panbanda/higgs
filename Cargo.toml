@@ -7,8 +7,8 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.87.0"
-repository = "https://github.com/panbanda/mlx-server"
-homepage = "https://github.com/panbanda/mlx-server"
+repository = "https://github.com/panbanda/higgs"
+homepage = "https://github.com/panbanda/higgs"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -75,8 +75,8 @@ wildcard_enum_match_arm = "deny"
 
 [workspace.dependencies]
 # Local crates
-mlx-engine = { path = "crates/mlx-engine" }
-mlx-models = { path = "crates/mlx-models" }
+higgs-engine = { path = "crates/higgs-engine" }
+higgs-models = { path = "crates/higgs-models" }
 
 # MLX
 mlx-rs = "0.25.3"

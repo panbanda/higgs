@@ -19,7 +19,7 @@ use crate::{
         TopLogprob,
     },
 };
-use mlx_models::SamplingParams;
+use higgs_models::SamplingParams;
 
 pub async fn completions(
     State(state): State<SharedState>,
@@ -186,8 +186,8 @@ fn build_sampling_params(req: &CompletionRequest) -> SamplingParams {
 }
 
 fn logprobs_to_response(
-    infos: &[mlx_models::TokenLogprobInfo],
-    tokenizer: &mlx_engine::tokenizers::Tokenizer,
+    infos: &[higgs_models::TokenLogprobInfo],
+    tokenizer: &higgs_engine::tokenizers::Tokenizer,
 ) -> ChoiceLogprobs {
     let content = infos
         .iter()

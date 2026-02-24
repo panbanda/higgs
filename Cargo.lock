@@ -946,6 +946,70 @@ dependencies = [
 ]
 
 [[package]]
+name = "higgs"
+version = "0.1.9"
+dependencies = [
+ "async-stream",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "clap",
+ "directories",
+ "figment",
+ "governor",
+ "higgs-engine",
+ "higgs-models",
+ "http-body-util",
+ "hyper",
+ "mlx-rs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "higgs-engine"
+version = "0.1.9"
+dependencies = [
+ "higgs-models",
+ "minijinja",
+ "minijinja-contrib",
+ "mlx-rs",
+ "mlx-sys",
+ "outlines-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokenizers",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "higgs-models"
+version = "0.1.9"
+dependencies = [
+ "image",
+ "mlx-rs",
+ "mlx-sys",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokenizers",
+ "tracing",
+]
+
+[[package]]
 name = "http"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1435,25 +1499,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mlx-engine"
-version = "0.1.6"
-dependencies = [
- "minijinja",
- "minijinja-contrib",
- "mlx-models",
- "mlx-rs",
- "mlx-sys",
- "outlines-core",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokenizers",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
 source = "git+https://github.com/oxideai/mlx-rs.git?rev=af21d79#af21d799dd826bd64703ba85623fbd45cc1452bb"
@@ -1477,21 +1522,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mlx-models"
-version = "0.1.5"
-dependencies = [
- "image",
- "mlx-rs",
- "mlx-sys",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokenizers",
- "tracing",
-]
-
-[[package]]
 name = "mlx-rs"
 version = "0.25.3"
 source = "git+https://github.com/oxideai/mlx-rs.git?rev=af21d79#af21d799dd826bd64703ba85623fbd45cc1452bb"
@@ -1512,36 +1542,6 @@ dependencies = [
  "smallvec",
  "strum",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "mlx-server"
-version = "0.1.8"
-dependencies = [
- "async-stream",
- "axum",
- "base64 0.22.1",
- "chrono",
- "clap",
- "directories",
- "figment",
- "governor",
- "http-body-util",
- "hyper",
- "mlx-engine",
- "mlx-models",
- "mlx-rs",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

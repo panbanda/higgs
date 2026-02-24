@@ -1,4 +1,4 @@
-pub use mlx_models::{TokenLogprobInfo, TopLogprobEntry};
+pub use higgs_models::{TokenLogprobInfo, TopLogprobEntry};
 
 /// Output from a generation request.
 #[derive(Debug, Clone)]
