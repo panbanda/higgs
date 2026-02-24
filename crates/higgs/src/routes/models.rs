@@ -6,7 +6,7 @@ use crate::{
 };
 
 pub async fn list_models(State(state): State<SharedState>) -> Json<ModelList> {
-    let data = model_objects_sorted(state.engines.keys().map(String::as_str));
+    let data = model_objects_sorted(state.router.local_engines().keys().map(String::as_str));
     Json(ModelList {
         object: "list",
         data,

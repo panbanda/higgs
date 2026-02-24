@@ -1,18 +1,25 @@
 use std::convert::Infallible;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::{
     Json,
     extract::State,
+    http::HeaderMap,
     response::{
         IntoResponse, Sse,
         sse::{Event, KeepAlive},
     },
 };
+use bytes::Bytes;
 use tokio_stream::Stream;
 
 use crate::{
+    config::ApiFormat,
     error::ServerError,
-    state::SharedState,
+    metrics::{MetricsStore, RequestRecord},
+    router::ResolvedRoute,
+    state::{Engine, SharedState},
     types::openai::{
         ChatCompletionChoice, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionDelta,
         ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse, ChoiceLogprobs,
@@ -22,23 +29,182 @@ use crate::{
 };
 use higgs_models::SamplingParams;
 
+#[allow(clippy::too_many_lines)]
 pub async fn chat_completions(
     State(state): State<SharedState>,
-    Json(req): Json<ChatCompletionRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<axum::response::Response, ServerError> {
+    let req: ChatCompletionRequest = serde_json::from_slice(&body)
+        .map_err(|e| ServerError::BadRequest(format!("Invalid request body: {e}")))?;
+
     if req.messages.is_empty() {
         return Err(ServerError::BadRequest(
             "messages array must not be empty".to_owned(),
         ));
     }
 
-    if req.stream == Some(true) {
-        let stream = chat_completions_stream(state, req)?;
-        let sse = Sse::new(stream).keep_alive(KeepAlive::default());
-        Ok(sse.into_response())
-    } else {
-        let response = chat_completions_non_streaming(state, req).await?;
-        Ok(Json(response).into_response())
+    let resolved = state
+        .router
+        .resolve(&req.model, None)
+        .await
+        .map_err(ServerError::ModelNotFound)?;
+
+    let request_model = req.model.clone();
+
+    match resolved {
+        ResolvedRoute::Higgs {
+            engine,
+            routing_method,
+            ..
+        } => {
+            if req.stream == Some(true) {
+                let stream = chat_completions_stream(
+                    Arc::clone(&state),
+                    req,
+                    engine,
+                    state.metrics.clone(),
+                    routing_method,
+                )?;
+                let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+                Ok(sse.into_response())
+            } else {
+                let start = Instant::now();
+                let response =
+                    chat_completions_non_streaming(Arc::clone(&state), req, engine).await?;
+                if let Some(ref metrics) = state.metrics {
+                    metrics.record(RequestRecord {
+                        id: 0,
+                        timestamp: Instant::now(),
+                        wallclock: chrono::Utc::now(),
+                        model: response.model.clone(),
+                        provider: "higgs".to_owned(),
+                        routing_method: routing_method.into(),
+                        status: 200,
+                        duration: start.elapsed(),
+                        input_tokens: u64::from(response.usage.prompt_tokens),
+                        output_tokens: u64::from(response.usage.completion_tokens),
+                        error_body: None,
+                    });
+                }
+                Ok(Json(response).into_response())
+            }
+        }
+        ResolvedRoute::Remote {
+            provider_name,
+            provider_url,
+            provider_format,
+            strip_auth,
+            api_key,
+            model_rewrite,
+            routing_method,
+            ..
+        } => {
+            let is_streaming = req.stream == Some(true);
+            match provider_format {
+                ApiFormat::OpenAi => {
+                    let proxy_body = if let Some(ref rewrite) = model_rewrite {
+                        crate::proxy::rewrite_model_in_body(&body, rewrite)?
+                    } else {
+                        body
+                    };
+                    let start = Instant::now();
+                    let result = crate::proxy::proxy_request(
+                        &state.http_client,
+                        &provider_url,
+                        "/v1/chat/completions",
+                        proxy_body,
+                        &headers,
+                        strip_auth,
+                        api_key.as_deref(),
+                    )
+                    .await;
+                    if let Some(ref metrics) = state.metrics {
+                        metrics.record(RequestRecord {
+                            id: 0,
+                            timestamp: Instant::now(),
+                            wallclock: chrono::Utc::now(),
+                            model: request_model,
+                            provider: provider_name.clone(),
+                            routing_method: routing_method.into(),
+                            status: if result.is_ok() { 200 } else { 502 },
+                            duration: start.elapsed(),
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            error_body: None,
+                        });
+                    }
+                    result
+                }
+                ApiFormat::Anthropic => {
+                    let translated = crate::translate::openai_to_anthropic_request(
+                        &body,
+                        state.config.server.max_tokens,
+                    )?;
+                    let proxy_body = if let Some(ref rewrite) = model_rewrite {
+                        crate::proxy::rewrite_model_in_body(&translated, rewrite)?
+                    } else {
+                        translated
+                    };
+
+                    if is_streaming {
+                        let upstream = crate::proxy::send_to_provider(
+                            &state.http_client,
+                            &provider_url,
+                            "/v1/messages",
+                            proxy_body,
+                            &headers,
+                            strip_auth,
+                            api_key.as_deref(),
+                        )
+                        .await?;
+                        let stream =
+                            crate::translate::anthropic_stream_to_openai(upstream, req.model);
+                        let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+                        Ok(sse.into_response())
+                    } else {
+                        let start = Instant::now();
+                        let upstream = crate::proxy::send_to_provider(
+                            &state.http_client,
+                            &provider_url,
+                            "/v1/messages",
+                            proxy_body,
+                            &headers,
+                            strip_auth,
+                            api_key.as_deref(),
+                        )
+                        .await?;
+                        let resp_bytes = upstream.bytes().await.map_err(|e| {
+                            ServerError::ProxyError(format!("Failed to read response: {e}"))
+                        })?;
+                        let translated_resp = crate::translate::anthropic_response_to_openai(
+                            &resp_bytes,
+                            &req.model,
+                        )?;
+                        if let Some(ref metrics) = state.metrics {
+                            metrics.record(RequestRecord {
+                                id: 0,
+                                timestamp: Instant::now(),
+                                wallclock: chrono::Utc::now(),
+                                model: request_model,
+                                provider: provider_name.clone(),
+                                routing_method: routing_method.into(),
+                                status: 200,
+                                duration: start.elapsed(),
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                error_body: None,
+                            });
+                        }
+                        Ok((
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            translated_resp,
+                        )
+                            .into_response())
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -46,12 +212,9 @@ pub async fn chat_completions(
 async fn chat_completions_non_streaming(
     state: SharedState,
     req: ChatCompletionRequest,
+    engine: Arc<Engine>,
 ) -> Result<ChatCompletionResponse, ServerError> {
-    let engine = state
-        .engine_for(&req.model)
-        .ok_or_else(|| ServerError::ModelNotFound(req.model.clone()))?;
-
-    let max_tokens = req.max_tokens.unwrap_or(state.config.max_tokens);
+    let max_tokens = req.max_tokens.unwrap_or(state.config.server.max_tokens);
     let sampling = build_sampling_params(&req);
     let stop_sequences = StopSequence::extract(req.stop);
     let want_logprobs = req.logprobs.unwrap_or(false);
@@ -191,6 +354,9 @@ async fn chat_completions_non_streaming(
 fn chat_completions_stream(
     state: SharedState,
     req: ChatCompletionRequest,
+    engine: Arc<Engine>,
+    metrics: Option<Arc<MetricsStore>>,
+    routing_method: crate::router::RoutingMethod,
 ) -> Result<impl Stream<Item = Result<Event, Infallible>>, ServerError> {
     if req.tools.is_some() {
         return Err(ServerError::BadRequest(
@@ -198,11 +364,7 @@ fn chat_completions_stream(
         ));
     }
 
-    let engine = state
-        .engine_for(&req.model)
-        .ok_or_else(|| ServerError::ModelNotFound(req.model.clone()))?;
-
-    let max_tokens = req.max_tokens.unwrap_or(state.config.max_tokens);
+    let max_tokens = req.max_tokens.unwrap_or(state.config.server.max_tokens);
     let sampling = build_sampling_params(&req);
     let stop_sequences = StopSequence::extract(req.stop);
     let want_logprobs = req.logprobs.unwrap_or(false);
@@ -245,6 +407,24 @@ fn chat_completions_stream(
     let request_id = generate_request_id();
     let created = current_unix_timestamp();
     let model = req.model;
+    let prompt_token_count = u32::try_from(prompt_tokens.len()).unwrap_or(0);
+
+    let start = Instant::now();
+    let metrics_id = metrics.as_ref().map(|m| {
+        m.record_pending(RequestRecord {
+            id: 0,
+            timestamp: Instant::now(),
+            wallclock: chrono::Utc::now(),
+            model: model.clone(),
+            provider: "higgs".to_owned(),
+            routing_method: routing_method.into(),
+            status: 200,
+            duration: Duration::ZERO,
+            input_tokens: u64::from(prompt_token_count),
+            output_tokens: 0,
+            error_body: None,
+        })
+    });
 
     let tokenizer = engine.tokenizer().clone();
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
@@ -291,8 +471,10 @@ fn chat_completions_stream(
         }
 
         let mut reasoning_tracker = higgs_engine::reasoning_parser::StreamingReasoningTracker::new();
+        let mut output_token_count: u32 = 0;
 
         while let Some(output) = rx.recv().await {
+            output_token_count = output.completion_tokens;
             let chunk_logprobs = output
                 .token_logprob
                 .as_ref()
@@ -420,6 +602,12 @@ fn chat_completions_stream(
             match serde_json::to_string(&vis_chunk) {
                 Ok(json) => yield Ok(Event::default().data(json)),
                 Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
+            }
+        }
+
+        if let Some(ref m) = metrics {
+            if let Some(id) = metrics_id {
+                m.finalize_stream(id, u64::from(output_token_count), start.elapsed());
             }
         }
 

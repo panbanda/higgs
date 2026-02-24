@@ -33,6 +33,9 @@ pub enum ServerError {
 
     #[error("Internal error: {0}")]
     InternalError(String),
+
+    #[error("Proxy error: {0}")]
+    ProxyError(String),
 }
 
 impl IntoResponse for ServerError {
@@ -62,6 +65,14 @@ impl IntoResponse for ServerError {
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "server_error",
                     "Internal server error".to_owned(),
+                )
+            }
+            Self::ProxyError(msg) => {
+                tracing::error!(error = %msg, "Proxy error");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "proxy_error",
+                    format!("Upstream provider error: {msg}"),
                 )
             }
         };
@@ -204,6 +215,21 @@ mod tests {
         assert!(error_obj.get("message").is_some());
         assert!(error_obj.get("type").is_some());
         assert!(error_obj.get("code").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_proxy_error_returns_502() {
+        let error = ServerError::ProxyError("connection refused".to_owned());
+        let resp = error.into_response();
+        let (status, body) = response_status_and_body(resp).await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"]["type"].as_str().unwrap(), "proxy_error");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("connection refused"),
+            "expected proxy detail in message: {message}"
+        );
     }
 
     #[tokio::test]

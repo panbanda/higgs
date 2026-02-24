@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -11,7 +10,9 @@ use higgs_engine::tokenizers::Tokenizer;
 use higgs_models::SamplingParams;
 use mlx_rs::Array;
 
-use crate::config::ServerConfig;
+use crate::config::HiggsConfig;
+use crate::metrics::MetricsStore;
+use crate::router::Router;
 
 /// Unified engine interface wrapping either the simple (serialized) or batch
 /// (interleaved) engine. Route handlers interact with this enum exclusively.
@@ -174,17 +175,14 @@ impl Engine {
 
 /// Shared application state available to all route handlers.
 pub struct AppState {
-    /// Inference engines keyed by model name, one per loaded model.
-    pub engines: HashMap<String, Arc<Engine>>,
-    /// Server configuration (host, port, etc.).
-    pub config: ServerConfig,
-}
-
-impl AppState {
-    /// Look up an engine by the model name from the request.
-    pub fn engine_for(&self, model: &str) -> Option<Arc<Engine>> {
-        self.engines.get(model).cloned()
-    }
+    /// Routes model names to local engines or remote providers.
+    pub router: Router,
+    /// Full server configuration.
+    pub config: HiggsConfig,
+    /// HTTP client for proxying requests to remote providers.
+    pub http_client: reqwest::Client,
+    /// Request metrics (present in config mode, absent in simple mode).
+    pub metrics: Option<Arc<MetricsStore>>,
 }
 
 /// Type alias for the shared state used by Axum handlers.
