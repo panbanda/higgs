@@ -75,8 +75,10 @@ jobs:
 
           mkdir -p dist
           cp target/${{ matrix.target }}/release/higgs dist/
+          cp target/${{ matrix.target }}/release/mlx.metallib dist/ 2>/dev/null || \
+            cp $(find target/${{ matrix.target }}/release/build/mlx-sys-*/out/build/lib -name mlx.metallib | head -1) dist/
           cd dist
-          tar -czvf "${ARCHIVE_NAME}.tar.gz" higgs
+          tar -czvf "${ARCHIVE_NAME}.tar.gz" higgs mlx.metallib
           shasum -a 256 "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
 
       - name: Upload release assets
@@ -193,6 +195,7 @@ jobs:
 
             def install
               bin.install "higgs"
+              bin.install "mlx.metallib"
             end
 
             test do
