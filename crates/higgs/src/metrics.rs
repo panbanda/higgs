@@ -81,6 +81,7 @@ impl MetricsStore {
         }
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     pub fn record(&self, mut record: RequestRecord) {
         record.id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.log_record(&record);
@@ -95,6 +96,7 @@ impl MetricsStore {
     }
 
     /// Record a pending entry and return its stable ID for later finalization.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn record_pending(&self, mut record: RequestRecord) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         record.id = id;
@@ -261,7 +263,13 @@ impl MetricsStore {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::expect_used,
+    clippy::unchecked_time_subtraction
+)]
 mod tests {
     use super::*;
     use std::sync::Arc;
@@ -481,8 +489,8 @@ mod tests {
 
         store.finalize_stream(id, 500, Duration::from_secs(3));
 
-        let content = std::fs::read_to_string(dir.path().join("metrics.jsonl")).unwrap();
-        let entry: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        let log_content = std::fs::read_to_string(dir.path().join("metrics.jsonl")).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(log_content.trim()).unwrap();
         assert_eq!(entry["output_tokens"], 500);
         assert_eq!(entry["duration_ms"], 3000);
     }

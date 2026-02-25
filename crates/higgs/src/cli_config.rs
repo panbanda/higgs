@@ -21,6 +21,8 @@ fn parse_toml_value(raw: &str) -> toml_edit::Item {
         toml_edit::value(false)
     } else if let Ok(n) = raw.parse::<i64>() {
         toml_edit::value(n)
+    } else if let Ok(f) = raw.parse::<f64>() {
+        toml_edit::value(f)
     } else {
         toml_edit::value(raw)
     }
@@ -116,7 +118,7 @@ pub fn config_get(config_path: &Path, key: &str) {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use tempfile::TempDir;

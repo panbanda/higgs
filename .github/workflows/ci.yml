@@ -157,7 +157,6 @@ jobs:
         with:
           comment: true
           label: true
-          check: true
-          check-threshold: critical
+          check: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

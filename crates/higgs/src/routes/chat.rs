@@ -147,41 +147,20 @@ pub async fn chat_completions(
                         translated
                     };
 
+                    let start = Instant::now();
+                    let upstream = crate::proxy::send_to_provider(
+                        &state.http_client,
+                        &provider_url,
+                        "/v1/messages",
+                        proxy_body,
+                        &headers,
+                        strip_auth,
+                        api_key.as_deref(),
+                    )
+                    .await?;
+                    let upstream_status = upstream.status().as_u16();
+
                     if is_streaming {
-                        let upstream = crate::proxy::send_to_provider(
-                            &state.http_client,
-                            &provider_url,
-                            "/v1/messages",
-                            proxy_body,
-                            &headers,
-                            strip_auth,
-                            api_key.as_deref(),
-                        )
-                        .await?;
-                        let stream =
-                            crate::translate::anthropic_stream_to_openai(upstream, req.model);
-                        let sse = Sse::new(stream).keep_alive(KeepAlive::default());
-                        Ok(sse.into_response())
-                    } else {
-                        let start = Instant::now();
-                        let upstream = crate::proxy::send_to_provider(
-                            &state.http_client,
-                            &provider_url,
-                            "/v1/messages",
-                            proxy_body,
-                            &headers,
-                            strip_auth,
-                            api_key.as_deref(),
-                        )
-                        .await?;
-                        let upstream_status = upstream.status().as_u16();
-                        let resp_bytes = upstream.bytes().await.map_err(|e| {
-                            ServerError::ProxyError(format!("Failed to read response: {e}"))
-                        })?;
-                        let translated_resp = crate::translate::anthropic_response_to_openai(
-                            &resp_bytes,
-                            &req.model,
-                        )?;
                         if let Some(ref metrics) = state.metrics {
                             metrics.record(RequestRecord {
                                 id: 0,
@@ -197,11 +176,50 @@ pub async fn chat_completions(
                                 error_body: None,
                             });
                         }
-                        Ok((
-                            [(axum::http::header::CONTENT_TYPE, "application/json")],
-                            translated_resp,
-                        )
-                            .into_response())
+                        let stream =
+                            crate::translate::anthropic_stream_to_openai(upstream, req.model);
+                        let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+                        Ok(sse.into_response())
+                    } else {
+                        let resp_bytes = upstream.bytes().await.map_err(|e| {
+                            ServerError::ProxyError(format!("Failed to read response: {e}"))
+                        })?;
+                        if let Some(ref metrics) = state.metrics {
+                            metrics.record(RequestRecord {
+                                id: 0,
+                                timestamp: Instant::now(),
+                                wallclock: chrono::Utc::now(),
+                                model: request_model,
+                                provider: provider_name.clone(),
+                                routing_method: routing_method.into(),
+                                status: upstream_status,
+                                duration: start.elapsed(),
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                error_body: None,
+                            });
+                        }
+                        let status_code = axum::http::StatusCode::from_u16(upstream_status)
+                            .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+                        if upstream_status >= 400 {
+                            // Pass through error responses without translation
+                            Ok((
+                                status_code,
+                                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                                resp_bytes,
+                            )
+                                .into_response())
+                        } else {
+                            let translated_resp = crate::translate::anthropic_response_to_openai(
+                                &resp_bytes,
+                                &req.model,
+                            )?;
+                            Ok((
+                                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                                translated_resp,
+                            )
+                                .into_response())
+                        }
                     }
                 }
             }

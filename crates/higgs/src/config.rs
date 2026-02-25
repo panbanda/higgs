@@ -669,7 +669,7 @@ mod tests {
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 3100);
         assert_eq!(config.models.len(), 1);
-        assert!(config.models.first().map_or(false, |m| m.batch));
+        assert!(config.models.first().is_some_and(|m| m.batch));
         assert_eq!(config.providers.len(), 1);
         assert_eq!(config.routes.len(), 1);
         assert_eq!(config.default.provider, "anthropic");

@@ -33,6 +33,9 @@ impl MetricsLogger {
     }
 
     fn maybe_rotate(&mut self) -> io::Result<()> {
+        if self.max_files == 0 {
+            return Ok(());
+        }
         let size = fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
         if size < self.max_size {
             return Ok(());
@@ -76,11 +79,7 @@ mod tests {
     fn test_config(dir: &Path, max_size_mb: u64, max_files: u32) -> MetricsLogConfig {
         MetricsLogConfig {
             enabled: true,
-            path: dir
-                .join("metrics.jsonl")
-                .to_string_lossy()
-                .to_owned()
-                .to_string(),
+            path: dir.join("metrics.jsonl").to_string_lossy().to_string(),
             max_size_mb,
             max_files,
         }
@@ -92,11 +91,7 @@ mod tests {
         let nested = tmp.path().join("a/b/c");
         let config = MetricsLogConfig {
             enabled: true,
-            path: nested
-                .join("metrics.jsonl")
-                .to_string_lossy()
-                .to_owned()
-                .to_string(),
+            path: nested.join("metrics.jsonl").to_string_lossy().to_string(),
             max_size_mb: 1,
             max_files: 3,
         };
@@ -160,7 +155,6 @@ mod tests {
                 .path()
                 .join("metrics.jsonl")
                 .to_string_lossy()
-                .to_owned()
                 .to_string(),
             max_size_mb: 0,
             max_files: 3,
@@ -191,7 +185,6 @@ mod tests {
                 .path()
                 .join("metrics.jsonl")
                 .to_string_lossy()
-                .to_owned()
                 .to_string(),
             max_size_mb: 0,
             max_files: 3,
@@ -222,7 +215,6 @@ mod tests {
                 .path()
                 .join("metrics.jsonl")
                 .to_string_lossy()
-                .to_owned()
                 .to_string(),
             max_size_mb: 0,
             max_files: 2,

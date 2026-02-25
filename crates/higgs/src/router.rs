@@ -236,19 +236,18 @@ impl Router {
         let messages_owned = msg_slice.to_vec();
 
         let timeout = std::time::Duration::from_millis(self.auto_router_timeout_ms);
-        let name = match tokio::time::timeout(
+        let timeout_result = tokio::time::timeout(
             timeout,
             tokio::task::spawn_blocking(move || {
                 crate::auto_router::classify_local(&engine_clone, &candidates, &messages_owned)
             }),
         )
-        .await
-        {
-            Ok(join_result) => join_result.ok()??,
-            Err(_) => {
-                warn!("auto-router classification timed out after {timeout:?}");
-                return None;
-            }
+        .await;
+        let name = if let Ok(join_result) = timeout_result {
+            join_result.ok()??
+        } else {
+            warn!("auto-router classification timed out after {timeout:?}");
+            return None;
         };
 
         let entry = self.auto_routes.iter().find(|r| r.name == name)?;
@@ -320,7 +319,13 @@ fn build_route_target(
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::shadow_unrelated
+)]
 mod tests {
     use super::*;
     use crate::config::load_config_file;

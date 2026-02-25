@@ -244,6 +244,13 @@ pub fn anthropic_to_openai_request(body: &[u8]) -> Result<Bytes, ServerError> {
                                 "content": tr.1,
                             }));
                         }
+                        // Preserve any text alongside tool results as a user message
+                        if !text.is_empty() {
+                            openai_messages.push(serde_json::json!({
+                                "role": "user",
+                                "content": text,
+                            }));
+                        }
                     } else if !tool_uses.is_empty() {
                         let mut msg_obj = serde_json::json!({
                             "role": "assistant",
@@ -509,6 +516,7 @@ pub fn openai_response_to_anthropic(body: &[u8], model: &str) -> Result<Bytes, S
 // ---------------------------------------------------------------------------
 
 /// Transform an Anthropic SSE stream into `OpenAI` SSE events.
+#[allow(clippy::too_many_lines)]
 pub fn anthropic_stream_to_openai(
     upstream: reqwest::Response,
     model: String,
@@ -664,6 +672,7 @@ pub fn anthropic_stream_to_openai(
 }
 
 /// Transform an `OpenAI` SSE stream into Anthropic SSE events.
+#[allow(clippy::too_many_lines, clippy::map_entry)]
 pub fn openai_stream_to_anthropic(
     upstream: reqwest::Response,
     model: String,
@@ -701,6 +710,7 @@ pub fn openai_stream_to_anthropic(
         // Next Anthropic content block index (0 is text)
         let mut next_block_index: u64 = 1;
         let mut has_text = false;
+        let mut text_block_closed = false;
 
         while let Some((_event_type, data)) = reader.next_event().await {
             if data == "[DONE]" {
@@ -735,17 +745,17 @@ pub fn openai_stream_to_anthropic(
                         .and_then(|tc| tc.as_array())
                     {
                         for tc in tool_calls {
-                            let tc_index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                            let tc_index = tc.get("index").and_then(serde_json::Value::as_u64).unwrap_or(0);
 
                             if !started_tools.contains_key(&tc_index) {
                                 // Close text block before first tool if we haven't emitted text
-                                if !has_text && next_block_index == 1 {
+                                if !text_block_closed && !has_text && next_block_index == 1 {
                                     let block_stop = serde_json::json!({
                                         "type": "content_block_stop",
                                         "index": 0,
                                     });
                                     yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
-                                    has_text = true; // prevent double-close
+                                    text_block_closed = true;
                                 }
 
                                 let block_idx = next_block_index;
@@ -803,12 +813,14 @@ pub fn openai_stream_to_anthropic(
             }
         }
 
-        // Close text block (index 0)
-        let block_stop = serde_json::json!({
-            "type": "content_block_stop",
-            "index": 0,
-        });
-        yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
+        // Close text block (index 0) if not already closed before tools
+        if !text_block_closed {
+            let block_stop = serde_json::json!({
+                "type": "content_block_stop",
+                "index": 0,
+            });
+            yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
+        }
 
         // Close any open tool_use blocks
         for block_idx in started_tools.values() {
@@ -1119,7 +1131,7 @@ mod tests {
         let resp = serde_json::json!({
             "id": "chatcmpl-abc",
             "object": "chat.completion",
-            "created": 1234567890,
+            "created": 1_234_567_890,
             "model": "gpt-4",
             "choices": [{
                 "index": 0,

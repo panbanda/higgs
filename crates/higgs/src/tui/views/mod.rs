@@ -193,7 +193,7 @@ mod tests {
             "1d ago"
         );
         assert_eq!(
-            format_time_ago(std::time::Duration::from_secs(172800)),
+            format_time_ago(std::time::Duration::from_secs(172_800)),
             "2d ago"
         );
     }

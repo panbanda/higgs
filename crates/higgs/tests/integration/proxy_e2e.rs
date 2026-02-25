@@ -9,7 +9,9 @@
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::tests_outside_test_module,
-    clippy::needless_pass_by_value
+    clippy::needless_pass_by_value,
+    clippy::unreadable_literal,
+    clippy::needless_borrows_for_generic_args
 )]
 
 use std::collections::HashMap;

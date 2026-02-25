@@ -134,7 +134,13 @@ pub fn tail_log(path: &Path, store: &Arc<MetricsStore>, stop: &Arc<AtomicBool>) 
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::expect_used,
+    clippy::option_if_let_else
+)]
 mod tests {
     use super::*;
     use std::fs;

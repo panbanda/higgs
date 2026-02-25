@@ -58,6 +58,16 @@ pub fn cmd_stop() {
                 eprintln!("failed to send SIGTERM to {pid}: {e}");
                 std::process::exit(1);
             }
+            // Wait for process to exit before removing PID file
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while pid_is_alive(pid) {
+                if std::time::Instant::now() >= deadline {
+                    eprintln!("sent SIGTERM to {pid} but process still running after 5s");
+                    remove_pid_file();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
             remove_pid_file();
             eprintln!("stopped higgs (pid {pid})");
         }

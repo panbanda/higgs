@@ -152,12 +152,13 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
     // Build router with middleware
     let app = build_router(shared_state, timeout_secs, api_key, rate_limit);
 
-    // Write PID file for daemon management
-    higgs::daemon::write_pid_file();
-
     // Start server
     tracing::info!(addr = %bind_addr, "Starting server");
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+
+    // Write PID file after bind succeeds so it's never stale on bind errors
+    higgs::daemon::write_pid_file();
+
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -230,8 +231,11 @@ fn load_engines(
     Ok(engines)
 }
 
-fn cmd_config(_cli: &Cli, action: &ConfigAction) {
-    let config_path = config::default_config_path();
+fn cmd_config(cli: &Cli, action: &ConfigAction) {
+    let config_path = cli
+        .config
+        .clone()
+        .unwrap_or_else(config::default_config_path);
     match action {
         ConfigAction::Get { key } => {
             higgs::cli_config::config_get(&config_path, key);
