@@ -13,8 +13,7 @@ fn main() {
 /// MLX's runtime uses dladdr to look for mlx.metallib next to the executable.
 /// Returns true if the copy succeeded.
 fn copy_metallib() -> bool {
-    let out_dir = env::var("OUT_DIR").map(PathBuf::from).ok();
-    let Some(out_dir) = out_dir.as_deref() else {
+    let Some(out_dir) = env::var("OUT_DIR").map(PathBuf::from).ok() else {
         return false;
     };
 
