@@ -206,6 +206,17 @@ fn check_auto_router(config: &HiggsConfig, result: &mut DoctorResult) {
         );
     }
 
+    match model_resolver::resolve(model_name) {
+        Ok(_) => pass(
+            &format!("auto_router model \"{model_name}\" downloaded"),
+            result,
+        ),
+        Err(err) => fail(
+            &format!("auto_router model \"{model_name}\" not downloaded: {err}"),
+            result,
+        ),
+    }
+
     let routes_with_descriptions = config
         .routes
         .iter()
@@ -540,6 +551,7 @@ mod tests {
         let config = HiggsConfig {
             auto_router: AutoRouterConfig {
                 enabled: false,
+                force: false,
                 model: String::new(),
                 timeout_ms: 2000,
             },
@@ -557,6 +569,7 @@ mod tests {
         let config = HiggsConfig {
             auto_router: AutoRouterConfig {
                 enabled: true,
+                force: false,
                 model: String::new(),
                 timeout_ms: 2000,
             },
@@ -572,6 +585,7 @@ mod tests {
         let config = HiggsConfig {
             auto_router: AutoRouterConfig {
                 enabled: true,
+                force: false,
                 model: "nonexistent/model".to_owned(),
                 timeout_ms: 2000,
             },
@@ -583,7 +597,31 @@ mod tests {
         };
         let mut result = empty_result();
         check_auto_router(&config, &mut result);
+        // Fails twice: not in [[models]] and not downloaded
+        assert_eq!(result.failures, 2);
+    }
+
+    #[test]
+    fn test_auto_router_model_not_downloaded_fails() {
+        let config = HiggsConfig {
+            auto_router: AutoRouterConfig {
+                enabled: true,
+                force: false,
+                model: "org/router-model".to_owned(),
+                timeout_ms: 2000,
+            },
+            models: vec![ModelConfig {
+                path: "org/router-model".to_owned(),
+                batch: false,
+            }],
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_auto_router(&config, &mut result);
+        // Model is in [[models]] (pass), but not downloaded (fail)
+        assert_eq!(result.passes, 1);
         assert_eq!(result.failures, 1);
+        assert_eq!(result.warnings, 0);
     }
 
     #[test]
@@ -591,6 +629,7 @@ mod tests {
         let config = HiggsConfig {
             auto_router: AutoRouterConfig {
                 enabled: true,
+                force: false,
                 model: "org/router-model".to_owned(),
                 timeout_ms: 2000,
             },

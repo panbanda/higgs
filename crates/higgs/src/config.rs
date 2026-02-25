@@ -249,6 +249,8 @@ pub struct AutoRouterConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
+    pub force: bool,
+    #[serde(default = "default_auto_router_model")]
     pub model: String,
     #[serde(default = "default_auto_router_timeout_ms")]
     pub timeout_ms: u64,
@@ -258,10 +260,15 @@ impl Default for AutoRouterConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            model: String::new(),
+            force: false,
+            model: default_auto_router_model(),
             timeout_ms: default_auto_router_timeout_ms(),
         }
     }
+}
+
+fn default_auto_router_model() -> String {
+    "katanemo/Arch-Router-1.5B".to_owned()
 }
 
 const fn default_auto_router_timeout_ms() -> u64 {
@@ -397,6 +404,7 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
     config.server = server;
 
     validate_config(&config, true)?;
+    ensure_auto_router_model(&mut config);
     Ok(config)
 }
 
@@ -440,11 +448,12 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
         }
     }
 
-    let config: HiggsConfig = figment
+    let mut config: HiggsConfig = figment
         .extract()
         .map_err(|e| format!("failed to load config from {}: {e}", path.display()))?;
 
     validate_config(&config, false)?;
+    ensure_auto_router_model(&mut config);
     Ok(config)
 }
 
@@ -493,6 +502,23 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
     }
 
     Ok(())
+}
+
+/// If `auto_router` is enabled, ensure its model is present in `config.models`.
+fn ensure_auto_router_model(config: &mut HiggsConfig) {
+    if !config.auto_router.enabled || config.auto_router.model.is_empty() {
+        return;
+    }
+    let already_listed = config
+        .models
+        .iter()
+        .any(|m| m.path == config.auto_router.model);
+    if !already_listed {
+        config.models.push(ModelConfig {
+            path: config.auto_router.model.clone(),
+            batch: false,
+        });
+    }
 }
 
 /// Returns the default config directory path (~/.config/higgs/).
@@ -805,8 +831,113 @@ mod tests {
     fn test_auto_router_defaults() {
         let config = HiggsConfig::default();
         assert!(!config.auto_router.enabled);
+        assert!(!config.auto_router.force);
         assert_eq!(config.auto_router.timeout_ms, 2000);
-        assert!(config.auto_router.model.is_empty());
+        assert_eq!(config.auto_router.model, "katanemo/Arch-Router-1.5B");
+    }
+
+    #[test]
+    fn auto_router_model_auto_injected_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [provider.anthropic]
+            url = "https://api.anthropic.com"
+            format = "anthropic"
+
+            [default]
+            provider = "anthropic"
+
+            [auto_router]
+            enabled = true
+            model = "katanemo/Arch-Router-1.5B"
+            "#,
+        )
+        .unwrap();
+        let config = load_config_file(&path, None).unwrap();
+        assert!(
+            config
+                .models
+                .iter()
+                .any(|m| m.path == "katanemo/Arch-Router-1.5B")
+        );
+    }
+
+    #[test]
+    fn auto_router_model_not_duplicated_when_already_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[models]]
+            path = "katanemo/Arch-Router-1.5B"
+
+            [auto_router]
+            enabled = true
+            model = "katanemo/Arch-Router-1.5B"
+            "#,
+        )
+        .unwrap();
+        let config = load_config_file(&path, None).unwrap();
+        let count = config
+            .models
+            .iter()
+            .filter(|m| m.path == "katanemo/Arch-Router-1.5B")
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn auto_router_model_not_injected_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [provider.anthropic]
+            url = "https://api.anthropic.com"
+            format = "anthropic"
+
+            [default]
+            provider = "anthropic"
+
+            [auto_router]
+            enabled = false
+            "#,
+        )
+        .unwrap();
+        let config = load_config_file(&path, None).unwrap();
+        assert!(
+            !config
+                .models
+                .iter()
+                .any(|m| m.path == "katanemo/Arch-Router-1.5B")
+        );
+    }
+
+    #[test]
+    fn auto_router_force_deserializes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[models]]
+            path = "some/model"
+
+            [auto_router]
+            enabled = true
+            force = true
+            model = "katanemo/Arch-Router-1.5B"
+            "#,
+        )
+        .unwrap();
+        let config = load_config_file(&path, None).unwrap();
+        assert!(config.auto_router.force);
+        assert!(config.auto_router.enabled);
     }
 
     #[test]

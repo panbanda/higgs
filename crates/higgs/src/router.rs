@@ -89,6 +89,7 @@ pub struct Router {
     auto_routes: Vec<AutoRouteEntry>,
     auto_candidates: Vec<RouteCandidate>,
     auto_router_engine: Option<Arc<Engine>>,
+    auto_router_force: bool,
     auto_router_timeout_ms: u64,
     default_target: RouteTarget,
 }
@@ -174,6 +175,7 @@ impl Router {
             auto_routes,
             auto_candidates,
             auto_router_engine,
+            auto_router_force: config.auto_router.force,
             auto_router_timeout_ms: config.auto_router.timeout_ms,
             default_target,
         })
@@ -181,17 +183,21 @@ impl Router {
 
     /// Resolve a model name to a route.
     ///
-    /// Pass `messages` for auto-routing support (only used when `model == "auto"`).
+    /// Pass `messages` for auto-routing support. Used when `model == "auto"` or
+    /// when `force` mode is enabled.
     pub async fn resolve(
         &self,
         model: &str,
         messages: Option<&[serde_json::Value]>,
     ) -> Result<ResolvedRoute, String> {
-        if model == "auto" {
+        if self.auto_router_force || model == "auto" {
             if let Some(resolved) = self.try_auto_route(messages).await {
                 return Ok(resolved);
             }
-            return self.resolve_target(&self.default_target, model, RoutingMethod::Default);
+            if model == "auto" {
+                return self.resolve_target(&self.default_target, model, RoutingMethod::Default);
+            }
+            // force mode: auto-routing returned nothing, fall through to normal resolution
         }
 
         // Pattern matching (first match wins)
@@ -809,6 +815,75 @@ mod tests {
             }
             Ok(ResolvedRoute::Higgs { .. }) => panic!("expected Remote route"),
             Err(e) => panic!("should resolve to default remote, got error: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn force_mode_falls_through_without_engine() {
+        // force=true, no auto-router engine loaded, named model should
+        // fall through to normal resolution (pattern/direct/default).
+        let config = config_from_toml(
+            r#"
+            [provider.anthropic]
+            url = "https://api.anthropic.com"
+            format = "anthropic"
+
+            [[routes]]
+            pattern = "opus"
+            provider = "anthropic"
+
+            [default]
+            provider = "anthropic"
+
+            [auto_router]
+            enabled = false
+            force = true
+            "#,
+        );
+        let router = Router::from_config(&config, HashMap::new()).unwrap();
+        let result = router.resolve("claude-opus-4-6", None).await.unwrap();
+        match result {
+            ResolvedRoute::Remote {
+                provider_name,
+                routing_method,
+                ..
+            } => {
+                assert_eq!(provider_name, "anthropic");
+                assert_eq!(routing_method, RoutingMethod::Pattern);
+            }
+            ResolvedRoute::Higgs { .. } => panic!("expected Remote route"),
+        }
+    }
+
+    #[tokio::test]
+    async fn force_mode_unmatched_falls_to_default() {
+        // force=true, no auto-router engine, unmatched model falls to default
+        let config = config_from_toml(
+            r#"
+            [provider.anthropic]
+            url = "https://api.anthropic.com"
+            format = "anthropic"
+
+            [default]
+            provider = "anthropic"
+
+            [auto_router]
+            enabled = false
+            force = true
+            "#,
+        );
+        let router = Router::from_config(&config, HashMap::new()).unwrap();
+        let result = router.resolve("some-unknown-model", None).await.unwrap();
+        match result {
+            ResolvedRoute::Remote {
+                provider_name,
+                routing_method,
+                ..
+            } => {
+                assert_eq!(provider_name, "anthropic");
+                assert_eq!(routing_method, RoutingMethod::Default);
+            }
+            ResolvedRoute::Higgs { .. } => panic!("expected Remote route"),
         }
     }
 }
