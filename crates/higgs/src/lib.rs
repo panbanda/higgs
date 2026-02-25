@@ -1,10 +1,21 @@
 pub mod anthropic_adapter;
+pub mod attach;
+pub mod auto_router;
+pub mod cli_config;
 pub mod config;
+pub mod daemon;
+pub mod doctor;
 pub mod error;
+pub mod metrics;
+pub mod metrics_log;
 pub mod model_download;
 pub mod model_resolver;
+pub mod proxy;
+pub mod router;
 pub mod routes;
 pub mod state;
+pub mod translate;
+pub mod tui;
 pub mod types;
 
 use std::net::SocketAddr;

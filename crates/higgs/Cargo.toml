@@ -31,10 +31,20 @@ uuid.workspace = true
 chrono.workspace = true
 async-stream.workspace = true
 base64.workspace = true
+reqwest.workspace = true
+regex.workspace = true
+bytes.workspace = true
+http.workspace = true
+futures.workspace = true
+toml_edit.workspace = true
+nix.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
 
 [dev-dependencies]
-http-body-util = "0.1"
+http-body-util.workspace = true
 tokio = { version = "1", features = ["macros", "rt"] }
 tower = { version = "0.5", features = ["util"] }
 hyper = "1"
 tempfile = "3.25.0"
+wiremock = "0.6"

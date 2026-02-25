@@ -100,8 +100,22 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 # CLI + Configuration
 clap = { version = "4", features = ["derive"] }
-figment = { version = "0.10", features = ["env"] }
+figment = { version = "0.10", features = ["env", "toml"] }
 directories = "6"
+toml_edit = "0.22"
+
+# Proxy + Networking
+reqwest = { version = "0.12", features = ["stream", "json"] }
+regex = "1"
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+futures = "0.3"
+
+# Daemon + TUI
+nix = { version = "0.29", features = ["signal", "process"] }
+ratatui = "0.29"
+crossterm = "0.28"
 
 # Observability
 tracing = "0.1"
