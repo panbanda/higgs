@@ -522,7 +522,11 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
 }
 
 /// Returns the default config directory path (~/.config/higgs/).
+/// Honors the `HIGGS_CONFIG_DIR` environment variable if set.
 pub fn config_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("HIGGS_CONFIG_DIR") {
+        return PathBuf::from(dir);
+    }
     directories::BaseDirs::new().map_or_else(
         || PathBuf::from("/tmp/higgs"),
         |d| d.home_dir().join(".config/higgs"),

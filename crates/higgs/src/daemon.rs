@@ -9,24 +9,16 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
 use crate::attach;
-use crate::config::HiggsConfig;
+use crate::config::{self, HiggsConfig};
 use crate::metrics::MetricsStore;
 use crate::metrics_log::MetricsLogger;
 
-pub fn config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("HIGGS_CONFIG_DIR") {
-        return PathBuf::from(dir);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
-    PathBuf::from(home).join(".config/higgs")
+fn pid_path() -> std::path::PathBuf {
+    config::pid_path()
 }
 
-pub fn pid_path() -> PathBuf {
-    config_dir().join("higgs.pid")
-}
-
-pub fn log_path() -> PathBuf {
-    config_dir().join("higgs.log")
+fn log_path() -> std::path::PathBuf {
+    config::log_path()
 }
 
 pub fn read_pid() -> Option<i32> {
@@ -83,7 +75,7 @@ pub fn cmd_stop() {
 
 #[allow(clippy::print_stderr)]
 pub fn cmd_init() {
-    let dir = config_dir();
+    let dir = config::config_dir();
     let path = dir.join("config.toml");
 
     if path.exists() {
@@ -205,7 +197,7 @@ pub fn detach(config_path: &Path, verbose: bool) {
         remove_pid_file();
     }
 
-    let dir = config_dir();
+    let dir = config::config_dir();
     if let Err(e) = fs::create_dir_all(&dir) {
         eprintln!("failed to create {}: {e}", dir.display());
         std::process::exit(1);
@@ -422,7 +414,7 @@ mod tests {
         unsafe {
             std::env::set_var("HIGGS_CONFIG_DIR", dir.path());
         }
-        assert_eq!(config_dir(), dir.path());
+        assert_eq!(config::config_dir(), dir.path());
         unsafe {
             std::env::remove_var("HIGGS_CONFIG_DIR");
         }
@@ -433,7 +425,7 @@ mod tests {
         unsafe {
             std::env::remove_var("HIGGS_CONFIG_DIR");
         }
-        let path = config_dir();
+        let path = config::config_dir();
         assert!(path.to_string_lossy().ends_with(".config/higgs"));
     }
 

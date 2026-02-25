@@ -299,16 +299,25 @@ impl Router {
                 strip_auth,
                 api_key,
                 stub_count_tokens,
-            } => Ok(ResolvedRoute::Remote {
-                provider_name: provider_name.clone(),
-                provider_url: provider_url.clone(),
-                provider_format: *provider_format,
-                model_rewrite: model_rewrite.clone(),
-                strip_auth: *strip_auth,
-                api_key: api_key.clone(),
-                stub_count_tokens: *stub_count_tokens,
-                routing_method: method,
-            }),
+            } => {
+                if model == "auto" && model_rewrite.is_none() {
+                    return Err(
+                        "cannot forward virtual model name \"auto\" to remote provider; \
+                         configure a model rewrite on the default route or add auto-router routes"
+                            .to_owned(),
+                    );
+                }
+                Ok(ResolvedRoute::Remote {
+                    provider_name: provider_name.clone(),
+                    provider_url: provider_url.clone(),
+                    provider_format: *provider_format,
+                    model_rewrite: model_rewrite.clone(),
+                    strip_auth: *strip_auth,
+                    api_key: api_key.clone(),
+                    stub_count_tokens: *stub_count_tokens,
+                    routing_method: method,
+                })
+            }
         }
     }
 }
@@ -800,21 +809,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_model_with_remote_default_succeeds() {
-        // When model="auto" and default is a remote provider, should work fine
+    async fn auto_model_with_remote_default_rejects_without_rewrite() {
+        // model="auto" falling through to a remote default with no model_rewrite
+        // should error -- "auto" is not a real model name for upstream providers.
         let router = router_from_toml(production_toml());
         let result = router.resolve("auto", None).await;
         match result {
-            Ok(ResolvedRoute::Remote {
-                provider_name,
-                routing_method,
-                ..
-            }) => {
-                assert_eq!(provider_name, "anthropic");
-                assert_eq!(routing_method, RoutingMethod::Default);
-            }
-            Ok(ResolvedRoute::Higgs { .. }) => panic!("expected Remote route"),
-            Err(e) => panic!("should resolve to default remote, got error: {e}"),
+            Err(e) => assert!(e.contains("cannot forward virtual model name"), "got: {e}"),
+            Ok(_) => panic!("expected error for auto with remote default"),
         }
     }
 
