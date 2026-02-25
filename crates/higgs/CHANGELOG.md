@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.12](https://github.com/panbanda/higgs/compare/higgs-v0.1.11...higgs-v0.1.12) (2026-02-25)
+
+
+### Bug Fixes
+
+* resolve auto_router model by basename when config uses full path ([#41](https://github.com/panbanda/higgs/issues/41)) ([7220fa2](https://github.com/panbanda/higgs/commit/7220fa27ce4f9f67b587ea9a5a3785735d3cfb1d))
+
 ## [0.1.11](https://github.com/panbanda/higgs/compare/higgs-v0.1.10...higgs-v0.1.11) (2026-02-25)
 
 
