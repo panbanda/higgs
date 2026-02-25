@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.10](https://github.com/panbanda/higgs/compare/higgs-v0.1.9...higgs-v0.1.10) (2026-02-25)
+
+
+### Features
+
+* unified AI gateway with proxy routing and format translation ([#38](https://github.com/panbanda/higgs/issues/38)) ([7c5668b](https://github.com/panbanda/higgs/commit/7c5668b67a4de113447dce9297c56ace23f5f017))
+
 ## [0.1.9](https://github.com/panbanda/mlx-server/compare/mlx-server-v0.1.8...mlx-server-v0.1.9) (2026-02-23)
 
 
