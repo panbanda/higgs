@@ -26,8 +26,10 @@ struct LogEntry {
 
 pub fn parse_log_entry(line: &str) -> Option<RequestRecord> {
     let entry: LogEntry = serde_json::from_str(line).ok()?;
-    let age = (Utc::now() - entry.timestamp).to_std().ok()?;
-    let timestamp = Instant::now().checked_sub(age)?;
+    let age = (Utc::now() - entry.timestamp)
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    let timestamp = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
     Some(RequestRecord {
         id: 0,
         timestamp,

@@ -369,32 +369,32 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
         ..HiggsConfig::default()
     };
 
-    if let Some(ref host) = args.host {
-        host.clone_into(&mut config.server.host);
-    }
-    if let Some(port) = args.port {
-        config.server.port = port;
-    }
-    if let Some(max_tokens) = args.max_tokens {
-        config.server.max_tokens = max_tokens;
-    }
-    if let Some(ref api_key) = args.api_key {
-        config.server.api_key = Some(api_key.clone());
-    }
-    if let Some(rate_limit) = args.rate_limit {
-        config.server.rate_limit = rate_limit;
-    }
-    if let Some(timeout) = args.timeout {
-        config.server.timeout = timeout;
-    }
-
-    // Overlay HIGGS_* env vars on server section
+    // Overlay HIGGS_* env vars, then re-apply explicit CLI args on top
     let figment = Figment::new()
-        .merge(Serialized::defaults(&config.server))
+        .merge(Serialized::defaults(&ServerSection::default()))
         .merge(Env::prefixed("HIGGS_"));
-    config.server = figment
+    let mut server: ServerSection = figment
         .extract()
         .map_err(|e| format!("env overlay failed: {e}"))?;
+    if let Some(ref host) = args.host {
+        host.clone_into(&mut server.host);
+    }
+    if let Some(port) = args.port {
+        server.port = port;
+    }
+    if let Some(max_tokens) = args.max_tokens {
+        server.max_tokens = max_tokens;
+    }
+    if let Some(ref api_key) = args.api_key {
+        server.api_key = Some(api_key.clone());
+    }
+    if let Some(rate_limit) = args.rate_limit {
+        server.rate_limit = rate_limit;
+    }
+    if let Some(timeout) = args.timeout {
+        server.timeout = timeout;
+    }
+    config.server = server;
 
     validate_config(&config, true)?;
     Ok(config)
@@ -488,8 +488,8 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
         ));
     }
 
-    if config.server.timeout < 0.0 {
-        return Err("timeout must not be negative".to_owned());
+    if !config.server.timeout.is_finite() || config.server.timeout < 0.0 {
+        return Err("timeout must be a finite, non-negative number".to_owned());
     }
 
     Ok(())

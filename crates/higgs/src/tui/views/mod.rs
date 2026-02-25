@@ -72,8 +72,9 @@ pub fn render_scrollbar(frame: &mut Frame, area: Rect, total_rows: usize, scroll
     #[allow(clippy::as_conversions)]
     let visible_rows = area.height.saturating_sub(3) as usize;
     if total_rows > visible_rows {
-        let mut state =
-            ScrollbarState::new(total_rows.saturating_sub(visible_rows)).position(scroll);
+        let mut state = ScrollbarState::new(total_rows)
+            .viewport_content_length(visible_rows)
+            .position(scroll);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .thumb_style(Style::default().fg(Color::DarkGray))
             .track_style(Style::default().fg(Color::Black));
