@@ -80,13 +80,16 @@ pub fn load_history(config: &MetricsLogConfig, store: &MetricsStore) {
             if record.wallclock < cutoff {
                 continue;
             }
-            store.record(record);
+            store.record_silent(record);
         }
     }
 }
 
 pub fn tail_log(path: &Path, store: &Arc<MetricsStore>, stop: &Arc<AtomicBool>) {
+    use std::os::unix::fs::MetadataExt;
+
     let mut position: u64 = std::fs::metadata(path).map_or(0, |m| m.len());
+    let mut current_ino: u64 = std::fs::metadata(path).map_or(0, |m| m.ino());
 
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(250));
@@ -99,10 +102,12 @@ pub fn tail_log(path: &Path, store: &Arc<MetricsStore>, stop: &Arc<AtomicBool>) 
             continue;
         };
         let file_len = meta.len();
+        let file_ino = meta.ino();
 
-        // Detect rotation: file shrunk
-        if file_len < position {
+        // Detect rotation: inode changed or file shrunk
+        if file_ino != current_ino || file_len < position {
             position = 0;
+            current_ino = file_ino;
         }
 
         if file_len == position {
@@ -127,7 +132,7 @@ pub fn tail_log(path: &Path, store: &Arc<MetricsStore>, stop: &Arc<AtomicBool>) 
                         continue;
                     }
                     if let Some(record) = parse_log_entry(trimmed) {
-                        store.record(record);
+                        store.record_silent(record);
                     }
                 }
             }

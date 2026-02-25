@@ -19,6 +19,8 @@ use crate::router::Router;
 pub enum Engine {
     Simple(Box<SimpleEngine>),
     Batch(Box<BatchEngine>),
+    #[cfg(test)]
+    Stub(String),
 }
 
 impl Engine {
@@ -30,17 +32,27 @@ impl Engine {
         BatchEngine::load(dir).map(|e| Self::Batch(Box::new(e)))
     }
 
+    #[cfg(test)]
+    pub fn test_stub(name: &str) -> Self {
+        Self::Stub(name.to_owned())
+    }
+
     pub fn model_name(&self) -> &str {
         match self {
             Self::Simple(e) => e.model_name(),
             Self::Batch(e) => e.model_name(),
+            #[cfg(test)]
+            Self::Stub(name) => name,
         }
     }
 
+    #[cfg_attr(test, allow(clippy::panic))]
     pub fn tokenizer(&self) -> &Tokenizer {
         match self {
             Self::Simple(e) => e.tokenizer(),
             Self::Batch(e) => e.tokenizer(),
+            #[cfg(test)]
+            Self::Stub(_) => panic!("Engine::test_stub has no tokenizer"),
         }
     }
 
@@ -48,6 +60,8 @@ impl Engine {
         match self {
             Self::Simple(e) => e.eos_token_ids(),
             Self::Batch(e) => e.eos_token_ids(),
+            #[cfg(test)]
+            Self::Stub(_) => &[],
         }
     }
 
@@ -55,6 +69,8 @@ impl Engine {
         match self {
             Self::Simple(e) => e.hidden_size(),
             Self::Batch(e) => e.hidden_size(),
+            #[cfg(test)]
+            Self::Stub(_) => 0,
         }
     }
 
@@ -62,6 +78,8 @@ impl Engine {
         match self {
             Self::Simple(e) => e.is_vlm(),
             Self::Batch(_) => false,
+            #[cfg(test)]
+            Self::Stub(_) => false,
         }
     }
 
@@ -69,6 +87,8 @@ impl Engine {
         match self {
             Self::Simple(e) => e.vlm_image_size(),
             Self::Batch(_) => None,
+            #[cfg(test)]
+            Self::Stub(_) => None,
         }
     }
 
@@ -76,6 +96,8 @@ impl Engine {
         match self {
             Self::Simple(e) => e.replace_image_tokens(tokens),
             Self::Batch(_) => {}
+            #[cfg(test)]
+            Self::Stub(_) => {}
         }
     }
 
@@ -87,6 +109,8 @@ impl Engine {
         match self {
             Self::Simple(e) => e.prepare_chat_prompt(messages, tools),
             Self::Batch(e) => e.prepare_chat_prompt(messages, tools),
+            #[cfg(test)]
+            Self::Stub(_) => Ok(Vec::new()),
         }
     }
 
@@ -123,6 +147,8 @@ impl Engine {
                 constraint,
                 pixel_values,
             ),
+            #[cfg(test)]
+            Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
         }
     }
 
@@ -162,6 +188,8 @@ impl Engine {
                 constraint,
                 pixel_values,
             ),
+            #[cfg(test)]
+            Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
         }
     }
 
@@ -169,6 +197,8 @@ impl Engine {
         match self {
             Self::Simple(e) => e.embed(token_ids),
             Self::Batch(e) => e.embed(token_ids),
+            #[cfg(test)]
+            Self::Stub(_) => Ok(Vec::new()),
         }
     }
 }

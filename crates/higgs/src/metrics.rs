@@ -85,6 +85,18 @@ impl MetricsStore {
     pub fn record(&self, mut record: RequestRecord) {
         record.id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.log_record(&record);
+        self.insert_record(record);
+    }
+
+    /// Store a record without writing it to the JSONL log. Used when ingesting
+    /// entries that already exist in the log (history replay / tail).
+    pub fn record_silent(&self, mut record: RequestRecord) {
+        record.id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.insert_record(record);
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    fn insert_record(&self, record: RequestRecord) {
         let mut records = self.records.write().unwrap_or_else(PoisonError::into_inner);
         let idx = records.len();
         let id = record.id;

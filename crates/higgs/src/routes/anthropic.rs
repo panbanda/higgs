@@ -45,9 +45,16 @@ pub async fn create_message(
         ));
     }
 
+    let messages_json = serde_json::to_value(&req.messages).ok().and_then(|v| {
+        if let serde_json::Value::Array(a) = v {
+            Some(a)
+        } else {
+            None
+        }
+    });
     let resolved = state
         .router
-        .resolve(&req.model, None)
+        .resolve(&req.model, messages_json.as_deref())
         .await
         .map_err(ServerError::ModelNotFound)?;
 
@@ -419,9 +426,16 @@ pub async fn count_tokens(
     let req: CountTokensRequest = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("Invalid request body: {e}")))?;
 
+    let messages_json = serde_json::to_value(&req.messages).ok().and_then(|v| {
+        if let serde_json::Value::Array(a) = v {
+            Some(a)
+        } else {
+            None
+        }
+    });
     let resolved = state
         .router
-        .resolve(&req.model, None)
+        .resolve(&req.model, messages_json.as_deref())
         .await
         .map_err(ServerError::ModelNotFound)?;
 

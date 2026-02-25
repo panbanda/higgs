@@ -264,12 +264,24 @@ impl Router {
         match target {
             RouteTarget::Higgs { model_rewrite } => {
                 let lookup_name = model_rewrite.as_deref().unwrap_or(model);
-                let engine = self.local_engines.get(lookup_name).ok_or_else(|| {
-                    format!("model '{lookup_name}' not found among loaded local models")
-                })?;
+                let (engine, resolved_name) =
+                    if let Some(engine) = self.local_engines.get(lookup_name) {
+                        (Arc::clone(engine), lookup_name.to_owned())
+                    } else if model == "auto" {
+                        // "auto" is a virtual model name; pick any loaded engine
+                        let (name, engine) =
+                            self.local_engines.iter().next().ok_or_else(|| {
+                                "no local models loaded for default route".to_owned()
+                            })?;
+                        (Arc::clone(engine), name.clone())
+                    } else {
+                        return Err(format!(
+                            "model '{lookup_name}' not found among loaded local models"
+                        ));
+                    };
                 Ok(ResolvedRoute::Higgs {
-                    engine: Arc::clone(engine),
-                    model_name: lookup_name.to_owned(),
+                    engine,
+                    model_name: resolved_name,
                     routing_method: method,
                 })
             }
@@ -747,5 +759,56 @@ mod tests {
         );
         let router = Router::from_config(&config, HashMap::new()).unwrap();
         assert!(router.local_engines().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_model_with_higgs_default_picks_first_engine() {
+        // When model="auto", auto-router returns None, default is higgs
+        // with no model_rewrite, it should pick the first loaded engine
+        // instead of trying to look up "auto" as a model name.
+        let config = config_from_toml(
+            r#"
+            [[models]]
+            path = "test/model-a"
+            "#,
+        );
+        let engine = crate::state::Engine::test_stub("test/model-a");
+        let mut engines = HashMap::new();
+        engines.insert("test/model-a".to_owned(), Arc::new(engine));
+
+        let router = Router::from_config(&config, engines).unwrap();
+        // No auto-router configured, so "auto" falls through to default
+        let result = router.resolve("auto", None).await;
+        match result {
+            Ok(ResolvedRoute::Higgs {
+                model_name,
+                routing_method,
+                ..
+            }) => {
+                assert_eq!(model_name, "test/model-a");
+                assert_eq!(routing_method, RoutingMethod::Default);
+            }
+            Ok(ResolvedRoute::Remote { .. }) => panic!("expected Higgs route"),
+            Err(e) => panic!("should resolve to first engine, got error: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_model_with_remote_default_succeeds() {
+        // When model="auto" and default is a remote provider, should work fine
+        let router = router_from_toml(production_toml());
+        let result = router.resolve("auto", None).await;
+        match result {
+            Ok(ResolvedRoute::Remote {
+                provider_name,
+                routing_method,
+                ..
+            }) => {
+                assert_eq!(provider_name, "anthropic");
+                assert_eq!(routing_method, RoutingMethod::Default);
+            }
+            Ok(ResolvedRoute::Higgs { .. }) => panic!("expected Remote route"),
+            Err(e) => panic!("should resolve to default remote, got error: {e}"),
+        }
     }
 }

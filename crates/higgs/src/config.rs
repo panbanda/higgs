@@ -404,7 +404,7 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
 pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsConfig, String> {
     let mut figment = Figment::new()
         .merge(Toml::file(path))
-        .merge(Env::prefixed("HIGGS_").split("_"));
+        .merge(Env::prefixed("HIGGS_").split("__"));
 
     // Overlay CLI args on server section
     if let Some(serve_args) = args {

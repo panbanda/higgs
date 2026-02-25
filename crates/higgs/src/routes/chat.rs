@@ -44,9 +44,16 @@ pub async fn chat_completions(
         ));
     }
 
+    let messages_json = serde_json::to_value(&req.messages).ok().and_then(|v| {
+        if let serde_json::Value::Array(a) = v {
+            Some(a)
+        } else {
+            None
+        }
+    });
     let resolved = state
         .router
-        .resolve(&req.model, None)
+        .resolve(&req.model, messages_json.as_deref())
         .await
         .map_err(ServerError::ModelNotFound)?;
 
