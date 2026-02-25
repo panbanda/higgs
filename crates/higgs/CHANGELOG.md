@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.11](https://github.com/panbanda/higgs/compare/higgs-v0.1.10...higgs-v0.1.11) (2026-02-25)
+
+
+### Features
+
+* ship mlx.metallib alongside the higgs binary ([#39](https://github.com/panbanda/higgs/issues/39)) ([deaa322](https://github.com/panbanda/higgs/commit/deaa32275c8ef8236846cc1adc2edf24d698fbe5))
+
 ## [0.1.10](https://github.com/panbanda/higgs/compare/higgs-v0.1.9...higgs-v0.1.10) (2026-02-25)
 
 
