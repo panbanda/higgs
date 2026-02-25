@@ -183,6 +183,19 @@ pub async fn chat_completions(
                                 error_body: None,
                             });
                         }
+                        if upstream_status >= 400 {
+                            let status_code = axum::http::StatusCode::from_u16(upstream_status)
+                                .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+                            let resp_bytes = upstream.bytes().await.map_err(|e| {
+                                ServerError::ProxyError(format!("Failed to read response: {e}"))
+                            })?;
+                            return Ok((
+                                status_code,
+                                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                                resp_bytes,
+                            )
+                                .into_response());
+                        }
                         let stream =
                             crate::translate::anthropic_stream_to_openai(upstream, req.model);
                         let sse = Sse::new(stream).keep_alive(KeepAlive::default());

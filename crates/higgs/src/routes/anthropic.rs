@@ -129,32 +129,36 @@ pub async fn create_message(
                         translated
                     };
 
-                    if is_streaming {
-                        let upstream = crate::proxy::send_to_provider(
-                            &state.http_client,
-                            &provider_url,
-                            "/v1/chat/completions",
-                            proxy_body,
-                            &headers,
-                            strip_auth,
-                            api_key.as_deref(),
+                    let upstream = crate::proxy::send_to_provider(
+                        &state.http_client,
+                        &provider_url,
+                        "/v1/chat/completions",
+                        proxy_body,
+                        &headers,
+                        strip_auth,
+                        api_key.as_deref(),
+                    )
+                    .await?;
+                    let upstream_status = upstream.status().as_u16();
+
+                    if upstream_status >= 400 {
+                        let status_code = axum::http::StatusCode::from_u16(upstream_status)
+                            .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+                        let resp_bytes = upstream.bytes().await.map_err(|e| {
+                            ServerError::ProxyError(format!("Failed to read response: {e}"))
+                        })?;
+                        Ok((
+                            status_code,
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            resp_bytes,
                         )
-                        .await?;
+                            .into_response())
+                    } else if is_streaming {
                         let stream =
                             crate::translate::openai_stream_to_anthropic(upstream, req.model);
                         let sse = Sse::new(stream).keep_alive(KeepAlive::default());
                         Ok(sse.into_response())
                     } else {
-                        let upstream = crate::proxy::send_to_provider(
-                            &state.http_client,
-                            &provider_url,
-                            "/v1/chat/completions",
-                            proxy_body,
-                            &headers,
-                            strip_auth,
-                            api_key.as_deref(),
-                        )
-                        .await?;
                         let resp_bytes = upstream.bytes().await.map_err(|e| {
                             ServerError::ProxyError(format!("Failed to read response: {e}"))
                         })?;
