@@ -1152,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "higgs"
-version = "0.1.13"
+version = "0.1.16"
 dependencies = [
  "async-stream",
  "axum",
@@ -1192,7 +1192,7 @@ dependencies = [
 
 [[package]]
 name = "higgs-engine"
-version = "0.1.13"
+version = "0.1.16"
 dependencies = [
  "higgs-models",
  "minijinja",
@@ -1211,7 +1211,7 @@ dependencies = [
 
 [[package]]
 name = "higgs-models"
-version = "0.1.13"
+version = "0.1.16"
 dependencies = [
  "image",
  "mlx-rs",

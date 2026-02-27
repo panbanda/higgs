@@ -1,6 +1,6 @@
 [package]
 name = "higgs-models"
-version = "0.1.15"
+version = "0.1.16"
 description = "Model architectures and weight loading for higgs (LLaMA, Mistral, Qwen2/3)"
 edition.workspace = true
 license.workspace = true

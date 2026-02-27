@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.16](https://github.com/panbanda/higgs/compare/higgs-v0.1.15...higgs-v0.1.16) (2026-02-27)
+
+
+### Features
+
+* add `higgs exec -- <command>` subcommand ([#49](https://github.com/panbanda/higgs/issues/49)) ([b61dbf5](https://github.com/panbanda/higgs/commit/b61dbf575ff2ec944e81751f654a65b1b746a90f))
+
 ## [0.1.15](https://github.com/panbanda/higgs/compare/higgs-v0.1.14...higgs-v0.1.15) (2026-02-27)
 
 

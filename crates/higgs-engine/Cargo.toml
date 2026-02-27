@@ -1,6 +1,6 @@
 [package]
 name = "higgs-engine"
-version = "0.1.15"
+version = "0.1.16"
 description = "Inference engine (tokenization, generation loop, prompt caching) for higgs"
 edition.workspace = true
 license.workspace = true
