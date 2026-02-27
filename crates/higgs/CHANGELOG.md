@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.17](https://github.com/panbanda/higgs/compare/higgs-v0.1.16...higgs-v0.1.17) (2026-02-27)
+
+
+### Bug Fixes
+
+* normalize auto_router.model to a name like routes do ([1e741c5](https://github.com/panbanda/higgs/commit/1e741c5c83133923565b59260e9bf64d41cd3e87))
+* normalize auto_router.model to a name like routes do ([3b52db4](https://github.com/panbanda/higgs/commit/3b52db488c4099e44b22712640f82f3f57f8efaa))
+
 ## [0.1.16](https://github.com/panbanda/higgs/compare/higgs-v0.1.15...higgs-v0.1.16) (2026-02-27)
 
 
