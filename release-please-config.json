@@ -6,6 +6,10 @@
   "include-v-in-tag": true,
   "plugins": [
     {
+      "type": "cargo-workspace",
+      "merge": false
+    },
+    {
       "type": "linked-versions",
       "groupName": "workspace",
       "components": ["higgs-models", "higgs-engine", "higgs"]
