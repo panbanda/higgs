@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.14](https://github.com/panbanda/higgs/compare/higgs-v0.1.13...higgs-v0.1.14) (2026-02-27)
+
+
+### Features
+
+* add --profile CLI flag, TUI routing tab, and config visibility ([#45](https://github.com/panbanda/higgs/issues/45)) ([95dda05](https://github.com/panbanda/higgs/commit/95dda054071942979aaa2a9c5611a067c0f227d5))
+
 ## [0.1.13](https://github.com/panbanda/higgs/compare/higgs-v0.1.12...higgs-v0.1.13) (2026-02-27)
 
 
