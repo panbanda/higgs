@@ -539,25 +539,50 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
     Ok(())
 }
 
-/// If `auto_router` is enabled, ensure its model is present in `config.models`.
+/// If `auto_router` is enabled, ensure its model is present in `config.models`
+/// and that `auto_router.model` is normalized to a model name (not a path).
 ///
-/// The `auto_router.model` field can reference a model by its `name` or `path`.
+/// This mirrors how `routes[].model` works: always a name reference into the
+/// engines map, never a raw filesystem path.
 fn ensure_auto_router_model(config: &mut HiggsConfig) {
     if !config.auto_router.enabled || config.auto_router.model.is_empty() {
         return;
     }
-    let auto_model = &config.auto_router.model;
-    let already_listed = config
+    let auto_ref = &config.auto_router.model;
+
+    // Already references a model by name -- nothing to do.
+    if config
         .models
         .iter()
-        .any(|m| m.path == *auto_model || m.name.as_deref() == Some(auto_model));
-    if !already_listed {
-        config.models.push(ModelConfig {
-            path: config.auto_router.model.clone(),
-            name: None,
-            batch: false,
-        });
+        .any(|m| m.name.as_deref() == Some(auto_ref))
+    {
+        return;
     }
+
+    // References a model by path -- normalize to its name.
+    if let Some(model) = config.models.iter_mut().find(|m| m.path == *auto_ref) {
+        let name = model.name.get_or_insert_with(|| path_basename(&model.path));
+        config.auto_router.model = name.clone();
+        return;
+    }
+
+    // Not listed at all -- inject a model entry with a derived name.
+    let path = config.auto_router.model.clone();
+    let name = path_basename(&path);
+    config.models.push(ModelConfig {
+        path,
+        name: Some(name.clone()),
+        batch: false,
+    });
+    config.auto_router.model = name;
+}
+
+fn path_basename(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(path)
+        .to_owned()
 }
 
 /// Returns the default config directory path (~/.config/higgs/).
