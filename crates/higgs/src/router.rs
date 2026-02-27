@@ -824,6 +824,52 @@ mod tests {
         assert!(router.is_ok(), "should resolve auto_router model by name");
     }
 
+    #[test]
+    fn auto_router_model_resolved_by_path() {
+        let config = config_from_toml(
+            r#"
+            [[models]]
+            path = "/Users/someone/models/Arch-Router-1.5B-4bit"
+            name = "router"
+
+            [auto_router]
+            enabled = true
+            model = "/Users/someone/models/Arch-Router-1.5B-4bit"
+            "#,
+        );
+        let engine = crate::state::Engine::test_stub("router");
+        let mut engines = HashMap::new();
+        engines.insert("router".to_owned(), Arc::new(engine));
+
+        let router = Router::from_config(&config, engines);
+        assert!(router.is_ok(), "should resolve auto_router model by path");
+    }
+
+    #[test]
+    fn auto_router_model_resolved_by_path_without_name() {
+        // ensure_auto_router_model injects the model entry with name=None,
+        // so the engine key is derived from engine.model_name() (the basename).
+        let config = config_from_toml(
+            r#"
+            [[models]]
+            path = "/Users/someone/models/Arch-Router-1.5B-4bit"
+
+            [auto_router]
+            enabled = true
+            model = "/Users/someone/models/Arch-Router-1.5B-4bit"
+            "#,
+        );
+        let engine = crate::state::Engine::test_stub("Arch-Router-1.5B-4bit");
+        let mut engines = HashMap::new();
+        engines.insert("Arch-Router-1.5B-4bit".to_owned(), Arc::new(engine));
+
+        let router = Router::from_config(&config, engines);
+        assert!(
+            router.is_ok(),
+            "should resolve auto_router model by path when model has no name"
+        );
+    }
+
     #[tokio::test]
     async fn auto_model_with_remote_default_rejects_without_rewrite() {
         // model="auto" falling through to a remote default with no model_rewrite
