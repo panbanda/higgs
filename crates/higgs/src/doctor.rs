@@ -61,11 +61,19 @@ fn check_config_valid(result: &mut DoctorResult) {
     pass("config file is valid", result);
 }
 
+fn model_label(model: &crate::config::ModelConfig) -> String {
+    model.name.as_ref().map_or_else(
+        || model.path.clone(),
+        |name| format!("\"{name}\" ({})", model.path),
+    )
+}
+
 fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
     for model in &config.models {
+        let label = model_label(model);
         match model_resolver::resolve(&model.path) {
-            Ok(_) => pass(&format!("model {} resolvable", model.path), result),
-            Err(err) => fail(&format!("model {} not found: {err}", model.path), result),
+            Ok(_) => pass(&format!("model {label} resolvable"), result),
+            Err(err) => fail(&format!("model {label} not found: {err}"), result),
         }
     }
 }
@@ -206,19 +214,15 @@ fn check_auto_router(config: &HiggsConfig, result: &mut DoctorResult) {
         .find(|m| m.path == *model_ref || m.name.as_deref() == Some(model_ref));
 
     if let Some(matched_model) = matched {
+        let label = model_label(matched_model);
         pass(
-            &format!("auto_router model \"{model_ref}\" found in models"),
+            &format!("auto_router model {label} found in models"),
             result,
         );
-        // Use the model's path for the download check
-        let resolve_path = &matched_model.path;
-        match model_resolver::resolve(resolve_path) {
-            Ok(_) => pass(
-                &format!("auto_router model \"{model_ref}\" downloaded"),
-                result,
-            ),
+        match model_resolver::resolve(&matched_model.path) {
+            Ok(_) => pass(&format!("auto_router model {label} downloaded"), result),
             Err(err) => fail(
-                &format!("auto_router model \"{model_ref}\" not downloaded: {err}"),
+                &format!("auto_router model {label} not downloaded: {err}"),
                 result,
             ),
         }
