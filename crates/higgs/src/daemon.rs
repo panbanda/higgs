@@ -1,5 +1,6 @@
 use std::fs;
 use std::net::TcpStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -157,6 +158,10 @@ provider = "higgs"
 # model = "mlx-community/Arch-Router-1.5B-4bit"
 # timeout_ms = 2000
 
+# --- Usage ---
+# eval "$(higgs shellenv)"  -- set env vars in current shell
+# higgs run -- claude        -- run a command with env vars set
+
 # --- Retention ---
 # How long to keep metrics in memory for the TUI dashboard.
 
@@ -197,6 +202,37 @@ pub fn cmd_shellenv(config: &HiggsConfig) {
         println!("export ANTHROPIC_BASE_URL={base_url}");
         println!("export OPENAI_BASE_URL={base_url}");
     }
+}
+
+#[allow(clippy::print_stderr)]
+pub fn cmd_run(config: &HiggsConfig, command: &[String]) -> ! {
+    let Some((program, args)) = command.split_first() else {
+        eprintln!("no command specified");
+        std::process::exit(1);
+    };
+
+    let host = match config.server.host.as_str() {
+        "0.0.0.0" => "127.0.0.1",
+        "::" => "::1",
+        other => other,
+    };
+    let addr = format!("{host}:{}", config.server.port);
+
+    if TcpStream::connect(&addr).is_err() {
+        eprintln!("higgs is not running on {addr}");
+        eprintln!("hint: start with 'higgs start' or 'higgs serve'");
+        std::process::exit(1);
+    }
+
+    let base_url = format!("http://{addr}");
+    let err = std::process::Command::new(program)
+        .args(args)
+        .env("ANTHROPIC_BASE_URL", &base_url)
+        .env("OPENAI_BASE_URL", &base_url)
+        .exec();
+
+    eprintln!("failed to exec '{program}': {err}");
+    std::process::exit(1);
 }
 
 #[allow(clippy::print_stderr, clippy::too_many_lines, unsafe_code)]

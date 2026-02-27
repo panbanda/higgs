@@ -48,6 +48,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             higgs::daemon::cmd_shellenv(&config);
             Ok(())
         }
+        Commands::Run { ref command } => {
+            let config = load_config_for_command(&cli).unwrap_or_default();
+            higgs::daemon::cmd_run(&config, command);
+        }
         Commands::Config { ref action } => {
             cmd_config(&cli, action);
             Ok(())
