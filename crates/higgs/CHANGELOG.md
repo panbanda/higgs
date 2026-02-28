@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.19](https://github.com/panbanda/higgs/compare/higgs-v0.1.18...higgs-v0.1.19) (2026-02-28)
+
+
+### Bug Fixes
+
+* strip thinking tags from Anthropic route, fix force routing, add proxy usage tracking ([89f8db2](https://github.com/panbanda/higgs/commit/89f8db2c889971b8c2ae21dec8d63ea70308491e))
+* strip thinking tags, fix force routing, add proxy usage metrics ([0ffbabb](https://github.com/panbanda/higgs/commit/0ffbabb1cb0abbca70d5c01bea007028b21d6ff4))
+
 ## [0.1.18](https://github.com/panbanda/higgs/compare/higgs-v0.1.17...higgs-v0.1.18) (2026-02-28)
 
 
