@@ -189,16 +189,10 @@ impl Router {
             if let Some(resolved) = self.try_auto_route(messages).await {
                 return Ok(resolved);
             }
-            // Auto-routing returned nothing -- skip pattern matching.
-            // Direct engine lookup still applies (the model may be a local engine name).
-            if let Some(engine) = self.local_engines.get(model) {
-                return Ok(ResolvedRoute::Higgs {
-                    engine: Arc::clone(engine),
-                    model_name: model.to_owned(),
-                    routing_method: RoutingMethod::Direct,
-                });
+            if model == "auto" {
+                return self.resolve_target(&self.default_target, model, RoutingMethod::Default);
             }
-            return self.resolve_target(&self.default_target, model, RoutingMethod::Default);
+            // force mode: auto-routing returned nothing, fall through to normal resolution
         }
 
         // Pattern matching (first match wins)
@@ -889,9 +883,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn force_mode_skips_pattern_matching() {
-        // force=true, no auto-router engine loaded -- should skip pattern
-        // matching and fall through to default, not pattern.
+    async fn force_mode_falls_through_without_engine() {
+        // force=true, no auto-router engine loaded, named model should
+        // fall through to normal resolution (pattern/direct/default).
         let config = config_from_toml(
             r#"
             [provider.anthropic]
@@ -919,7 +913,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(provider_name, "anthropic");
-                assert_eq!(routing_method, RoutingMethod::Default);
+                assert_eq!(routing_method, RoutingMethod::Pattern);
             }
             ResolvedRoute::Higgs { .. } => panic!("expected Remote route"),
         }
