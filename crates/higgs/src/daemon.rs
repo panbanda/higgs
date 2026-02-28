@@ -211,9 +211,9 @@ pub fn cmd_shellenv(config: &HiggsConfig) {
     }
 }
 
-/// Execute a command with `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` pointing at the Higgs server.
+/// Spawn a command with `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` pointing at the Higgs server.
 ///
-/// Replaces the current process via `exec`. Never returns on success.
+/// Forwards signals to the child and exits with its status. Never returns.
 #[allow(clippy::print_stderr)]
 pub fn cmd_exec(config: &HiggsConfig, command: &[String]) -> ! {
     let Some((program, args)) = command.split_first() else {
@@ -242,12 +242,17 @@ pub fn cmd_exec(config: &HiggsConfig, command: &[String]) -> ! {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("failed to exec '{program}': {e}");
+            eprintln!("failed to spawn '{program}': {e}");
             std::process::exit(1);
         }
     };
 
-    let child_pid = nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap_or(0));
+    let Ok(child_pid_raw) = i32::try_from(child.id()) else {
+        eprintln!("child pid {} exceeds i32 range", child.id());
+        let _ = child.kill();
+        std::process::exit(1);
+    };
+    let child_pid = nix::unistd::Pid::from_raw(child_pid_raw);
 
     // Forward SIGINT/SIGTERM to child, then wait for it to exit.
     ctrlc::set_handler(move || {

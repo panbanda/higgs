@@ -66,8 +66,8 @@ pub enum AnthropicContent {
 
 /// A content block in the Anthropic format.
 ///
-/// Remaining block types (e.g. `document`, `server_tool_use`) are captured
-/// as `Other` and silently skipped during text extraction.
+/// Unknown future block types are captured as `Other`
+/// and silently skipped during text extraction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
