@@ -104,6 +104,8 @@ pub async fn create_message(
             let start = Instant::now();
             let metrics_model = model_rewrite.as_deref().unwrap_or(&req.model).to_owned();
             let is_streaming = req.stream == Some(true);
+            let mut usage = (0u64, 0u64);
+
             let result = match provider_format {
                 ApiFormat::Anthropic => {
                     let proxy_body = if let Some(ref rewrite) = model_rewrite {
@@ -111,16 +113,36 @@ pub async fn create_message(
                     } else {
                         body
                     };
-                    crate::proxy::proxy_request(
-                        &state.http_client,
-                        &provider_url,
-                        "/v1/messages",
-                        proxy_body,
-                        &headers,
-                        strip_auth,
-                        api_key.as_deref(),
-                    )
-                    .await
+                    if is_streaming {
+                        crate::proxy::proxy_request(
+                            &state.http_client,
+                            &provider_url,
+                            "/v1/messages",
+                            proxy_body,
+                            &headers,
+                            strip_auth,
+                            api_key.as_deref(),
+                        )
+                        .await
+                    } else {
+                        let (status, resp_bytes) = crate::proxy::send_and_read(
+                            &state.http_client,
+                            &provider_url,
+                            "/v1/messages",
+                            proxy_body,
+                            &headers,
+                            strip_auth,
+                            api_key.as_deref(),
+                        )
+                        .await?;
+                        usage = crate::proxy::extract_usage(&resp_bytes);
+                        Ok((
+                            status,
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            resp_bytes,
+                        )
+                            .into_response())
+                    }
                 }
                 ApiFormat::OpenAi => {
                     let translated = crate::translate::anthropic_to_openai_request(&body)?;
@@ -163,6 +185,7 @@ pub async fn create_message(
                         let resp_bytes = upstream.bytes().await.map_err(|e| {
                             ServerError::ProxyError(format!("Failed to read response: {e}"))
                         })?;
+                        usage = crate::proxy::extract_usage(&resp_bytes);
                         let translated_resp = crate::translate::openai_response_to_anthropic(
                             &resp_bytes,
                             &req.model,
@@ -186,8 +209,8 @@ pub async fn create_message(
                     routing_method: routing_method.into(),
                     status,
                     duration: start.elapsed(),
-                    input_tokens: 0,
-                    output_tokens: 0,
+                    input_tokens: usage.0,
+                    output_tokens: usage.1,
                     error_body: None,
                 });
             }
@@ -235,13 +258,20 @@ async fn create_message_non_streaming(
     let stop_reason = openai_finish_to_anthropic_stop(&output.finish_reason);
     let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
 
+    let reasoning_result = higgs_engine::reasoning_parser::parse_reasoning(&output.text);
+    let visible_text = if reasoning_result.reasoning.is_some() {
+        reasoning_result.text
+    } else {
+        output.text
+    };
+
     Ok(CreateMessageResponse {
         id: msg_id,
         message_type: "message",
         role: "assistant",
         content: vec![ContentBlockResponse {
             block_type: "text",
-            text: output.text,
+            text: visible_text,
         }],
         model: req.model,
         stop_reason: Some(stop_reason),
@@ -356,15 +386,18 @@ fn create_message_stream(
         // 3. content_block_delta events (one per token)
         let mut final_stop_reason = None;
         let mut total_output_tokens: u32 = 0;
+        let mut reasoning_tracker = higgs_engine::reasoning_parser::StreamingReasoningTracker::new();
 
         while let Some(output) = rx.recv().await {
-            if !output.new_text.is_empty() {
+            let (visible, _reasoning) = reasoning_tracker.process(&output.new_text);
+
+            if !visible.is_empty() {
                 let delta_event = ContentBlockDeltaEvent {
                     event_type: "content_block_delta",
                     index: 0,
                     delta: TextDelta {
                         delta_type: "text_delta",
-                        text: output.new_text,
+                        text: visible,
                     },
                 };
                 match serde_json::to_string(&delta_event) {
@@ -375,6 +408,23 @@ fn create_message_stream(
             total_output_tokens = output.completion_tokens;
             if let Some(reason) = output.finish_reason {
                 final_stop_reason = Some(openai_finish_to_anthropic_stop(&reason));
+            }
+        }
+
+        // Flush any remaining visible text buffered by the reasoning tracker
+        let (flush_visible, _flush_reasoning) = reasoning_tracker.flush();
+        if !flush_visible.is_empty() {
+            let delta_event = ContentBlockDeltaEvent {
+                event_type: "content_block_delta",
+                index: 0,
+                delta: TextDelta {
+                    delta_type: "text_delta",
+                    text: flush_visible,
+                },
+            };
+            match serde_json::to_string(&delta_event) {
+                Ok(json) => yield Ok(Event::default().event("content_block_delta").data(json)),
+                Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
             }
         }
 

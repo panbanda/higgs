@@ -102,6 +102,50 @@ pub fn stub_count_tokens_response() -> Response {
         .into_response()
 }
 
+/// Send a request to an upstream provider and return status + body bytes.
+///
+/// Unlike [`send_to_provider`], this does not error on 4xx/5xx status codes,
+/// making it suitable for passthrough where error responses should be forwarded.
+/// Unlike [`proxy_request`], this reads the full body so the caller can inspect
+/// it (e.g., to extract usage for metrics).
+pub async fn send_and_read(
+    client: &reqwest::Client,
+    provider_url: &str,
+    path: &str,
+    body: Bytes,
+    original_headers: &HeaderMap,
+    strip_auth: bool,
+    api_key: Option<&str>,
+) -> Result<(StatusCode, Bytes), ServerError> {
+    let url = format!("{}{path}", provider_url.trim_end_matches('/'));
+    let headers = build_forwarding_headers(original_headers, strip_auth, api_key, body.len());
+
+    tracing::debug!(url = %url, body_bytes = body.len(), "sending to provider (read)");
+
+    let upstream = client
+        .post(&url)
+        .headers(headers)
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::error!(url = %url, error = %e, "provider request failed");
+            ServerError::ProxyError(format!("provider unreachable: {e}"))
+        })?;
+
+    let status = StatusCode::from_u16(upstream.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+    tracing::info!(status = %status, url = %url, "provider responded");
+
+    let resp_bytes = upstream
+        .bytes()
+        .await
+        .map_err(|e| ServerError::ProxyError(format!("Failed to read response: {e}")))?;
+
+    Ok((status, resp_bytes))
+}
+
 /// Send a request to an upstream provider and return the raw response.
 ///
 /// Unlike [`proxy_request`], this returns the reqwest response directly so the
@@ -185,6 +229,32 @@ pub async fn proxy_request(
     *response.status_mut() = status;
     *response.headers_mut() = response_headers;
     Ok(response)
+}
+
+/// Extract `(input_tokens, output_tokens)` from a proxy response body.
+///
+/// Handles both Anthropic (`usage.input_tokens` / `usage.output_tokens`)
+/// and `OpenAI` (`usage.prompt_tokens` / `usage.completion_tokens`) formats.
+pub fn extract_usage(body: &[u8]) -> (u64, u64) {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return (0, 0);
+    };
+    let Some(usage) = json.get("usage") else {
+        return (0, 0);
+    };
+
+    let input = usage
+        .get("input_tokens")
+        .or_else(|| usage.get("prompt_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let output = usage
+        .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+
+    (input, output)
 }
 
 #[cfg(test)]

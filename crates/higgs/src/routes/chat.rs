@@ -204,6 +204,7 @@ pub async fn chat_completions(
                         let resp_bytes = upstream.bytes().await.map_err(|e| {
                             ServerError::ProxyError(format!("Failed to read response: {e}"))
                         })?;
+                        let usage = crate::proxy::extract_usage(&resp_bytes);
                         if let Some(ref metrics) = state.metrics {
                             metrics.record(RequestRecord {
                                 id: 0,
@@ -214,15 +215,14 @@ pub async fn chat_completions(
                                 routing_method: routing_method.into(),
                                 status: upstream_status,
                                 duration: start.elapsed(),
-                                input_tokens: 0,
-                                output_tokens: 0,
+                                input_tokens: usage.0,
+                                output_tokens: usage.1,
                                 error_body: None,
                             });
                         }
                         let status_code = axum::http::StatusCode::from_u16(upstream_status)
                             .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
                         if upstream_status >= 400 {
-                            // Pass through error responses without translation
                             Ok((
                                 status_code,
                                 [(axum::http::header::CONTENT_TYPE, "application/json")],
