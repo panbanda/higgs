@@ -44,6 +44,16 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError>
                 .map_err(EngineError::Model)?;
             Ok(AnyModel::Qwen3Next(model))
         }
+        "qwen3_5" => {
+            let model = higgs_models::qwen3_next::load_qwen3_5_model(&config.model_dir)
+                .map_err(EngineError::Model)?;
+            Ok(AnyModel::Qwen3Next(model))
+        }
+        "qwen3_5_moe" => {
+            let model = higgs_models::qwen3_next::load_qwen3_5_moe_model(&config.model_dir)
+                .map_err(EngineError::Model)?;
+            Ok(AnyModel::Qwen3Next(model))
+        }
         "qwen3_moe" => {
             let model = higgs_models::qwen3_moe::load_qwen3_moe_model(&config.model_dir)
                 .map_err(EngineError::Model)?;
@@ -173,6 +183,18 @@ mod tests {
     fn model_config_from_dir_deepseek_v2() {
         let (_dir, result) = config_for_model("deepseek_v2");
         assert_eq!(result.unwrap().model_type, "deepseek_v2");
+    }
+
+    #[test]
+    fn model_config_from_dir_qwen3_5() {
+        let (_dir, result) = config_for_model("qwen3_5");
+        assert_eq!(result.unwrap().model_type, "qwen3_5");
+    }
+
+    #[test]
+    fn model_config_from_dir_qwen3_5_moe() {
+        let (_dir, result) = config_for_model("qwen3_5_moe");
+        assert_eq!(result.unwrap().model_type, "qwen3_5_moe");
     }
 
     #[test]

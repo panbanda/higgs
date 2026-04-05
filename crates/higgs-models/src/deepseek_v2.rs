@@ -12,6 +12,7 @@ use mlx_rs::{
     Array,
     builder::Builder,
     error::Exception,
+    fast,
     macros::ModuleParameters,
     module::Module,
     nn,
@@ -25,7 +26,7 @@ use crate::{
     qwen3_next::{
         QEmbedding, QLinear, QuantizationConfig, SwitchMlpWeights, new_mlp_projections, swiglu,
     },
-    utils::{AttentionMask, create_attention_mask, scaled_dot_product_attention},
+    utils::{AttentionMask, create_attention_mask},
 };
 
 // ---------------------------------------------------------------------------
@@ -376,7 +377,7 @@ impl DeepSeekV2Attention {
     fn forward<C: KeyValueCache>(
         &mut self,
         x: &Array,
-        mask: Option<&Array>,
+        mask: Option<&AttentionMask>,
         cache: Option<&mut C>,
     ) -> Result<Array, Exception> {
         let shape = x.shape();
@@ -473,9 +474,17 @@ impl DeepSeekV2Attention {
             (keys_combined, v_decompressed)
         };
 
-        let output = scaled_dot_product_attention(queries, keys, values, self.scale, mask)?
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[B, L, -1])?;
+        let sdpa_mask = mask.map(fast::ScaledDotProductAttentionMask::from);
+        let output = fast::scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            self.scale,
+            sdpa_mask,
+            None::<&Array>,
+        )?
+        .transpose_axes(&[0, 2, 1, 3])?
+        .reshape(&[B, L, -1])?;
 
         self.o_proj.forward(&output)
     }
@@ -623,7 +632,7 @@ impl DeepSeekV2MlpBlock {
             .switch_mlp
             .as_ref()
             .ok_or_else(|| Exception::custom("MoE switch_mlp missing"))?
-            .forward_gather(x, &top_inds, false)?;
+            .forward_gather_global_sort(x, &top_inds)?;
         let mut result = y
             .multiply(&scaled_scores.expand_dims(-1)?)?
             .sum_axes(&[-2], false)?;
@@ -700,7 +709,7 @@ impl DeepSeekV2DecoderLayer {
     fn forward<C: KeyValueCache>(
         &mut self,
         x: &Array,
-        mask: Option<&Array>,
+        mask: Option<&AttentionMask>,
         cache: Option<&mut C>,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(x)?;
@@ -795,14 +804,8 @@ impl DeepSeekV2CausalLM {
         let mut h = self.model.embed_tokens.forward(inputs)?;
 
         let computed_mask = match mask {
-            Some(m) => Some(m.clone()),
-            None => match create_attention_mask(&h, kv_cache, Some(true))? {
-                Some(AttentionMask::Array(a)) => Some(a),
-                Some(AttentionMask::Causal) => {
-                    return Err(Exception::custom("Only Array mask is supported"));
-                }
-                None => None,
-            },
+            Some(m) => Some(AttentionMask::Array(m.clone())),
+            None => create_attention_mask(&h, kv_cache, None)?,
         };
 
         if kv_cache.is_empty() {
@@ -832,10 +835,11 @@ impl DeepSeekV2CausalLM {
         kv_cache: &mut Vec<Option<SteppingKeyValueCache>>,
     ) -> Result<Array, Exception> {
         let h = self.forward_hidden(inputs, mask, kv_cache)?;
+        let h_last = h.index((.., -1.., ..));
 
         match self.lm_head.as_ref() {
-            Some(head) => head.forward(&h),
-            None => self.model.embed_tokens.as_linear(&h),
+            Some(head) => head.forward(&h_last),
+            None => self.model.embed_tokens.as_linear(&h_last),
         }
     }
 }

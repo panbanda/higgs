@@ -239,6 +239,7 @@ async fn create_message_non_streaming(
         .prepare_chat_prompt(&engine_messages, tools)
         .map_err(ServerError::Engine)?;
 
+    let thinking_enabled = engine.enable_thinking();
     let output = tokio::task::spawn_blocking(move || {
         engine.generate(
             &prompt_tokens,
@@ -258,11 +259,24 @@ async fn create_message_non_streaming(
     let stop_reason = openai_finish_to_anthropic_stop(&output.finish_reason);
     let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
 
-    let reasoning_result = higgs_engine::reasoning_parser::parse_reasoning(&output.text);
+    // When thinking is enabled, the template already opened `<think>` so
+    // the model output starts inside the thinking block. We wrap it in a
+    // properly closed `<think>...</think>` before parsing so the parser
+    // always sees balanced tags, even if the model was length-stopped.
+    let parse_input = if thinking_enabled {
+        if output.text.contains("</think>") {
+            format!("<think>{}", output.text)
+        } else {
+            format!("<think>{}</think>", output.text)
+        }
+    } else {
+        output.text
+    };
+    let reasoning_result = higgs_engine::reasoning_parser::parse_reasoning(&parse_input);
     let visible_text = if reasoning_result.reasoning.is_some() {
         reasoning_result.text
     } else {
-        output.text
+        parse_input
     };
 
     Ok(CreateMessageResponse {
@@ -309,6 +323,8 @@ fn create_message_stream(
     let model = req.model;
     let prompt_token_count = u32::try_from(prompt_tokens.len())
         .map_err(|_| ServerError::BadRequest("Token count overflow".to_owned()))?;
+
+    let thinking_enabled = engine.enable_thinking();
 
     // Spawn generation before creating the stream so prefill starts immediately
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
@@ -386,7 +402,11 @@ fn create_message_stream(
         // 3. content_block_delta events (one per token)
         let mut final_stop_reason = None;
         let mut total_output_tokens: u32 = 0;
-        let mut reasoning_tracker = higgs_engine::reasoning_parser::StreamingReasoningTracker::new();
+        let mut reasoning_tracker = if thinking_enabled {
+            higgs_engine::reasoning_parser::StreamingReasoningTracker::new_inside_think()
+        } else {
+            higgs_engine::reasoning_parser::StreamingReasoningTracker::new()
+        };
 
         while let Some(output) = rx.recv().await {
             let (visible, _reasoning) = reasoning_tracker.process(&output.new_text);

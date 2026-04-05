@@ -204,6 +204,8 @@ pub struct ChatCompletionChunk {
     pub created: i64,
     pub model: String,
     pub choices: Vec<ChatCompletionChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<CompletionUsage>,
 }
 
 /// A choice in a streaming chunk.
@@ -416,6 +418,7 @@ mod tests {
                 finish_reason,
                 logprobs: None,
             }],
+            usage: None,
         }
     }
 

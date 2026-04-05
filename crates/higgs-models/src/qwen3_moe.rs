@@ -10,6 +10,7 @@ use mlx_rs::{
     Array,
     builder::Builder,
     error::Exception,
+    fast,
     macros::ModuleParameters,
     module::Module,
     nn,
@@ -23,7 +24,9 @@ use crate::{
     qwen3_next::{
         QEmbedding, QLinear, QuantizationConfig, SwitchMlpWeights, new_mlp_projections, swiglu,
     },
-    utils::{AttentionMask, apply_rope, create_attention_mask, scaled_dot_product_attention},
+    utils::{
+        AttentionMask, apply_rope, cached_scaled_dot_product_attention, create_attention_mask,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -156,7 +159,7 @@ impl Qwen3MoeAttention {
     fn forward<C: KeyValueCache>(
         &mut self,
         x: &Array,
-        mask: Option<&Array>,
+        mask: Option<&AttentionMask>,
         cache: Option<&mut C>,
     ) -> Result<Array, Exception> {
         let shape = x.shape();
@@ -185,7 +188,7 @@ impl Qwen3MoeAttention {
                     .reshape(&[B, L, self.num_key_value_heads, -1])?,
             )?
             .transpose_axes(&[0, 2, 1, 3])?;
-        let mut values = self
+        let values = self
             .v_proj
             .forward(x)?
             .reshape(&[B, L, self.num_key_value_heads, -1])?
@@ -195,17 +198,50 @@ impl Qwen3MoeAttention {
             queries = apply_rope(&queries, &self.rope, kv_cache.offset())?;
             keys = apply_rope(&keys, &self.rope, kv_cache.offset())?;
 
-            let (cached_keys, cached_values) = kv_cache.update_and_fetch(keys, values)?;
-            keys = cached_keys;
-            values = cached_values;
-        } else {
-            queries = apply_rope(&queries, &self.rope, 0)?;
-            keys = apply_rope(&keys, &self.rope, 0)?;
-        }
+            // Causal mask: bypass TurboQuant loop, use MLX fast SDPA causal mode
+            if matches!(mask, Some(AttentionMask::Causal)) {
+                let (cached_keys, cached_values) = kv_cache.update_and_fetch(keys, values)?;
+                let output = fast::scaled_dot_product_attention(
+                    queries,
+                    cached_keys,
+                    cached_values,
+                    self.scale,
+                    Some(fast::ScaledDotProductAttentionMask::Causal),
+                    None::<&Array>,
+                )?
+                .transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[B, L, -1])?;
+                return self.o_proj.forward(&output);
+            }
 
-        let output = scaled_dot_product_attention(queries, keys, values, self.scale, mask)?
+            // Array mask or None: existing cached path (supports TurboQuant)
+            let array_mask = match mask {
+                Some(AttentionMask::Array(a)) => Some(a),
+                _ => None,
+            };
+            let output = cached_scaled_dot_product_attention(
+                queries, kv_cache, keys, values, self.scale, array_mask,
+            )?
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[B, L, -1])?;
+
+            return self.o_proj.forward(&output);
+        }
+
+        queries = apply_rope(&queries, &self.rope, 0)?;
+        keys = apply_rope(&keys, &self.rope, 0)?;
+
+        let sdpa_mask = mask.map(fast::ScaledDotProductAttentionMask::from);
+        let output = fast::scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            self.scale,
+            sdpa_mask,
+            None::<&Array>,
+        )?
+        .transpose_axes(&[0, 2, 1, 3])?
+        .reshape(&[B, L, -1])?;
 
         self.o_proj.forward(&output)
     }
@@ -315,7 +351,7 @@ impl Qwen3MoeMlpBlock {
             raw_scores
         };
 
-        let y = experts.forward_gather(x, &top_inds, false)?;
+        let y = experts.forward_gather_global_sort(x, &top_inds)?;
 
         y.multiply(&top_scores.expand_dims(-1)?)?
             .sum_axes(&[-2], false)
@@ -379,7 +415,7 @@ impl Qwen3MoeDecoderLayer {
     fn forward<C: KeyValueCache>(
         &mut self,
         x: &Array,
-        mask: Option<&Array>,
+        mask: Option<&AttentionMask>,
         cache: Option<&mut C>,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(x)?;
@@ -479,15 +515,9 @@ impl Qwen3MoeCausalLM {
     ) -> Result<Array, Exception> {
         let mut h = self.model.embed_tokens.forward(inputs)?;
 
-        let computed_mask = match mask {
-            Some(m) => Some(m.clone()),
-            None => match create_attention_mask(&h, kv_cache, Some(true))? {
-                Some(AttentionMask::Array(a)) => Some(a),
-                Some(AttentionMask::Causal) => {
-                    return Err(Exception::custom("Only Array mask is supported"));
-                }
-                None => None,
-            },
+        let computed_mask: Option<AttentionMask> = match mask {
+            Some(m) => Some(AttentionMask::Array(m.clone())),
+            None => create_attention_mask(&h, kv_cache, None)?,
         };
 
         if kv_cache.is_empty() {
@@ -518,10 +548,13 @@ impl Qwen3MoeCausalLM {
         kv_cache: &mut Vec<Option<SteppingKeyValueCache>>,
     ) -> Result<Array, Exception> {
         let h = self.forward_hidden(inputs, mask, kv_cache)?;
+        let h_last = h.index((.., -1.., ..)); // [B, 1, hidden]
 
+        let T = inputs.shape().get(1).copied().unwrap_or(1);
+        let lm_input = if T > 1 { h.index((.., -1.., ..)) } else { h };
         match self.lm_head.as_ref() {
-            Some(head) => head.forward(&h),
-            None => self.model.embed_tokens.as_linear(&h),
+            Some(head) => head.forward(&lm_input),
+            None => self.model.embed_tokens.as_linear(&lm_input),
         }
     }
 }

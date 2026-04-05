@@ -23,6 +23,7 @@ thiserror.workspace = true
 tracing.workspace = true
 tokio = { version = "1", features = ["sync"] }
 outlines-core = { version = "0.2.14", default-features = false }
+half = { version = "2.4", features = ["bytemuck"] }
 
 [dev-dependencies]
 tempfile = "3"

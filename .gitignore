@@ -6,3 +6,4 @@ target/
 .vscode/
 mlx-rs/
 bench/
+.gitnexus

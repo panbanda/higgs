@@ -294,6 +294,7 @@ async fn chat_completions_non_streaming(
     let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
 
     let tokenizer = engine.tokenizer().clone();
+    let thinking_enabled = engine.enable_thinking();
     let output = tokio::task::spawn_blocking(move || {
         engine.generate(
             &prompt_tokens,
@@ -318,12 +319,20 @@ async fn chat_completions_non_streaming(
         .as_ref()
         .map(|lps| logprobs_to_response(lps, &tokenizer));
 
-    // Parse reasoning (think tags) from the output
-    let reasoning_result = higgs_engine::reasoning_parser::parse_reasoning(&output.text);
+    // Parse reasoning (think tags) from the output.
+    // When thinking mode is enabled, the template already opened `<think>` in the prompt,
+    // so the generated text starts inside the think block. Prepend `<think>` so the parser
+    // can find the matching `</think>` and split reasoning from visible content.
+    let parse_input = if thinking_enabled {
+        format!("<think>{}", output.text)
+    } else {
+        output.text
+    };
+    let reasoning_result = higgs_engine::reasoning_parser::parse_reasoning(&parse_input);
     let raw_text = if reasoning_result.reasoning.is_some() {
         reasoning_result.text
     } else {
-        output.text
+        parse_input
     };
     let reasoning_content = reasoning_result.reasoning;
 
@@ -397,10 +406,11 @@ fn chat_completions_stream(
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,
 ) -> Result<impl Stream<Item = Result<Event, Infallible>>, ServerError> {
-    if req.tools.is_some() {
-        return Err(ServerError::BadRequest(
-            "Streaming with tool_calls is not yet supported".to_owned(),
-        ));
+    // Tool-calling responses are not supported in streaming mode.
+    // Accept requests that include tools (nanobot always sends them) but
+    // exclude them from prompt rendering so the model generates plain text.
+    if req.tools.as_ref().is_some_and(|t| !t.is_empty()) {
+        tracing::debug!("Streaming request includes tools; ignoring for prompt rendering");
     }
 
     let max_tokens = req.max_tokens.unwrap_or(state.config.server.max_tokens);
@@ -418,10 +428,10 @@ fn chat_completions_stream(
     };
 
     let messages = convert_messages(&effective_messages);
-    let tools = req.tools.as_deref();
 
+    // Exclude tools from streaming prompt — tool_calls deltas are unsupported.
     let mut prompt_tokens = engine
-        .prepare_chat_prompt(&messages, tools)
+        .prepare_chat_prompt(&messages, None)
         .map_err(ServerError::Engine)?;
 
     // Preprocess images for VLM
@@ -466,6 +476,7 @@ fn chat_completions_stream(
     });
 
     let tokenizer = engine.tokenizer().clone();
+    let thinking_enabled_stream = engine.enable_thinking();
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
 
     tokio::task::spawn_blocking(move || {
@@ -503,13 +514,18 @@ fn chat_completions_stream(
                 finish_reason: None,
                 logprobs: None,
             }],
+            usage: None,
         };
         match serde_json::to_string(&role_chunk) {
             Ok(json) => yield Ok(Event::default().data(json)),
             Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
         }
 
-        let mut reasoning_tracker = higgs_engine::reasoning_parser::StreamingReasoningTracker::new();
+        let mut reasoning_tracker = if thinking_enabled_stream {
+            higgs_engine::reasoning_parser::StreamingReasoningTracker::new_inside_think()
+        } else {
+            higgs_engine::reasoning_parser::StreamingReasoningTracker::new()
+        };
         let mut output_token_count: u32 = 0;
 
         while let Some(output) = rx.recv().await {
@@ -539,6 +555,7 @@ fn chat_completions_stream(
                         finish_reason: None,
                         logprobs: None,
                     }],
+                    usage: None,
                 };
                 match serde_json::to_string(&reas_chunk) {
                     Ok(json) => yield Ok(Event::default().data(json)),
@@ -564,6 +581,7 @@ fn chat_completions_stream(
                         finish_reason: output.finish_reason.clone(),
                         logprobs: chunk_logprobs,
                     }],
+                    usage: None,
                 };
                 match serde_json::to_string(&chunk) {
                     Ok(json) => yield Ok(Event::default().data(json)),
@@ -587,6 +605,7 @@ fn chat_completions_stream(
                         finish_reason: output.finish_reason,
                         logprobs: chunk_logprobs,
                     }],
+                    usage: None,
                 };
                 match serde_json::to_string(&chunk) {
                     Ok(json) => yield Ok(Event::default().data(json)),
@@ -614,6 +633,7 @@ fn chat_completions_stream(
                     finish_reason: None,
                     logprobs: None,
                 }],
+                usage: None,
             };
             match serde_json::to_string(&reas_chunk) {
                 Ok(json) => yield Ok(Event::default().data(json)),
@@ -637,11 +657,30 @@ fn chat_completions_stream(
                     finish_reason: None,
                     logprobs: None,
                 }],
+                usage: None,
             };
             match serde_json::to_string(&vis_chunk) {
                 Ok(json) => yield Ok(Event::default().data(json)),
                 Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
             }
+        }
+
+        // Emit final chunk with usage (OpenAI stream_options.include_usage)
+        let usage_chunk = ChatCompletionChunk {
+            id: request_id.clone(),
+            object: "chat.completion.chunk",
+            created,
+            model: model.clone(),
+            choices: vec![],
+            usage: Some(CompletionUsage {
+                prompt_tokens: prompt_token_count,
+                completion_tokens: output_token_count,
+                total_tokens: prompt_token_count + output_token_count,
+            }),
+        };
+        match serde_json::to_string(&usage_chunk) {
+            Ok(json) => yield Ok(Event::default().data(json)),
+            Err(e) => tracing::error!(error = %e, "Failed to serialize usage chunk"),
         }
 
         if let Some(ref m) = metrics {

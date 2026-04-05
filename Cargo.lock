@@ -306,6 +306,20 @@ name = "bytemuck"
 version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
+dependencies = [
+ "bytemuck_derive",
+]
+
+[[package]]
+name = "bytemuck_derive"
+version = "1.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9abbd1bc6865053c427f7198e6af43bfdedc55ab791faed4fbd361d789575ff"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "byteorder"
@@ -1173,6 +1187,7 @@ version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
 dependencies = [
+ "bytemuck",
  "cfg-if",
  "crunchy",
  "zerocopy",
@@ -1276,6 +1291,7 @@ dependencies = [
 name = "higgs-engine"
 version = "0.1.20"
 dependencies = [
+ "half",
  "higgs-models",
  "minijinja",
  "minijinja-contrib",
@@ -1298,6 +1314,7 @@ dependencies = [
  "image",
  "mlx-rs",
  "mlx-sys",
+ "rand 0.9.2",
  "serde",
  "serde_json",
  "tempfile",
@@ -1907,7 +1924,7 @@ dependencies = [
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=af21d79#af21d799dd826bd64703ba85623fbd45cc1452bb"
+source = "git+https://github.com/oxideai/mlx-rs.git?rev=f4aa309c79b6be35255ca7d34157dfc10d9ed4c9#f4aa309c79b6be35255ca7d34157dfc10d9ed4c9"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -1919,7 +1936,7 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=af21d79#af21d799dd826bd64703ba85623fbd45cc1452bb"
+source = "git+https://github.com/oxideai/mlx-rs.git?rev=f4aa309c79b6be35255ca7d34157dfc10d9ed4c9#f4aa309c79b6be35255ca7d34157dfc10d9ed4c9"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -1930,7 +1947,7 @@ dependencies = [
 [[package]]
 name = "mlx-rs"
 version = "0.25.3"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=af21d79#af21d799dd826bd64703ba85623fbd45cc1452bb"
+source = "git+https://github.com/oxideai/mlx-rs.git?rev=f4aa309c79b6be35255ca7d34157dfc10d9ed4c9#f4aa309c79b6be35255ca7d34157dfc10d9ed4c9"
 dependencies = [
  "dyn-clone",
  "half",
@@ -1953,7 +1970,7 @@ dependencies = [
 [[package]]
 name = "mlx-sys"
 version = "0.2.0"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=af21d79#af21d799dd826bd64703ba85623fbd45cc1452bb"
+source = "git+https://github.com/oxideai/mlx-rs.git?rev=f4aa309c79b6be35255ca7d34157dfc10d9ed4c9#f4aa309c79b6be35255ca7d34157dfc10d9ed4c9"
 dependencies = [
  "bindgen",
  "cc",

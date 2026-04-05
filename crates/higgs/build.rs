@@ -52,7 +52,10 @@ fn copy_metallib() -> Result<(), &'static str> {
         return Err("mlx.metallib not found in mlx-sys build output");
     };
 
-    println!("cargo:rerun-if-changed={}", metallib.display());
+    // NOTE: don't emit `cargo:rerun-if-changed` for this specific metallib path.
+    // When mlx-sys rebuilds in a new build directory (different hash), the old
+    // path wouldn't change, so cargo wouldn't re-run this script, leaving a
+    // stale metallib that can cause silent Metal failures.
 
     // Copy to target profile dir (e.g. target/release/) so the binary finds it via dladdr
     let Some(profile_dir) = out_dir.ancestors().nth(3) else {

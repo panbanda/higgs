@@ -54,6 +54,7 @@ fn make_chat_chunk(
             finish_reason,
             logprobs: None,
         }],
+        usage: None,
     }
 }
 

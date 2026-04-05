@@ -6,6 +6,7 @@ use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},
 };
+use higgs_models::turboquant::{KvCacheConfig, KvCacheMode};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -114,6 +115,34 @@ pub struct ServeArgs {
     /// Use batch engine for all models (simple mode only).
     #[arg(long)]
     pub batch: bool,
+
+    /// KV cache mode for simple mode models.
+    #[arg(long, value_name = "MODE", value_parser = ["off", "turboquant"])]
+    pub kv_cache: Option<String>,
+
+    /// Bit width for TurboQuant KV caches.
+    #[arg(long)]
+    pub kv_bits: Option<u8>,
+
+    /// Override key bit width (default: kv-bits - 1).
+    #[arg(long)]
+    pub kv_key_bits: Option<u8>,
+
+    /// Override value bit width (default: kv-bits).
+    #[arg(long)]
+    pub kv_value_bits: Option<u8>,
+
+    /// Disable post-quantization norm correction.
+    #[arg(long)]
+    pub kv_no_norm_correction: bool,
+
+    /// Number of final layers that stay dense (0 = all TQ).
+    #[arg(long, default_value = "0")]
+    pub kv_adaptive_dense_layers: Option<u8>,
+
+    /// Seed used to generate TurboQuant rotation/QJL matrices.
+    #[arg(long)]
+    pub kv_seed: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +231,42 @@ pub struct ModelConfig {
     pub name: Option<String>,
     #[serde(default)]
     pub batch: bool,
+    #[serde(default)]
+    pub kv_cache: KvCacheMode,
+    #[serde(default = "default_kv_bits")]
+    pub kv_bits: u8,
+    #[serde(default)]
+    pub kv_key_bits: Option<u8>,
+    #[serde(default)]
+    pub kv_value_bits: Option<u8>,
+    #[serde(default = "default_norm_correction")]
+    pub kv_norm_correction: bool,
+    #[serde(default)]
+    pub kv_adaptive_dense_layers: u8,
+    #[serde(default)]
+    pub kv_seed: u64,
+}
+
+const fn default_norm_correction() -> bool {
+    true
+}
+
+const fn default_kv_bits() -> u8 {
+    3
+}
+
+impl ModelConfig {
+    pub const fn kv_cache_config(&self) -> KvCacheConfig {
+        KvCacheConfig {
+            mode: self.kv_cache,
+            bits: self.kv_bits,
+            key_bits_override: self.kv_key_bits,
+            value_bits_override: self.kv_value_bits,
+            norm_correction: self.kv_norm_correction,
+            adaptive_dense_layers: self.kv_adaptive_dense_layers,
+            seed: self.kv_seed,
+        }
+    }
 }
 
 // -- Provider config --------------------------------------------------------
@@ -384,6 +449,7 @@ pub const fn is_simple_mode(cli: &Cli, serve_args: &ServeArgs) -> bool {
 
 /// Build a `HiggsConfig` from CLI args only (simple mode, no config file).
 pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
+    let kv_cache = cli_kv_cache_mode(args.kv_cache.as_deref())?;
     let models: Vec<ModelConfig> = args
         .models
         .iter()
@@ -391,6 +457,13 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             path: p.clone(),
             name: None,
             batch: args.batch,
+            kv_cache,
+            kv_bits: args.kv_bits.unwrap_or(default_kv_bits()),
+            kv_key_bits: args.kv_key_bits,
+            kv_value_bits: args.kv_value_bits,
+            kv_norm_correction: !args.kv_no_norm_correction,
+            kv_adaptive_dense_layers: args.kv_adaptive_dense_layers.unwrap_or(0),
+            kv_seed: args.kv_seed.unwrap_or_default(),
         })
         .collect();
 
@@ -459,6 +532,7 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
         }
         // Additional models from CLI in config mode
         if !serve_args.models.is_empty() {
+            let kv_cache = cli_kv_cache_mode(serve_args.kv_cache.as_deref())?;
             let extra: Vec<ModelConfig> = serve_args
                 .models
                 .iter()
@@ -466,6 +540,13 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                     path: p.clone(),
                     name: None,
                     batch: serve_args.batch,
+                    kv_cache,
+                    kv_bits: serve_args.kv_bits.unwrap_or(default_kv_bits()),
+                    kv_key_bits: serve_args.kv_key_bits,
+                    kv_value_bits: serve_args.kv_value_bits,
+                    kv_norm_correction: !serve_args.kv_no_norm_correction,
+                    kv_adaptive_dense_layers: serve_args.kv_adaptive_dense_layers.unwrap_or(0),
+                    kv_seed: serve_args.kv_seed.unwrap_or_default(),
                 })
                 .collect();
             figment = figment.merge(Serialized::default("models", &extra));
@@ -498,6 +579,16 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
             if name.trim().is_empty() {
                 return Err("model name must not be empty or whitespace-only".to_owned());
             }
+        }
+        model
+            .kv_cache_config()
+            .validate()
+            .map_err(|err| err.to_string())?;
+        if model.batch && model.kv_cache_config().is_turboquant() {
+            return Err(format!(
+                "TurboQuant is not supported with batch=true for model {}",
+                model.path
+            ));
         }
     }
 
@@ -573,8 +664,24 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         path,
         name: Some(name.clone()),
         batch: false,
+        kv_cache: KvCacheMode::Off,
+        kv_bits: default_kv_bits(),
+        kv_key_bits: None,
+        kv_value_bits: None,
+        kv_norm_correction: true,
+        kv_adaptive_dense_layers: 0,
+        kv_seed: 0,
     });
     config.auto_router.model = name;
+}
+
+fn cli_kv_cache_mode(mode: Option<&str>) -> Result<KvCacheMode, String> {
+    match mode {
+        None => Ok(KvCacheMode::Off),
+        Some("off") => Ok(KvCacheMode::Off),
+        Some("turboquant") => Ok(KvCacheMode::Turboquant),
+        Some(other) => Err(format!("unknown kv_cache mode '{other}'")),
+    }
 }
 
 fn path_basename(path: &str) -> String {
@@ -698,6 +805,13 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: true,
+            kv_cache: None,
+            kv_bits: None,
+            kv_seed: None,
+            kv_key_bits: None,
+            kv_value_bits: None,
+            kv_no_norm_correction: false,
+            kv_adaptive_dense_layers: None,
         };
         let config = build_simple_config(&args).unwrap();
         assert_eq!(config.models.len(), 2);
@@ -719,6 +833,13 @@ mod tests {
             rate_limit: Some(60),
             timeout: Some(60.0),
             batch: false,
+            kv_cache: None,
+            kv_bits: None,
+            kv_seed: None,
+            kv_key_bits: None,
+            kv_value_bits: None,
+            kv_no_norm_correction: false,
+            kv_adaptive_dense_layers: None,
         };
         let config = build_simple_config(&args).unwrap();
         assert_eq!(config.server.host, "127.0.0.1");
@@ -727,6 +848,32 @@ mod tests {
         assert_eq!(config.server.api_key, Some("sk-test".to_owned()));
         assert_eq!(config.server.rate_limit, 60);
         assert!((config.server.timeout - 60.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_simple_mode_turboquant_cli_flags() {
+        let args = ServeArgs {
+            models: vec!["some/model".to_owned()],
+            host: None,
+            port: None,
+            max_tokens: None,
+            api_key: None,
+            rate_limit: None,
+            timeout: None,
+            batch: false,
+            kv_cache: Some("turboquant".to_owned()),
+            kv_bits: Some(4),
+            kv_seed: Some(99),
+            kv_key_bits: None,
+            kv_value_bits: None,
+            kv_no_norm_correction: false,
+            kv_adaptive_dense_layers: None,
+        };
+        let config = build_simple_config(&args).unwrap();
+        let model = config.models.first().unwrap();
+        assert_eq!(model.kv_cache, KvCacheMode::Turboquant);
+        assert_eq!(model.kv_bits, 4);
+        assert_eq!(model.kv_seed, 99);
     }
 
     #[test]
@@ -740,6 +887,13 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: false,
+            kv_cache: None,
+            kv_bits: None,
+            kv_seed: None,
+            kv_key_bits: None,
+            kv_value_bits: None,
+            kv_no_norm_correction: false,
+            kv_adaptive_dense_layers: None,
         };
         assert!(build_simple_config(&args).is_err());
     }
@@ -755,6 +909,13 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: false,
+            kv_cache: None,
+            kv_bits: None,
+            kv_seed: None,
+            kv_key_bits: None,
+            kv_value_bits: None,
+            kv_no_norm_correction: false,
+            kv_adaptive_dense_layers: None,
         };
         assert!(build_simple_config(&args).is_err());
     }
@@ -770,8 +931,38 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: false,
+            kv_cache: None,
+            kv_bits: None,
+            kv_seed: None,
+            kv_key_bits: None,
+            kv_value_bits: None,
+            kv_no_norm_correction: false,
+            kv_adaptive_dense_layers: None,
         };
         assert!(build_simple_config(&args).is_err());
+    }
+
+    #[test]
+    fn test_simple_mode_rejects_turboquant_batch() {
+        let args = ServeArgs {
+            models: vec!["org/model".to_owned()],
+            host: None,
+            port: None,
+            max_tokens: None,
+            api_key: None,
+            rate_limit: None,
+            timeout: None,
+            batch: true,
+            kv_cache: Some("turboquant".to_owned()),
+            kv_bits: Some(3),
+            kv_seed: Some(0),
+            kv_key_bits: None,
+            kv_value_bits: None,
+            kv_no_norm_correction: false,
+            kv_adaptive_dense_layers: None,
+        };
+        let error = build_simple_config(&args).unwrap_err();
+        assert!(error.contains("TurboQuant"));
     }
 
     #[test]
@@ -1072,6 +1263,13 @@ mod tests {
             rate_limit: None,
             timeout: Some(-1.0),
             batch: false,
+            kv_cache: None,
+            kv_bits: None,
+            kv_seed: None,
+            kv_key_bits: None,
+            kv_value_bits: None,
+            kv_no_norm_correction: false,
+            kv_adaptive_dense_layers: None,
         };
         assert!(build_simple_config(&args).is_err());
     }
@@ -1102,11 +1300,41 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: false,
+            kv_cache: None,
+            kv_bits: None,
+            kv_seed: None,
+            kv_key_bits: None,
+            kv_value_bits: None,
+            kv_no_norm_correction: false,
+            kv_adaptive_dense_layers: None,
         };
 
         let config = load_config_file(&path, Some(&args)).unwrap();
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 9000);
+    }
+
+    #[test]
+    fn test_config_file_parses_turboquant_model_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[models]]
+            path = "some/model"
+            kv_cache = "turboquant"
+            kv_bits = 4
+            kv_seed = 123
+            "#,
+        )
+        .unwrap();
+
+        let config = load_config_file(&path, None).unwrap();
+        let model = config.models.first().unwrap();
+        assert_eq!(model.kv_cache, KvCacheMode::Turboquant);
+        assert_eq!(model.kv_bits, 4);
+        assert_eq!(model.kv_seed, 123);
     }
 
     #[test]

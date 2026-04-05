@@ -15,6 +15,9 @@ pub struct ChatMessage {
 /// Renders chat messages using a Jinja2 template (`HuggingFace` format).
 pub struct ChatTemplateRenderer {
     env: Environment<'static>,
+    /// Special tokens loaded from tokenizer_config.json for template rendering.
+    bos_token: String,
+    eos_token: String,
 }
 
 impl ChatTemplateRenderer {
@@ -26,7 +29,11 @@ impl ChatTemplateRenderer {
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_template_owned("chat".to_owned(), template_source.into())
             .map_err(|e| EngineError::Template(e.to_string()))?;
-        Ok(Self { env })
+        Ok(Self {
+            env,
+            bos_token: String::new(),
+            eos_token: String::new(),
+        })
     }
 
     /// Load template from a model directory (`chat_template.jinja` or `tokenizer_config.json`).
@@ -39,25 +46,58 @@ impl ChatTemplateRenderer {
     /// Like [`Self::from_model_dir`] but returns `Ok(None)` when no template is present,
     /// rather than an error. Parse/IO failures still propagate as `Err`.
     pub fn try_from_model_dir(model_dir: &std::path::Path) -> Result<Option<Self>, EngineError> {
+        // Load tokenizer_config.json for special tokens (needed by both paths)
+        let config_path = model_dir.join("tokenizer_config.json");
+        let config: Option<serde_json::Value> = if config_path.exists() {
+            let config_str = std::fs::read_to_string(&config_path)
+                .map_err(|e| EngineError::Template(format!("Failed to read config: {e}")))?;
+            Some(
+                serde_json::from_str(&config_str)
+                    .map_err(|e| EngineError::Template(format!("Invalid JSON: {e}")))?,
+            )
+        } else {
+            None
+        };
+
+        let extract_token = |config: &serde_json::Value, key: &str| -> String {
+            config
+                .get(key)
+                .and_then(|v| {
+                    // Token can be a string or {"content": "..."} object
+                    v.as_str().map(ToOwned::to_owned).or_else(|| {
+                        v.get("content")
+                            .and_then(|c| c.as_str())
+                            .map(ToOwned::to_owned)
+                    })
+                })
+                .unwrap_or_default()
+        };
+
+        let mut set_tokens = |renderer: &mut Self| {
+            if let Some(ref cfg) = config {
+                renderer.bos_token = extract_token(cfg, "bos_token");
+                renderer.eos_token = extract_token(cfg, "eos_token");
+            }
+        };
+
         // Prefer standalone chat_template.jinja
         let jinja_path = model_dir.join("chat_template.jinja");
         if jinja_path.exists() {
             let template = std::fs::read_to_string(&jinja_path)
                 .map_err(|e| EngineError::Template(format!("Failed to read template: {e}")))?;
-            return Self::new(&template).map(Some);
+            let mut renderer = Self::new(&template)?;
+            set_tokens(&mut renderer);
+            return Ok(Some(renderer));
         }
 
         // Fall back to tokenizer_config.json
-        let config_path = model_dir.join("tokenizer_config.json");
-        if config_path.exists() {
-            let config_str = std::fs::read_to_string(&config_path)
-                .map_err(|e| EngineError::Template(format!("Failed to read config: {e}")))?;
-            let config: serde_json::Value = serde_json::from_str(&config_str)
-                .map_err(|e| EngineError::Template(format!("Invalid JSON: {e}")))?;
-            if let Some(ct) = config.get("chat_template") {
+        if let Some(ref cfg) = config {
+            if let Some(ct) = cfg.get("chat_template") {
                 // String template
                 if let Some(template) = ct.as_str() {
-                    return Self::new(template).map(Some);
+                    let mut renderer = Self::new(template)?;
+                    set_tokens(&mut renderer);
+                    return Ok(Some(renderer));
                 }
                 // Array of {name, template} objects -- use "default" or first entry
                 if let Some(arr) = ct.as_array() {
@@ -68,7 +108,9 @@ impl ChatTemplateRenderer {
                         .and_then(|v| v.get("template"))
                         .and_then(|v| v.as_str());
                     if let Some(template) = found {
-                        return Self::new(template).map(Some);
+                        let mut renderer = Self::new(template)?;
+                        set_tokens(&mut renderer);
+                        return Ok(Some(renderer));
                     }
                 }
                 tracing::warn!("chat_template field present but not a string or valid array");
@@ -85,16 +127,32 @@ impl ChatTemplateRenderer {
         tools: Option<&[serde_json::Value]>,
         add_generation_prompt: bool,
     ) -> Result<String, EngineError> {
+        self.apply_with_thinking(messages, tools, add_generation_prompt, false)
+    }
+
+    /// Apply the chat template with explicit `enable_thinking` control.
+    pub fn apply_with_thinking(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        add_generation_prompt: bool,
+        enable_thinking: bool,
+    ) -> Result<String, EngineError> {
         let tmpl = self
             .env
             .get_template("chat")
             .map_err(|e| EngineError::Template(e.to_string()))?;
 
+        let bos = &self.bos_token;
+        let eos = &self.eos_token;
         let context = tools.map_or_else(
             || {
                 minijinja::context! {
                     messages => messages,
                     add_generation_prompt => add_generation_prompt,
+                    enable_thinking => enable_thinking,
+                    bos_token => bos,
+                    eos_token => eos,
                 }
             },
             |tool_list| {
@@ -102,6 +160,9 @@ impl ChatTemplateRenderer {
                     messages => messages,
                     tools => tool_list,
                     add_generation_prompt => add_generation_prompt,
+                    enable_thinking => enable_thinking,
+                    bos_token => bos,
+                    eos_token => eos,
                 }
             },
         );
@@ -465,6 +526,62 @@ TOOLS:{{ tools | length }}
         .unwrap();
         let result = ChatTemplateRenderer::try_from_model_dir(dir.path()).unwrap();
         assert!(result.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // enable_thinking context passing
+    // -----------------------------------------------------------------------
+
+    /// Template that uses the `enable_thinking` variable.
+    const THINKING_TEMPLATE: &str = r"{%- for message in messages %}{{ message.content }}{%- endfor %}{%- if enable_thinking %}<think>{%- endif %}";
+
+    #[test]
+    fn apply_with_thinking_false_omits_think_tag() {
+        let renderer = ChatTemplateRenderer::new(THINKING_TEMPLATE).unwrap();
+        let result = renderer
+            .apply_with_thinking(&[msg("user", "hello")], None, false, false)
+            .unwrap();
+        assert!(
+            !result.contains("<think>"),
+            "should not contain <think> when disabled"
+        );
+    }
+
+    #[test]
+    fn apply_with_thinking_true_emits_think_tag() {
+        let renderer = ChatTemplateRenderer::new(THINKING_TEMPLATE).unwrap();
+        let result = renderer
+            .apply_with_thinking(&[msg("user", "hello")], None, false, true)
+            .unwrap();
+        assert!(
+            result.contains("<think>"),
+            "should contain <think> when enabled"
+        );
+    }
+
+    #[test]
+    fn apply_delegates_to_apply_with_thinking_false() {
+        let renderer = ChatTemplateRenderer::new(THINKING_TEMPLATE).unwrap();
+        let via_apply = renderer.apply(&[msg("user", "hi")], None, false).unwrap();
+        let via_explicit = renderer
+            .apply_with_thinking(&[msg("user", "hi")], None, false, false)
+            .unwrap();
+        assert_eq!(
+            via_apply, via_explicit,
+            "apply() should delegate with enable_thinking=false"
+        );
+    }
+
+    #[test]
+    fn apply_with_thinking_and_tools() {
+        let template = r"{%- for message in messages %}{{ message.content }}{%- endfor %}{%- if tools %}[TOOLS]{%- endif %}{%- if enable_thinking %}<think>{%- endif %}";
+        let renderer = ChatTemplateRenderer::new(template).unwrap();
+        let tools = vec![serde_json::json!({"type": "function"})];
+        let result = renderer
+            .apply_with_thinking(&[msg("user", "hi")], Some(&tools), false, true)
+            .unwrap();
+        assert!(result.contains("[TOOLS]"), "tools should be rendered");
+        assert!(result.contains("<think>"), "thinking tag should be present");
     }
 
     #[test]

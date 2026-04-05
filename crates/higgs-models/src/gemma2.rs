@@ -18,12 +18,13 @@ use mlx_rs::{
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParameters},
     nn, ops,
+    ops::indexing::IndexOp,
     quantization::MaybeQuantized,
 };
 use serde::Deserialize;
 
 use crate::{
-    cache::KeyValueCache,
+    cache::{KeyValueCache, KvCacheView},
     error::ModelError,
     utils::{AttentionMask, apply_rope, create_attention_mask},
 };
@@ -247,9 +248,99 @@ where
             queries = apply_rope(&queries, &self.rope, kv_cache.offset())?;
             keys = apply_rope(&keys, &self.rope, kv_cache.offset())?;
 
-            let (cached_keys, cached_values) = kv_cache.update_and_fetch(keys, values)?;
-            keys = cached_keys;
-            values = cached_values;
+            match kv_cache.update_and_view(keys, values)? {
+                KvCacheView::TurboQuant(view) if is_single_token_decode(&queries) => {
+                    let mut scores = view.decode_scores(&queries, self.n_heads)?;
+
+                    if self
+                        .cached_scale
+                        .as_ref()
+                        .is_none_or(|cached| cached.dtype() != scores.dtype())
+                    {
+                        self.cached_scale = Some(array!(self.scale).as_dtype(scores.dtype())?);
+                    }
+                    let scale = self
+                        .cached_scale
+                        .as_ref()
+                        .ok_or_else(|| Exception::custom("cached_scale not initialized"))?;
+                    scores = scores.multiply(scale)?;
+
+                    if let Some(cap) = self.attn_logit_softcapping {
+                        let needs_cap_cache = self
+                            .cached_inv_cap
+                            .as_ref()
+                            .is_none_or(|cached| cached.dtype() != scores.dtype())
+                            || self
+                                .cached_cap
+                                .as_ref()
+                                .is_none_or(|cached| cached.dtype() != scores.dtype());
+                        if needs_cap_cache {
+                            self.cached_inv_cap = Some(array!(1.0 / cap).as_dtype(scores.dtype())?);
+                            self.cached_cap = Some(array!(cap).as_dtype(scores.dtype())?);
+                        }
+                        let inv_cap = self
+                            .cached_inv_cap
+                            .as_ref()
+                            .ok_or_else(|| Exception::custom("cached_inv_cap not initialized"))?;
+                        let cap_arr = self
+                            .cached_cap
+                            .as_ref()
+                            .ok_or_else(|| Exception::custom("cached_cap not initialized"))?;
+                        scores = ops::tanh(&scores.multiply(inv_cap)?)?.multiply(cap_arr)?;
+                    }
+
+                    if let Some(window) = self.sliding_window {
+                        let s_len = *scores
+                            .shape()
+                            .last()
+                            .ok_or_else(|| Exception::custom("scores must have >= 1 dim"))?;
+                        if s_len > window {
+                            if self
+                                .cached_neg_inf
+                                .as_ref()
+                                .is_none_or(|cached| cached.dtype() != scores.dtype())
+                            {
+                                self.cached_neg_inf =
+                                    Some(array!(f32::NEG_INFINITY).as_dtype(scores.dtype())?);
+                            }
+                            let window_mask = create_sliding_window_mask(L, s_len, window)?;
+                            let neg_inf = self.cached_neg_inf.as_ref().ok_or_else(|| {
+                                Exception::custom("cached_neg_inf not initialized")
+                            })?;
+                            scores = ops::r#where(&window_mask, &scores, neg_inf)?;
+                        }
+                    }
+
+                    if let Some(m) = mask {
+                        if self
+                            .cached_neg_inf
+                            .as_ref()
+                            .is_none_or(|cached| cached.dtype() != scores.dtype())
+                        {
+                            self.cached_neg_inf =
+                                Some(array!(f32::NEG_INFINITY).as_dtype(scores.dtype())?);
+                        }
+                        let neg_inf = self
+                            .cached_neg_inf
+                            .as_ref()
+                            .ok_or_else(|| Exception::custom("cached_neg_inf not initialized"))?;
+                        scores = ops::r#where(m, &scores, neg_inf)?;
+                    }
+
+                    let weights = ops::softmax_axis(&scores, -1, None)?;
+                    let output = view
+                        .decode_values(&weights, self.n_heads)?
+                        .transpose_axes(&[0, 2, 1, 3])?
+                        .reshape(&[B, L, -1])?;
+
+                    return self.o_proj.forward(&output);
+                }
+                view => {
+                    let (cached_keys, cached_values) = view.into_dense()?;
+                    keys = cached_keys;
+                    values = cached_values;
+                }
+            }
         } else {
             queries = apply_rope(&queries, &self.rope, 0)?;
             keys = apply_rope(&keys, &self.rope, 0)?;
@@ -272,7 +363,11 @@ where
 
         // Manual attention with soft-capping
         // scores: [B, n_kv, n_rep, L, S]
-        if self.cached_scale.is_none() {
+        if self
+            .cached_scale
+            .as_ref()
+            .is_none_or(|cached| cached.dtype() != q5.dtype())
+        {
             self.cached_scale = Some(array!(self.scale).as_dtype(q5.dtype())?);
         }
         let scale = self
@@ -285,7 +380,15 @@ where
 
         // Soft-capping: tanh(scores / cap) * cap
         if let Some(cap) = self.attn_logit_softcapping {
-            if self.cached_inv_cap.is_none() {
+            let needs_cap_cache = self
+                .cached_inv_cap
+                .as_ref()
+                .is_none_or(|cached| cached.dtype() != scores.dtype())
+                || self
+                    .cached_cap
+                    .as_ref()
+                    .is_none_or(|cached| cached.dtype() != scores.dtype());
+            if needs_cap_cache {
                 self.cached_inv_cap = Some(array!(1.0 / cap).as_dtype(scores.dtype())?);
                 self.cached_cap = Some(array!(cap).as_dtype(scores.dtype())?);
             }
@@ -307,7 +410,11 @@ where
                 .last()
                 .ok_or_else(|| Exception::custom("scores must have >= 1 dim"))?;
             if s_len > window {
-                if self.cached_neg_inf.is_none() {
+                if self
+                    .cached_neg_inf
+                    .as_ref()
+                    .is_none_or(|cached| cached.dtype() != scores.dtype())
+                {
                     self.cached_neg_inf = Some(array!(f32::NEG_INFINITY).as_dtype(scores.dtype())?);
                 }
                 let window_mask = create_sliding_window_mask(L, s_len, window)?;
@@ -321,7 +428,11 @@ where
 
         // Apply causal mask (boolean: true = attend, false = mask out)
         if let Some(m) = mask {
-            if self.cached_neg_inf.is_none() {
+            if self
+                .cached_neg_inf
+                .as_ref()
+                .is_none_or(|cached| cached.dtype() != scores.dtype())
+            {
                 self.cached_neg_inf = Some(array!(f32::NEG_INFINITY).as_dtype(scores.dtype())?);
             }
             let neg_inf = self
@@ -349,6 +460,11 @@ where
         self.o_proj.training_mode(mode);
         <nn::Rope as Module<nn::RopeInput>>::training_mode(&mut self.rope, mode);
     }
+}
+
+fn is_single_token_decode(queries: &Array) -> bool {
+    let shape = queries.shape();
+    shape.len() == 4 && shape[0] == 1 && shape[2] == 1
 }
 
 /// Create a boolean mask for sliding window attention.
@@ -689,12 +805,19 @@ impl Gemma2CausalLM {
         kv_cache: &mut Vec<Option<C>>,
     ) -> Result<Array, Exception> {
         let hidden = self.forward_hidden(inputs, mask, kv_cache)?;
+        let hidden = hidden.index((.., -1.., ..));
 
+        let T = inputs.shape().get(1).copied().unwrap_or(1);
+        let lm_input = if T > 1 {
+            hidden.index((.., -1.., ..))
+        } else {
+            hidden
+        };
         let mut logits = match self.lm_head.as_mut() {
-            Some(head) => head.forward(&hidden)?,
+            Some(head) => head.forward(&lm_input)?,
             None => match &mut self.model.embed_tokens {
-                MaybeQuantized::Original(embed) => embed.as_linear(&hidden)?,
-                MaybeQuantized::Quantized(q_embed) => q_embed.as_linear(&hidden)?,
+                MaybeQuantized::Original(embed) => embed.as_linear(&lm_input)?,
+                MaybeQuantized::Quantized(q_embed) => q_embed.as_linear(&lm_input)?,
             },
         };
 
@@ -829,6 +952,10 @@ fn apply_rmsnorm_plus_one(model: &mut Gemma2CausalLM) -> Result<(), Exception> {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::{
+        cache::SteppingKeyValueCache,
+        turboquant::{KvCacheConfig, KvCacheMode},
+    };
 
     fn default_gemma2_args() -> Gemma2ModelArgs {
         Gemma2ModelArgs {
@@ -972,6 +1099,77 @@ mod tests {
             true, true,
         ];
         assert_eq!(flat, expected);
+    }
+
+    #[test]
+    fn turboquant_decode_matches_dense_attention_close_enough() {
+        let args = default_gemma2_args();
+        let mut dense_attn = Gemma2Attention::new(&args, false).unwrap();
+        let mut turbo_attn = dense_attn.clone();
+
+        let prefill: Vec<f32> = (0..args.hidden_size).map(|i| i as f32 / 100.0).collect();
+        let decode: Vec<f32> = (0..args.hidden_size)
+            .map(|i| (args.hidden_size - i) as f32 / 100.0)
+            .collect();
+        let prefill = Array::from_slice(&prefill, &[1, 1, args.hidden_size]);
+        let decode = Array::from_slice(&decode, &[1, 1, args.hidden_size]);
+
+        let mut dense_cache = SteppingKeyValueCache::new();
+        let mut turbo_cache = SteppingKeyValueCache::new_turbo(
+            KvCacheConfig {
+                mode: KvCacheMode::Turboquant,
+                bits: 3,
+                seed: 0,
+                ..Default::default()
+            },
+            args.num_key_value_heads,
+            args.head_dim,
+        )
+        .unwrap();
+
+        let _ = dense_attn
+            .forward(Gemma2AttentionInput {
+                x: &prefill,
+                mask: None,
+                cache: Some(&mut dense_cache),
+            })
+            .unwrap();
+        let _ = turbo_attn
+            .forward(Gemma2AttentionInput {
+                x: &prefill,
+                mask: None,
+                cache: Some(&mut turbo_cache),
+            })
+            .unwrap();
+
+        let dense = dense_attn
+            .forward(Gemma2AttentionInput {
+                x: &decode,
+                mask: None,
+                cache: Some(&mut dense_cache),
+            })
+            .unwrap();
+        let turbo = turbo_attn
+            .forward(Gemma2AttentionInput {
+                x: &decode,
+                mask: None,
+                cache: Some(&mut turbo_cache),
+            })
+            .unwrap();
+
+        assert_eq!(dense.shape(), turbo.shape());
+        let dense_values = dense.as_slice::<f32>();
+        let turbo_values = turbo.as_slice::<f32>();
+        let max_diff = dense_values
+            .iter()
+            .zip(turbo_values.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0_f32, f32::max);
+
+        assert!(
+            max_diff < 0.5,
+            "TurboQuant decode drifted too far from dense attention: max_diff={max_diff}"
+        );
     }
 
     #[test]

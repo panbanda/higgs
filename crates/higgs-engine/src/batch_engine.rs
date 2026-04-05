@@ -9,7 +9,10 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use higgs_models::{AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample};
+use higgs_models::{
+    AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample,
+    turboquant::KvCacheConfig,
+};
 use mlx_rs::{
     Array, Stream,
     ops::indexing::{IndexOp, NewAxis},
@@ -83,7 +86,15 @@ pub struct BatchEngine {
 
 impl BatchEngine {
     /// Load a model and start the background processing loop.
-    pub fn load<P: AsRef<Path>>(dir: P) -> Result<Self, EngineError> {
+    pub fn load<P: AsRef<Path>>(
+        dir: P,
+        kv_cache_config: KvCacheConfig,
+    ) -> Result<Self, EngineError> {
+        if kv_cache_config.is_turboquant() {
+            return Err(EngineError::Generation(
+                "TurboQuant is not supported with the batch engine".to_owned(),
+            ));
+        }
         let model_dir = dir.as_ref();
         let model_name = crate::simple::derive_model_name(model_dir);
 
@@ -630,6 +641,7 @@ fn prefill_request(
 
         // Cache the post-prefill state
         prefix_cache.store(&req.prompt_tokens, cache.clone());
+        crate::simple::maybe_clear_mlx_cache("batch_post_prefill");
 
         let first_token_id: u32 = current_token.item();
         let first_token_logprob = first_logprob_data

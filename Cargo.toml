@@ -79,8 +79,8 @@ higgs-engine = { path = "crates/higgs-engine" }
 higgs-models = { path = "crates/higgs-models" }
 
 # MLX
-mlx-rs = "0.25.3"
-mlx-sys = "=0.2.0"
+mlx-rs = { git = "https://github.com/oxideai/mlx-rs.git", rev = "f4aa309c79b6be35255ca7d34157dfc10d9ed4c9" }
+mlx-sys = { git = "https://github.com/oxideai/mlx-rs.git", rev = "f4aa309c79b6be35255ca7d34157dfc10d9ed4c9" }
 
 # HTTP
 axum = { version = "0.8", features = ["macros"] }
@@ -138,10 +138,7 @@ base64 = "0.22"
 # Utilities
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
-
-[patch.crates-io]
-mlx-rs = { git = "https://github.com/oxideai/mlx-rs.git", rev = "af21d79" }
-mlx-sys = { git = "https://github.com/oxideai/mlx-rs.git", rev = "af21d79" }
+rand = "0.9"
 
 [profile.release]
 lto = "thin"

@@ -16,6 +16,7 @@ use mlx_rs::{
     macros::{ModuleParameters, Quantizable},
     module::Module,
     nn,
+    ops::indexing::IndexOp,
     quantization::MaybeQuantized,
 };
 use serde::Deserialize;
@@ -23,7 +24,10 @@ use serde::Deserialize;
 use crate::{
     cache::KeyValueCache,
     error::ModelError,
-    utils::{apply_rope, create_causal_mask, scaled_dot_product_attention},
+    utils::{
+        apply_rope, cached_scaled_dot_product_attention, create_causal_mask,
+        scaled_dot_product_attention,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -240,7 +244,7 @@ where
             .forward(x)?
             .reshape(&[B, L, self.n_kv_heads, -1])?
             .transpose_axes(&[0, 2, 1, 3])?;
-        let mut values = self
+        let values = self
             .v_proj
             .forward(x)?
             .reshape(&[B, L, self.n_kv_heads, -1])?
@@ -250,9 +254,13 @@ where
             queries = apply_rope(&queries, &self.rope, kv_cache.offset())?;
             keys = apply_rope(&keys, &self.rope, kv_cache.offset())?;
 
-            let (cached_keys, cached_values) = kv_cache.update_and_fetch(keys, values)?;
-            keys = cached_keys;
-            values = cached_values;
+            let output = cached_scaled_dot_product_attention(
+                queries, kv_cache, keys, values, self.scale, mask,
+            )?
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[B, L, -1])?;
+
+            return self.o_proj.forward(&output);
         } else {
             queries = apply_rope(&queries, &self.rope, 0)?;
             keys = apply_rope(&keys, &self.rope, 0)?;
@@ -562,12 +570,19 @@ impl Starcoder2CausalLM {
         kv_cache: &mut Vec<Option<C>>,
     ) -> Result<Array, Exception> {
         let out = self.forward_hidden(inputs, mask, kv_cache)?;
+        let out = out.index((.., -1.., ..));
 
+        let T = inputs.shape().get(1).copied().unwrap_or(1);
+        let lm_input = if T > 1 {
+            out.index((.., -1.., ..))
+        } else {
+            out
+        };
         match self.lm_head.as_mut() {
-            Some(head) => head.forward(&out),
+            Some(head) => head.forward(&lm_input),
             None => match &mut self.model.embed_tokens {
-                MaybeQuantized::Original(embed) => embed.as_linear(&out),
-                MaybeQuantized::Quantized(q_embed) => q_embed.as_linear(&out),
+                MaybeQuantized::Original(embed) => embed.as_linear(&lm_input),
+                MaybeQuantized::Quantized(q_embed) => q_embed.as_linear(&lm_input),
             },
         }
     }

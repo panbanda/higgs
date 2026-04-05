@@ -8,6 +8,7 @@ use higgs_engine::error::EngineError;
 use higgs_engine::simple::SimpleEngine;
 use higgs_engine::tokenizers::Tokenizer;
 use higgs_models::SamplingParams;
+use higgs_models::turboquant::KvCacheConfig;
 use mlx_rs::Array;
 
 use crate::config::HiggsConfig;
@@ -24,12 +25,18 @@ pub enum Engine {
 }
 
 impl Engine {
-    pub fn load_simple<P: AsRef<Path>>(dir: P) -> Result<Self, EngineError> {
-        SimpleEngine::load(dir).map(|e| Self::Simple(Box::new(e)))
+    pub fn load_simple<P: AsRef<Path>>(
+        dir: P,
+        kv_cache_config: KvCacheConfig,
+    ) -> Result<Self, EngineError> {
+        SimpleEngine::load(dir, kv_cache_config).map(|e| Self::Simple(Box::new(e)))
     }
 
-    pub fn load_batch<P: AsRef<Path>>(dir: P) -> Result<Self, EngineError> {
-        BatchEngine::load(dir).map(|e| Self::Batch(Box::new(e)))
+    pub fn load_batch<P: AsRef<Path>>(
+        dir: P,
+        kv_cache_config: KvCacheConfig,
+    ) -> Result<Self, EngineError> {
+        BatchEngine::load(dir, kv_cache_config).map(|e| Self::Batch(Box::new(e)))
     }
 
     #[cfg(test)]
@@ -71,6 +78,15 @@ impl Engine {
             Self::Batch(e) => e.hidden_size(),
             #[cfg(test)]
             Self::Stub(_) => 0,
+        }
+    }
+
+    pub fn enable_thinking(&self) -> bool {
+        match self {
+            Self::Simple(e) => e.enable_thinking(),
+            Self::Batch(_) => false,
+            #[cfg(test)]
+            Self::Stub(_) => false,
         }
     }
 

@@ -248,10 +248,11 @@ fn load_engines(
         };
 
         tracing::info!(model = %model_path, resolved = %resolved.display(), "Loading model");
+        let kv_cache_config = model_cfg.kv_cache_config();
         let engine = if model_cfg.batch {
-            Engine::load_batch(&resolved)?
+            Engine::load_batch(&resolved, kv_cache_config)?
         } else {
-            Engine::load_simple(&resolved)?
+            Engine::load_simple(&resolved, kv_cache_config)?
         };
         let name = model_cfg
             .name

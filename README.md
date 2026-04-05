@@ -290,6 +290,17 @@ Single request, 500 generated tokens, median of 3 runs.
 
 MLX models use 4-bit (8-bit for MoE). llama.cpp/Ollama use Q4_K_M (Q8_0 for MoE).
 
+### MoE prefill (time to first token)
+
+Measured on DeepSeek-V2-Lite-4bit (64 experts, top_k=6). Global batch sort reorders tokens by expert index before `gather_qmm`, giving coalesced GPU memory access.
+
+| Prompt tokens | Before | After | Speedup |
+|---|---|---|---|
+| 59 | 472ms | 227ms | 2.1x |
+| 481 | 3,734ms | 863ms | 4.3x |
+| 1,831 | 14,390ms | 3,123ms | 4.6x |
+| 4,532 | 37,489ms | 8,860ms | 4.2x |
+
 ### Continuous batching (Llama-1B)
 
 | Concurrent requests | higgs tok/s | vllm-mlx tok/s |

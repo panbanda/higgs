@@ -19,6 +19,7 @@ tokenizers.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 image.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
