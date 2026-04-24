@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.0](https://github.com/panbanda/higgs/compare/higgs-models-v0.1.22...higgs-models-v0.2.0) (2026-04-24)
+
+
+### ⚠ BREAKING CHANGES
+
+* higgs start is now config/profile-only, attach is a strict daemon dashboard, shellenv/exec fail fast on invalid or unreachable targets, and exact local model matches now take precedence over regex routes.
+
+### Features
+
+* harden CLI, dashboard, routing, and MLX runtime ([4dfc930](https://github.com/panbanda/higgs/commit/4dfc930365ec1d8eb8143508fe63c41b21001ba1))
+
 ## [0.1.22](https://github.com/panbanda/higgs/compare/higgs-models-v0.1.21...higgs-models-v0.1.22) (2026-04-24)
 
 
