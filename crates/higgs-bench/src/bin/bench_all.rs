@@ -144,14 +144,6 @@ async fn run(args: Args) -> Result<()> {
     if selected.is_empty() {
         anyhow::bail!("no models match tag/keys; populate benchmarks/models.toml");
     }
-    if let Some(first) = selected.first() {
-        metadata.model = Some(ModelInfo {
-            key: first.key.clone(),
-            path: first.path.clone(),
-            quantization: first.quantization.clone(),
-            approx_size_gb: first.approx_size_gb,
-        });
-    }
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
@@ -217,14 +209,41 @@ async fn run(args: Args) -> Result<()> {
         tag: args.tag.clone(),
         model_keys: selected.iter().map(|m| m.key.clone()).collect(),
     };
+
+    // Persist one JSON file per model so `bench_summarize` (which
+    // groups by `metadata.model.key`) sees every comparison instead of
+    // only the first model's run. The aggregate `Results { per_model }`
+    // is still rendered to stdout for the human-facing report.
+    let by_key: std::collections::HashMap<String, &models::Model> =
+        selected.iter().map(|m| (m.key.clone(), m)).collect();
+    for model_result in &per_model {
+        let Some(model) = by_key.get(&model_result.model_key) else {
+            continue;
+        };
+        let mut model_meta = metadata.clone();
+        model_meta.model = Some(ModelInfo {
+            key: model.key.clone(),
+            path: model.path.clone(),
+            quantization: model.quantization.clone(),
+            approx_size_gb: model.approx_size_gb,
+        });
+        let single = BenchOutput {
+            metadata: model_meta,
+            params: &params,
+            results: model_result,
+        };
+        match persist_result(&single) {
+            Ok(path) => eprintln!("[persisted] {}", path.display()),
+            Err(e) => eprintln!("warning: persist {}: {e:#}", model.key),
+        }
+    }
+
     let results = Results { per_model };
     let output = BenchOutput {
         metadata,
         params,
         results,
     };
-    let path = persist_result(&output)?;
-    eprintln!("[persisted] {}", path.display());
     let rendered = match args.format {
         OutputFormat::Json => format_json(&output)?,
         OutputFormat::Markdown => format_markdown(&output)?,
