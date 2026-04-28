@@ -459,13 +459,18 @@ async fn stream(
     max_tokens: u32,
     api_key: Option<&str>,
 ) -> Result<StreamMetrics> {
+    let is_omlx = api_key.is_some();
     let opts = StreamChatOptions {
         max_tokens,
         temperature: 0.0,
         api_key,
         response_format: None,
         // oMLX doesn't report prompt tokens in SSE; estimate.
-        estimate_prompt_tokens: api_key.is_some(),
+        estimate_prompt_tokens: is_omlx,
+        // Higgs honors stream_options.include_usage; oMLX rejects unknown
+        // body keys, so only request it on the Higgs side. The oMLX path
+        // falls back to the character-count completion-token estimate.
+        include_usage: !is_omlx,
     };
     http::stream_chat_metrics(client, base_url, model, messages, &opts)
         .await

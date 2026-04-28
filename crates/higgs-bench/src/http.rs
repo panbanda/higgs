@@ -273,6 +273,11 @@ pub struct StreamChatOptions<'a> {
     pub api_key: Option<&'a str>,
     pub response_format: Option<serde_json::Value>,
     pub estimate_prompt_tokens: bool,
+    /// Ask the server to emit a terminal `usage` chunk by sending
+    /// `stream_options.include_usage = true`. Higgs honors this; some
+    /// other backends (oMLX, in particular) reject unknown keys, so leave
+    /// disabled for those and rely on the character-count estimate.
+    pub include_usage: bool,
 }
 
 /// Drives a streaming chat completion and returns ttft + decode-tok/s.
@@ -299,6 +304,14 @@ pub async fn stream_chat_metrics(
     if let Some(rf) = &opts.response_format {
         if let Some(map) = body.as_object_mut() {
             map.insert("response_format".to_owned(), rf.clone());
+        }
+    }
+    if opts.include_usage {
+        if let Some(map) = body.as_object_mut() {
+            map.insert(
+                "stream_options".to_owned(),
+                serde_json::json!({"include_usage": true}),
+            );
         }
     }
 

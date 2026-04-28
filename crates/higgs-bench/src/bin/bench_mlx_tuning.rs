@@ -524,6 +524,8 @@ async fn stream(
         api_key: None,
         response_format,
         estimate_prompt_tokens: false,
+        // bench_mlx_tuning only targets a local Higgs server.
+        include_usage: true,
     };
     http::stream_chat_metrics(client, base_url, model, messages, &opts).await
 }
