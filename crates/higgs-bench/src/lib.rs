@@ -11,7 +11,9 @@
 //! and git state, a `params` block describing the bench inputs, and a
 //! `results` block with the measurements. See `docs/benchmarking.md`.
 
+pub mod http;
 pub mod models;
+pub mod process;
 pub mod server;
 pub mod stats;
 

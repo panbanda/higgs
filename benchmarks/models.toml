@@ -44,3 +44,39 @@ quantization = "3bit"
 approx_size_gb = 14.0
 context = 32768
 tags = ["large", "moe"]
+
+[[models]]
+key = "qwen3-0.6B-4bit"
+label = "Qwen3-0.6B-4bit (Dense)"
+path = "mlx-community/Qwen3-0.6B-4bit"
+quantization = "4bit"
+approx_size_gb = 0.4
+context = 32768
+tags = ["small", "dense", "all"]
+
+[[models]]
+key = "qwen3-4B-4bit"
+label = "Qwen3-4B-Instruct-2507-4bit (Dense)"
+path = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
+quantization = "4bit"
+approx_size_gb = 2.4
+context = 32768
+tags = ["small", "dense", "all"]
+
+[[models]]
+key = "qwen3-8B-4bit"
+label = "Qwen3-8B-4bit (Dense)"
+path = "mlx-community/Qwen3-8B-4bit"
+quantization = "4bit"
+approx_size_gb = 4.5
+context = 32768
+tags = ["medium", "dense", "all"]
+
+[[models]]
+key = "qwen3-14B-4bit"
+label = "Qwen3-14B-4bit (Dense)"
+path = "mlx-community/Qwen3-14B-4bit"
+quantization = "4bit"
+approx_size_gb = 8.0
+context = 32768
+tags = ["medium", "dense", "all"]

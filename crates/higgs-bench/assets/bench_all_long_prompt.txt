@@ -1,0 +1,17 @@
+Write an extremely comprehensive and detailed technical guide covering the following topics in depth. For each topic, provide multiple paragraphs with specific technical details, examples, and explanations:
+
+1. COMPILER DESIGN: Explain lexical analysis, parsing (LL, LR, LALR), abstract syntax trees, semantic analysis, intermediate representations (SSA form, three-address code), optimization passes (constant folding, dead code elimination, loop unrolling, register allocation via graph coloring), and code generation for modern CPU architectures.
+
+2. OPERATING SYSTEMS: Cover process scheduling algorithms (CFS, MLFQ, lottery scheduling), virtual memory management (page tables, TLB, huge pages, NUMA), file systems (ext4, btrfs, ZFS internals), I/O scheduling, interrupt handling, system calls, and the differences between monolithic and microkernel designs.
+
+3. DISTRIBUTED SYSTEMS: Explain consensus protocols (Paxos, Raft, PBFT), distributed hash tables, vector clocks, CRDTs, the CAP theorem and its practical implications, leader election algorithms, distributed transactions (2PC, 3PC, saga pattern), and how systems like Spanner, CockroachDB, and TiKV achieve global consistency.
+
+4. CRYPTOGRAPHY: Cover symmetric encryption (AES internals, modes of operation), asymmetric encryption (RSA, elliptic curves, key exchange), hash functions (SHA-256 internals), digital signatures, zero-knowledge proofs, homomorphic encryption, and post-quantum cryptography approaches.
+
+5. DATABASE INTERNALS: Explain B-tree and LSM-tree storage engines, write-ahead logging, MVCC, query optimization (cost-based vs rule-based), join algorithms (nested loop, hash, sort-merge), buffer pool management, and how modern databases handle concurrent transactions with different isolation levels.
+
+6. NETWORKING: Cover TCP congestion control (Reno, CUBIC, BBR), QUIC protocol design, BGP routing, DNS resolution chain, HTTP/3 internals, TLS certificate chains, NAT traversal techniques, and software-defined networking concepts.
+
+7. MACHINE LEARNING SYSTEMS: Explain backpropagation mathematics, gradient descent variants (SGD, Adam, LAMB), mixed-precision training, data parallelism vs model parallelism vs pipeline parallelism, attention mechanism computation, KV-cache optimization, quantization methods (GPTQ, AWQ, GGML), and inference optimization.
+
+Be thorough and technical throughout.
