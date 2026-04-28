@@ -29,7 +29,7 @@ pub struct Model {
     pub tags: Vec<String>,
     /// Local directory containing this model in oMLX's expected layout
     /// (parent of the model directory). oMLX's `--model-dir` walks one
-    /// level deep and rejects HuggingFace repo IDs, so `bench_h2h`
+    /// level deep and rejects `HuggingFace` repo IDs, so `bench_h2h`
     /// requires this for any model tagged `h2h`. Leading `~` is expanded
     /// against `$HOME` at load time.
     #[serde(default)]

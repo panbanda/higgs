@@ -361,15 +361,13 @@ async fn run_for_omlx(
     // `model.path` strings so that Higgs can resolve them via its own
     // cache; here we require an explicit `omlx_model_dir` cache prefix
     // (typically `~/.cache/lm-studio/models`) and fail loudly if missing.
-    let cache_prefix = model
-        .resolved_omlx_model_dir()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "model '{}' has no `omlx_model_dir`; H2H requires a local cache path. \
+    let cache_prefix = model.resolved_omlx_model_dir().ok_or_else(|| {
+        anyhow::anyhow!(
+            "model '{}' has no `omlx_model_dir`; H2H requires a local cache path. \
                  Add `omlx_model_dir = \"~/.cache/lm-studio/models/...\"` to its manifest entry.",
-                model.key
-            )
-        })?;
+            model.key
+        )
+    })?;
     // oMLX walks one level deep from --model-dir, so `omlx_model_dir`
     // must be the parent of the model's own directory. The model's
     // directory name is the trailing path component of `model.path`.
