@@ -13,20 +13,38 @@ use serde::{Deserialize, Serialize};
 /// One streamed chat completion result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamResult {
+    /// Time from request send to the first non-empty `delta.content` SSE
+    /// chunk, in milliseconds.
     pub ttft_ms: f64,
+    /// Wall-clock time of the full streaming exchange, request send to
+    /// last byte read, in milliseconds.
     pub total_ms: f64,
+    /// Concatenated `delta.content` text across all SSE chunks.
     pub output: String,
+    /// Number of non-empty content SSE chunks observed (a coarse
+    /// fallback for token count when `completion_tokens` is `None`).
     pub num_tokens: u32,
+    /// Server-reported prompt token count from the terminal `usage`
+    /// chunk. `None` when the server omits `usage`.
     pub prompt_tokens: Option<u32>,
+    /// Server-reported completion token count from the terminal `usage`
+    /// chunk. `None` when the server omits `usage`. Prefer this over
+    /// `num_tokens` for throughput math.
     pub completion_tokens: Option<u32>,
 }
 
 /// One non-streaming chat completion plus its wall time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatResult {
+    /// `choices[0].message.content` from the response body.
     pub content: String,
+    /// Wall-clock time of the request, including body deserialization,
+    /// in milliseconds.
     pub elapsed_ms: f64,
+    /// Server-reported prompt token count from `usage.prompt_tokens`.
     pub prompt_tokens: u32,
+    /// Server-reported completion token count from
+    /// `usage.completion_tokens`.
     pub completion_tokens: u32,
 }
 
@@ -170,8 +188,11 @@ pub async fn chat(
         let text = resp.text().await.unwrap_or_default();
         anyhow::bail!("{url} returned HTTP {status}: {text}");
     }
-    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    // `reqwest::Response::json` consumes the body lazily — the network
+    // read happens here. Measure elapsed *after* deserialization so the
+    // reported wall time matches what a caller actually waited for.
     let value: serde_json::Value = resp.json().await.context("decode chat response JSON")?;
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     let content = value
         .get("choices")
         .and_then(|c| c.get(0))

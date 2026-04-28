@@ -192,15 +192,41 @@ async fn run(args: Args) -> Result<()> {
         system_prompt_words: SYSTEM_PROMPT.split_whitespace().count(),
         model_keys: selected.iter().map(|m| m.key.clone()).collect(),
     };
+
+    // Persist one BenchOutput per model so `bench_summarize` (which
+    // groups by `metadata.model.key`) attributes each summary to its
+    // own model. The aggregate Results { per_model } is still rendered
+    // to stdout for the human-facing report.
+    let by_key: std::collections::HashMap<String, &models::Model> =
+        selected.iter().map(|m| (m.key.clone(), m)).collect();
+    for summary in &per_model {
+        let Some(model) = by_key.get(&summary.model) else {
+            continue;
+        };
+        let mut model_meta = metadata.clone();
+        model_meta.model = Some(ModelInfo {
+            key: model.key.clone(),
+            path: model.path.clone(),
+            quantization: model.quantization.clone(),
+            approx_size_gb: model.approx_size_gb,
+        });
+        let single = BenchOutput {
+            metadata: model_meta,
+            params: &params,
+            results: summary,
+        };
+        match persist_result(&single) {
+            Ok(path) => eprintln!("[persisted] {}", path.display()),
+            Err(e) => eprintln!("warning: persist {}: {e:#}", model.key),
+        }
+    }
+
     let results = Results { per_model };
     let output = BenchOutput {
         metadata,
         params,
         results,
     };
-
-    let path = persist_result(&output)?;
-    eprintln!("[persisted] {}", path.display());
 
     let rendered = match args.format {
         OutputFormat::Json => format_json(&output)?,

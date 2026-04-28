@@ -69,19 +69,37 @@ pub async fn start_higgs_server(
         .stderr(Stdio::null())
         .kill_on_drop(true);
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn {} serve --model {model}", bin.display()))?;
 
+    // Race the readiness probe against the child process exiting. If
+    // `higgs` exits during startup (bad model path, --port already in
+    // use, panic during model load), surface that immediately instead
+    // of waiting out the full readiness `timeout` and returning a
+    // generic "not reachable" message.
     let base_url = format!("http://127.0.0.1:{port}");
-    crate::server::wait_until_ready(&base_url, timeout).await?;
+    tokio::select! {
+        ready = crate::server::wait_until_ready(&base_url, timeout) => {
+            ready?;
+        }
+        wait_result = child.wait() => {
+            let exit_status = wait_result.context("wait higgs child during startup")?;
+            anyhow::bail!(
+                "higgs exited before becoming ready (status: {exit_status}); \
+                 check the model path and that port {port} is free"
+            );
+        }
+    }
     Ok(child)
 }
 
-/// Sends `SIGTERM` (via `Child::kill`) and waits for the process to exit.
+/// Forcefully terminates the higgs child and waits for it to exit.
 ///
-/// Errors signaling/reaping are returned but typically swallowed by
-/// callers — teardown failures shouldn't mask the bench's real result.
+/// `Child::start_kill` sends `SIGKILL` on Unix; there is no graceful
+/// shutdown path. Errors signaling/reaping are returned but typically
+/// swallowed by callers — teardown failures shouldn't mask the bench's
+/// real result.
 pub async fn stop_server(mut child: Child) -> Result<()> {
     child.start_kill().context("signal higgs child")?;
     child.wait().await.context("reap higgs child")?;
