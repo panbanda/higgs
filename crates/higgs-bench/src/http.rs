@@ -44,12 +44,18 @@ pub async fn stream_chat(
     max_tokens: u32,
     temperature: f32,
 ) -> Result<StreamResult> {
+    // `stream_options.include_usage` makes Higgs emit a terminal SSE
+    // chunk carrying `usage: {prompt_tokens, completion_tokens, ...}`
+    // and an empty `choices` array. Without it the streamed response
+    // has no usage and prefill/decode tok/s collapse to 0 or to a
+    // chunk-count estimate once the server emits buffered text.
     let body = serde_json::json!({
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "stream": true,
+        "stream_options": { "include_usage": true },
     });
     let url = format!("{base_url}/v1/chat/completions");
     let started = Instant::now();
