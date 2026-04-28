@@ -196,6 +196,7 @@ async fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::option_if_let_else)]
 fn select_models(manifest: &models::Manifest, args: &Args) -> Result<Vec<models::Model>> {
     if let Some(list) = &args.models {
         list.split(',')

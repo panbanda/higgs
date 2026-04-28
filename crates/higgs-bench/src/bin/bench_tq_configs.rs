@@ -13,7 +13,7 @@
     clippy::shadow_same,
     clippy::too_many_lines
 )]
-//! `bench_tq_configs` — sweep TurboQuant KV-cache configs.
+//! `bench_tq_configs` -- sweep `TurboQuant` KV-cache configs.
 //!
 //! Port of `benchmarks/bench_tq_configs.py`. For each KV-cache config:
 //! launch a higgs server, measure prefill TTFT + decode tok/s at three

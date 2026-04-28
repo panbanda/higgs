@@ -16,7 +16,7 @@
 //!
 //! Port of `benchmarks/bench_ttft_quick.py`. Sends a non-streaming
 //! `max_tokens=1` chat completion at four prompt sizes (short, medium,
-//! long, very_long), uses a unique prefix per request to defeat the
+//! long, `very_long`), uses a unique prefix per request to defeat the
 //! prefix cache, and reports the median wall time per size.
 
 use std::process::ExitCode;
