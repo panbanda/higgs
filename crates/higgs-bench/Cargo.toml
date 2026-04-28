@@ -53,3 +53,11 @@ path = "src/bin/bench_tq_configs.rs"
 [[bin]]
 name = "bench_all"
 path = "src/bin/bench_all.rs"
+
+[[bin]]
+name = "bench_h2h"
+path = "src/bin/bench_h2h.rs"
+
+[[bin]]
+name = "bench_mlx_tuning"
+path = "src/bin/bench_mlx_tuning.rs"
