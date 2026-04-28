@@ -53,6 +53,21 @@ binaries. Each binary drives a running higgs server (or, for MLX-direct
 benches, the engine in-process) and produces output that satisfies the
 contract below.
 
+### Prerequisites
+
+Spawn-based benches (`bench_all`, `bench_prefix_cache`,
+`bench_prefix_cache_turns`, `bench_tq_configs`) launch a `higgs serve`
+subprocess. Build the `higgs` binary first:
+
+```bash
+cargo build --release -p higgs
+```
+
+The benches default to `./target/release/higgs`. Set
+`HIGGS_BIN=/path/to/higgs` to point at a different build. If the binary
+is missing the bench fails fast with an actionable error rather than
+silently auto-building.
+
 ### Bench output contract
 
 Every bench binary in `higgs-bench` emits a JSON object with three
