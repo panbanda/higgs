@@ -26,6 +26,8 @@ quantization = "4bit"
 approx_size_gb = 9.5
 context = 32768
 tags = ["medium", "moe", "h2h"]
+# oMLX requires a local cache path (matches LMS prefix in bench_h2h.py).
+omlx_model_dir = "~/.cache/lm-studio/models"
 
 [[models]]
 key = "qwen3.5-27B-4bit"
@@ -35,6 +37,7 @@ quantization = "4bit"
 approx_size_gb = 16.0
 context = 32768
 tags = ["large", "dense", "h2h"]
+omlx_model_dir = "~/.cache/lm-studio/models"
 
 [[models]]
 key = "qwen3.5-35B-a3b-3bit"
@@ -44,6 +47,7 @@ quantization = "3bit"
 approx_size_gb = 14.0
 context = 32768
 tags = ["large", "moe", "h2h"]
+omlx_model_dir = "~/.cache/lm-studio/models"
 
 [[models]]
 key = "qwen3-0.6B-4bit"

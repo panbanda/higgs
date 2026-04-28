@@ -4,7 +4,7 @@
 //! Adding a new model is one TOML entry; benches can filter by tag.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,35 @@ pub struct Model {
     /// Optional tags for filtering, e.g. `small`, `dense`, `moe`, `h2h`.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Local directory containing this model in oMLX's expected layout
+    /// (parent of the model directory). oMLX's `--model-dir` walks one
+    /// level deep and rejects HuggingFace repo IDs, so `bench_h2h`
+    /// requires this for any model tagged `h2h`. Leading `~` is expanded
+    /// against `$HOME` at load time.
+    #[serde(default)]
+    pub omlx_model_dir: Option<PathBuf>,
+}
+
+impl Model {
+    /// Returns `omlx_model_dir` with a leading `~` expanded to `$HOME`.
+    #[must_use]
+    pub fn resolved_omlx_model_dir(&self) -> Option<PathBuf> {
+        self.omlx_model_dir.as_ref().map(|p| expand_tilde(p))
+    }
+}
+
+fn expand_tilde(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    } else if s == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+    p.to_path_buf()
 }
 
 /// Top-level structure of `benchmarks/models.toml`.

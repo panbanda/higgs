@@ -203,20 +203,16 @@ async fn run(args: Args) -> Result<()> {
     );
     eprintln!("{}", "=".repeat(80));
 
-    if let Some(first) = selected.first() {
-        metadata.model = Some(ModelInfo {
-            key: first.key.clone(),
-            path: first.path.clone(),
-            quantization: first.quantization.clone(),
-            approx_size_gb: first.approx_size_gb,
-        });
-    }
-
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
         .build()?;
 
-    let mut comparisons: Vec<ModelComparison> = Vec::new();
+    // Persist one BenchOutput per model. `persist_result` derives the
+    // filename from `metadata.model.key` and `bench_summarize` groups by
+    // it; a single combined record would only record the first model's
+    // key, hiding every other model's data inside `results.comparisons`.
+    // Splitting per-model keeps each model independently summarizable.
+    let mut all_comparisons: Vec<ModelComparison> = Vec::new();
     for model in &selected {
         eprintln!("\n{}", "#".repeat(80));
         eprintln!("# MODEL: {}", model.label);
@@ -248,10 +244,47 @@ async fn run(args: Args) -> Result<()> {
         if let (Some(h), Some(o)) = (&comparison.higgs, &comparison.omlx) {
             print_comparison(&model.label, h, o);
         }
-        comparisons.push(comparison);
+
+        let mut per_model_meta = metadata.clone();
+        per_model_meta.model = Some(ModelInfo {
+            key: model.key.clone(),
+            path: model.path.clone(),
+            quantization: model.quantization.clone(),
+            approx_size_gb: model.approx_size_gb,
+        });
+        per_model_meta.duration_ms = started.elapsed().as_millis() as u64;
+        let per_params = Params {
+            max_tokens: MAX_TOKENS,
+            turns: args.turns,
+            cooldown_s: COOLDOWN_S,
+            skip_multiturn: args.skip_multiturn,
+            higgs_only: args.higgs_only,
+            omlx_only: args.omlx_only,
+            model_keys: vec![model.key.clone()],
+        };
+        let per_results = Results {
+            comparisons: vec![comparison.clone()],
+        };
+        let per_model_output = BenchOutput {
+            metadata: per_model_meta,
+            params: per_params,
+            results: per_results,
+        };
+        let path = persist_result(&per_model_output)?;
+        eprintln!("[persisted] {}", path.display());
+        all_comparisons.push(comparison);
     }
 
+    // Render a combined view to stdout for the human watching the run.
     metadata.duration_ms = started.elapsed().as_millis() as u64;
+    if let Some(first) = selected.first() {
+        metadata.model = Some(ModelInfo {
+            key: first.key.clone(),
+            path: first.path.clone(),
+            quantization: first.quantization.clone(),
+            approx_size_gb: first.approx_size_gb,
+        });
+    }
     let params = Params {
         max_tokens: MAX_TOKENS,
         turns: args.turns,
@@ -261,17 +294,16 @@ async fn run(args: Args) -> Result<()> {
         omlx_only: args.omlx_only,
         model_keys: selected.iter().map(|m| m.key.clone()).collect(),
     };
-    let results = Results { comparisons };
-    let output = BenchOutput {
+    let combined = BenchOutput {
         metadata,
         params,
-        results,
+        results: Results {
+            comparisons: all_comparisons,
+        },
     };
-    let path = persist_result(&output)?;
-    eprintln!("[persisted] {}", path.display());
     let rendered = match args.format {
-        OutputFormat::Json => format_json(&output)?,
-        OutputFormat::Markdown => format_markdown(&output)?,
+        OutputFormat::Json => format_json(&combined)?,
+        OutputFormat::Markdown => format_markdown(&combined)?,
     };
     println!("{rendered}");
     Ok(())
@@ -323,11 +355,32 @@ async fn run_for_omlx(
 ) -> Result<BackendResults> {
     eprintln!("\n  --- omlx ---");
     eprintln!("  Starting oMLX on :{OMLX_PORT} (--no-cache) ...");
-    // oMLX walks one level deep from --model-dir; pass the parent directory.
-    let parent = Path::new(&model.path)
+    // oMLX's `--model-dir` expects a local parent directory containing
+    // the model one level below — not a HuggingFace repo id like
+    // `mlx-community/Foo`. The default manifest uses HF-style
+    // `model.path` strings so that Higgs can resolve them via its own
+    // cache; here we require an explicit `omlx_model_dir` cache prefix
+    // (typically `~/.cache/lm-studio/models`) and fail loudly if missing.
+    let cache_prefix = model
+        .resolved_omlx_model_dir()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "model '{}' has no `omlx_model_dir`; H2H requires a local cache path. \
+                 Add `omlx_model_dir = \"~/.cache/lm-studio/models/...\"` to its manifest entry.",
+                model.key
+            )
+        })?;
+    // oMLX walks one level deep from --model-dir, so `omlx_model_dir`
+    // must be the parent of the model's own directory. The model's
+    // directory name is the trailing path component of `model.path`.
+    let model_subdir = Path::new(&model.path);
+    let model_full_path = cache_prefix.join(model_subdir);
+    let parent = model_full_path
         .parent()
         .map(|p| p.to_string_lossy().into_owned())
-        .ok_or_else(|| anyhow::anyhow!("can't resolve parent dir of {}", model.path))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("can't resolve parent dir of {}", model_full_path.display())
+        })?;
     let child: Child = process::start_omlx_server(
         &parent,
         OMLX_PORT,
@@ -336,7 +389,7 @@ async fn run_for_omlx(
     .await?;
     let base_url = format!("http://127.0.0.1:{OMLX_PORT}");
     // oMLX discovers models by directory basename — use that as the model id.
-    let basename = Path::new(&model.path)
+    let basename = model_full_path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| model.path.clone());
