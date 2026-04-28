@@ -23,6 +23,27 @@ pub fn higgs_bin() -> PathBuf {
     PathBuf::from("./target/release/higgs")
 }
 
+/// Verifies the `higgs` binary is present before spawning. Auto-building
+/// from inside a bench would hide setup work, so the caller is expected
+/// to run `cargo build --release -p higgs` first or set `HIGGS_BIN`.
+fn ensure_higgs_bin(bin: &std::path::Path) -> Result<()> {
+    if bin.exists() {
+        return Ok(());
+    }
+    if std::env::var_os("HIGGS_BIN").is_some() {
+        anyhow::bail!(
+            "HIGGS_BIN points to {} but that file does not exist. \
+             Run `cargo build --release -p higgs` first or fix HIGGS_BIN.",
+            bin.display()
+        );
+    }
+    anyhow::bail!(
+        "higgs binary not found at {}. \
+         Run `cargo build --release -p higgs` first or set HIGGS_BIN=/path/to/higgs.",
+        bin.display()
+    );
+}
+
 /// Spawns `higgs serve --model <model> --port <port> [extra_args...]` as a
 /// child process with stdio captured to /dev/null, then waits up to
 /// `timeout` for the server to respond on `/v1/models`. Returns the live
@@ -34,6 +55,7 @@ pub async fn start_higgs_server(
     timeout: Duration,
 ) -> Result<Child> {
     let bin = higgs_bin();
+    ensure_higgs_bin(&bin)?;
     let mut cmd = Command::new(&bin);
     cmd.arg("serve")
         .arg("--model")
