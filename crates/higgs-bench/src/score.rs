@@ -11,7 +11,7 @@
 //! Composite-score math for `bench_mlx_tuning`.
 //!
 //! Pulled into the library crate (rather than the bin file) so the unit
-//! tests ported from `benchmarks/test_bench_mlx_tuning.py` can exercise
+//! tests ported from `test_bench_mlx_tuning.py` can exercise
 //! the formulas directly. The formulas mirror the Python verbatim —
 //! `bench_mlx_tuning.py`'s acceptance criterion is "composite score
 //! matches Python given the same inputs", so any drift here is a bug.

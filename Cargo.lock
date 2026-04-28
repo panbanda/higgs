@@ -1612,6 +1612,8 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
+ "mlx-rs",
+ "mlx-sys",
  "reqwest",
  "serde",
  "serde_json",

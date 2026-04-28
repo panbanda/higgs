@@ -231,8 +231,8 @@ Spins up five higgs server profiles (baseline / latency / balanced /
 throughput / throughput+TurboQuant), runs a TTFT sweep across short,
 medium, and long prompts, scores short QA accuracy, long-context needle
 retrieval, structured-output correctness, and prefix-cache speedup, and
-emits a composite score that mirrors the Python `bench_mlx_tuning.py`
-formula exactly. Use this to pick the right MLX profile for a model.
+emits a composite score using the standard formula in
+`higgs_bench::score`. Use this to pick the right MLX profile for a model.
 
 ```bash
 cargo run --release -p higgs-bench --bin bench_mlx_tuning -- \
@@ -262,6 +262,37 @@ cargo run --release -p higgs-bench --bin bench_h2h -- \
 
 Pass `--skip-multiturn` to skip the multi-turn phase, `--higgs-only` /
 `--omlx-only` to limit the comparison to one backend.
+
+### `bench_ppl_tq`
+
+Drives the higgs server twice -- once with a baseline KV cache and once
+with TurboQuant -- and reports decode tok/s vs context length, output
+quality (Jaccard similarity between baseline and TQ generations), and a
+proxy perplexity computed from generated-token logprobs. Designed to
+quantify the TurboQuant tradeoff on a single model.
+
+```bash
+cargo run --release -p higgs-bench --bin bench_ppl_tq -- \
+  ~/.cache/lm-studio/models/mlx-community/Qwen3-1.7B-4bit --bits 3
+```
+
+The proxy PPL uses `/v1/chat/completions` with `logprobs=true` over a
+small fixed prompt set. It is reproducible across runs of the same
+build but is not equivalent to wikitext PPL -- use it for relative
+comparisons between baseline and TQ on the same prompt set.
+
+### `bench_moe_sort`
+
+MLX-direct microbench (no server). Times MoE dispatch via `gather_qmm`
+under three schedules at DeepSeek-V2-Lite scale (64 experts, top-k=6,
+4-bit, hidden=2048): per-token sort, no sort, and global flatten+argsort
+(mlx-lm path). Reports median wall time per call across `--iters`
+iterations after `--warmup` warmups.
+
+```bash
+cargo run --release -p higgs-bench --bin bench_moe_sort -- \
+  --warmup 3 --iters 10
+```
 
 ### Adding a new bench
 

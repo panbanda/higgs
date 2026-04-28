@@ -15,7 +15,7 @@
 )]
 //! `bench_tq_configs` -- sweep `TurboQuant` KV-cache configs.
 //!
-//! Port of `benchmarks/bench_tq_configs.py`. For each KV-cache config:
+//! Port of `bench_tq_configs.py`. For each KV-cache config:
 //! launch a higgs server, measure prefill TTFT + decode tok/s at three
 //! context sizes, then generate 10 short answers for a quality (Jaccard)
 //! comparison against the baseline config.

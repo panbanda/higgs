@@ -16,7 +16,7 @@
     clippy::suboptimal_flops,
     clippy::useless_vec
 )]
-//! `bench_mlx_tuning` — port of `benchmarks/bench_mlx_tuning.py`.
+//! `bench_mlx_tuning` — port of `bench_mlx_tuning.py`.
 //!
 //! Sweeps five MLX tuning profiles (baseline / latency / balanced /
 //! throughput / throughput+TQ) and reports a composite score combining
@@ -24,7 +24,7 @@
 //! structured-output correctness, and prefix-cache speedup. The composite
 //! formula is implemented in `higgs_bench::score` and exercised by the
 //! unit tests at the bottom of this file (ports of
-//! `benchmarks/test_bench_mlx_tuning.py`).
+//! `test_bench_mlx_tuning.py`).
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -829,7 +829,7 @@ fn print_summary(results: &[IterationResult], winner: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
-    //! Ports of `benchmarks/test_bench_mlx_tuning.py`.
+    //! Ports of `test_bench_mlx_tuning.py`.
     use super::*;
     use higgs_bench::score::{
         AccuracyInputs, CacheInputs, SpeedInputs, clamp_cache_speedup, compute_iteration_score,

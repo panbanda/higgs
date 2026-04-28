@@ -19,7 +19,7 @@
 )]
 //! `bench_h2h` — Higgs vs oMLX head-to-head TTFT and decode tok/s.
 //!
-//! Port of `benchmarks/bench_h2h.py`. Spins up a higgs server then an
+//! Port of `bench_h2h.py`. Spins up a higgs server then an
 //! oMLX subprocess (path: `/Applications/oMLX.app/Contents/MacOS/omlx-cli`,
 //! overridable via `OMLX_CLI`) for each model, sends the same set of
 //! prompts to both, and prints a side-by-side comparison.

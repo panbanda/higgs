@@ -15,7 +15,7 @@
 )]
 //! `bench_prefix_cache` — TTFT on cache miss vs cache hit.
 //!
-//! Port of `benchmarks/bench_prefix_cache.py`. For each model, spawns a
+//! Port of `bench_prefix_cache.py`. For each model, spawns a
 //! higgs server, sends a long shared system prompt with three different
 //! short user prompts, and reports the speedup from prefix-cache hits on
 //! the second and third request.

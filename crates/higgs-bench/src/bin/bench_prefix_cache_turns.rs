@@ -14,7 +14,7 @@
     clippy::too_many_lines
 )]
 //! `bench_prefix_cache_turns` — does prefix-cache speedup degrade as the
-//! conversation grows? Port of `benchmarks/bench_prefix_cache_turns.py`.
+//! conversation grows? Port of `bench_prefix_cache_turns.py`.
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
