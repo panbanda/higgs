@@ -40,7 +40,18 @@
 //! caveat.
 
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+// Per-request nonce for cache-busting prefixes. An atomic counter is used
+// rather than wall-clock time so each prefix is guaranteed distinct within a
+// single bench run, which keeps the prefix cache cold across context-length
+// probes.
+static PROMPT_NONCE: AtomicU64 = AtomicU64::new(0);
+
+fn next_nonce() -> u64 {
+    PROMPT_NONCE.fetch_add(1, Ordering::Relaxed)
+}
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -396,10 +407,7 @@ async fn decode_sweep(
 
         // Two requests per context: max_tokens=1 isolates TTFT, max_tokens=128
         // gives a decode time after subtracting TTFT.
-        let mut p1 = format!(
-            "[a{:.6}] Summarize: ",
-            Instant::now().elapsed().as_secs_f64()
-        );
+        let mut p1 = format!("[a{}] Summarize: ", next_nonce());
         p1.push_str(&prompt);
         let r1 = match chat_with_prompt(client, base_url, model, &p1, 1).await {
             Ok(r) => r,
@@ -417,10 +425,7 @@ async fn decode_sweep(
         let ttft_ms = r1.elapsed_ms;
         let ptoks = r1.prompt_tokens;
 
-        let mut p2 = format!(
-            "[b{:.6}] Summarize: ",
-            Instant::now().elapsed().as_secs_f64()
-        );
+        let mut p2 = format!("[b{}] Summarize: ", next_nonce());
         p2.push_str(&prompt);
         let r2 = match chat_with_prompt(client, base_url, model, &p2, 128).await {
             Ok(r) => r,

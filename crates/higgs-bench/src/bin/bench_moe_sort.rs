@@ -178,8 +178,11 @@ fn run(args: Args) -> Result<()> {
         })?;
 
         let fastest_higgs = t_nosort.min(t_ptsort);
-        let speedup = if t_global > 0.0 {
-            fastest_higgs / t_global
+        // Wall-clock times: smaller is faster. Speedup of Higgs over the
+        // global-sort baseline is t_global / fastest_higgs, so values >1x
+        // mean Higgs is faster.
+        let speedup = if fastest_higgs > 0.0 {
+            t_global / fastest_higgs
         } else {
             f64::INFINITY
         };
