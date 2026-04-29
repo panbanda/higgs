@@ -494,22 +494,13 @@ fn model_weight_bytes(model_dir: &Path) -> Option<u64> {
 #[allow(unsafe_code)]
 fn mlx_max_recommended_working_set_size() -> Option<usize> {
     unsafe {
-        let mut info = mlx_sys::mlx_device_info_new();
-        let mut dev = mlx_sys::mlx_device_new();
-        mlx_sys::mlx_get_default_device(&raw mut dev);
-        let mut max_rec = None;
-        if mlx_sys::mlx_device_info_get(&raw mut info, dev) == 0 {
-            let mut value: usize = 0;
-            let key = c"max_recommended_working_set_size";
-            if mlx_sys::mlx_device_info_get_size(&raw mut value, info, key.as_ptr()) == 0
-                && value > 0
-            {
-                max_rec = Some(value);
-            }
+        let mut available = false;
+        if mlx_sys::mlx_metal_is_available(&raw mut available) != 0 || !available {
+            return None;
         }
-        mlx_sys::mlx_device_info_free(info);
-        mlx_sys::mlx_device_free(dev);
-        max_rec
+
+        let info = mlx_sys::mlx_metal_device_info();
+        Some(info.max_recommended_working_set_size).filter(|value| *value > 0)
     }
 }
 

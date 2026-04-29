@@ -55,7 +55,6 @@ pub(crate) fn scaled_dot_product_attention(
         values,
         scale,
         mask.map(ScaledDotProductAttentionMask::Array),
-        None::<&Array>,
     )
 }
 
@@ -569,7 +568,6 @@ mod tests {
             &values,
             scale,
             Some(ScaledDotProductAttentionMask::Array(&mask_array)),
-            None::<&Array>,
         )
         .unwrap();
 
@@ -580,7 +578,6 @@ mod tests {
             &values,
             scale,
             Some(ScaledDotProductAttentionMask::Causal),
-            None::<&Array>,
         )
         .unwrap();
 
@@ -635,7 +632,6 @@ mod tests {
             &values,
             scale,
             Some(ScaledDotProductAttentionMask::Causal),
-            None::<&Array>,
         )
         .unwrap();
 
@@ -676,7 +672,6 @@ mod tests {
             &values,
             scale,
             Some(ScaledDotProductAttentionMask::Array(&mask_array)),
-            None::<&Array>,
         )
         .unwrap();
 
@@ -687,7 +682,6 @@ mod tests {
             &values,
             scale,
             Some(ScaledDotProductAttentionMask::Causal),
-            None::<&Array>,
         )
         .unwrap();
 

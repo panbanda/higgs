@@ -207,7 +207,6 @@ impl Qwen3MoeAttention {
                     cached_values,
                     self.scale,
                     Some(fast::ScaledDotProductAttentionMask::Causal),
-                    None::<&Array>,
                 )?
                 .transpose_axes(&[0, 2, 1, 3])?
                 .reshape(&[B, L, -1])?;
@@ -232,16 +231,10 @@ impl Qwen3MoeAttention {
         keys = apply_rope(&keys, &self.rope, 0)?;
 
         let sdpa_mask = mask.map(fast::ScaledDotProductAttentionMask::from);
-        let output = fast::scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            self.scale,
-            sdpa_mask,
-            None::<&Array>,
-        )?
-        .transpose_axes(&[0, 2, 1, 3])?
-        .reshape(&[B, L, -1])?;
+        let output =
+            fast::scaled_dot_product_attention(queries, keys, values, self.scale, sdpa_mask)?
+                .transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[B, L, -1])?;
 
         self.o_proj.forward(&output)
     }

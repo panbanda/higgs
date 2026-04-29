@@ -75,12 +75,12 @@ wildcard_enum_match_arm = "deny"
 
 [workspace.dependencies]
 # Local crates
-higgs-engine = { path = "crates/higgs-engine" }
-higgs-models = { path = "crates/higgs-models" }
+higgs-engine = { version = "1.1.1", path = "crates/higgs-engine" }
+higgs-models = { version = "1.1.1", path = "crates/higgs-models" }
 
 # MLX
-mlx-rs = { git = "https://github.com/oxideai/mlx-rs.git", rev = "f4aa309c79b6be35255ca7d34157dfc10d9ed4c9" }
-mlx-sys = { git = "https://github.com/oxideai/mlx-rs.git", rev = "f4aa309c79b6be35255ca7d34157dfc10d9ed4c9" }
+mlx-rs = "0.25.3"
+mlx-sys = "0.2.0"
 
 # HTTP
 axum = { version = "0.8", features = ["macros"] }

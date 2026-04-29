@@ -104,55 +104,43 @@ jobs:
         with:
           ref: ${{ needs.release-please.outputs.tag_name }}
 
-      - name: Check crates.io publishability
-        id: publishability
-        run: |
-          if grep -Eq '^mlx-(rs|sys)\s*=\s*\{[^}]*git\s*=' Cargo.toml; then
-            echo "publishable=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping crates.io publish: release artifacts depend on unreleased mlx-rs git revisions."
-            exit 0
-          fi
-
-          echo "publishable=true" >> "$GITHUB_OUTPUT"
-
       - name: Install Rust toolchain
-        if: ${{ steps.publishability.outputs.publishable == 'true' }}
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
 
       - name: Cache cargo registry and build
-        if: ${{ steps.publishability.outputs.publishable == 'true' }}
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Publish higgs-models
-        if: ${{ steps.publishability.outputs.publishable == 'true' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          out=$(cargo publish -p higgs-models --token ${{ secrets.CARGO_REGISTRY_TOKEN }} 2>&1) && echo "$out" || {
+          out=$(cargo publish -p higgs-models 2>&1) && echo "$out" || {
             echo "$out"
             echo "$out" | grep -q "already exists" || exit 1
           }
 
       - name: Wait for crates.io to index higgs-models
-        if: ${{ steps.publishability.outputs.publishable == 'true' }}
         run: sleep 30
 
       - name: Publish higgs-engine
-        if: ${{ steps.publishability.outputs.publishable == 'true' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          out=$(cargo publish -p higgs-engine --token ${{ secrets.CARGO_REGISTRY_TOKEN }} 2>&1) && echo "$out" || {
+          out=$(cargo publish -p higgs-engine 2>&1) && echo "$out" || {
             echo "$out"
             echo "$out" | grep -q "already exists" || exit 1
           }
 
       - name: Wait for crates.io to index higgs-engine
-        if: ${{ steps.publishability.outputs.publishable == 'true' }}
         run: sleep 30
 
       - name: Publish higgs
-        if: ${{ steps.publishability.outputs.publishable == 'true' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          out=$(cargo publish -p higgs --token ${{ secrets.CARGO_REGISTRY_TOKEN }} 2>&1) && echo "$out" || {
+          out=$(cargo publish -p higgs 2>&1) && echo "$out" || {
             echo "$out"
             echo "$out" | grep -q "already exists" || exit 1
           }

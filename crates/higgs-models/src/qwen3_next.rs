@@ -541,15 +541,8 @@ pub(crate) fn gather_qmm(
             null_lhs,
             rhs_indices.as_ptr(),
             transpose,
-            mlx_sys::mlx_optional_int_ {
-                value: group_size,
-                has_value: true,
-            },
-            mlx_sys::mlx_optional_int_ {
-                value: bits,
-                has_value: true,
-            },
-            c"affine".as_ptr(),
+            group_size,
+            bits,
             sorted_indices,
             stream.as_ptr(),
         )
@@ -1473,7 +1466,6 @@ impl Qwen3NextAttention {
                     cached_values,
                     self.scale,
                     sdpa_mask,
-                    None::<&Array>,
                 )?
                 .transpose_axes(&[0, 2, 1, 3])?
                 .reshape(&[B, L, -1])?
