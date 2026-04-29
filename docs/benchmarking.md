@@ -53,6 +53,21 @@ binaries. Each binary drives a running higgs server (or, for MLX-direct
 benches, the engine in-process) and produces output that satisfies the
 contract below.
 
+### Prerequisites
+
+Spawn-based benches (`bench_all`, `bench_prefix_cache`,
+`bench_prefix_cache_turns`, `bench_tq_configs`) launch a `higgs serve`
+subprocess. Build the `higgs` binary first:
+
+```bash
+cargo build --release -p higgs
+```
+
+The benches default to `./target/release/higgs`. Set
+`HIGGS_BIN=/path/to/higgs` to point at a different build. If the binary
+is missing the bench fails fast with an actionable error rather than
+silently auto-building.
+
 ### Bench output contract
 
 Every bench binary in `higgs-bench` emits a JSON object with three
@@ -146,6 +161,67 @@ model. This is what the README quotes for headline numbers.
 
 ```bash
 cargo run --release -p higgs-bench --bin bench_summarize
+```
+
+### `bench_ttft_quick`
+
+Sends one non-streaming `max_tokens=1` request at four prompt sizes
+(short, medium, long, very_long) with a unique prefix per call to defeat
+the prefix cache, and reports the median TTFT per size. Smallest of the
+HTTP benches.
+
+```bash
+cargo run --release -p higgs-bench --bin bench_ttft_quick -- \
+  --port 9999 --model deepseek-v2-lite-4bit --warmup 1 --iters 3
+```
+
+### `bench_prefix_cache`
+
+For each model: spawns a higgs server, sends a long shared system prompt
+followed by three different short user prompts, and reports the speedup
+between the first (cache miss) and subsequent (cache hit) TTFTs. Pass
+`--no-spawn` to use a server you already started.
+
+```bash
+cargo run --release -p higgs-bench --bin bench_prefix_cache -- \
+  --models qwen3.5-35B-a3b-3bit,qwen3.5-27B-4bit
+```
+
+### `bench_prefix_cache_turns`
+
+Multi-turn variant: builds a five-turn conversation incrementally and
+reports TTFT + speedup-vs-miss at each turn, then again on two new
+questions appended to the full history. Tells you whether prefix-cache
+speedup degrades as context grows.
+
+```bash
+cargo run --release -p higgs-bench --bin bench_prefix_cache_turns -- \
+  --models qwen3.5-35B-a3b-3bit
+```
+
+### `bench_tq_configs`
+
+Sweeps five TurboQuant KV-cache configurations against one model
+(baseline, default 3-bit, no-norm-correction, asymmetric K=4/V=3, and
+layer-adaptive). For each config: spawns a higgs server with the right
+flags, measures prefill TTFT + decode tok/s at three context sizes, and
+generates 10 quality prompts. Quality is reported as Jaccard similarity
+(per-prompt average and minimum) versus the baseline config's outputs.
+
+```bash
+cargo run --release -p higgs-bench --bin bench_tq_configs -- \
+  --model qwen3.5-35B-a3b-3bit
+```
+
+### `bench_all`
+
+Sweeps TTFT, prefill tok/s, and decode tok/s across every model in the
+manifest matching `--tag` (default `all`), running three prompts of
+varying length per model. Spawns and tears down one higgs server per
+model.
+
+```bash
+cargo run --release -p higgs-bench --bin bench_all -- --tag all
 ```
 
 ### Adding a new bench

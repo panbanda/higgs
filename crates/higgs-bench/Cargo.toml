@@ -33,3 +33,23 @@ path = "src/bin/bench_decode.rs"
 [[bin]]
 name = "bench_summarize"
 path = "src/bin/bench_summarize.rs"
+
+[[bin]]
+name = "bench_ttft_quick"
+path = "src/bin/bench_ttft_quick.rs"
+
+[[bin]]
+name = "bench_prefix_cache"
+path = "src/bin/bench_prefix_cache.rs"
+
+[[bin]]
+name = "bench_prefix_cache_turns"
+path = "src/bin/bench_prefix_cache_turns.rs"
+
+[[bin]]
+name = "bench_tq_configs"
+path = "src/bin/bench_tq_configs.rs"
+
+[[bin]]
+name = "bench_all"
+path = "src/bin/bench_all.rs"
