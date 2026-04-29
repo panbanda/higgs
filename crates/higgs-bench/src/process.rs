@@ -54,6 +54,18 @@ pub async fn start_higgs_server(
     extra_args: &[String],
     timeout: Duration,
 ) -> Result<Child> {
+    start_higgs_server_with_env(model, port, extra_args, &[], timeout).await
+}
+
+/// Like `start_higgs_server`, but injects extra environment variables —
+/// e.g. `HIGGS_MLX_PROFILE` for `bench_mlx_tuning`.
+pub async fn start_higgs_server_with_env(
+    model: &str,
+    port: u16,
+    extra_args: &[String],
+    extra_env: &[(String, String)],
+    timeout: Duration,
+) -> Result<Child> {
     let bin = higgs_bin();
     ensure_higgs_bin(&bin)?;
     let mut cmd = Command::new(&bin);
@@ -68,6 +80,9 @@ pub async fn start_higgs_server(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
 
     let mut child = cmd
         .spawn()
@@ -92,6 +107,83 @@ pub async fn start_higgs_server(
         }
     }
     Ok(child)
+}
+
+/// Path to the oMLX CLI on macOS. Honors `OMLX_CLI` if set.
+#[must_use]
+pub fn omlx_cli() -> PathBuf {
+    if let Ok(p) = std::env::var("OMLX_CLI") {
+        return PathBuf::from(p);
+    }
+    PathBuf::from("/Applications/oMLX.app/Contents/MacOS/omlx-cli")
+}
+
+/// Spawns `omlx-cli serve --model-dir <dir> --port <port>` as a child
+/// process with stdio captured, then waits up to `timeout` for the server
+/// to respond on `/v1/models` (oMLX requires a bearer token; we send
+/// `omlx`).
+///
+/// `model_parent_dir` is the *parent* of the model dir — oMLX walks one
+/// level deep. The Python helper does `os.path.dirname(model_path)`.
+pub async fn start_omlx_server(
+    model_parent_dir: &str,
+    port: u16,
+    timeout: Duration,
+) -> Result<Child> {
+    let bin = omlx_cli();
+    let mut cmd = Command::new(&bin);
+    cmd.arg("serve")
+        .arg("--model-dir")
+        .arg(model_parent_dir)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--no-cache")
+        .arg("--max-num-seqs")
+        .arg("1")
+        .arg("--log-level")
+        .arg("warning")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+
+    let child = cmd.spawn().with_context(|| {
+        format!(
+            "spawn {} serve --model-dir {model_parent_dir}",
+            bin.display()
+        )
+    })?;
+
+    // oMLX requires bearer auth on /v1/models; the readiness probe
+    // doesn't send one, but oMLX reports HTTP 200 on /v1/models when
+    // bearer is present and 401 otherwise — both indicate a live server.
+    // Wait for either status by treating 401 as "alive".
+    let base_url = format!("http://127.0.0.1:{port}");
+    wait_until_responding(&base_url, timeout).await?;
+    Ok(child)
+}
+
+async fn wait_until_responding(base_url: &str, timeout: Duration) -> Result<()> {
+    use std::time::Instant;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("build readiness probe client")?;
+    let deadline = Instant::now() + timeout;
+    let url = format!("{base_url}/v1/models");
+    let mut last_err = String::new();
+    while Instant::now() < deadline {
+        match client.get(&url).bearer_auth("omlx").send().await {
+            Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 401 => {
+                return Ok(());
+            }
+            Ok(resp) => last_err = format!("HTTP {}", resp.status()),
+            Err(e) => last_err = format!("{e}"),
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err(anyhow::anyhow!(
+        "server at {base_url} did not become ready within {timeout:?}: {last_err}"
+    ))
 }
 
 /// Forcefully terminates the higgs child and waits for it to exit.

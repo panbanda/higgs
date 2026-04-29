@@ -13,7 +13,8 @@ This document collects the benchmark methodology and the benchmark-driven defaul
 Use the benchmark harness below to compare five serving iterations on the same local model:
 
 ```bash
-python3 benchmarks/bench_mlx_tuning.py ~/.cache/lm-studio/models/mlx-community/Qwen3.6-35B-A3B-4bit
+cargo run --release -p higgs-bench --bin bench_mlx_tuning -- \
+  ~/.cache/lm-studio/models/mlx-community/Qwen3.6-35B-A3B-4bit
 ```
 
 The harness evaluates:
@@ -223,6 +224,44 @@ model.
 ```bash
 cargo run --release -p higgs-bench --bin bench_all -- --tag all
 ```
+
+### `bench_mlx_tuning`
+
+Spins up five higgs server profiles (baseline / latency / balanced /
+throughput / throughput+TurboQuant), runs a TTFT sweep across short,
+medium, and long prompts, scores short QA accuracy, long-context needle
+retrieval, structured-output correctness, and prefix-cache speedup, and
+emits a composite score that mirrors the Python `bench_mlx_tuning.py`
+formula exactly. Use this to pick the right MLX profile for a model.
+
+```bash
+cargo run --release -p higgs-bench --bin bench_mlx_tuning -- \
+  ~/.cache/lm-studio/models/mlx-community/Qwen3-1.7B-4bit
+```
+
+Each profile sweep starts a fresh higgs server with the relevant
+`HIGGS_MLX_PROFILE` env var (and TurboQuant flags for the fifth pass);
+the bench tears the server down with a 2-second cooldown between passes.
+
+### `bench_h2h`
+
+Head-to-head comparison of higgs vs oMLX on the same models. Spins up a
+higgs server, runs short / medium / long single-turn prompts plus an
+optional multi-turn conversation, then repeats the suite against an
+oMLX subprocess (path: `/Applications/oMLX.app/Contents/MacOS/omlx-cli`,
+override via `OMLX_CLI`).
+
+Models are selected by key from `benchmarks/models.toml`; defaults to
+all entries tagged `h2h`. Pass `--models qwen3.5-35B-a3b-3bit` etc. to
+match the Python `--models 35B|27B|DSV2` shape.
+
+```bash
+cargo run --release -p higgs-bench --bin bench_h2h -- \
+  --models qwen3.5-35B-a3b-3bit --turns 5
+```
+
+Pass `--skip-multiturn` to skip the multi-turn phase, `--higgs-only` /
+`--omlx-only` to limit the comparison to one backend.
 
 ### Adding a new bench
 

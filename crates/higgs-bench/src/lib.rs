@@ -14,6 +14,7 @@
 pub mod http;
 pub mod models;
 pub mod process;
+pub mod score;
 pub mod server;
 pub mod stats;
 
