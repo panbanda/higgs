@@ -15,7 +15,7 @@
 )]
 //! `bench_all` — sweep TTFT/prefill/decode across many local models.
 //!
-//! Port of `benchmarks/bench_all.py`. For each model in the manifest
+//! Port of `bench_all.py`. For each model in the manifest
 //! (default: tag `all`), launches a higgs server, runs three prompts of
 //! varying lengths in streaming mode, and reports per-prompt TTFT,
 //! prefill tok/s, decode tok/s, and total wall time.
