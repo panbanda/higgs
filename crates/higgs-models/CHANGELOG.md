@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.2.0](https://github.com/panbanda/higgs/compare/higgs-models-v1.1.1...higgs-models-v1.2.0) (2026-05-06)
+
+
+### Features
+
+* **bonsai-q1:** packed engine scaffold with upstream MLX guard ([#142](https://github.com/panbanda/higgs/issues/142)) ([fe43aab](https://github.com/panbanda/higgs/commit/fe43aabe44104ab285e19e8ff73c724c0875cbe0))
+* **cache:** AnyCache::trim_by dispatcher for spec-decode rollback ([#143](https://github.com/panbanda/higgs/issues/143)) ([229c111](https://github.com/panbanda/higgs/commit/229c1110f2da4c3d93ac79c8f28c2435e0c97aad))
+* **qwen3_next:** mixed-bit Qwen3.5 GDN BA loading fallback ([#148](https://github.com/panbanda/higgs/issues/148)) ([cc18616](https://github.com/panbanda/higgs/commit/cc186160756c9d5741fc18baecbacd3666eeacf3))
+
+
+### Bug Fixes
+
+* **deps:** update rust crate safetensors to 0.7 ([#151](https://github.com/panbanda/higgs/issues/151)) ([a177ef6](https://github.com/panbanda/higgs/commit/a177ef6ce08508a08fa20ab9be4175d3a3a77476))
+
+
+### Performance Improvements
+
+* **models:** opt-in fused MoE gate+up — 3→2 expert matmuls per layer ([#141](https://github.com/panbanda/higgs/issues/141)) ([60d7cb4](https://github.com/panbanda/higgs/commit/60d7cb48f28ddff5254f8aece898a24a1a475d66))
+
 ## [1.1.1](https://github.com/panbanda/higgs/compare/higgs-models-v1.1.0...higgs-models-v1.1.1) (2026-04-28)
 
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/panbanda/higgs/compare/higgs-engine-v1.1.1...higgs-engine-v1.2.0) (2026-05-06)
+
+
+### Features
+
+* **bonsai-q1:** packed engine scaffold with upstream MLX guard ([#142](https://github.com/panbanda/higgs/issues/142)) ([fe43aab](https://github.com/panbanda/higgs/commit/fe43aabe44104ab285e19e8ff73c724c0875cbe0))
+
 ## [1.1.1](https://github.com/panbanda/higgs/compare/higgs-engine-v1.1.0...higgs-engine-v1.1.1) (2026-04-28)
 
 

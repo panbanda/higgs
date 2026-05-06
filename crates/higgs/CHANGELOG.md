@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/panbanda/higgs/compare/higgs-v1.1.1...higgs-v1.2.0) (2026-05-06)
+
+
+### Bug Fixes
+
+* default Qwen3.6 to non-thinking mode ([#150](https://github.com/panbanda/higgs/issues/150)) ([372020e](https://github.com/panbanda/higgs/commit/372020ec5198b47bfb29babbaf60b4250507a76e))
+
 ## [1.1.1](https://github.com/panbanda/higgs/compare/higgs-v1.1.0...higgs-v1.1.1) (2026-04-28)
 
 
