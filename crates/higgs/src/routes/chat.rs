@@ -328,18 +328,14 @@ async fn chat_completions_non_streaming(
     // When thinking mode is enabled, the template already opened `<think>` in the prompt,
     // so the generated text starts inside the think block. Prepend `<think>` so the parser
     // can find the matching `</think>` and split reasoning from visible content.
-    let parse_input = if thinking_enabled {
-        if output_text.contains("</think>") {
+    let (raw_text, reasoning_content) = if thinking_enabled {
+        let parse_input = if output_text.contains("</think>") {
             format!("<think>{output_text}")
         } else {
             // Model was length-stopped mid-thinking — close the tag so the
             // parser can extract reasoning instead of leaking raw `<think>`.
             format!("<think>{output_text}</think>")
-        }
-    } else {
-        output_text.clone()
-    };
-    let (raw_text, reasoning_content) = if thinking_enabled {
+        };
         let reasoning_result = higgs_engine::reasoning_parser::parse_reasoning(&parse_input);
         let raw_text = if reasoning_result.reasoning.is_some() {
             reasoning_result.text
@@ -348,7 +344,7 @@ async fn chat_completions_non_streaming(
         };
         (raw_text, reasoning_result.reasoning)
     } else {
-        (parse_input, None)
+        (output_text, None)
     };
 
     let (content, tool_calls, finish_reason) = if has_tools {

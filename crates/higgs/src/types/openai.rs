@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatCompletionMessage>,
+    /// Maximum number of tokens to generate.
+    ///
+    /// Accepts `max_completion_tokens` and `max_output_tokens` aliases.
     #[serde(default, alias = "max_completion_tokens", alias = "max_output_tokens")]
     pub max_tokens: Option<u32>,
     #[serde(default)]
@@ -284,6 +287,9 @@ pub struct ToolCallFunctionDelta {
 pub struct CompletionRequest {
     pub model: String,
     pub prompt: String,
+    /// Maximum number of tokens to generate.
+    ///
+    /// Accepts `max_completion_tokens` and `max_output_tokens` aliases.
     #[serde(default, alias = "max_completion_tokens", alias = "max_output_tokens")]
     pub max_tokens: Option<u32>,
     #[serde(default)]
@@ -824,6 +830,17 @@ mod tests {
             "model": "m",
             "prompt": "test",
             "max_completion_tokens": 100
+        }"#;
+        let req: CompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.max_tokens, Some(100));
+    }
+
+    #[test]
+    fn test_completion_request_accepts_max_output_tokens_alias() {
+        let json = r#"{
+            "model": "m",
+            "prompt": "test",
+            "max_output_tokens": 100
         }"#;
         let req: CompletionRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.max_tokens, Some(100));
