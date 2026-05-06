@@ -11,6 +11,7 @@ pub mod metrics_log;
 pub mod model_download;
 pub mod model_resolver;
 pub mod proxy;
+pub(crate) mod reasoning;
 pub mod router;
 pub mod routes;
 #[doc(hidden)]

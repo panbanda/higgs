@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatCompletionMessage>,
-    #[serde(default)]
+    #[serde(default, alias = "max_completion_tokens", alias = "max_output_tokens")]
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f32>,
@@ -284,7 +284,7 @@ pub struct ToolCallFunctionDelta {
 pub struct CompletionRequest {
     pub model: String,
     pub prompt: String,
-    #[serde(default)]
+    #[serde(default, alias = "max_completion_tokens", alias = "max_output_tokens")]
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f32>,
@@ -729,6 +729,18 @@ mod tests {
     }
 
     #[test]
+    fn test_chat_request_accepts_max_completion_tokens_alias() {
+        let req = chat_request_with(r#""max_completion_tokens": 100"#);
+        assert_eq!(req.max_tokens, Some(100));
+    }
+
+    #[test]
+    fn test_chat_request_accepts_max_output_tokens_alias() {
+        let req = chat_request_with(r#""max_output_tokens": 100"#);
+        assert_eq!(req.max_tokens, Some(100));
+    }
+
+    #[test]
     fn test_chat_request_with_temperature_zero() {
         let req = chat_request_with(r#""temperature": 0.0"#);
         assert!((req.temperature.unwrap()).abs() < f32::EPSILON);
@@ -804,6 +816,17 @@ mod tests {
         assert!((req.top_p.unwrap() - 0.8).abs() < f32::EPSILON);
         assert_eq!(req.stream, Some(false));
         assert!(req.stop.is_some());
+    }
+
+    #[test]
+    fn test_completion_request_accepts_max_completion_tokens_alias() {
+        let json = r#"{
+            "model": "m",
+            "prompt": "test",
+            "max_completion_tokens": 100
+        }"#;
+        let req: CompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.max_tokens, Some(100));
     }
 
     #[test]

@@ -234,20 +234,25 @@ async fn create_message_non_streaming(
 
     let engine_messages = anthropic_messages_to_engine(&req.messages, req.system.as_ref());
     let tools = req.tools.as_deref();
+    let thinking_enabled = crate::reasoning::effective_thinking_enabled(
+        engine.enable_thinking(),
+        &[engine.model_name(), req.model.as_str()],
+        None,
+    );
 
     let prompt_tokens = engine
-        .prepare_chat_prompt(&engine_messages, tools)
+        .prepare_chat_prompt_with_thinking(&engine_messages, tools, thinking_enabled)
         .map_err(ServerError::Engine)?;
 
-    let thinking_enabled = engine.enable_thinking();
     let output = tokio::task::spawn_blocking(move || {
-        engine.generate(
+        engine.generate_with_thinking(
             &prompt_tokens,
             max_tokens,
             &sampling,
             &stop_sequences,
             false,
             None,
+            thinking_enabled,
             None,
             None,
         )
@@ -315,9 +320,14 @@ fn create_message_stream(
 
     let engine_messages = anthropic_messages_to_engine(&req.messages, req.system.as_ref());
     let tools = req.tools.as_deref();
+    let thinking_enabled = crate::reasoning::effective_thinking_enabled(
+        engine.enable_thinking(),
+        &[engine.model_name(), req.model.as_str()],
+        None,
+    );
 
     let prompt_tokens = engine
-        .prepare_chat_prompt(&engine_messages, tools)
+        .prepare_chat_prompt_with_thinking(&engine_messages, tools, thinking_enabled)
         .map_err(ServerError::Engine)?;
 
     let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
@@ -325,13 +335,11 @@ fn create_message_stream(
     let prompt_token_count = u32::try_from(prompt_tokens.len())
         .map_err(|_| ServerError::BadRequest("Token count overflow".to_owned()))?;
 
-    let thinking_enabled = engine.enable_thinking();
-
     // Spawn generation before creating the stream so prefill starts immediately
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
 
     tokio::task::spawn_blocking(move || {
-        let result = engine.generate_streaming(
+        let result = engine.generate_streaming_with_thinking(
             &prompt_tokens,
             max_tokens,
             &sampling,
@@ -339,6 +347,7 @@ fn create_message_stream(
             false,
             None,
             &tx,
+            thinking_enabled,
             None,
             None,
         );
@@ -509,12 +518,19 @@ pub async fn count_tokens(
         .map_err(ServerError::ModelNotFound)?;
 
     match resolved {
-        ResolvedRoute::Higgs { engine, .. } => {
+        ResolvedRoute::Higgs {
+            engine, model_name, ..
+        } => {
             let engine_messages = anthropic_messages_to_engine(&req.messages, req.system.as_ref());
             let tools = req.tools.as_deref();
+            let thinking_enabled = crate::reasoning::effective_thinking_enabled(
+                engine.enable_thinking(),
+                &[engine.model_name(), model_name.as_str()],
+                None,
+            );
 
             let tokens = engine
-                .prepare_chat_prompt(&engine_messages, tools)
+                .prepare_chat_prompt_with_thinking(&engine_messages, tools, thinking_enabled)
                 .map_err(ServerError::Engine)?;
 
             let count = u32::try_from(tokens.len())
