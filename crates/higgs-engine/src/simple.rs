@@ -328,6 +328,7 @@ impl SimpleEngine {
                 chunked_prefill_chunk_size = tuning.chunked_prefill_chunk_size(),
                 clear_cache_after_prefill = tuning.clear_cache_after_prefill(),
                 mtp_enabled = tuning.enable_mtp(),
+                mtp_draft_n_max = tuning.mtp_draft_n_max(),
                 paged_kv_target_mb = tuning.paged_kv_target_bytes() / (1024 * 1024),
                 "Engine ready"
             );
@@ -341,6 +342,7 @@ impl SimpleEngine {
                 chunked_prefill_chunk_size = tuning.chunked_prefill_chunk_size(),
                 clear_cache_after_prefill = tuning.clear_cache_after_prefill(),
                 mtp_enabled = tuning.enable_mtp(),
+                mtp_draft_n_max = tuning.mtp_draft_n_max(),
                 "Engine ready"
             );
             tracing::debug!("Experimental paged KV disabled; session cache allocation skipped");
@@ -1249,10 +1251,28 @@ impl SimpleEngine {
         }
     }
 
+    #[allow(clippy::cast_precision_loss)]
+    fn log_mtp_decode_stats(
+        stats: &crate::mtp::MtpStats,
+        elapsed: std::time::Duration,
+        reason: &str,
+    ) {
+        tracing::info!(
+            reason,
+            cycles = stats.cycles(),
+            drafted = stats.drafted(),
+            accepted_drafts = stats.accepted_drafts(),
+            emitted = stats.emitted(),
+            accept_rate = format!("{:.1}%", stats.acceptance_rate_percent()),
+            tok_per_s = format!("{:.1}", f64::from(stats.emitted()) / elapsed.as_secs_f64()),
+            "MTP decode complete"
+        );
+    }
+
     /// MTP speculative decode loop.
     ///
     /// Runs the backbone to get the initial hidden state, then loops calling
-    /// `mtp_cycle()` which drafts one extra token per cycle for ~1.5x speedup.
+    /// `mtp_cycle()` which drafts multiple tokens per cycle for speculative speedup.
     #[allow(
         clippy::too_many_arguments,
         clippy::as_conversions,
@@ -1290,8 +1310,7 @@ impl SimpleEngine {
 
         let mut current_hidden = h;
         let mut confirmed_token_id: u32 = next_arr.item();
-        let mut accepted: u32 = 0;
-        let mut total_cycles: u32 = 0;
+        let mut mtp_stats = crate::mtp::MtpStats::default();
         let t_start = std::time::Instant::now();
 
         // Thinking budget: force </think> after N tokens if model hasn't closed it.
@@ -1313,9 +1332,10 @@ impl SimpleEngine {
                 &mut mtp_cache,
                 &current_hidden,
                 confirmed_token_id,
+                self.tuning.mtp_draft_n_max(),
             )?;
 
-            total_cycles += 1;
+            mtp_stats.record_cycle(result.drafted, result.tokens.len());
 
             for &tok in &result.tokens {
                 // Thinking budget enforcement
@@ -1327,7 +1347,6 @@ impl SimpleEngine {
                             thinking_tokens += 1;
                             if thinking_tokens >= THINKING_BUDGET {
                                 tokens.push(close_id);
-                                accepted += 1;
                                 seen_think_close = true;
                                 tracing::info!(
                                     budget = THINKING_BUDGET,
@@ -1335,20 +1354,7 @@ impl SimpleEngine {
                                 );
                                 if self.eos_token_ids.contains(&close_id) {
                                     let elapsed = t_start.elapsed();
-                                    tracing::info!(
-                                        tokens = accepted,
-                                        cycles = total_cycles,
-                                        accept_rate = format!(
-                                            "{:.1}%",
-                                            (f64::from(accepted) / f64::from(total_cycles) - 1.0)
-                                                * 100.0
-                                        ),
-                                        tok_per_s = format!(
-                                            "{:.1}",
-                                            f64::from(accepted) / elapsed.as_secs_f64()
-                                        ),
-                                        "MTP decode complete"
-                                    );
+                                    Self::log_mtp_decode_stats(&mtp_stats, elapsed, "stop");
                                     return Ok(GenerationOutput {
                                         text: self.decode_tokens(tokens)?,
                                         finish_reason: "stop".to_owned(),
@@ -1376,20 +1382,7 @@ impl SimpleEngine {
                                 let completion_len = Self::completion_len(tokens)?;
                                 if completion_len >= max_tokens {
                                     let elapsed = t_start.elapsed();
-                                    tracing::info!(
-                                        tokens = accepted,
-                                        cycles = total_cycles,
-                                        accept_rate = format!(
-                                            "{:.1}%",
-                                            (f64::from(accepted) / f64::from(total_cycles) - 1.0)
-                                                * 100.0
-                                        ),
-                                        tok_per_s = format!(
-                                            "{:.1}",
-                                            f64::from(accepted) / elapsed.as_secs_f64()
-                                        ),
-                                        "MTP decode complete (length limit)"
-                                    );
+                                    Self::log_mtp_decode_stats(&mtp_stats, elapsed, "length");
                                     return Ok(GenerationOutput {
                                         text: self.decode_tokens(tokens)?,
                                         finish_reason: "length".to_owned(),
@@ -1407,20 +1400,10 @@ impl SimpleEngine {
                 }
 
                 tokens.push(tok);
-                accepted += 1;
 
                 if self.eos_token_ids.contains(&tok) {
                     let elapsed = t_start.elapsed();
-                    tracing::info!(
-                        tokens = accepted,
-                        cycles = total_cycles,
-                        accept_rate = format!(
-                            "{:.1}%",
-                            (f64::from(accepted) / f64::from(total_cycles) - 1.0) * 100.0
-                        ),
-                        tok_per_s = format!("{:.1}", f64::from(accepted) / elapsed.as_secs_f64()),
-                        "MTP decode complete"
-                    );
+                    Self::log_mtp_decode_stats(&mtp_stats, elapsed, "stop");
                     return Ok(GenerationOutput {
                         text: self.decode_tokens(tokens)?,
                         finish_reason: "stop".to_owned(),
@@ -1447,16 +1430,7 @@ impl SimpleEngine {
             let completion_len = Self::completion_len(tokens)?;
             if completion_len >= max_tokens {
                 let elapsed = t_start.elapsed();
-                tracing::info!(
-                    tokens = accepted,
-                    cycles = total_cycles,
-                    accept_rate = format!(
-                        "{:.1}%",
-                        (f64::from(accepted) / f64::from(total_cycles) - 1.0) * 100.0
-                    ),
-                    tok_per_s = format!("{:.1}", f64::from(accepted) / elapsed.as_secs_f64()),
-                    "MTP decode complete (length limit)"
-                );
+                Self::log_mtp_decode_stats(&mtp_stats, elapsed, "length");
                 return Ok(GenerationOutput {
                     text: self.decode_tokens(tokens)?,
                     finish_reason: "length".to_owned(),
@@ -1511,8 +1485,7 @@ impl SimpleEngine {
 
         let mut current_hidden = h;
         let mut confirmed_token_id: u32 = next_arr.item();
-        let mut accepted: u32 = 0;
-        let mut total_cycles: u32 = 0;
+        let mut mtp_stats = crate::mtp::MtpStats::default();
         let t_start = std::time::Instant::now();
 
         const THINKING_BUDGET: u32 = 256;
@@ -1532,9 +1505,10 @@ impl SimpleEngine {
                 &mut mtp_cache,
                 &current_hidden,
                 confirmed_token_id,
+                self.tuning.mtp_draft_n_max(),
             )?;
 
-            total_cycles += 1;
+            mtp_stats.record_cycle(result.drafted, result.tokens.len());
 
             for &tok in &result.tokens {
                 // Thinking budget enforcement
@@ -1546,7 +1520,6 @@ impl SimpleEngine {
                             thinking_tokens += 1;
                             if thinking_tokens >= THINKING_BUDGET {
                                 tokens.push(close_id);
-                                accepted += 1;
                                 seen_think_close = true;
                                 tracing::info!(
                                     budget = THINKING_BUDGET,
@@ -1598,19 +1571,10 @@ impl SimpleEngine {
 
                                 if step_finished {
                                     let elapsed = t_start.elapsed();
-                                    tracing::info!(
-                                        tokens = accepted,
-                                        cycles = total_cycles,
-                                        accept_rate = format!(
-                                            "{:.1}%",
-                                            (f64::from(accepted) / f64::from(total_cycles) - 1.0)
-                                                * 100.0
-                                        ),
-                                        tok_per_s = format!(
-                                            "{:.1}",
-                                            f64::from(accepted) / elapsed.as_secs_f64()
-                                        ),
-                                        "MTP streaming decode complete"
+                                    Self::log_mtp_decode_stats(
+                                        &mtp_stats,
+                                        elapsed,
+                                        finish_reason.as_deref().unwrap_or("client"),
                                     );
                                 }
 
@@ -1639,7 +1603,6 @@ impl SimpleEngine {
                 }
 
                 tokens.push(tok);
-                accepted += 1;
 
                 let is_eos = self.eos_token_ids.contains(&tok);
                 let completion_len = Self::completion_len(tokens)?;
@@ -1679,15 +1642,10 @@ impl SimpleEngine {
 
                 if step_finished {
                     let elapsed = t_start.elapsed();
-                    tracing::info!(
-                        tokens = accepted,
-                        cycles = total_cycles,
-                        accept_rate = format!(
-                            "{:.1}%",
-                            (f64::from(accepted) / f64::from(total_cycles) - 1.0) * 100.0
-                        ),
-                        tok_per_s = format!("{:.1}", f64::from(accepted) / elapsed.as_secs_f64()),
-                        "MTP streaming decode complete"
+                    Self::log_mtp_decode_stats(
+                        &mtp_stats,
+                        elapsed,
+                        finish_reason.as_deref().unwrap_or("client"),
                     );
                 }
 

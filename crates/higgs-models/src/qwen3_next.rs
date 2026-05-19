@@ -3569,13 +3569,29 @@ impl Qwen3NextCausalLM {
         next_token_id: u32,
         mtp_cache: &mut [SteppingKeyValueCache],
     ) -> Result<Array, Exception> {
+        let (_, logits) = self.mtp_draft_with_hidden(hidden, next_token_id, mtp_cache)?;
+        Ok(logits)
+    }
+
+    /// Run the MTP head and return both its hidden state and draft logits.
+    ///
+    /// The hidden state is useful for chained speculative drafting. Final
+    /// committed MTP cache state is still replayed with backbone hidden states
+    /// after verification.
+    pub fn mtp_draft_with_hidden(
+        &mut self,
+        hidden: &Array,
+        next_token_id: u32,
+        mtp_cache: &mut [SteppingKeyValueCache],
+    ) -> Result<(Array, Array), Exception> {
         let normed = self.mtp_step_hidden(hidden, next_token_id, mtp_cache)?;
 
         // Now lm_head/embed_tokens can be borrowed immutably.
-        match self.lm_head.as_ref() {
+        let logits = match self.lm_head.as_ref() {
             Some(head) => head.forward(&normed),
             None => self.model.embed_tokens.as_linear(&normed),
-        }
+        }?;
+        Ok((normed, logits))
     }
 
     /// Advance the MTP cache for a newly accepted token without computing logits.

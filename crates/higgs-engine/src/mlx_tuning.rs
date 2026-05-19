@@ -9,11 +9,19 @@ const DEFAULT_CHUNKED_PREFILL_CHUNK_SIZE: i32 = 512;
 const DEFAULT_PAGED_KV_TARGET_BYTES: usize = 512 * 1024 * 1024;
 const MIN_PAGED_KV_TARGET_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PAGED_KV_TARGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
+const DEFAULT_MTP_DRAFT_N_MAX: usize = 3;
+const MAX_MTP_DRAFT_N_MAX: usize = 8;
 
 fn parse_positive_chunked_prefill_value(raw: Option<&str>, default: i32) -> i32 {
     raw.and_then(|s| s.parse::<i32>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(default)
+}
+
+fn parse_mtp_draft_n_max(raw: Option<&str>, default: usize) -> usize {
+    raw.and_then(|s| s.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .map_or(default, |v| v.min(MAX_MTP_DRAFT_N_MAX))
 }
 
 fn parse_enabled_flag(raw: Option<&str>) -> Option<bool> {
@@ -193,6 +201,7 @@ pub struct MlxRuntimeTuning {
     chunked_prefill_chunk_size: i32,
     clear_cache_after_prefill: bool,
     enable_mtp: bool,
+    mtp_draft_n_max: usize,
     paged_kv_target_bytes: usize,
 }
 
@@ -224,6 +233,10 @@ impl MlxRuntimeTuning {
         .unwrap_or(tuning.clear_cache_after_prefill);
         tuning.enable_mtp = parse_enabled_flag(std::env::var("HIGGS_MTP").ok().as_deref())
             .unwrap_or(tuning.enable_mtp);
+        tuning.mtp_draft_n_max = parse_mtp_draft_n_max(
+            std::env::var("HIGGS_MTP_DRAFT_N_MAX").ok().as_deref(),
+            tuning.mtp_draft_n_max,
+        );
 
         tuning
     }
@@ -248,6 +261,7 @@ impl MlxRuntimeTuning {
                 chunked_prefill_chunk_size: DEFAULT_CHUNKED_PREFILL_CHUNK_SIZE,
                 clear_cache_after_prefill: false,
                 enable_mtp: false,
+                mtp_draft_n_max: 1,
                 paged_kv_target_bytes: DEFAULT_PAGED_KV_TARGET_BYTES,
             },
             ResolvedMlxProfile::Latency => Self {
@@ -257,6 +271,7 @@ impl MlxRuntimeTuning {
                 chunked_prefill_chunk_size: balanced_chunk.max(768),
                 clear_cache_after_prefill: false,
                 enable_mtp: true,
+                mtp_draft_n_max: DEFAULT_MTP_DRAFT_N_MAX,
                 paged_kv_target_bytes: clamp_paged_kv_target_bytes(
                     balanced_paged_kv.saturating_mul(9) / 8,
                 ),
@@ -268,6 +283,7 @@ impl MlxRuntimeTuning {
                 chunked_prefill_chunk_size: balanced_chunk,
                 clear_cache_after_prefill: false,
                 enable_mtp: true,
+                mtp_draft_n_max: DEFAULT_MTP_DRAFT_N_MAX,
                 paged_kv_target_bytes: balanced_paged_kv,
             },
             ResolvedMlxProfile::Throughput => Self {
@@ -277,6 +293,7 @@ impl MlxRuntimeTuning {
                 chunked_prefill_chunk_size: balanced_chunk.max(1024),
                 clear_cache_after_prefill: false,
                 enable_mtp: true,
+                mtp_draft_n_max: DEFAULT_MTP_DRAFT_N_MAX,
                 paged_kv_target_bytes: clamp_paged_kv_target_bytes(
                     balanced_paged_kv.saturating_mul(5) / 4,
                 ),
@@ -309,6 +326,10 @@ impl MlxRuntimeTuning {
 
     pub const fn enable_mtp(&self) -> bool {
         self.enable_mtp
+    }
+
+    pub const fn mtp_draft_n_max(&self) -> usize {
+        self.mtp_draft_n_max
     }
 
     pub const fn paged_kv_target_bytes(&self) -> usize {
@@ -517,8 +538,8 @@ fn mlx_max_recommended_working_set_size() -> Option<usize> {
 mod tests {
     use super::{
         MlxRuntimeTuning, ModelMetadata, RequestedMlxProfile, ResolvedMlxProfile,
-        parse_enabled_flag, parse_positive_chunked_prefill_value, resolve_effective_mlx_profile,
-        resolve_profile_from_metadata, resolve_runtime_tuning,
+        parse_enabled_flag, parse_mtp_draft_n_max, parse_positive_chunked_prefill_value,
+        resolve_effective_mlx_profile, resolve_profile_from_metadata, resolve_runtime_tuning,
     };
     use std::fs;
     use tempfile::TempDir;
@@ -659,6 +680,16 @@ mod tests {
         assert_eq!(parse_positive_chunked_prefill_value(Some("-8"), 32), 32);
         assert_eq!(parse_positive_chunked_prefill_value(Some("bad"), 32), 32);
         assert_eq!(parse_positive_chunked_prefill_value(None, 32), 32);
+    }
+
+    #[test]
+    fn test_parse_mtp_draft_n_max_clamps_invalid_and_large_values() {
+        assert_eq!(parse_mtp_draft_n_max(Some("1"), 3), 1);
+        assert_eq!(parse_mtp_draft_n_max(Some("3"), 1), 3);
+        assert_eq!(parse_mtp_draft_n_max(Some("0"), 3), 3);
+        assert_eq!(parse_mtp_draft_n_max(Some("bad"), 3), 3);
+        assert_eq!(parse_mtp_draft_n_max(Some("99"), 3), 8);
+        assert_eq!(parse_mtp_draft_n_max(None, 3), 3);
     }
 
     #[test]

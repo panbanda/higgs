@@ -25,6 +25,18 @@ The harness evaluates:
 - structured-output correctness
 - prefix-cache speedup on multi-turn conversations
 
+## MTP Draft-Depth Sweep
+
+Use the focused MTP sweep to compare baseline greedy decode with MTP disabled
+against draft depths 1, 2, and 3:
+
+```bash
+python3 benchmarks/bench_mtp.py ~/.cache/lm-studio/models/mlx-community/Qwen3.6-35B-A3B-4bit
+```
+
+The sweep sets `temperature=0`, starts a fresh server per trial, and reports
+completion tokens per second for each MTP setting.
+
 ## Iterations
 
 The harness compares five iterations:

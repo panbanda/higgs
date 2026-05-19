@@ -419,6 +419,25 @@ impl AnyModel {
         }
     }
 
+    /// Run the MTP head and return both speculative hidden state and logits.
+    pub fn mtp_draft_with_hidden(
+        &mut self,
+        hidden: &Array,
+        next_token_id: u32,
+        mtp_cache: &mut MtpCache,
+    ) -> Result<(Array, Array), Exception> {
+        match self {
+            Self::Qwen3Next(m) => m.mtp_draft_with_hidden(hidden, next_token_id, mtp_cache),
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::LlavaQwen2(_)
+            | Self::DeepSeekV2(_) => Err(Exception::custom("MTP not supported for this model")),
+        }
+    }
+
     /// Advance the MTP head/cache for an accepted token without projecting logits.
     pub fn mtp_advance(
         &mut self,
