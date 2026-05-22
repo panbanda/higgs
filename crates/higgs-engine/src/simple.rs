@@ -1369,6 +1369,8 @@ impl SimpleEngine {
                                     if let Some(truncated) =
                                         check_stop_sequences(&text, stop_sequences)
                                     {
+                                        let elapsed = t_start.elapsed();
+                                        Self::log_mtp_decode_stats(&mtp_stats, elapsed, "stop");
                                         return Ok(GenerationOutput {
                                             text: truncated,
                                             finish_reason: "stop".to_owned(),
@@ -1417,6 +1419,8 @@ impl SimpleEngine {
             if has_stop_sequences {
                 let text = self.decode_tokens(tokens)?;
                 if let Some(truncated) = check_stop_sequences(&text, stop_sequences) {
+                    let elapsed = t_start.elapsed();
+                    Self::log_mtp_decode_stats(&mtp_stats, elapsed, "stop");
                     return Ok(GenerationOutput {
                         text: truncated,
                         finish_reason: "stop".to_owned(),

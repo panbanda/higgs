@@ -434,7 +434,8 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
-            | Self::DeepSeekV2(_) => Err(Exception::custom("MTP not supported for this model")),
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
         }
     }
 

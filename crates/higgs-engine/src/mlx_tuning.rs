@@ -201,6 +201,10 @@ pub struct MlxRuntimeTuning {
     chunked_prefill_chunk_size: i32,
     clear_cache_after_prefill: bool,
     enable_mtp: bool,
+    /// Maximum MTP draft tokens per speculative cycle.
+    ///
+    /// Controlled by `HIGGS_MTP_DRAFT_N_MAX`; defaults to 3 for non-baseline
+    /// profiles and is clamped to 1..=8.
     mtp_draft_n_max: usize,
     paged_kv_target_bytes: usize,
 }
@@ -328,6 +332,9 @@ impl MlxRuntimeTuning {
         self.enable_mtp
     }
 
+    /// Maximum MTP draft tokens per speculative cycle.
+    ///
+    /// Configurable via `HIGGS_MTP_DRAFT_N_MAX`.
     pub const fn mtp_draft_n_max(&self) -> usize {
         self.mtp_draft_n_max
     }

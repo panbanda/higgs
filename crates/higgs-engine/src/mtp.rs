@@ -15,11 +15,17 @@ const fn draft_matches_target(draft_token_id: u32, target_id: u32) -> bool {
 }
 
 /// Aggregate MTP decode counters.
+///
+/// Tracks per-cycle telemetry for MTP speculative decoding.
 #[derive(Debug, Default, Clone)]
 pub struct MtpStats {
+    /// Number of speculative decode cycles executed.
     cycles: u32,
+    /// Total speculative tokens drafted by the MTP head.
     drafted: u32,
+    /// Drafted tokens that matched the backbone verifier.
     accepted_drafts: u32,
+    /// Tokens emitted by MTP cycles, including confirmed tokens and accepted drafts.
     emitted: u32,
 }
 
@@ -254,6 +260,6 @@ mod tests {
         assert_eq!(stats.drafted(), 5);
         assert_eq!(stats.emitted(), 5);
         assert_eq!(stats.accepted_drafts(), 3);
-        assert_eq!(stats.acceptance_rate_percent(), 60.0);
+        assert!((stats.acceptance_rate_percent() - 60.0).abs() < f64::EPSILON);
     }
 }

@@ -17,6 +17,7 @@ import sys
 import time
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 
@@ -31,6 +32,20 @@ DEFAULT_PROMPT = (
 class Trial:
     label: str
     env: dict[str, str]
+
+
+def derive_model_name(model_path: str) -> str:
+    path = Path(model_path.rstrip("/"))
+    parts = path.parts
+    if "snapshots" in parts:
+        idx = parts.index("snapshots")
+        if idx > 0:
+            cache_name = parts[idx - 1]
+            if cache_name.startswith("models--"):
+                name = cache_name.removeprefix("models--").replace("--", "/")
+                if name:
+                    return name
+    return path.name or model_path
 
 
 def wait_for_server(base: str, timeout: float) -> None:
@@ -135,7 +150,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--request-timeout", type=int, default=600)
     args = parser.parse_args()
     if args.model_name is None:
-        args.model_name = os.path.basename(args.model_path.rstrip("/")) or args.model_path
+        args.model_name = derive_model_name(args.model_path)
     return args
 
 
