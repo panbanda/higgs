@@ -4609,8 +4609,7 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
                 unmatched.push(key);
                 continue;
             };
-            if let Some((target_key, dense_mtp_target)) =
-                qwen35_target_param_key(&params, stripped)
+            if let Some((target_key, dense_mtp_target)) = qwen35_target_param_key(&params, stripped)
             {
                 if let Some(param) = params.get_mut(target_key.as_str()) {
                     **param = qwen35_loaded_value(stripped, value, dense_mtp_target)?;
