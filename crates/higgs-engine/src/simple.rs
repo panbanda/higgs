@@ -56,6 +56,35 @@ fn experimental_paged_kv_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn prompt_lookup_enabled() -> bool {
+    parse_enabled_flag(std::env::var("HIGGS_PROMPT_LOOKUP").ok().as_deref()).unwrap_or(false)
+}
+
+fn unchecked_prompt_lookup_enabled() -> bool {
+    parse_enabled_flag(
+        std::env::var("HIGGS_PROMPT_LOOKUP_UNCHECKED")
+            .ok()
+            .as_deref(),
+    )
+    .unwrap_or(false)
+}
+
+fn parse_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn prompt_lookup_config() -> crate::mtp::PromptLookupConfig {
+    let defaults = crate::mtp::PromptLookupConfig::default();
+    crate::mtp::PromptLookupConfig {
+        max_drafts: parse_env_usize("HIGGS_PROMPT_LOOKUP_DRAFT_N_MAX", defaults.max_drafts),
+        max_ngram: parse_env_usize("HIGGS_PROMPT_LOOKUP_NGRAM_MAX", defaults.max_ngram),
+        max_window: parse_env_usize("HIGGS_PROMPT_LOOKUP_WINDOW", defaults.max_window),
+    }
+}
+
 fn estimate_paged_kv_blocks(
     target_bytes: usize,
     num_kv_heads: usize,
@@ -992,6 +1021,24 @@ impl SimpleEngine {
             });
         }
 
+        // Architecture-neutral speculative decode: prompt-lookup drafting plus
+        // batched verifier logits. Explicitly opt-in while benchmark data is
+        // collected because the normal path has a pipelined single-token loop.
+        #[allow(clippy::float_cmp)]
+        if prompt_lookup_enabled() && constraint.is_none() && !logprobs && params.temperature == 0.0
+        {
+            return self.prompt_lookup_generate(
+                &mut prepared.model,
+                &mut prepared.cache,
+                first_token_id,
+                max_tokens,
+                prompt_len,
+                &mut tokens,
+                stop_sequences,
+                enable_thinking,
+            );
+        }
+
         // MTP speculative decode: enabled by the resolved MLX runtime tuning.
         // Only for greedy (temperature == 0), no constraints, no logprobs.
         #[allow(clippy::float_cmp)]
@@ -1267,6 +1314,215 @@ impl SimpleEngine {
             tok_per_s = format!("{:.1}", f64::from(stats.emitted()) / elapsed.as_secs_f64()),
             "MTP decode complete"
         );
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn log_prompt_lookup_decode_stats(
+        stats: &crate::mtp::MtpStats,
+        elapsed: std::time::Duration,
+        reason: &str,
+    ) {
+        tracing::info!(
+            reason,
+            cycles = stats.cycles(),
+            drafted = stats.drafted(),
+            accepted_drafts = stats.accepted_drafts(),
+            emitted = stats.emitted(),
+            accept_rate = format!("{:.1}%", stats.acceptance_rate_percent()),
+            tok_per_s = format!("{:.1}", f64::from(stats.emitted()) / elapsed.as_secs_f64()),
+            "Prompt-lookup decode complete"
+        );
+    }
+
+    /// Architecture-neutral prompt-lookup speculative decode loop.
+    ///
+    /// The draft provider copies likely next tokens from repeated prompt/history
+    /// spans, then verifies the whole candidate window in one model pass.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::as_conversions,
+        clippy::cast_precision_loss
+    )]
+    fn prompt_lookup_generate(
+        &self,
+        model: &mut higgs_models::AnyModel,
+        cache: &mut higgs_models::AnyCache,
+        first_token_id: u32,
+        max_tokens: u32,
+        prompt_len: u32,
+        tokens: &mut Vec<u32>,
+        stop_sequences: &[String],
+        enable_thinking: bool,
+    ) -> Result<GenerationOutput, EngineError> {
+        let has_stop_sequences = !stop_sequences.is_empty();
+        let unchecked_lookup = unchecked_prompt_lookup_enabled();
+        let first_token_i32 = i32::try_from(first_token_id)
+            .map_err(|_| EngineError::Generation("token id exceeds i32 range".to_owned()))?;
+        let first_input = Array::from_slice(&[first_token_i32], &[1, 1]);
+        let logits = model
+            .forward_all_logits(&first_input, None, cache)
+            .map_err(EngineError::Mlx)?;
+        let next_arr =
+            mlx_rs::argmax_axis!(&logits.index((.., -1, ..)), -1).map_err(EngineError::Mlx)?;
+        eval([&next_arr]).map_err(EngineError::Mlx)?;
+
+        let mut confirmed_token_id: u32 = next_arr.item();
+        let base_config = prompt_lookup_config();
+        let mut stats = crate::mtp::MtpStats::default();
+        let t_start = std::time::Instant::now();
+
+        const THINKING_BUDGET: u32 = 256;
+        let think_close_token = if enable_thinking {
+            self.think_close_token
+        } else {
+            None
+        };
+        let mut thinking_tokens: u32 = u32::from(think_close_token.is_some());
+        let mut seen_think_close =
+            think_close_token.is_some_and(|close_id| first_token_id == close_id);
+
+        loop {
+            let completion_len = Self::completion_len(tokens)?;
+            if completion_len >= max_tokens {
+                let elapsed = t_start.elapsed();
+                Self::log_prompt_lookup_decode_stats(&stats, elapsed, "length");
+                return Ok(GenerationOutput {
+                    text: self.decode_tokens(tokens)?,
+                    finish_reason: "length".to_owned(),
+                    prompt_tokens: prompt_len,
+                    completion_tokens: completion_len,
+                    token_logprobs: None,
+                });
+            }
+
+            let remaining = usize::try_from(max_tokens.saturating_sub(completion_len))
+                .map_err(|_| EngineError::Generation("max_tokens overflow".to_owned()))?;
+            let config = crate::mtp::PromptLookupConfig {
+                max_drafts: base_config.max_drafts.min(remaining.saturating_sub(1)),
+                ..base_config
+            };
+
+            let result = if unchecked_lookup {
+                crate::mtp::unchecked_prompt_lookup_cycle(
+                    model,
+                    cache,
+                    tokens,
+                    confirmed_token_id,
+                    config,
+                )?
+            } else {
+                crate::mtp::prompt_lookup_cycle(model, cache, tokens, confirmed_token_id, config)?
+            };
+            stats.record_cycle(result.drafted, result.tokens.len());
+
+            for &tok in &result.tokens {
+                if let Some(close_id) = think_close_token {
+                    if !seen_think_close {
+                        if tok == close_id {
+                            seen_think_close = true;
+                        } else {
+                            thinking_tokens += 1;
+                            if thinking_tokens >= THINKING_BUDGET {
+                                tokens.push(close_id);
+                                seen_think_close = true;
+                                tracing::info!(
+                                    budget = THINKING_BUDGET,
+                                    "Prompt lookup: thinking budget reached, forcing </think>"
+                                );
+                                if self.eos_token_ids.contains(&close_id) {
+                                    let elapsed = t_start.elapsed();
+                                    Self::log_prompt_lookup_decode_stats(&stats, elapsed, "stop");
+                                    return Ok(GenerationOutput {
+                                        text: self.decode_tokens(tokens)?,
+                                        finish_reason: "stop".to_owned(),
+                                        prompt_tokens: prompt_len,
+                                        completion_tokens: Self::completion_len(tokens)?,
+                                        token_logprobs: None,
+                                    });
+                                }
+
+                                if has_stop_sequences {
+                                    let text = self.decode_tokens(tokens)?;
+                                    if let Some(truncated) =
+                                        check_stop_sequences(&text, stop_sequences)
+                                    {
+                                        let elapsed = t_start.elapsed();
+                                        Self::log_prompt_lookup_decode_stats(
+                                            &stats, elapsed, "stop",
+                                        );
+                                        return Ok(GenerationOutput {
+                                            text: truncated,
+                                            finish_reason: "stop".to_owned(),
+                                            prompt_tokens: prompt_len,
+                                            completion_tokens: Self::completion_len(tokens)?,
+                                            token_logprobs: None,
+                                        });
+                                    }
+                                }
+
+                                let completion_len = Self::completion_len(tokens)?;
+                                if completion_len >= max_tokens {
+                                    let elapsed = t_start.elapsed();
+                                    Self::log_prompt_lookup_decode_stats(&stats, elapsed, "length");
+                                    return Ok(GenerationOutput {
+                                        text: self.decode_tokens(tokens)?,
+                                        finish_reason: "length".to_owned(),
+                                        prompt_tokens: prompt_len,
+                                        completion_tokens: completion_len,
+                                        token_logprobs: None,
+                                    });
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                tokens.push(tok);
+
+                if self.eos_token_ids.contains(&tok) {
+                    let elapsed = t_start.elapsed();
+                    Self::log_prompt_lookup_decode_stats(&stats, elapsed, "stop");
+                    return Ok(GenerationOutput {
+                        text: self.decode_tokens(tokens)?,
+                        finish_reason: "stop".to_owned(),
+                        prompt_tokens: prompt_len,
+                        completion_tokens: Self::completion_len(tokens)?,
+                        token_logprobs: None,
+                    });
+                }
+            }
+
+            if has_stop_sequences {
+                let text = self.decode_tokens(tokens)?;
+                if let Some(truncated) = check_stop_sequences(&text, stop_sequences) {
+                    let elapsed = t_start.elapsed();
+                    Self::log_prompt_lookup_decode_stats(&stats, elapsed, "stop");
+                    return Ok(GenerationOutput {
+                        text: truncated,
+                        finish_reason: "stop".to_owned(),
+                        prompt_tokens: prompt_len,
+                        completion_tokens: Self::completion_len(tokens)?,
+                        token_logprobs: None,
+                    });
+                }
+            }
+
+            let completion_len = Self::completion_len(tokens)?;
+            if completion_len >= max_tokens {
+                let elapsed = t_start.elapsed();
+                Self::log_prompt_lookup_decode_stats(&stats, elapsed, "length");
+                return Ok(GenerationOutput {
+                    text: self.decode_tokens(tokens)?,
+                    finish_reason: "length".to_owned(),
+                    prompt_tokens: prompt_len,
+                    completion_tokens: completion_len,
+                    token_logprobs: None,
+                });
+            }
+
+            confirmed_token_id = result.next_token_id;
+        }
     }
 
     /// MTP speculative decode loop.

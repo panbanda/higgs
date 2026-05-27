@@ -82,6 +82,36 @@ pub struct MtpCycleResult {
     pub accepted_drafts: usize,
 }
 
+/// Prompt-lookup speculative decode settings.
+#[derive(Debug, Clone, Copy)]
+pub struct PromptLookupConfig {
+    pub max_drafts: usize,
+    pub max_ngram: usize,
+    pub max_window: usize,
+}
+
+impl Default for PromptLookupConfig {
+    fn default() -> Self {
+        Self {
+            max_drafts: 6,
+            max_ngram: 8,
+            max_window: 2048,
+        }
+    }
+}
+
+/// Result of one architecture-neutral prompt-lookup speculative cycle.
+pub struct PromptLookupCycleResult {
+    /// Token IDs accepted this cycle (the confirmed token plus accepted drafts).
+    pub tokens: Vec<u32>,
+    /// The next confirmed token to process in the following cycle.
+    pub next_token_id: u32,
+    /// Number of prompt-lookup draft tokens proposed this cycle.
+    pub drafted: usize,
+    /// Number of prompt-lookup draft tokens accepted this cycle.
+    pub accepted_drafts: usize,
+}
+
 fn greedy_token_id(logits: &Array) -> Result<u32, EngineError> {
     let token_arr = argmax_axis!(&logits.index((.., -1, ..)), -1).map_err(EngineError::Mlx)?;
     eval([&token_arr]).map_err(EngineError::Mlx)?;
@@ -107,6 +137,153 @@ fn emitted_tokens(confirmed_token_id: u32, drafts: &[u32], accepted_drafts: usiz
     tokens.push(confirmed_token_id);
     tokens.extend(drafts.iter().take(accepted_drafts).copied());
     tokens
+}
+
+pub fn prompt_lookup_draft(
+    context: &[u32],
+    max_drafts: usize,
+    max_ngram: usize,
+    max_window: usize,
+) -> Vec<u32> {
+    if context.is_empty() || max_drafts == 0 || max_ngram == 0 {
+        return Vec::new();
+    }
+
+    let end = context.len();
+    let max_ngram = max_ngram.min(end);
+    let search_start = end.saturating_sub(max_window.max(1));
+
+    for ngram in (1..=max_ngram).rev() {
+        let suffix = &context[end - ngram..end];
+        let search_end = end.saturating_sub(ngram);
+
+        for pos in (search_start..search_end).rev() {
+            let match_end = pos + ngram;
+            if &context[pos..match_end] != suffix {
+                continue;
+            }
+
+            let draft_start = match_end;
+            if draft_start >= end {
+                continue;
+            }
+            let draft_end = draft_start.saturating_add(max_drafts).min(end);
+            return context[draft_start..draft_end].to_vec();
+        }
+    }
+
+    Vec::new()
+}
+
+/// Run one prompt-lookup speculative decode cycle.
+///
+/// This is architecture-neutral: the draft provider only copies tokens from
+/// prior prompt/history, and the model verifies `[confirmed + drafts]` in one
+/// forward pass using all-position logits.
+pub fn prompt_lookup_cycle(
+    model: &mut AnyModel,
+    cache: &mut AnyCache,
+    history_before_confirmed: &[u32],
+    confirmed_token_id: u32,
+    config: PromptLookupConfig,
+) -> Result<PromptLookupCycleResult, EngineError> {
+    let mut lookup_context = Vec::with_capacity(history_before_confirmed.len().saturating_add(1));
+    lookup_context.extend_from_slice(history_before_confirmed);
+    lookup_context.push(confirmed_token_id);
+    let drafts = prompt_lookup_draft(
+        &lookup_context,
+        config.max_drafts,
+        config.max_ngram,
+        config.max_window,
+    );
+
+    let base_cache = cache.clone();
+    let mut verify_tokens = Vec::with_capacity(drafts.len().saturating_add(1));
+    verify_tokens.push(confirmed_token_id);
+    verify_tokens.extend(drafts.iter().copied());
+
+    let logits = model
+        .forward_all_logits(&token_input(&verify_tokens)?, None, cache)
+        .map_err(EngineError::Mlx)?;
+    let verifier_targets = greedy_token_ids(&logits)?;
+    if verifier_targets.len() < verify_tokens.len() {
+        return Err(EngineError::Generation(format!(
+            "prompt-lookup verifier returned {} target ids for {} input tokens",
+            verifier_targets.len(),
+            verify_tokens.len()
+        )));
+    }
+
+    let accepted_drafts = accepted_draft_prefix_len(&drafts, &verifier_targets);
+    let tokens = emitted_tokens(confirmed_token_id, &drafts, accepted_drafts);
+
+    let next_token_id = if accepted_drafts == drafts.len() {
+        *verifier_targets.get(accepted_drafts).ok_or_else(|| {
+            EngineError::Generation(format!(
+                "prompt-lookup verifier missing target at accepted index {accepted_drafts}"
+            ))
+        })?
+    } else {
+        *cache = base_cache;
+        let replay_logits = model
+            .forward_all_logits(&token_input(&tokens)?, None, cache)
+            .map_err(EngineError::Mlx)?;
+        let replay_targets = greedy_token_ids(&replay_logits)?;
+        *replay_targets.get(accepted_drafts).ok_or_else(|| {
+            EngineError::Generation(format!(
+                "prompt-lookup replay returned {} target ids for accepted index {}",
+                replay_targets.len(),
+                accepted_drafts
+            ))
+        })?
+    };
+
+    Ok(PromptLookupCycleResult {
+        tokens,
+        next_token_id,
+        drafted: drafts.len(),
+        accepted_drafts,
+    })
+}
+
+/// Run one unchecked prompt-lookup cycle.
+///
+/// This path copies draft tokens from prompt/history without per-token verifier
+/// logits. It still advances the target model cache over the emitted span and
+/// samples the next token from the final position, but it is not guaranteed to
+/// reproduce greedy decode if the copied tokens would have been rejected.
+pub fn unchecked_prompt_lookup_cycle(
+    model: &mut AnyModel,
+    cache: &mut AnyCache,
+    history_before_confirmed: &[u32],
+    confirmed_token_id: u32,
+    config: PromptLookupConfig,
+) -> Result<PromptLookupCycleResult, EngineError> {
+    let mut lookup_context = Vec::with_capacity(history_before_confirmed.len().saturating_add(1));
+    lookup_context.extend_from_slice(history_before_confirmed);
+    lookup_context.push(confirmed_token_id);
+    let drafts = prompt_lookup_draft(
+        &lookup_context,
+        config.max_drafts,
+        config.max_ngram,
+        config.max_window,
+    );
+
+    let mut tokens = Vec::with_capacity(drafts.len().saturating_add(1));
+    tokens.push(confirmed_token_id);
+    tokens.extend(drafts.iter().copied());
+
+    let logits = model
+        .forward_last_token(&token_input(&tokens)?, None, cache)
+        .map_err(EngineError::Mlx)?;
+    let next_token_id = greedy_token_id(&logits)?;
+
+    Ok(PromptLookupCycleResult {
+        tokens,
+        next_token_id,
+        drafted: drafts.len(),
+        accepted_drafts: drafts.len(),
+    })
 }
 
 fn token_input(tokens: &[u32]) -> Result<Array, EngineError> {
@@ -278,7 +455,10 @@ pub fn mtp_cycle(
 
 #[cfg(test)]
 mod tests {
-    use super::{MtpStats, accepted_draft_prefix_len, draft_matches_target, emitted_tokens};
+    use super::{
+        MtpStats, accepted_draft_prefix_len, draft_matches_target, emitted_tokens,
+        prompt_lookup_draft,
+    };
 
     #[test]
     fn draft_match_helper_accepts_identical_tokens() {
@@ -324,5 +504,33 @@ mod tests {
         let drafts = [10, 20, 30];
 
         assert_eq!(emitted_tokens(7, &drafts, 2), vec![7, 10, 20]);
+    }
+
+    #[test]
+    fn prompt_lookup_drafts_from_longest_prior_suffix_match() {
+        let context = [1, 2, 3, 4, 5, 1, 2];
+
+        assert_eq!(prompt_lookup_draft(&context, 3, 4, 64), vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn prompt_lookup_caps_drafts() {
+        let context = [9, 8, 7, 6, 9, 8];
+
+        assert_eq!(prompt_lookup_draft(&context, 1, 3, 64), vec![7]);
+    }
+
+    #[test]
+    fn prompt_lookup_ignores_current_tail_self_match() {
+        let context = [1, 2, 3, 4];
+
+        assert!(prompt_lookup_draft(&context, 3, 4, 64).is_empty());
+    }
+
+    #[test]
+    fn prompt_lookup_respects_search_window() {
+        let context = [1, 2, 3, 4, 5, 1, 2];
+
+        assert!(prompt_lookup_draft(&context, 3, 4, 3).is_empty());
     }
 }

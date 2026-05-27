@@ -845,6 +845,45 @@ impl Gemma2CausalLM {
         Ok(logits)
     }
 
+    /// Forward pass producing logits for every input position.
+    pub fn forward_all_logits<C: KeyValueCache>(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<C>>,
+    ) -> Result<Array, Exception> {
+        let hidden_all = self.forward_hidden(inputs, mask, kv_cache)?;
+        let mut logits = match self.lm_head.as_mut() {
+            Some(head) => head.forward(&hidden_all)?,
+            None => match &mut self.model.embed_tokens {
+                MaybeQuantized::Original(embed) => embed.as_linear(&hidden_all)?,
+                MaybeQuantized::Quantized(q_embed) => q_embed.as_linear(&hidden_all)?,
+            },
+        };
+
+        if let Some(cap) = self.args.final_logit_softcapping {
+            let needs_refresh = self
+                .cached_final_inv_cap
+                .as_ref()
+                .is_none_or(|cached| cached.dtype() != logits.dtype());
+            if needs_refresh {
+                self.cached_final_inv_cap = Some(array!(1.0 / cap).as_dtype(logits.dtype())?);
+                self.cached_final_cap = Some(array!(cap).as_dtype(logits.dtype())?);
+            }
+            let final_inv_cap = self
+                .cached_final_inv_cap
+                .as_ref()
+                .ok_or_else(|| Exception::custom("cached_final_inv_cap not initialized"))?;
+            let final_cap = self
+                .cached_final_cap
+                .as_ref()
+                .ok_or_else(|| Exception::custom("cached_final_cap not initialized"))?;
+            logits = ops::tanh(&logits.multiply(final_inv_cap)?)?.multiply(final_cap)?;
+        }
+
+        Ok(logits)
+    }
+
     pub fn forward_hidden<C: KeyValueCache>(
         &mut self,
         inputs: &Array,

@@ -281,6 +281,35 @@ impl AnyModel {
         }
     }
 
+    /// Forward pass producing logits for every input position.
+    ///
+    /// Speculative verifiers use this for a candidate window where each
+    /// position's logits predict the following token.
+    pub fn forward_all_logits(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+    ) -> Result<Array, Exception> {
+        match (self, cache) {
+            (Self::Transformer(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
+            (Self::Qwen3Moe(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
+            (Self::Gemma2(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
+            (Self::Phi3(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
+            (Self::Starcoder2(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
+            (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text_all_logits(inputs, mask, c),
+            (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                let (_, logits) = m.forward_with_hidden(inputs, mask, c)?;
+                Ok(logits)
+            }
+            (Self::BonsaiQ1(_), AnyCache::KV(_)) => Err(Exception::custom(
+                "forward_all_logits not supported for BonsaiQ1",
+            )),
+            _ => Err(Exception::custom("Model/cache type mismatch")),
+        }
+    }
+
     /// Chunked prefill: process the prompt in `chunk_size`-token segments.
     ///
     /// Produces identical logits to `forward()` but evaluates the compute graph

@@ -858,6 +858,21 @@ impl DeepSeekV2CausalLM {
             None => self.model.embed_tokens.as_linear(&h_last),
         }
     }
+
+    /// Run the model and return logits for every input position.
+    #[allow(non_snake_case)]
+    pub fn forward_all_logits(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<SteppingKeyValueCache>>,
+    ) -> Result<Array, Exception> {
+        let h = self.forward_hidden(inputs, mask, kv_cache)?;
+        match self.lm_head.as_ref() {
+            Some(head) => head.forward(&h),
+            None => self.model.embed_tokens.as_linear(&h),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

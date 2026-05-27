@@ -129,6 +129,16 @@ impl LlavaQwen2Model {
         self.language_model.forward_hidden(inputs, mask, cache)
     }
 
+    /// Forward pass for text-only, returning logits for every input position.
+    pub fn forward_text_all_logits<C: KeyValueCache>(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut Vec<Option<C>>,
+    ) -> Result<Array, Exception> {
+        self.language_model.forward_all_logits(inputs, mask, cache)
+    }
+
     /// Encode an image through the vision tower and projector.
     ///
     /// Input: `pixel_values` with shape `[1, H, W, 3]` (NHWC).

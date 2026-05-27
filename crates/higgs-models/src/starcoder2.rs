@@ -586,6 +586,23 @@ impl Starcoder2CausalLM {
         }
     }
 
+    #[allow(non_snake_case)]
+    pub fn forward_all_logits<C: KeyValueCache>(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<C>>,
+    ) -> Result<Array, Exception> {
+        let out = self.forward_hidden(inputs, mask, kv_cache)?;
+        match self.lm_head.as_mut() {
+            Some(head) => head.forward(&out),
+            None => match &mut self.model.embed_tokens {
+                MaybeQuantized::Original(embed) => embed.as_linear(&out),
+                MaybeQuantized::Quantized(q_embed) => q_embed.as_linear(&out),
+            },
+        }
+    }
+
     pub fn forward_hidden<C: KeyValueCache>(
         &mut self,
         inputs: &Array,

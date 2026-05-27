@@ -601,6 +601,17 @@ impl Model {
         self.apply_lm_head(&last)
     }
 
+    /// Run a forward pass producing logits for every input position.
+    pub fn forward_all_logits<C: KeyValueCache>(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<C>>,
+    ) -> Result<Array, Exception> {
+        let hidden = self.forward_hidden(inputs, mask, kv_cache)?;
+        self.apply_lm_head_all(&hidden)
+    }
+
     /// Get the hidden size.
     pub const fn hidden_size(&self) -> i32 {
         self.args.hidden_size
@@ -844,6 +855,16 @@ impl Model {
             None => match &mut self.model.embed_tokens {
                 MaybeQuantized::Original(embed) => embed.as_linear(&lm_input),
                 MaybeQuantized::Quantized(q_embed) => q_embed.as_linear(&lm_input),
+            },
+        }
+    }
+
+    fn apply_lm_head_all(&mut self, hidden: &Array) -> Result<Array, Exception> {
+        match self.lm_head.as_mut() {
+            Some(head) => head.forward(hidden),
+            None => match &mut self.model.embed_tokens {
+                MaybeQuantized::Original(embed) => embed.as_linear(hidden),
+                MaybeQuantized::Quantized(q_embed) => q_embed.as_linear(hidden),
             },
         }
     }

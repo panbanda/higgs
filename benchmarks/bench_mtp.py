@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Sweep Higgs MTP draft depth for a local MLX model.
+"""Sweep Higgs speculative decode modes for a local MLX model.
 
-The benchmark compares baseline greedy decode with MTP disabled against
-`HIGGS_MTP_DRAFT_N_MAX` values 1, 2, and 3. It starts a fresh Higgs server for
+The benchmark compares baseline greedy decode against built-in MTP draft depth
+and prompt-lookup speculative decode trials. It starts a fresh Higgs server for
 each run so model/runtime env is isolated.
 """
 
@@ -148,7 +148,9 @@ def run_trial(args: argparse.Namespace, trial: Trial) -> dict[str, Any]:
         "server_log": "\n".join(
             line
             for line in server_log.splitlines()
-            if "MTP decode complete" in line or "Engine ready" in line
+            if "MTP decode complete" in line
+            or "Prompt-lookup decode complete" in line
+            or "Engine ready" in line
         ),
     }
 
@@ -181,6 +183,26 @@ def main() -> int:
         trial = trial.strip()
         if trial == "baseline":
             trials.append(Trial("baseline_mtp_off", {"HIGGS_MTP": "0"}))
+        elif trial in {"mtp_default", "default"}:
+            trials.append(Trial("mtp_default", {"HIGGS_MTP": "1"}))
+        elif trial in {"prompt_lookup", "plookup"}:
+            trials.append(
+                Trial(
+                    "prompt_lookup",
+                    {"HIGGS_MTP": "0", "HIGGS_PROMPT_LOOKUP": "1"},
+                )
+            )
+        elif trial in {"prompt_lookup_unchecked", "plookup_unchecked"}:
+            trials.append(
+                Trial(
+                    "prompt_lookup_unchecked",
+                    {
+                        "HIGGS_MTP": "0",
+                        "HIGGS_PROMPT_LOOKUP": "1",
+                        "HIGGS_PROMPT_LOOKUP_UNCHECKED": "1",
+                    },
+                )
+            )
         elif trial:
             depth = int(trial)
             trials.append(
