@@ -1086,6 +1086,8 @@ pub struct WeightMapIndex {
     pub weight_map: HashMap<String, String>,
 }
 
+const AUXILIARY_SAFETENSORS_FILES: &[&str] = &["mtp.safetensors", "model-mtp.safetensors"];
+
 /// Load a tokenizer from a model directory.
 pub fn load_tokenizer<P: AsRef<Path>>(model_dir: P) -> Result<tokenizers::Tokenizer, ModelError> {
     let file = model_dir.as_ref().join("tokenizer.json");
@@ -1223,6 +1225,15 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
 
 /// Collect safetensors file paths from a model directory.
 fn collect_safetensors_files(model_path: &Path) -> Result<Vec<std::path::PathBuf>, ModelError> {
+    fn append_existing_auxiliary_files(model_path: &Path, files: &mut Vec<std::path::PathBuf>) {
+        for file_name in AUXILIARY_SAFETENSORS_FILES {
+            let file_path = model_path.join(file_name);
+            if file_path.exists() && !files.iter().any(|path| path == &file_path) {
+                files.push(file_path);
+            }
+        }
+    }
+
     let index_path = model_path.join("model.safetensors.index.json");
     if index_path.exists() {
         let json = std::fs::read_to_string(&index_path)?;
@@ -1233,11 +1244,16 @@ fn collect_safetensors_files(model_path: &Path) -> Result<Vec<std::path::PathBuf
             .map(|f| model_path.join(f))
             .collect();
         files.sort();
+        append_existing_auxiliary_files(model_path, &mut files);
+        files.sort();
         Ok(files)
     } else {
         let single_path = model_path.join("model.safetensors");
         if single_path.exists() {
-            Ok(vec![single_path])
+            let mut files = vec![single_path];
+            append_existing_auxiliary_files(model_path, &mut files);
+            files.sort();
+            Ok(files)
         } else {
             Err(ModelError::MissingWeight(
                 "No safetensors files found".to_owned(),
@@ -1448,6 +1464,33 @@ mod tests {
         let result = collect_safetensors_files(dir.path()).unwrap();
         // Two unique shard files
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn collect_safetensors_index_json_includes_auxiliary_mtp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_json = r#"{
+            "metadata": {"total_size": 12345},
+            "weight_map": {
+                "model.embed_tokens.weight": "model-00001-of-00001.safetensors"
+            }
+        }"#;
+        std::fs::write(dir.path().join("model.safetensors.index.json"), index_json).unwrap();
+        std::fs::write(dir.path().join("model-mtp.safetensors"), b"dummy").unwrap();
+
+        let result = collect_safetensors_files(dir.path()).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert!(
+            result
+                .iter()
+                .any(|path| path.file_name().unwrap() == "model-00001-of-00001.safetensors")
+        );
+        assert!(
+            result
+                .iter()
+                .any(|path| path.file_name().unwrap() == "model-mtp.safetensors")
+        );
     }
 
     #[test]

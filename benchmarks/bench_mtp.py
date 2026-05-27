@@ -100,11 +100,12 @@ def run_trial(args: argparse.Namespace, trial: Trial) -> dict[str, Any]:
         "--mlx-profile",
         "throughput",
     ]
+    show_server_logs = os.environ.get("HIGGS_BENCH_SHOW_SERVER_LOGS") == "1"
     proc = subprocess.Popen(
         cmd,
         env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE if show_server_logs else subprocess.DEVNULL,
+        stderr=subprocess.PIPE if show_server_logs else subprocess.DEVNULL,
     )
     try:
         wait_for_server(base, args.startup_timeout)
@@ -121,6 +122,15 @@ def run_trial(args: argparse.Namespace, trial: Trial) -> dict[str, Any]:
     finally:
         stop_server(proc)
 
+    server_log = ""
+    if show_server_logs:
+        chunks = []
+        if proc.stdout is not None:
+            chunks.append(proc.stdout.read().decode(errors="replace"))
+        if proc.stderr is not None:
+            chunks.append(proc.stderr.read().decode(errors="replace"))
+        server_log = "\n".join(chunks)
+
     usage = payload.get("usage", {})
     completion_tokens = int(usage.get("completion_tokens", 0))
     tok_s = completion_tokens / elapsed if elapsed > 0 else 0.0
@@ -135,6 +145,11 @@ def run_trial(args: argparse.Namespace, trial: Trial) -> dict[str, Any]:
         "completion_tokens": completion_tokens,
         "tok_s": tok_s,
         "content_prefix": content[:120],
+        "server_log": "\n".join(
+            line
+            for line in server_log.splitlines()
+            if "MTP decode complete" in line or "Engine ready" in line
+        ),
     }
 
 
@@ -146,6 +161,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8098)
     parser.add_argument("--max-tokens", type=int, default=192)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
+    parser.add_argument(
+        "--trials",
+        default="baseline,1,2,3",
+        help="Comma-separated trials: baseline and/or draft depths like 1,2,3",
+    )
     parser.add_argument("--startup-timeout", type=float, default=300.0)
     parser.add_argument("--request-timeout", type=int, default=600)
     args = parser.parse_args()
@@ -156,12 +176,19 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    trials = [
-        Trial("baseline_mtp_off", {"HIGGS_MTP": "0"}),
-        Trial("mtp_draft_1", {"HIGGS_MTP": "1", "HIGGS_MTP_DRAFT_N_MAX": "1"}),
-        Trial("mtp_draft_2", {"HIGGS_MTP": "1", "HIGGS_MTP_DRAFT_N_MAX": "2"}),
-        Trial("mtp_draft_3", {"HIGGS_MTP": "1", "HIGGS_MTP_DRAFT_N_MAX": "3"}),
-    ]
+    trials = []
+    for trial in args.trials.split(","):
+        trial = trial.strip()
+        if trial == "baseline":
+            trials.append(Trial("baseline_mtp_off", {"HIGGS_MTP": "0"}))
+        elif trial:
+            depth = int(trial)
+            trials.append(
+                Trial(
+                    f"mtp_draft_{depth}",
+                    {"HIGGS_MTP": "1", "HIGGS_MTP_DRAFT_N_MAX": str(depth)},
+                )
+            )
 
     results = []
     for trial in trials:

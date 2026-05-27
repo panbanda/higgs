@@ -207,6 +207,14 @@ pub struct Qwen3NextModelArgs {
     /// 0 = no MTP head, 1 = one transformer layer for next-next-token prediction.
     #[serde(default)]
     pub mtp_num_hidden_layers: i32,
+
+    /// Use dense projection tensors for the MTP head.
+    ///
+    /// Some Qwen3.5 MTP sidecars ship full-precision `mtp.*.weight` tensors
+    /// rather than quantized `weight/scales/biases` triples. This is set by the
+    /// loader after inspecting checkpoint keys; it is not expected in configs.
+    #[serde(default)]
+    pub use_dense_mtp: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -215,12 +223,12 @@ pub struct Qwen3NextModelArgs {
 
 type QuantizedParams = (Param<Array>, Param<Array>, Param<Array>);
 
-pub(crate) fn init_quantized_params() -> Result<QuantizedParams, Exception> {
-    Ok((
-        Param::new(Array::zeros::<f32>(&[1])?),
-        Param::new(Array::zeros::<f32>(&[1])?),
-        Param::new(Array::zeros::<f32>(&[1])?),
-    ))
+pub(crate) fn init_quantized_params() -> QuantizedParams {
+    fn placeholder() -> Param<Array> {
+        Param::new(Array::from_slice(&[0.0_f32], &[1]))
+    }
+
+    (placeholder(), placeholder(), placeholder())
 }
 
 pub(crate) fn quantized_forward(
@@ -249,8 +257,9 @@ pub(crate) struct QLinear {
 }
 
 impl QLinear {
+    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn new(group_size: i32, bits: i32) -> Result<Self, Exception> {
-        let (weight, scales, biases) = init_quantized_params()?;
+        let (weight, scales, biases) = init_quantized_params();
         Ok(Self {
             weight,
             scales,
@@ -288,6 +297,42 @@ impl QLinear {
     }
 }
 
+/// Dense linear layer with a single weight tensor and no bias.
+#[derive(Debug, Clone, ModuleParameters)]
+struct DenseLinearNoBias {
+    #[param]
+    weight: Param<Array>,
+}
+
+fn dense_linear_no_bias_forward(weight: &Array, x: &Array) -> Result<Array, Exception> {
+    let shape = x.shape().to_vec();
+    let in_features = *shape
+        .last()
+        .ok_or_else(|| Exception::custom("empty input"))?;
+    let batch: i32 = shape.iter().take(shape.len() - 1).product();
+    let x2d = x.reshape(&[batch, in_features])?;
+    let w = weight.as_dtype(x.dtype())?;
+    let out2d = x2d.matmul(&w.transpose()?)?;
+    let out_features = *out2d.shape().last().unwrap_or(&0);
+    let mut out_shape = shape;
+    if let Some(last) = out_shape.last_mut() {
+        *last = out_features;
+    }
+    out2d.reshape(&out_shape)
+}
+
+impl DenseLinearNoBias {
+    fn new() -> Self {
+        Self {
+            weight: Param::new(Array::from_slice(&[0.0_f32], &[1])),
+        }
+    }
+
+    fn forward(&self, x: &Array) -> Result<Array, Exception> {
+        dense_linear_no_bias_forward(&self.weight, x)
+    }
+}
+
 /// Quantized embedding stored as raw weight/scales/biases arrays.
 #[derive(Debug, Clone, ModuleParameters)]
 pub(crate) struct QEmbedding {
@@ -302,8 +347,9 @@ pub(crate) struct QEmbedding {
 }
 
 impl QEmbedding {
+    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn new(group_size: i32, bits: i32) -> Result<Self, Exception> {
-        let (weight, scales, biases) = init_quantized_params()?;
+        let (weight, scales, biases) = init_quantized_params();
         Ok(Self {
             weight,
             scales,
@@ -1454,37 +1500,19 @@ impl Qwen3NextAttention {
         let offset = cache.offset();
         queries = apply_rope(&queries, &self.rope, offset)?;
         keys = apply_rope(&keys, &self.rope, offset)?;
-
         let view = cache.update_and_view(keys, values)?;
-        let try_tq_decode = mask.is_none() && L == 1;
-
-        let output = match view {
-            crate::cache::KvCacheView::TurboQuant(tq_view) if try_tq_decode => {
-                let scores = tq_view.decode_scores(&queries, self.num_attention_heads)?;
-                let scale_arr = Array::from_f32(self.scale).as_dtype(scores.dtype())?;
-                let weights = ops::softmax_axis(&scores.multiply(&scale_arr)?, -1, true)?;
-                tq_view
-                    .decode_values(&weights, self.num_attention_heads)?
-                    .transpose_axes(&[0, 2, 1, 3])?
-                    .reshape(&[B, L, -1])?
-            }
-            other @ (crate::cache::KvCacheView::Dense { .. }
-            | crate::cache::KvCacheView::TurboQuant(_)) => {
-                let (cached_keys, cached_values) = other.into_dense()?;
-                let sdpa_mask = mask.map(fast::ScaledDotProductAttentionMask::from);
-                fast::scaled_dot_product_attention(
-                    queries,
-                    cached_keys,
-                    cached_values,
-                    self.scale,
-                    sdpa_mask,
-                    None::<&Array>,
-                )?
-                .transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[B, L, -1])?
-            }
-        };
-
+        let (cached_keys, cached_values) = view.into_dense()?;
+        let sdpa_mask = mask.map(fast::ScaledDotProductAttentionMask::from);
+        let output = fast::scaled_dot_product_attention(
+            queries,
+            cached_keys,
+            cached_values,
+            self.scale,
+            sdpa_mask,
+            None::<&Array>,
+        )?
+        .transpose_axes(&[0, 2, 1, 3])?
+        .reshape(&[B, L, -1])?;
         if L == 1 && async_layer_state_eval_enabled() {
             mlx_rs::transforms::async_eval(cache.eval_targets())?;
         }
@@ -1534,6 +1562,149 @@ impl Qwen3NextAttention {
     }
 }
 
+#[derive(Debug, Clone, ModuleParameters)]
+struct DenseQwen3NextAttention {
+    #[param]
+    q_proj: DenseLinearNoBias,
+    #[param]
+    k_proj: DenseLinearNoBias,
+    #[param]
+    v_proj: DenseLinearNoBias,
+    #[param]
+    o_proj: DenseLinearNoBias,
+    #[param]
+    q_norm: nn::RmsNorm,
+    #[param]
+    k_norm: nn::RmsNorm,
+    #[param]
+    rope: nn::Rope,
+    num_attention_heads: i32,
+    num_key_value_heads: i32,
+    scale: f32,
+}
+
+impl DenseQwen3NextAttention {
+    fn new(args: &Qwen3NextModelArgs) -> Result<Self, Exception> {
+        let head_dim = args.head_dim;
+        let head_dim_f32 = f32::from(
+            i16::try_from(head_dim).map_err(|_| Exception::custom("head_dim out of i16 range"))?,
+        );
+        let scale = head_dim_f32.sqrt().recip();
+        #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+        let partial_dim = (head_dim_f32 * args.partial_rotary_factor).round() as i32;
+
+        Ok(Self {
+            q_proj: DenseLinearNoBias::new(),
+            k_proj: DenseLinearNoBias::new(),
+            v_proj: DenseLinearNoBias::new(),
+            o_proj: DenseLinearNoBias::new(),
+            q_norm: nn::RmsNormBuilder::new(head_dim)
+                .eps(args.rms_norm_eps)
+                .build()?,
+            k_norm: nn::RmsNormBuilder::new(head_dim)
+                .eps(args.rms_norm_eps)
+                .build()?,
+            rope: nn::RopeBuilder::new(partial_dim)
+                .traditional(false)
+                .base(args.rope_theta)
+                .scale(1.0)
+                .build()
+                .map_err(|e| Exception::custom(format!("Failed to build RoPE: {e}")))?,
+            num_attention_heads: args.num_attention_heads,
+            num_key_value_heads: args.num_key_value_heads,
+            scale,
+        })
+    }
+
+    #[allow(non_snake_case)]
+    fn forward(
+        &mut self,
+        x: &Array,
+        mask: Option<&AttentionMask>,
+        cache: &mut SteppingKeyValueCache,
+    ) -> Result<Array, Exception> {
+        let shape = x.shape();
+        let B = *shape
+            .first()
+            .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
+        let L = *shape
+            .get(1)
+            .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
+
+        let q_proj_output = self.q_proj.forward(x)?;
+        let q_reshaped = q_proj_output.reshape(&[B, L, self.num_attention_heads, -1])?;
+        let q_halves = q_reshaped.split(2, Some(-1))?;
+        let queries_pre = q_halves
+            .first()
+            .ok_or_else(|| Exception::custom("split produced empty result"))?;
+        let gate = q_halves
+            .get(1)
+            .ok_or_else(|| Exception::custom("split produced empty result"))?
+            .reshape(&[B, L, -1])?;
+
+        let keys_raw = self.k_proj.forward(x)?;
+        let values_raw = self.v_proj.forward(x)?;
+
+        let mut queries = self
+            .q_norm
+            .forward(queries_pre)?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let mut keys = self
+            .k_norm
+            .forward(&keys_raw.reshape(&[B, L, self.num_key_value_heads, -1])?)?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let values = values_raw
+            .reshape(&[B, L, self.num_key_value_heads, -1])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+
+        let offset = cache.offset();
+        queries = apply_rope(&queries, &self.rope, offset)?;
+        keys = apply_rope(&keys, &self.rope, offset)?;
+
+        let view = cache.update_and_view(keys, values)?;
+        let try_tq_decode = mask.is_none() && L == 1;
+
+        let output = match view {
+            crate::cache::KvCacheView::TurboQuant(tq_view) if try_tq_decode => {
+                let scores = tq_view.decode_scores(&queries, self.num_attention_heads)?;
+                let scale_arr = Array::from_f32(self.scale).as_dtype(scores.dtype())?;
+                let weights = ops::softmax_axis(&scores.multiply(&scale_arr)?, -1, true)?;
+                tq_view
+                    .decode_values(&weights, self.num_attention_heads)?
+                    .transpose_axes(&[0, 2, 1, 3])?
+                    .reshape(&[B, L, -1])?
+            }
+            other @ (crate::cache::KvCacheView::Dense { .. }
+            | crate::cache::KvCacheView::TurboQuant(_)) => {
+                let (cached_keys, cached_values) = other.into_dense()?;
+                let sdpa_mask = mask.map(fast::ScaledDotProductAttentionMask::from);
+                fast::scaled_dot_product_attention(
+                    queries,
+                    cached_keys,
+                    cached_values,
+                    self.scale,
+                    sdpa_mask,
+                    None::<&Array>,
+                )?
+                .transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[B, L, -1])?
+            }
+        };
+
+        if L == 1 && async_layer_state_eval_enabled() {
+            mlx_rs::transforms::async_eval(cache.eval_targets())?;
+        }
+
+        let gated = sigmoid_mul(&gate, &output)?;
+        let out = self.o_proj.forward(&gated)?;
+        if L == 1 {
+            mlx_rs::stop_gradient(&out)
+        } else {
+            Ok(out)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Qwen3NextMLP (standard SwiGLU)
 // ---------------------------------------------------------------------------
@@ -1577,6 +1748,33 @@ impl Qwen3NextMLP {
     }
 }
 
+#[derive(Debug, Clone, ModuleParameters)]
+struct DenseQwen3NextMLP {
+    #[param]
+    gate_proj: DenseLinearNoBias,
+    #[param]
+    down_proj: DenseLinearNoBias,
+    #[param]
+    up_proj: DenseLinearNoBias,
+}
+
+impl DenseQwen3NextMLP {
+    fn new() -> Self {
+        Self {
+            gate_proj: DenseLinearNoBias::new(),
+            down_proj: DenseLinearNoBias::new(),
+            up_proj: DenseLinearNoBias::new(),
+        }
+    }
+
+    fn forward(&self, x: &Array) -> Result<Array, Exception> {
+        let gate_out = self.gate_proj.forward(x)?;
+        let up_out = self.up_proj.forward(x)?;
+        let activated = swiglu(&gate_out, &up_out)?;
+        self.down_proj.forward(&activated)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // MTP (Multi-Token Prediction) head
 // ---------------------------------------------------------------------------
@@ -1592,6 +1790,20 @@ struct MtpTransformerLayer {
     post_attention_layernorm: nn::RmsNorm,
     #[param]
     mlp: Qwen3NextMLP,
+}
+
+/// Single dense MTP transformer layer for sidecar checkpoints that store
+/// full-precision projection weights without quantization metadata.
+#[derive(Debug, Clone, ModuleParameters)]
+struct DenseMtpTransformerLayer {
+    #[param]
+    self_attn: DenseQwen3NextAttention,
+    #[param]
+    input_layernorm: nn::RmsNorm,
+    #[param]
+    post_attention_layernorm: nn::RmsNorm,
+    #[param]
+    mlp: DenseQwen3NextMLP,
 }
 
 /// Multi-Token Prediction head.
@@ -1616,6 +1828,20 @@ pub struct MtpHead {
     norm: nn::RmsNorm,
 }
 
+#[derive(Debug, Clone, ModuleParameters)]
+struct DenseMtpHead {
+    #[param]
+    pre_fc_norm_hidden: nn::RmsNorm,
+    #[param]
+    pre_fc_norm_embedding: nn::RmsNorm,
+    #[param]
+    fc: MtpFc,
+    #[param]
+    layers: Vec<DenseMtpTransformerLayer>,
+    #[param]
+    norm: nn::RmsNorm,
+}
+
 /// MTP fusion projection — kept in full precision (fp16) for accuracy.
 ///
 /// mlx-lm's `quant_predicate` excludes `mtp.fc` from quantization because
@@ -1634,22 +1860,7 @@ impl MtpFc {
     }
 
     fn forward(&self, x: &Array) -> Result<Array, Exception> {
-        // Dense matmul: x @ W^T (weight shape [out_features, in_features])
-        // Reshape to 2D for matmul, then restore batch dims.
-        let shape = x.shape().to_vec();
-        let in_features = *shape
-            .last()
-            .ok_or_else(|| Exception::custom("empty input"))?;
-        let batch: i32 = shape.iter().take(shape.len() - 1).product();
-        let x2d = x.reshape(&[batch, in_features])?;
-        let w = (*self.weight).as_dtype(x.dtype())?;
-        let out2d = x2d.matmul(&w.transpose()?)?;
-        let out_features = *out2d.shape().last().unwrap_or(&0);
-        let mut out_shape = shape;
-        if let Some(last) = out_shape.last_mut() {
-            *last = out_features;
-        }
-        out2d.reshape(&out_shape)
+        dense_linear_no_bias_forward(&self.weight, x)
     }
 }
 
@@ -1669,6 +1880,42 @@ impl MtpHead {
                         .eps(args.rms_norm_eps)
                         .build()?,
                     mlp: Qwen3NextMLP::new(ql, qb)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Exception>>()?;
+
+        Ok(Self {
+            pre_fc_norm_hidden: nn::RmsNormBuilder::new(args.hidden_size)
+                .eps(args.rms_norm_eps)
+                .build()?,
+            pre_fc_norm_embedding: nn::RmsNormBuilder::new(args.hidden_size)
+                .eps(args.rms_norm_eps)
+                .build()?,
+            fc: MtpFc::new()?,
+            layers,
+            norm: nn::RmsNormBuilder::new(args.hidden_size)
+                .eps(args.rms_norm_eps)
+                .build()?,
+        })
+    }
+}
+
+impl DenseMtpHead {
+    fn new(args: &Qwen3NextModelArgs) -> Result<Self, Exception> {
+        let n = usize::try_from(args.mtp_num_hidden_layers)
+            .map_err(|_| Exception::custom("mtp_num_hidden_layers must be non-negative"))?;
+
+        let layers = (0..n)
+            .map(|_| {
+                Ok(DenseMtpTransformerLayer {
+                    self_attn: DenseQwen3NextAttention::new(args)?,
+                    input_layernorm: nn::RmsNormBuilder::new(args.hidden_size)
+                        .eps(args.rms_norm_eps)
+                        .build()?,
+                    post_attention_layernorm: nn::RmsNormBuilder::new(args.hidden_size)
+                        .eps(args.rms_norm_eps)
+                        .build()?,
+                    mlp: DenseQwen3NextMLP::new(),
                 })
             })
             .collect::<Result<Vec<_>, Exception>>()?;
@@ -2237,40 +2484,51 @@ impl GatedDeltaNet {
         let conv_kernel_size = args.linear_conv_kernel_dim;
 
         let use_sep = args.use_separate_gdn_projections;
+        let in_proj_qkvz = QLinear::new(ql, qb)?;
+        let in_proj_ba = QLinear::new(ql, qb)?;
+        let in_proj_qkv = if use_sep {
+            Some(QLinear::new(ql, qb)?)
+        } else {
+            None
+        };
+        let in_proj_z = if use_sep {
+            Some(QLinear::new(ql, qb)?)
+        } else {
+            None
+        };
+        let in_proj_a = if use_sep {
+            Some(QLinear::new(ql, qb)?)
+        } else {
+            None
+        };
+        let in_proj_b = if use_sep {
+            Some(QLinear::new(ql, qb)?)
+        } else {
+            None
+        };
+        let conv1d = nn::Conv1dBuilder::new(conv_dim, conv_dim, conv_kernel_size)
+            .bias(false)
+            .groups(conv_dim)
+            .padding(0)
+            .build()?;
+        let norm = nn::RmsNormBuilder::new(head_v_dim)
+            .eps(args.rms_norm_eps)
+            .build()?;
+        let out_proj = QLinear::new(ql, qb)?;
+        let a_log = Param::new(Array::zeros::<f32>(&[num_v_heads])?);
+        let dt_bias = Param::new(Array::zeros::<f32>(&[num_v_heads])?);
         Ok(Self {
-            in_proj_qkvz: QLinear::new(ql, qb)?,
-            in_proj_ba: QLinear::new(ql, qb)?,
-            in_proj_qkv: if use_sep {
-                Some(QLinear::new(ql, qb)?)
-            } else {
-                None
-            },
-            in_proj_z: if use_sep {
-                Some(QLinear::new(ql, qb)?)
-            } else {
-                None
-            },
-            in_proj_a: if use_sep {
-                Some(QLinear::new(ql, qb)?)
-            } else {
-                None
-            },
-            in_proj_b: if use_sep {
-                Some(QLinear::new(ql, qb)?)
-            } else {
-                None
-            },
-            conv1d: nn::Conv1dBuilder::new(conv_dim, conv_dim, conv_kernel_size)
-                .bias(false)
-                .groups(conv_dim)
-                .padding(0)
-                .build()?,
-            norm: nn::RmsNormBuilder::new(head_v_dim)
-                .eps(args.rms_norm_eps)
-                .build()?,
-            out_proj: QLinear::new(ql, qb)?,
-            A_log: Param::new(Array::zeros::<f32>(&[num_v_heads])?),
-            dt_bias: Param::new(Array::zeros::<f32>(&[num_v_heads])?),
+            in_proj_qkvz,
+            in_proj_ba,
+            in_proj_qkv,
+            in_proj_z,
+            in_proj_a,
+            in_proj_b,
+            conv1d,
+            norm,
+            out_proj,
+            A_log: a_log,
+            dt_bias,
             num_k_heads,
             num_v_heads,
             head_k_dim,
@@ -2284,20 +2542,28 @@ impl GatedDeltaNet {
                     i16::try_from(head_k_dim)
                         .map_err(|_| Exception::custom("head_k_dim out of i16 range"))?,
                 );
-                let s = dim_f32.sqrt().recip();
-                let w = Array::ones::<f32>(&[head_k_dim])?.multiply(Array::from_f32(s * s))?;
-                w.eval()?;
-                w
+                let value = dim_f32.sqrt().recip().powi(2);
+                let values = vec![
+                    value;
+                    usize::try_from(head_k_dim).map_err(|_| Exception::custom(
+                        "head_k_dim out of usize range"
+                    ))?
+                ];
+                Array::from_slice(&values, &[head_k_dim])
             },
             qk_norm_weight_k: {
                 let dim_f32 = f32::from(
                     i16::try_from(head_k_dim)
                         .map_err(|_| Exception::custom("head_k_dim out of i16 range"))?,
                 );
-                let s = dim_f32.sqrt().recip();
-                let w = Array::ones::<f32>(&[head_k_dim])?.multiply(Array::from_f32(s))?;
-                w.eval()?;
-                w
+                let value = dim_f32.sqrt().recip();
+                let values = vec![
+                    value;
+                    usize::try_from(head_k_dim).map_err(|_| Exception::custom(
+                        "head_k_dim out of usize range"
+                    ))?
+                ];
+                Array::from_slice(&values, &[head_k_dim])
             },
             conv_weight_t: None,
         })
@@ -3015,6 +3281,8 @@ pub struct Qwen3NextCausalLM {
     lm_head: Option<QLinear>,
     #[param]
     mtp: Option<MtpHead>,
+    #[param]
+    dense_mtp: Option<DenseMtpHead>,
 }
 
 // Manual RoPE implementation for arbitrary positions
@@ -3128,8 +3396,13 @@ impl Qwen3NextCausalLM {
         } else {
             Some(QLinear::new(ql, qb)?)
         };
-        let mtp = if args.mtp_num_hidden_layers > 0 {
+        let mtp = if args.mtp_num_hidden_layers > 0 && !args.use_dense_mtp {
             Some(MtpHead::new(&args, ql, qb)?)
+        } else {
+            None
+        };
+        let dense_mtp = if args.mtp_num_hidden_layers > 0 && args.use_dense_mtp {
+            Some(DenseMtpHead::new(&args)?)
         } else {
             None
         };
@@ -3139,6 +3412,7 @@ impl Qwen3NextCausalLM {
             model,
             lm_head,
             mtp,
+            dense_mtp,
         })
     }
 
@@ -3489,18 +3763,22 @@ impl Qwen3NextCausalLM {
 
     /// Whether this model has an MTP head loaded.
     pub const fn has_mtp(&self) -> bool {
-        self.mtp.is_some()
+        self.mtp.is_some() || self.dense_mtp.is_some()
     }
 
     /// Create a fresh KV cache for the MTP head (one entry per MTP layer).
     /// Returns `None` if the model has no MTP head.
     pub fn make_mtp_cache(&self) -> Option<Vec<SteppingKeyValueCache>> {
-        self.mtp.as_ref().map(|mtp| {
-            mtp.layers
-                .iter()
+        let layer_count = self
+            .mtp
+            .as_ref()
+            .map(|mtp| mtp.layers.len())
+            .or_else(|| self.dense_mtp.as_ref().map(|mtp| mtp.layers.len()))?;
+        Some(
+            (0..layer_count)
                 .map(|_| SteppingKeyValueCache::new())
-                .collect()
-        })
+                .collect(),
+        )
     }
 
     /// Look up the embedding for a token id. Shape: `[1, 1, hidden_size]`.
@@ -3524,7 +3802,7 @@ impl Qwen3NextCausalLM {
         next_token_id: u32,
         mtp_cache: &mut [SteppingKeyValueCache],
     ) -> Result<Array, Exception> {
-        if self.mtp.is_none() {
+        if !self.has_mtp() {
             return Err(Exception::custom("MTP head not loaded"));
         }
 
@@ -3532,12 +3810,7 @@ impl Qwen3NextCausalLM {
         let next_embed = self.embed_token(next_token_id)?;
 
         // Scope the mutable borrow: run MTP forward, defer lm_head projection.
-        Ok({
-            let mtp = self
-                .mtp
-                .as_mut()
-                .ok_or_else(|| Exception::custom("MTP head not loaded"))?;
-
+        if let Some(mtp) = self.mtp.as_mut() {
             let h_norm = mtp.pre_fc_norm_hidden.forward(hidden)?;
             let e_norm = mtp.pre_fc_norm_embedding.forward(&next_embed)?;
             let concat = ops::concatenate_axis(&[&e_norm, &h_norm], -1)?;
@@ -3552,8 +3825,29 @@ impl Qwen3NextCausalLM {
                 x = h2.add(mlp_out)?;
             }
 
-            mtp.norm.forward(&x)?
-        })
+            return mtp.norm.forward(&x);
+        }
+
+        let mtp = self
+            .dense_mtp
+            .as_mut()
+            .ok_or_else(|| Exception::custom("MTP head not loaded"))?;
+
+        let h_norm = mtp.pre_fc_norm_hidden.forward(hidden)?;
+        let e_norm = mtp.pre_fc_norm_embedding.forward(&next_embed)?;
+        let concat = ops::concatenate_axis(&[&e_norm, &h_norm], -1)?;
+        let mut x = mtp.fc.forward(&concat)?;
+
+        for (layer, kv) in mtp.layers.iter_mut().zip(mtp_cache.iter_mut()) {
+            let normed = layer.input_layernorm.forward(&x)?;
+            let attn_out = layer.self_attn.forward(&normed, None, kv)?;
+            let h2 = x.add(attn_out)?;
+            let normed_post = layer.post_attention_layernorm.forward(&h2)?;
+            let mlp_out = layer.mlp.forward(&normed_post)?;
+            x = h2.add(mlp_out)?;
+        }
+
+        mtp.norm.forward(&x)
     }
 
     /// Run the MTP head to produce draft logits for position t+2.
@@ -3703,7 +3997,50 @@ where
     )))
 }
 
-fn checkpoint_has_mtp_weights(model_path: &Path) -> Result<bool, ModelError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MtpWeightLayout {
+    None,
+    Quantized,
+    Dense,
+}
+
+fn is_mtp_key(key: &str) -> bool {
+    key.starts_with("mtp.") || key.contains(".mtp.")
+}
+
+fn mtp_weight_layout_from_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> MtpWeightLayout {
+    let mut has_mtp = false;
+    let mut has_unprefixed_mtp = false;
+    let mut has_quantized_aux = false;
+
+    for key in keys {
+        if !is_mtp_key(key) {
+            continue;
+        }
+        has_mtp = true;
+        has_unprefixed_mtp |= key.starts_with("mtp.");
+        has_quantized_aux |= key.ends_with(".scales") || key.ends_with(".biases");
+    }
+
+    if has_quantized_aux {
+        MtpWeightLayout::Quantized
+    } else if has_unprefixed_mtp {
+        MtpWeightLayout::Dense
+    } else if has_mtp {
+        MtpWeightLayout::Quantized
+    } else {
+        MtpWeightLayout::None
+    }
+}
+
+fn checkpoint_mtp_weight_layout(model_path: &Path) -> Result<MtpWeightLayout, ModelError> {
+    fn safetensors_file_mtp_weight_layout(file_path: &Path) -> Result<MtpWeightLayout, ModelError> {
+        let bytes = std::fs::read(file_path)?;
+        let metadata = safetensors::SafeTensors::deserialize(&bytes)
+            .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+        Ok(mtp_weight_layout_from_keys(metadata.names()))
+    }
+
     let index_path = model_path.join("model.safetensors.index.json");
     if index_path.exists() {
         let file = std::fs::File::open(index_path)?;
@@ -3716,23 +4053,37 @@ fn checkpoint_has_mtp_weights(model_path: &Path) -> Result<bool, ModelError> {
                 "model.safetensors.index.json missing weight_map".into(),
             ));
         };
-        return Ok(weight_map
-            .keys()
-            .any(|key| key.starts_with("mtp.") || key.contains(".mtp.")));
+        let index_layout = mtp_weight_layout_from_keys(weight_map.keys().map(String::as_str));
+        if index_layout != MtpWeightLayout::None {
+            return Ok(index_layout);
+        }
+
+        for file_name in crate::AUXILIARY_SAFETENSORS_FILES {
+            let file_path = model_path.join(file_name);
+            if file_path.exists() {
+                let layout = safetensors_file_mtp_weight_layout(&file_path)?;
+                if layout != MtpWeightLayout::None {
+                    return Ok(layout);
+                }
+            }
+        }
+
+        return Ok(MtpWeightLayout::None);
     }
 
     for file_path in crate::collect_safetensors_files(model_path)? {
-        let loaded = Array::load_safetensors(&file_path)
-            .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
-        if loaded
-            .keys()
-            .any(|key| key.starts_with("mtp.") || key.contains(".mtp."))
-        {
-            return Ok(true);
+        let layout = safetensors_file_mtp_weight_layout(&file_path)?;
+        if layout != MtpWeightLayout::None {
+            return Ok(layout);
         }
     }
 
-    Ok(false)
+    Ok(MtpWeightLayout::None)
+}
+
+#[cfg(test)]
+fn checkpoint_has_mtp_weights(model_path: &Path) -> Result<bool, ModelError> {
+    Ok(checkpoint_mtp_weight_layout(model_path)? != MtpWeightLayout::None)
 }
 
 fn maybe_disable_mtp_without_checkpoint_weights(
@@ -3743,8 +4094,16 @@ fn maybe_disable_mtp_without_checkpoint_weights(
         return Ok(());
     }
 
-    if checkpoint_has_mtp_weights(model_path)? {
-        return Ok(());
+    match checkpoint_mtp_weight_layout(model_path)? {
+        MtpWeightLayout::Quantized => {
+            args.use_dense_mtp = false;
+            return Ok(());
+        }
+        MtpWeightLayout::Dense => {
+            args.use_dense_mtp = true;
+            return Ok(());
+        }
+        MtpWeightLayout::None => {}
     }
 
     tracing::warn!(
@@ -4174,6 +4533,60 @@ fn can_concatenate_axis0(a: &Array, b: &Array) -> bool {
     can_concatenate_axis0_shapes(a_shape, b_shape)
 }
 
+fn qwen35_checkpoint_param_key(key: &str) -> Option<&str> {
+    if key.starts_with("mtp.") {
+        Some(key)
+    } else {
+        key.strip_prefix("language_model.")
+    }
+}
+
+fn dense_mtp_param_key(stripped: &str) -> Option<String> {
+    stripped
+        .strip_prefix("mtp.")
+        .map(|rest| format!("dense_mtp.{rest}"))
+}
+
+fn qwen35_target_param_key(
+    params: &HashMap<std::rc::Rc<str>, &mut Array>,
+    stripped: &str,
+) -> Option<(String, bool)> {
+    if params.contains_key(stripped) {
+        Some((stripped.to_owned(), false))
+    } else {
+        dense_mtp_param_key(stripped)
+            .filter(|dense_key| params.contains_key(dense_key.as_str()))
+            .map(|dense_key| (dense_key, true))
+    }
+}
+
+fn dense_mtp_rmsnorm_weight_key(stripped: &str) -> bool {
+    stripped.starts_with("mtp.")
+        && stripped.ends_with(".weight")
+        && (stripped.contains(".input_layernorm.")
+            || stripped.contains(".post_attention_layernorm.")
+            || stripped.contains(".q_norm.")
+            || stripped.contains(".k_norm.")
+            || stripped == "mtp.norm.weight"
+            || stripped == "mtp.pre_fc_norm_hidden.weight"
+            || stripped == "mtp.pre_fc_norm_embedding.weight")
+}
+
+fn qwen35_loaded_value(
+    stripped: &str,
+    value: Array,
+    dense_mtp_target: bool,
+) -> Result<Array, crate::error::ModelError> {
+    if dense_mtp_target && dense_mtp_rmsnorm_weight_key(stripped) {
+        let one = Array::from_f32(1.0)
+            .as_dtype(value.dtype())
+            .map_err(crate::error::ModelError::Mlx)?;
+        value.add(&one).map_err(crate::error::ModelError::Mlx)
+    } else {
+        Ok(value)
+    }
+}
+
 /// Load Qwen3.5-MoE weights with GDN projection fusion.
 ///
 /// Direct weight loader: strip `language_model.` prefix, no rearrangement.
@@ -4184,7 +4597,6 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
 ) -> Result<(), crate::error::ModelError> {
     let safetensors_files = crate::collect_safetensors_files(model_path)?;
     let mut params = model.parameters_mut().flatten();
-    let prefix = "language_model.";
     let mut matched = 0usize;
     let mut unmatched = Vec::new();
 
@@ -4193,12 +4605,19 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
             .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
 
         for (key, value) in loaded {
-            let Some(stripped) = key.strip_prefix(prefix) else {
+            let Some(stripped) = qwen35_checkpoint_param_key(&key) else {
                 unmatched.push(key);
                 continue;
             };
-            if let Some(param) = params.get_mut(stripped) {
-                **param = value;
+            if let Some((target_key, dense_mtp_target)) =
+                qwen35_target_param_key(&params, stripped)
+            {
+                if let Some(param) = params.get_mut(target_key.as_str()) {
+                    **param = qwen35_loaded_value(stripped, value, dense_mtp_target)?;
+                } else {
+                    unmatched.push(key);
+                    continue;
+                }
                 matched += 1;
             } else {
                 unmatched.push(key);
@@ -4236,6 +4655,7 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
 
 /// Rearranges flat (qkv,z,b,a) projections to per-head-grouped (qkvz,ba)
 /// so the model uses the fused 2-dispatch forward path instead of 4 separate.
+#[allow(clippy::too_many_lines)]
 fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     model: &mut M,
     model_path: &Path,
@@ -4254,7 +4674,6 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     // Key format: "model.layers.N.linear_attn.in_proj_qkvz.{weight|scales|biases}"
     let mut gdn_parts: HashMap<String, (Option<Array>, Option<Array>)> = HashMap::new();
 
-    let prefix = "language_model.";
     let gdn_remap: &[(&str, &str, &str)] = &[
         ("in_proj_qkv", "in_proj_z", "in_proj_qkvz"),
         ("in_proj_b", "in_proj_a", "in_proj_ba"),
@@ -4265,7 +4684,7 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
             .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
 
         for (key, value) in loaded {
-            let Some(stripped) = key.strip_prefix(prefix) else {
+            let Some(stripped) = qwen35_checkpoint_param_key(&key) else {
                 continue;
             };
 
@@ -4293,8 +4712,12 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
             }
 
             if !handled {
-                if let Some(param) = params.get_mut(stripped) {
-                    **param = value;
+                if let Some((target_key, dense_mtp_target)) =
+                    qwen35_target_param_key(&params, stripped)
+                {
+                    if let Some(param) = params.get_mut(target_key.as_str()) {
+                        **param = qwen35_loaded_value(stripped, value, dense_mtp_target)?;
+                    }
                 }
             }
         }
@@ -13100,6 +13523,14 @@ mod tests {
         std::fs::write(dir.join("model.safetensors.index.json"), index).unwrap();
     }
 
+    fn write_safetensors_file(dir: &std::path::Path, file_name: &str, key: &str) {
+        let data = [0_u8; 4];
+        let tensor =
+            safetensors::tensor::TensorView::new(safetensors::tensor::Dtype::F32, vec![1], &data)
+                .unwrap();
+        safetensors::serialize_to_file([(key, tensor)], None, &dir.join(file_name)).unwrap();
+    }
+
     #[test]
     fn test_load_qwen35_moe_text_config_moe_sets_decoder_sparse_step() {
         let dir = tempfile::tempdir().unwrap();
@@ -13134,6 +13565,97 @@ mod tests {
             &["language_model.mtp.layers.0.self_attn.q_proj.weight"],
         );
         assert!(checkpoint_has_mtp_weights(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn test_checkpoint_has_mtp_weights_detects_auxiliary_mtp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_weight_index(
+            dir.path(),
+            &["language_model.model.layers.0.input_layernorm.weight"],
+        );
+        write_safetensors_file(
+            dir.path(),
+            "model-mtp.safetensors",
+            "language_model.mtp.layers.0.self_attn.q_proj.weight",
+        );
+
+        assert!(checkpoint_has_mtp_weights(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn test_checkpoint_mtp_weight_layout_detects_quantized_indexed_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        write_weight_index(
+            dir.path(),
+            &[
+                "language_model.mtp.layers.0.self_attn.q_proj.weight",
+                "language_model.mtp.layers.0.self_attn.q_proj.scales",
+                "language_model.mtp.layers.0.self_attn.q_proj.biases",
+            ],
+        );
+
+        assert_eq!(
+            checkpoint_mtp_weight_layout(dir.path()).unwrap(),
+            MtpWeightLayout::Quantized
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_mtp_weight_layout_detects_dense_auxiliary_mtp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_weight_index(
+            dir.path(),
+            &["language_model.model.layers.0.input_layernorm.weight"],
+        );
+        write_safetensors_file(
+            dir.path(),
+            "model-mtp.safetensors",
+            "mtp.layers.0.self_attn.q_proj.weight",
+        );
+
+        assert_eq!(
+            checkpoint_mtp_weight_layout(dir.path()).unwrap(),
+            MtpWeightLayout::Dense
+        );
+    }
+
+    #[test]
+    fn test_qwen35_checkpoint_key_accepts_unprefixed_mtp_sidecar() {
+        assert_eq!(
+            qwen35_checkpoint_param_key("mtp.layers.0.self_attn.q_proj.weight"),
+            Some("mtp.layers.0.self_attn.q_proj.weight")
+        );
+        assert_eq!(
+            qwen35_checkpoint_param_key("language_model.model.layers.0.input_layernorm.weight"),
+            Some("model.layers.0.input_layernorm.weight")
+        );
+        assert_eq!(qwen35_checkpoint_param_key("vision_tower.foo"), None);
+    }
+
+    #[test]
+    fn test_dense_mtp_param_key_remaps_mtp_namespace() {
+        assert_eq!(
+            dense_mtp_param_key("mtp.layers.0.self_attn.q_proj.weight").as_deref(),
+            Some("dense_mtp.layers.0.self_attn.q_proj.weight")
+        );
+        assert_eq!(dense_mtp_param_key("model.layers.0.foo"), None);
+    }
+
+    #[test]
+    fn test_dense_mtp_rmsnorm_weight_keys_require_plus_one() {
+        assert!(dense_mtp_rmsnorm_weight_key(
+            "mtp.layers.0.input_layernorm.weight"
+        ));
+        assert!(dense_mtp_rmsnorm_weight_key(
+            "mtp.layers.0.self_attn.q_norm.weight"
+        ));
+        assert!(dense_mtp_rmsnorm_weight_key(
+            "mtp.pre_fc_norm_hidden.weight"
+        ));
+        assert!(!dense_mtp_rmsnorm_weight_key(
+            "mtp.layers.0.self_attn.q_proj.weight"
+        ));
     }
 
     #[test]

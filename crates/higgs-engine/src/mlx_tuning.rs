@@ -9,7 +9,7 @@ const DEFAULT_CHUNKED_PREFILL_CHUNK_SIZE: i32 = 512;
 const DEFAULT_PAGED_KV_TARGET_BYTES: usize = 512 * 1024 * 1024;
 const MIN_PAGED_KV_TARGET_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PAGED_KV_TARGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
-const DEFAULT_MTP_DRAFT_N_MAX: usize = 3;
+const DEFAULT_MTP_DRAFT_N_MAX: usize = 1;
 const MAX_MTP_DRAFT_N_MAX: usize = 8;
 
 fn parse_positive_chunked_prefill_value(raw: Option<&str>, default: i32) -> i32 {
@@ -407,7 +407,7 @@ fn heuristic_paged_kv_target_bytes(
     size_class: ModelSizeClass,
     is_moe: bool,
 ) -> usize {
-    let Some(max_recommended) = mlx_max_recommended_working_set_size() else {
+    let Some(max_recommended) = configured_max_working_set_bytes() else {
         return DEFAULT_PAGED_KV_TARGET_BYTES;
     };
 
@@ -434,6 +434,13 @@ fn heuristic_paged_kv_target_bytes(
     };
 
     clamp_paged_kv_target_bytes(available / divisor)
+}
+
+fn configured_max_working_set_bytes() -> Option<usize> {
+    std::env::var("HIGGS_MLX_MAX_WORKING_SET_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
 }
 
 fn clamp_paged_kv_target_bytes(bytes: usize) -> usize {
@@ -517,28 +524,6 @@ fn model_weight_bytes(model_dir: &Path) -> Option<u64> {
     }
 
     Some(total).filter(|sum| *sum > 0)
-}
-
-#[allow(unsafe_code)]
-fn mlx_max_recommended_working_set_size() -> Option<usize> {
-    unsafe {
-        let mut info = mlx_sys::mlx_device_info_new();
-        let mut dev = mlx_sys::mlx_device_new();
-        mlx_sys::mlx_get_default_device(&raw mut dev);
-        let mut max_rec = None;
-        if mlx_sys::mlx_device_info_get(&raw mut info, dev) == 0 {
-            let mut value: usize = 0;
-            let key = c"max_recommended_working_set_size";
-            if mlx_sys::mlx_device_info_get_size(&raw mut value, info, key.as_ptr()) == 0
-                && value > 0
-            {
-                max_rec = Some(value);
-            }
-        }
-        mlx_sys::mlx_device_info_free(info);
-        mlx_sys::mlx_device_free(dev);
-        max_rec
-    }
 }
 
 #[cfg(test)]
