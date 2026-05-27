@@ -150,16 +150,18 @@ pub fn prompt_lookup_draft(
     }
 
     let end = context.len();
-    let max_ngram = max_ngram.min(end);
+    let capped_ngram = max_ngram.min(end);
     let search_start = end.saturating_sub(max_window.max(1));
 
-    for ngram in (1..=max_ngram).rev() {
-        let suffix = &context[end - ngram..end];
+    for ngram in (1..=capped_ngram).rev() {
+        let Some(suffix) = context.get(end - ngram..end) else {
+            continue;
+        };
         let search_end = end.saturating_sub(ngram);
 
         for pos in (search_start..search_end).rev() {
             let match_end = pos + ngram;
-            if &context[pos..match_end] != suffix {
+            if context.get(pos..match_end) != Some(suffix) {
                 continue;
             }
 
@@ -168,7 +170,9 @@ pub fn prompt_lookup_draft(
                 continue;
             }
             let draft_end = draft_start.saturating_add(max_drafts).min(end);
-            return context[draft_start..draft_end].to_vec();
+            if let Some(draft) = context.get(draft_start..draft_end) {
+                return draft.to_vec();
+            }
         }
     }
 

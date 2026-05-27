@@ -1460,15 +1460,15 @@ impl SimpleEngine {
                                     }
                                 }
 
-                                let completion_len = Self::completion_len(tokens)?;
-                                if completion_len >= max_tokens {
+                                let forced_completion_len = Self::completion_len(tokens)?;
+                                if forced_completion_len >= max_tokens {
                                     let elapsed = t_start.elapsed();
                                     Self::log_prompt_lookup_decode_stats(&stats, elapsed, "length");
                                     return Ok(GenerationOutput {
                                         text: self.decode_tokens(tokens)?,
                                         finish_reason: "length".to_owned(),
                                         prompt_tokens: prompt_len,
-                                        completion_tokens: completion_len,
+                                        completion_tokens: forced_completion_len,
                                         token_logprobs: None,
                                     });
                                 }
@@ -1508,15 +1508,15 @@ impl SimpleEngine {
                 }
             }
 
-            let completion_len = Self::completion_len(tokens)?;
-            if completion_len >= max_tokens {
+            let final_completion_len = Self::completion_len(tokens)?;
+            if final_completion_len >= max_tokens {
                 let elapsed = t_start.elapsed();
                 Self::log_prompt_lookup_decode_stats(&stats, elapsed, "length");
                 return Ok(GenerationOutput {
                     text: self.decode_tokens(tokens)?,
                     finish_reason: "length".to_owned(),
                     prompt_tokens: prompt_len,
-                    completion_tokens: completion_len,
+                    completion_tokens: final_completion_len,
                     token_logprobs: None,
                 });
             }
