@@ -7,7 +7,11 @@
 //! Expected speedup: ~1.5x on dense models at ~80% acceptance rate.
 
 use higgs_models::{AnyCache, AnyModel, MtpCache};
-use mlx_rs::{Array, argmax_axis, ops::indexing::IndexOp, transforms::eval};
+use mlx_rs::{
+    Array, argmax_axis,
+    ops::{self, concatenate_axis, indexing::IndexOp},
+    transforms::eval,
+};
 
 use crate::error::EngineError;
 
@@ -122,6 +126,18 @@ fn greedy_token_ids(logits: &Array) -> Result<Vec<u32>, EngineError> {
     let token_arr = argmax_axis!(logits, -1).map_err(EngineError::Mlx)?;
     eval([&token_arr]).map_err(EngineError::Mlx)?;
     Ok(token_arr.as_slice::<u32>().to_vec())
+}
+
+fn parse_enabled_flag(raw: Option<&str>) -> Option<bool> {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("1" | "true" | "on" | "yes") => Some(true),
+        Some("0" | "false" | "off" | "no") => Some(false),
+        _ => None,
+    }
+}
+
+fn mtp_mirror_verify_enabled() -> bool {
+    parse_enabled_flag(std::env::var("HIGGS_MTP_MIRROR_VERIFY").ok().as_deref()).unwrap_or(false)
 }
 
 fn accepted_draft_prefix_len(drafts: &[u32], verifier_targets: &[u32]) -> usize {
@@ -309,6 +325,77 @@ fn hidden_row(hidden: &Array, row: usize) -> Result<Array, EngineError> {
     Ok(hidden.index((.., row_i32..row_i32 + 1, ..)))
 }
 
+fn hidden_rows(hidden: &Array, start: usize, end: usize) -> Result<Array, EngineError> {
+    let start_i32 = i32::try_from(start)
+        .map_err(|_| EngineError::Generation("hidden row start index too large".to_owned()))?;
+    let end_i32 = i32::try_from(end)
+        .map_err(|_| EngineError::Generation("hidden row end index too large".to_owned()))?;
+    Ok(hidden.index((.., start_i32..end_i32, ..)))
+}
+
+fn zero_hidden_row_like(hidden: &Array) -> Result<Array, EngineError> {
+    let shape = hidden.shape();
+    let batch = *shape
+        .first()
+        .ok_or_else(|| EngineError::Generation("hidden tensor missing batch dim".to_owned()))?;
+    let hidden_dim = *shape
+        .get(2)
+        .ok_or_else(|| EngineError::Generation("hidden tensor missing hidden dim".to_owned()))?;
+    ops::zeros_dtype(&[batch, 1, hidden_dim], hidden.dtype()).map_err(EngineError::Mlx)
+}
+
+fn shifted_hidden_rows(
+    initial_hidden: &Array,
+    hidden: &Array,
+    count: usize,
+) -> Result<Array, EngineError> {
+    if count == 0 {
+        return Err(EngineError::Generation(
+            "cannot build shifted hidden rows for empty token batch".to_owned(),
+        ));
+    }
+    if count == 1 {
+        return Ok(initial_hidden.clone());
+    }
+
+    let tail = hidden_rows(hidden, 0, count - 1)?;
+    concatenate_axis(&[initial_hidden, &tail], 1).map_err(EngineError::Mlx)
+}
+
+/// Prime an MTP cache from a backbone hidden sequence.
+///
+/// `hidden` must contain the raw backbone hidden states for `tokens`.
+/// The first MTP row uses a zero previous-hidden row, matching llama.cpp's
+/// draft-mtp prompt mirroring behavior.
+pub fn prime_mtp_cache(
+    model: &mut AnyModel,
+    mtp_cache: &mut MtpCache,
+    tokens: &[u32],
+    hidden: &Array,
+) -> Result<(), EngineError> {
+    if tokens.is_empty() {
+        return Ok(());
+    }
+
+    let zero = zero_hidden_row_like(hidden)?;
+    let shifted = shifted_hidden_rows(&zero, hidden, tokens.len())?;
+    model
+        .mtp_advance_many(&shifted, tokens, mtp_cache)
+        .map_err(EngineError::Mlx)
+}
+
+/// Mirror one accepted backbone token into an already-primed MTP cache.
+pub fn mirror_mtp_token(
+    model: &mut AnyModel,
+    mtp_cache: &mut MtpCache,
+    previous_hidden: &Array,
+    token: u32,
+) -> Result<(), EngineError> {
+    model
+        .mtp_advance_many(previous_hidden, &[token], mtp_cache)
+        .map_err(EngineError::Mlx)
+}
+
 fn backbone_verify_batch(
     model: &mut AnyModel,
     cache: &mut AnyCache,
@@ -332,12 +419,49 @@ fn commit_mtp_cache(
 ) -> Result<(), EngineError> {
     *mtp_cache = confirmed_mtp_cache;
 
-    for (idx, &token) in drafts.iter().take(accepted_drafts).enumerate() {
-        let hidden_before = hidden_row(accepted_hidden_rows, idx)?;
+    if accepted_drafts > 0 {
+        let accepted = drafts.get(..accepted_drafts).ok_or_else(|| {
+            EngineError::Generation(format!(
+                "MTP cache commit missing accepted draft prefix len {accepted_drafts}"
+            ))
+        })?;
+        let hidden_before = hidden_rows(accepted_hidden_rows, 0, accepted_drafts)?;
         model
-            .mtp_advance(&hidden_before, token, mtp_cache)
+            .mtp_advance_many(&hidden_before, accepted, mtp_cache)
             .map_err(EngineError::Mlx)?;
     }
+
+    Ok(())
+}
+
+fn trim_mtp_cache_by(mtp_cache: &mut MtpCache, rejected: usize) {
+    if rejected == 0 {
+        return;
+    }
+
+    for layer in mtp_cache {
+        layer.trim_by(rejected);
+    }
+}
+
+fn mirror_verified_mtp_cache(
+    model: &mut AnyModel,
+    mtp_cache: &mut MtpCache,
+    base_mtp_cache: MtpCache,
+    previous_hidden: &Array,
+    verify_hidden: &Array,
+    verify_tokens: &[u32],
+    accepted_token_count: usize,
+) -> Result<(), EngineError> {
+    let mut mirrored = base_mtp_cache;
+    let shifted = shifted_hidden_rows(previous_hidden, verify_hidden, verify_tokens.len())?;
+    model
+        .mtp_advance_many(&shifted, verify_tokens, &mut mirrored)
+        .map_err(EngineError::Mlx)?;
+
+    let rejected = verify_tokens.len().saturating_sub(accepted_token_count);
+    trim_mtp_cache_by(&mut mirrored, rejected);
+    *mtp_cache = mirrored;
 
     Ok(())
 }
@@ -360,6 +484,7 @@ pub fn mtp_cycle(
 ) -> Result<MtpCycleResult, EngineError> {
     let draft_limit = draft_n_max.max(1);
     let base_cache = cache.clone();
+    let base_mtp_cache = mtp_cache.clone();
     let mut speculative_mtp_cache = mtp_cache.clone();
     let mut confirmed_mtp_cache: Option<MtpCache> = None;
     let mut speculative_hidden = hidden.clone();
@@ -392,6 +517,7 @@ pub fn mtp_cycle(
     verify_tokens.extend(drafts.iter().copied());
 
     let (verify_hidden, verifier_targets) = backbone_verify_batch(model, cache, &verify_tokens)?;
+    let verify_hidden_for_mtp = verify_hidden.clone();
     if verifier_targets.len() < verify_tokens.len() {
         return Err(EngineError::Generation(format!(
             "batched MTP verifier returned {} target ids for {} input tokens",
@@ -431,16 +557,28 @@ pub fn mtp_cycle(
     };
 
     let h_last = hidden_row(&accepted_hidden_rows, accepted_drafts)?;
-    commit_mtp_cache(
-        model,
-        mtp_cache,
-        confirmed_mtp_cache.ok_or_else(|| {
-            EngineError::Generation("MTP produced no cache checkpoint".to_owned())
-        })?,
-        &accepted_hidden_rows,
-        &drafts,
-        accepted_drafts,
-    )?;
+    if mtp_mirror_verify_enabled() {
+        mirror_verified_mtp_cache(
+            model,
+            mtp_cache,
+            base_mtp_cache,
+            hidden,
+            &verify_hidden_for_mtp,
+            &verify_tokens,
+            tokens.len(),
+        )?;
+    } else {
+        commit_mtp_cache(
+            model,
+            mtp_cache,
+            confirmed_mtp_cache.ok_or_else(|| {
+                EngineError::Generation("MTP produced no cache checkpoint".to_owned())
+            })?,
+            &accepted_hidden_rows,
+            &drafts,
+            accepted_drafts,
+        )?;
+    }
 
     if accepted_drafts < drafts.len() && tokens.is_empty() {
         return Err(EngineError::Generation(

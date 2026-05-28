@@ -44,3 +44,12 @@ quantization = "3bit"
 approx_size_gb = 14.0
 context = 32768
 tags = ["large", "moe"]
+
+[[models]]
+key = "qwen3.6-27B-mtp-8bit"
+label = "Qwen3.6-27B MTP 8-bit"
+path = "trevon/Qwen3.6-27B-mtp"
+quantization = "8bit"
+approx_size_gb = 27.0
+context = 32768
+tags = ["large", "dense", "mtp", "qwen3next"]

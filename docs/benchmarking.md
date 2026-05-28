@@ -10,20 +10,21 @@ This document collects the benchmark methodology and the benchmark-driven defaul
 
 ## MLX Tuning Harness
 
-Use the benchmark harness below to compare five serving iterations on the same local model:
+Use the Rust benchmark crate for checked-in benchmark workflows. Python
+benchmark scripts are treated as local scratch files and are ignored by git.
 
 ```bash
-python3 benchmarks/bench_mlx_tuning.py ~/.cache/lm-studio/models/mlx-community/Qwen3.6-35B-A3B-4bit
+cargo run --release -p higgs-bench --bin bench_decode -- \
+  --model qwen3-1.7B-4bit --port 8899 \
+  --max-tokens 200 --warmup 1 --trials 5 \
+  --temperature 0
 ```
 
-The harness evaluates:
+`bench_decode` evaluates:
 
-- TTFT across short, medium, and long prompts
-- decode throughput
-- short QA accuracy
-- long-context retrieval accuracy
-- structured-output correctness
-- prefix-cache speedup on multi-turn conversations
+- TTFT through the streaming API
+- decode throughput from server-reported token usage
+- reproducible JSON/Markdown output with redacted host metadata by default
 
 ## MTP Draft-Depth Sweep
 
@@ -31,11 +32,54 @@ Use the focused MTP sweep to compare baseline greedy decode with MTP disabled
 against draft depths 1, 2, and 3:
 
 ```bash
-python3 benchmarks/bench_mtp.py ~/.cache/lm-studio/models/mlx-community/Qwen3.6-35B-A3B-4bit
+cargo run --release -p higgs-bench --bin bench_speculative -- \
+  --model-path trevon/Qwen3.6-27B-mtp \
+  --trials baseline,mtp_default,1,2,3,prompt_lookup \
+  --max-tokens 96 --repeats 1
 ```
 
-The sweep sets `temperature=0`, starts a fresh server per trial, and reports
-completion tokens per second for each MTP setting.
+The sweep sets `temperature=0`, starts a fresh Higgs server per trial, and
+reports completion tokens per second plus filtered MTP/prompt-lookup telemetry
+for each setting. Use `--model <key>` to target `benchmarks/models.toml`, or
+`--model-path <repo-or-local-path>` for ad-hoc local runs. Local paths are not
+printed in the benchmark metadata; pass `--model-name <public-id>` when using a
+snapshot path whose request model name cannot be derived automatically.
+
+Set `RUST_LOG=info` when you want the persisted JSON to include Higgs' internal
+MTP decode telemetry (`cycles`, drafted tokens, accepted drafts, acceptance
+rate, and decode-only tok/s).
+
+### Qwen3.6 MTP Notes
+
+The Qwen3Next MTP path mirrors llama.cpp's merged `draft-mtp` design in the
+places that matter for speed and correctness:
+
+- the verifier processes `[confirmed + drafts]` in one backbone batch
+- the MTP cache is primed from prompt/first-token backbone hidden states
+- accepted draft tokens are advanced into the MTP cache in one sequence pass
+- Qwen3Next GDN convolution state is linearized before multi-token verifier
+  windows, so batched verifier logits match sequential greedy decode
+
+`HIGGS_MTP_PRIME_PREFILL=0` disables prompt/first-token MTP cache priming for
+experiments. `HIGGS_MTP_MIRROR_VERIFY=1` enables full verifier-window MTP cache
+mirroring; on the Qwen3.6 27B MTP 8-bit benchmark below it was slightly slower
+than the default accepted-prefix replay path, so it remains opt-in.
+
+Measured on M4 Max 128GB, `temperature=0`, 96 completion tokens, prompt:
+`Write a concise technical explanation of speculative decoding for local LLM inference...`
+
+| Runtime | Mode | Request tok/s | Decode-only tok/s | Speedup vs runtime baseline |
+| --- | ---: | ---: | ---: | ---: |
+| Higgs | baseline MTP off | 14.32 | n/a | 1.00x |
+| Higgs | MTP draft depth 2 | 22.89 | 28.0 | 1.60x request / 1.96x vs request baseline |
+| llama.cpp `b1-d374e71` | baseline | n/a | 15.9 | 1.00x |
+| llama.cpp `b1-d374e71` | MTP draft depth 1 | n/a | 25.0 | 1.57x |
+| llama.cpp `b1-d374e71` | MTP draft depth 2 | n/a | 24.3 | 1.53x |
+
+The Higgs request-level number includes HTTP and prompt processing; llama.cpp's
+CLI line reports generation only. The closest decode-only comparison from this
+run is Higgs MTP depth 2 at `28.0 tok/s` versus llama.cpp's best measured MTP
+setting at `25.0 tok/s`.
 
 ## Iterations
 
@@ -149,6 +193,23 @@ uses the server-reported `completion_tokens` from the terminal `usage` chunk
 SSE chunk count for backends that don't emit usage. The bench also sends
 `reasoning: { effort: "none" }` so decode timing reflects time-to-generate,
 not time-to-visible-answer for thinking-mode models.
+
+### `bench_speculative`
+
+Starts a fresh Higgs server per speculative mode and compares baseline greedy
+decode with MTP draft depths and architecture-neutral prompt lookup.
+
+```bash
+cargo run --release -p higgs-bench --bin bench_speculative -- \
+  --model qwen3.6-27B-mtp-8bit \
+  --trials baseline,mtp_default,1,2,3,prompt_lookup,prompt_lookup_unchecked \
+  --max-tokens 96 --repeats 3 --format markdown
+```
+
+`results.trials[*].speedup_vs_baseline` is computed from mean completion
+tokens/sec when a `baseline` trial appears before the speculative trial. Server
+logs are captured under `target/bench-results/bench_speculative/logs/`, and the
+JSON result stores only filtered speculative telemetry lines.
 
 ### `bench_summarize`
 

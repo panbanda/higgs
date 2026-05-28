@@ -69,6 +69,10 @@ fn unchecked_prompt_lookup_enabled() -> bool {
     .unwrap_or(false)
 }
 
+fn mtp_prefill_priming_enabled() -> bool {
+    parse_enabled_flag(std::env::var("HIGGS_MTP_PRIME_PREFILL").ok().as_deref()).unwrap_or(true)
+}
+
 fn parse_env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -246,6 +250,7 @@ pub struct SimpleEngine {
 struct PreparedGeneration<'a> {
     model: MutexGuard<'a, AnyModel>,
     cache: AnyCache,
+    actual_prompt_tokens: Vec<u32>,
     prompt_array: Array,
     prompt_len: u32,
     pixel_values: Option<Array>,
@@ -578,6 +583,7 @@ impl SimpleEngine {
         Ok(PreparedGeneration {
             model,
             cache,
+            actual_prompt_tokens,
             prompt_array,
             prompt_len,
             pixel_values,
@@ -594,7 +600,9 @@ impl SimpleEngine {
         params: &SamplingParams,
         logprob_top_n: Option<u32>,
         constraint: Option<&crate::constrained::ConstrainedGenerator>,
-    ) -> Result<(Array, Option<LogprobArrays>), EngineError> {
+        capture_hidden: bool,
+    ) -> Result<(Array, Option<LogprobArrays>, Option<Array>), EngineError> {
+        let mut prefill_hidden = None;
         let logits = if let Some(ref pixel_values) = prepared.pixel_values {
             // Multimodal path: full forward (VLMs need all tokens for vision)
             prepared
@@ -607,7 +615,14 @@ impl SimpleEngine {
             let seq_len = prepared.prompt_array.shape().get(1).copied().unwrap_or(0);
             let chunked_threshold = self.tuning.chunked_prefill_threshold();
             let chunked_size = self.tuning.chunked_prefill_chunk_size();
-            if seq_len > chunked_threshold {
+            if capture_hidden && seq_len <= chunked_threshold {
+                let (hidden, logits) = prepared
+                    .model
+                    .forward_with_hidden(&prepared.prompt_array, None, &mut prepared.cache)
+                    .map_err(EngineError::Mlx)?;
+                prefill_hidden = Some(hidden);
+                logits
+            } else if seq_len > chunked_threshold {
                 prepared
                     .model
                     .forward_chunked(&prepared.prompt_array, &mut prepared.cache, chunked_size)
@@ -650,6 +665,9 @@ impl SimpleEngine {
             if let Some(ref lp) = logprob_data {
                 eval_targets.extend(lp.eval_targets());
             }
+            if let Some(ref hidden) = prefill_hidden {
+                eval_targets.push(hidden);
+            }
             eval(eval_targets).map_err(EngineError::Mlx)?;
         }
 
@@ -676,7 +694,7 @@ impl SimpleEngine {
             "simple_post_prefill",
         );
 
-        Ok((current_token, logprob_data))
+        Ok((current_token, logprob_data, prefill_hidden))
     }
 
     /// Decode a single step: forward pass on the current token, apply penalties
@@ -795,6 +813,12 @@ impl SimpleEngine {
             .len()
             .try_into()
             .map_err(|_| EngineError::Generation("Too many tokens generated".to_owned()))
+    }
+
+    fn hidden_row_from_sequence(hidden: &Array, row_index: usize) -> Result<Array, EngineError> {
+        let row_i32 = i32::try_from(row_index)
+            .map_err(|_| EngineError::Generation("hidden row index too large".to_owned()))?;
+        Ok(hidden.index((.., row_i32..row_i32 + 1, ..)))
     }
 
     // =========================================================================
@@ -968,12 +992,22 @@ impl SimpleEngine {
 
         let mut prepared = self.prepare_generation(prompt_tokens, pixel_values)?;
         let prompt_len = prepared.prompt_len;
-        let (current_token, first_logprob_data) = self.run_prefill(
+        #[allow(clippy::float_cmp)]
+        let capture_mtp_prefill = mtp_prefill_priming_enabled()
+            && self.tuning.enable_mtp()
+            && prepared.model.has_mtp()
+            && prepared.pixel_values.is_none()
+            && constraint.is_none()
+            && !logprobs
+            && params.temperature == 0.0;
+
+        let (current_token, first_logprob_data, prefill_hidden) = self.run_prefill(
             prompt_tokens,
             &mut prepared,
             params,
             logprob_top_n,
             constraint.as_ref(),
+            capture_mtp_prefill,
         )?;
 
         // Capture T1 (already eval'd inside run_prefill).
@@ -1048,9 +1082,12 @@ impl SimpleEngine {
             && !logprobs
             && params.temperature == 0.0
         {
+            let actual_prompt_tokens = prepared.actual_prompt_tokens.clone();
             return self.mtp_generate(
                 &mut prepared.model,
                 &mut prepared.cache,
+                &actual_prompt_tokens,
+                prefill_hidden.as_ref(),
                 first_token_id,
                 max_tokens,
                 prompt_len,
@@ -1538,6 +1575,8 @@ impl SimpleEngine {
         &self,
         model: &mut higgs_models::AnyModel,
         cache: &mut higgs_models::AnyCache,
+        actual_prompt_tokens: &[u32],
+        prefill_hidden: Option<&Array>,
         first_token_id: u32,
         max_tokens: u32,
         prompt_len: u32,
@@ -1551,10 +1590,10 @@ impl SimpleEngine {
         let mut mtp_cache = model
             .make_mtp_cache()
             .ok_or_else(|| EngineError::Generation("MTP cache creation failed".into()))?;
+        if let Some(hidden) = prefill_hidden {
+            crate::mtp::prime_mtp_cache(model, &mut mtp_cache, actual_prompt_tokens, hidden)?;
+        }
 
-        // Get initial hidden state: re-run backbone on first token to obtain h_t.
-        // This single-token forward is cheap and gives us the hidden state needed
-        // for the first MTP draft.
         let first_input = Array::from_slice(&[first_token_id as i32], &[1, 1]);
         let (hidden, logits) = model
             .forward_with_hidden(&first_input, None, cache)
@@ -1562,6 +1601,13 @@ impl SimpleEngine {
         let next_arr =
             mlx_rs::argmax_axis!(&logits.index((.., -1, ..)), -1).map_err(EngineError::Mlx)?;
         let h = hidden.index((.., -1.., ..));
+        if let Some(previous_hidden) = prefill_hidden
+            .filter(|_| !actual_prompt_tokens.is_empty())
+            .map(|prefill| Self::hidden_row_from_sequence(prefill, actual_prompt_tokens.len() - 1))
+            .transpose()?
+        {
+            crate::mtp::mirror_mtp_token(model, &mut mtp_cache, &previous_hidden, first_token_id)?;
+        }
         eval([&next_arr, &h]).map_err(EngineError::Mlx)?;
 
         let mut current_hidden = h;
@@ -1719,6 +1765,8 @@ impl SimpleEngine {
         &self,
         model: &mut higgs_models::AnyModel,
         cache: &mut higgs_models::AnyCache,
+        actual_prompt_tokens: &[u32],
+        prefill_hidden: Option<&Array>,
         first_token_id: u32,
         max_tokens: u32,
         prompt_len: u32,
@@ -1733,6 +1781,9 @@ impl SimpleEngine {
         let mut mtp_cache = model
             .make_mtp_cache()
             .ok_or_else(|| EngineError::Generation("MTP cache creation failed".into()))?;
+        if let Some(hidden) = prefill_hidden {
+            crate::mtp::prime_mtp_cache(model, &mut mtp_cache, actual_prompt_tokens, hidden)?;
+        }
 
         let first_input = Array::from_slice(&[first_token_id as i32], &[1, 1]);
         let (hidden, logits) = model
@@ -1741,6 +1792,13 @@ impl SimpleEngine {
         let next_arr =
             mlx_rs::argmax_axis!(&logits.index((.., -1, ..)), -1).map_err(EngineError::Mlx)?;
         let h = hidden.index((.., -1.., ..));
+        if let Some(previous_hidden) = prefill_hidden
+            .filter(|_| !actual_prompt_tokens.is_empty())
+            .map(|prefill| Self::hidden_row_from_sequence(prefill, actual_prompt_tokens.len() - 1))
+            .transpose()?
+        {
+            crate::mtp::mirror_mtp_token(model, &mut mtp_cache, &previous_hidden, first_token_id)?;
+        }
         eval([&next_arr, &h]).map_err(EngineError::Mlx)?;
 
         let mut current_hidden = h;
@@ -2035,12 +2093,22 @@ impl SimpleEngine {
 
         let mut prepared = self.prepare_generation(prompt_tokens, pixel_values)?;
         let prompt_len = prepared.prompt_len;
-        let (current_token, first_logprob_data) = self.run_prefill(
+        #[allow(clippy::float_cmp)]
+        let capture_mtp_prefill = mtp_prefill_priming_enabled()
+            && self.tuning.enable_mtp()
+            && prepared.model.has_mtp()
+            && prepared.pixel_values.is_none()
+            && constraint.is_none()
+            && !logprobs
+            && params.temperature == 0.0;
+
+        let (current_token, first_logprob_data, prefill_hidden) = self.run_prefill(
             prompt_tokens,
             &mut prepared,
             params,
             logprob_top_n,
             constraint.as_ref(),
+            capture_mtp_prefill,
         )?;
 
         let mut all_tokens: Vec<u32> = Vec::new();
@@ -2101,9 +2169,12 @@ impl SimpleEngine {
             && !logprobs
             && params.temperature == 0.0
         {
+            let actual_prompt_tokens = prepared.actual_prompt_tokens.clone();
             return self.mtp_generate_streaming(
                 &mut prepared.model,
                 &mut prepared.cache,
+                &actual_prompt_tokens,
+                prefill_hidden.as_ref(),
                 first_token_id,
                 max_tokens,
                 prompt_len,

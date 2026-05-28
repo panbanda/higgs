@@ -17,3 +17,4 @@ bench/
 .planning/
 benchmarks/*.txt
 benchmarks/*.safetensors
+benchmarks/*.py

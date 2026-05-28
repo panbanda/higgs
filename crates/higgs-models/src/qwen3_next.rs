@@ -2629,6 +2629,46 @@ impl GatedDeltaNet {
         silu_direct(&conv_flat.reshape(&[batch, 1, self.conv_dim])?)
     }
 
+    fn chronological_conv_state(
+        &self,
+        cache: &mut ArraysCache,
+        batch: i32,
+        dtype: Dtype,
+    ) -> Result<Array, Exception> {
+        let n_keep = self.conv_kernel_size - 1;
+        let Some(state) = cache.conv_state.take() else {
+            return ops::zeros_dtype(&[batch, n_keep, self.conv_dim], dtype);
+        };
+
+        if n_keep <= 0 {
+            return Ok(state);
+        }
+
+        let available = cache.offset.clamp(0, n_keep);
+        if available == 0 {
+            return Ok(state);
+        }
+        if available == n_keep && cache.conv_pos == n_keep - 1 {
+            return Ok(state);
+        }
+
+        let start = (cache.conv_pos - available + 1).rem_euclid(n_keep);
+        let ordered_tail = if start + available <= n_keep {
+            state.index((.., start..start + available, ..))
+        } else {
+            let first = state.index((.., start.., ..));
+            let second = state.index((.., ..(start + available - n_keep), ..));
+            ops::concatenate_axis(&[&first, &second], 1)?
+        };
+
+        if available == n_keep {
+            return Ok(ordered_tail);
+        }
+
+        let pad = ops::zeros_dtype(&[batch, n_keep - available, self.conv_dim], state.dtype())?;
+        ops::concatenate_axis(&[&pad, &ordered_tail], 1)
+    }
+
     #[allow(non_snake_case, clippy::too_many_lines)]
     fn forward(
         &mut self,
@@ -2707,10 +2747,7 @@ impl GatedDeltaNet {
         let conv_out = if S == 1 {
             self.decode_conv1d_step(&mixed_qkv, cache, B)?
         } else {
-            let conv_state = match cache.conv_state.take() {
-                Some(state) => state,
-                None => ops::zeros_dtype(&[B, n_keep, self.conv_dim], inputs.dtype())?,
-            };
+            let conv_state = self.chronological_conv_state(cache, B, inputs.dtype())?;
             let conv_input = ops::concatenate_axis(&[&conv_state, &mixed_qkv], 1)?;
             let conv_input_len = *conv_input
                 .shape()
@@ -3597,11 +3634,10 @@ impl Qwen3NextCausalLM {
                 h = h2.add(mlp_out)?;
             }
 
-            // Eval every 8 layers during prefill to bound lazy graph size.
-            // Without this, 40 layers × ~15 ops × T tokens accumulates a huge
-            // graph that MLX must analyze at once, increasing scheduler overhead
-            // and peak memory. Decode (T=1) is unaffected.
-            if T > 1 && (layer_idx + 1) % 8 == 0 {
+            // Eval every 8 layers during long prefill chunks to bound lazy
+            // graph size. Short speculative verifier windows are intentionally
+            // left fused; otherwise MTP pays several eval barriers per cycle.
+            if should_eval_between_prefill_layers(T, layer_idx) {
                 mlx_rs::transforms::eval([&h])?;
             }
         }
@@ -3789,6 +3825,37 @@ impl Qwen3NextCausalLM {
         self.model.embed_tokens.forward(&ids)
     }
 
+    fn embed_tokens_from_ids(&self, token_ids: &[u32]) -> Result<Array, Exception> {
+        let token_i32s: Vec<i32> = token_ids
+            .iter()
+            .map(|&token_id| {
+                i32::try_from(token_id).map_err(|_| Exception::custom("token_id exceeds i32 range"))
+            })
+            .collect::<Result<_, _>>()?;
+        let len = i32::try_from(token_i32s.len())
+            .map_err(|_| Exception::custom("token id batch exceeds i32 range"))?;
+        let ids_array = Array::from_slice(&token_i32s, &[1, len]);
+        self.model.embed_tokens.forward(&ids_array)
+    }
+
+    fn mtp_attention_mask(
+        seq_len: i32,
+        mtp_cache: &[SteppingKeyValueCache],
+    ) -> Result<Option<AttentionMask>, Exception> {
+        if seq_len <= 1 {
+            return Ok(None);
+        }
+        let offset = mtp_cache.first().map_or(0, SteppingKeyValueCache::offset);
+        if offset > 0 {
+            Ok(Some(AttentionMask::Array(create_causal_mask(
+                seq_len,
+                Some(offset),
+            )?)))
+        } else {
+            Ok(Some(AttentionMask::Causal))
+        }
+    }
+
     /// Run the MTP head to produce draft logits for position t+2.
     ///
     /// - `hidden` — backbone hidden state at position t, shape `[B, 1, D]`.
@@ -3899,6 +3966,68 @@ impl Qwen3NextCausalLM {
         Ok(())
     }
 
+    /// Advance the MTP cache for multiple accepted tokens in one sequence pass.
+    pub fn mtp_advance_many(
+        &mut self,
+        hidden: &Array,
+        next_token_ids: &[u32],
+        mtp_cache: &mut [SteppingKeyValueCache],
+    ) -> Result<(), Exception> {
+        if next_token_ids.is_empty() {
+            return Ok(());
+        }
+        if !self.has_mtp() {
+            return Err(Exception::custom("MTP head not loaded"));
+        }
+
+        let seq_len = i32::try_from(next_token_ids.len())
+            .map_err(|_| Exception::custom("MTP advance token batch exceeds i32 range"))?;
+        let next_embed = self.embed_tokens_from_ids(next_token_ids)?;
+        let mask = Self::mtp_attention_mask(seq_len, mtp_cache)?;
+        let mask_ref = mask.as_ref();
+
+        if let Some(mtp) = self.mtp.as_mut() {
+            let h_norm = mtp.pre_fc_norm_hidden.forward(hidden)?;
+            let e_norm = mtp.pre_fc_norm_embedding.forward(&next_embed)?;
+            let concat = ops::concatenate_axis(&[&e_norm, &h_norm], -1)?;
+            let mut x = mtp.fc.forward(&concat)?;
+
+            for (layer, kv) in mtp.layers.iter_mut().zip(mtp_cache.iter_mut()) {
+                let normed = layer.input_layernorm.forward(&x)?;
+                let attn_out = layer.self_attn.forward(&normed, mask_ref, kv)?;
+                let h2 = x.add(attn_out)?;
+                let normed_post = layer.post_attention_layernorm.forward(&h2)?;
+                let mlp_out = layer.mlp.forward(&normed_post)?;
+                x = h2.add(mlp_out)?;
+            }
+
+            let _ = mtp.norm.forward(&x)?;
+            return Ok(());
+        }
+
+        let mtp = self
+            .dense_mtp
+            .as_mut()
+            .ok_or_else(|| Exception::custom("MTP head not loaded"))?;
+
+        let h_norm = mtp.pre_fc_norm_hidden.forward(hidden)?;
+        let e_norm = mtp.pre_fc_norm_embedding.forward(&next_embed)?;
+        let concat = ops::concatenate_axis(&[&e_norm, &h_norm], -1)?;
+        let mut x = mtp.fc.forward(&concat)?;
+
+        for (layer, kv) in mtp.layers.iter_mut().zip(mtp_cache.iter_mut()) {
+            let normed = layer.input_layernorm.forward(&x)?;
+            let attn_out = layer.self_attn.forward(&normed, mask_ref, kv)?;
+            let h2 = x.add(attn_out)?;
+            let normed_post = layer.post_attention_layernorm.forward(&h2)?;
+            let mlp_out = layer.mlp.forward(&normed_post)?;
+            x = h2.add(mlp_out)?;
+        }
+
+        let _ = mtp.norm.forward(&x)?;
+        Ok(())
+    }
+
     /// Forward pass returning BOTH raw hidden states and logits for all positions.
     ///
     /// Used by MTP speculative decode: the verify pass needs **raw** (pre-norm)
@@ -3920,6 +4049,31 @@ impl Qwen3NextCausalLM {
             None => self.model.embed_tokens.as_linear(&h_normed)?,
         };
         Ok((h_raw, logits))
+    }
+}
+
+const PREFILL_LAYER_EVAL_INTERVAL: usize = 8;
+const PREFILL_LAYER_EVAL_MIN_SEQ_LEN: i32 = 17;
+
+const fn should_eval_between_prefill_layers(seq_len: i32, layer_idx: usize) -> bool {
+    seq_len >= PREFILL_LAYER_EVAL_MIN_SEQ_LEN
+        && (layer_idx + 1).is_multiple_of(PREFILL_LAYER_EVAL_INTERVAL)
+}
+
+#[cfg(test)]
+mod prefill_eval_tests {
+    use super::should_eval_between_prefill_layers;
+
+    #[test]
+    fn skips_layer_eval_barriers_for_short_speculative_windows() {
+        assert!(!should_eval_between_prefill_layers(3, 7));
+        assert!(!should_eval_between_prefill_layers(8, 7));
+    }
+
+    #[test]
+    fn keeps_layer_eval_barriers_for_long_prefill_chunks() {
+        assert!(should_eval_between_prefill_layers(128, 7));
+        assert!(!should_eval_between_prefill_layers(128, 6));
     }
 }
 
@@ -5334,6 +5488,25 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires real model weights; placeholder test tensors cannot run MTP forward"]
+    fn test_mtp_advance_many_appends_accepted_token_states() {
+        let stream = Stream::new();
+        mlx_rs::with_new_default_stream(stream, || {
+            let mut args = valid_causal_lm_args();
+            args.mtp_num_hidden_layers = 1;
+            let mut model = Qwen3NextCausalLM::new(args).unwrap();
+            let mut mtp_cache = model.make_mtp_cache().unwrap();
+            let hidden = Array::zeros::<f32>(&[1, 2, model.args.hidden_size]).unwrap();
+
+            model
+                .mtp_advance_many(&hidden, &[1, 2], &mut mtp_cache)
+                .unwrap();
+
+            assert_eq!(mtp_cache[0].offset(), 2);
+        });
+    }
+
+    #[test]
     fn test_load_model_args_happy_path() {
         let dir = tempfile::tempdir().unwrap();
         let config = r#"{
@@ -6037,6 +6210,17 @@ mod tests {
             ref_state = conv_in.index((.., 1.., ..));
             cache.offset += 1;
         }
+
+        let ordered = gdn
+            .chronological_conv_state(&mut cache, 1, Dtype::Float16)
+            .unwrap();
+        mlx_rs::transforms::eval([&ordered, &ref_state]).unwrap();
+        let diff = ordered.subtract(&ref_state).unwrap().abs().unwrap();
+        let max_diff: f32 = diff.max(None).unwrap().item();
+        assert!(
+            max_diff < 2e-3,
+            "linearized ring-buffer conv state differs from chronological state by {max_diff}"
+        );
     }
 
     #[test]
@@ -7912,8 +8096,8 @@ mod tests {
         });
     }
 
-    /// Benchmark 36 GDN layers using bare Arrays (matching Python bench_gdn_real_python.py).
-    /// Isolates GDN ops from the model framework to compare GPU time vs Python.
+    /// Benchmark 36 GDN layers using bare Arrays.
+    /// Isolates GDN ops from the model framework to compare direct GPU time.
     #[test]
     #[ignore = "requires GPU"]
     fn bench_gdn_layers() {

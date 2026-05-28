@@ -13,6 +13,7 @@
 
 pub mod models;
 pub mod server;
+pub mod speculative;
 pub mod stats;
 
 use std::fs;
@@ -71,7 +72,10 @@ impl HostInfo {
         sys.refresh_memory();
         sys.refresh_cpu_all();
 
-        let hostname = System::host_name().unwrap_or_else(|| "unknown".into());
+        let hostname = hostname_for_output(
+            System::host_name().unwrap_or_else(|| "unknown".into()),
+            include_hostname(),
+        );
         let os_name = System::name().unwrap_or_else(|| "unknown".into());
         let os_version = System::os_version().unwrap_or_else(|| "?".into());
         let kernel = System::kernel_version().unwrap_or_else(|| "?".into());
@@ -105,6 +109,36 @@ fn detect_gpu() -> Option<String> {
     // Apple Silicon. Intel Macs return None rather than getting mislabeled.
     (cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64")
         .then(|| "Apple Silicon (MLX)".into())
+}
+
+fn include_hostname() -> bool {
+    matches!(
+        std::env::var("HIGGS_BENCH_INCLUDE_HOSTNAME")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
+fn hostname_for_output(hostname: String, include_hostname: bool) -> String {
+    if include_hostname {
+        hostname
+    } else {
+        "redacted".to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hostname_for_output;
+
+    #[test]
+    fn benchmark_metadata_redacts_hostname_by_default() {
+        assert_eq!(
+            hostname_for_output("developer-laptop".to_owned(), false),
+            "redacted"
+        );
+    }
 }
 
 /// The model under test, captured into bench output for reproducibility.

@@ -488,6 +488,26 @@ impl AnyModel {
         }
     }
 
+    /// Advance the MTP head/cache for accepted tokens without projecting logits.
+    pub fn mtp_advance_many(
+        &mut self,
+        hidden: &Array,
+        next_token_ids: &[u32],
+        mtp_cache: &mut MtpCache,
+    ) -> Result<(), Exception> {
+        match self {
+            Self::Qwen3Next(m) => m.mtp_advance_many(hidden, next_token_ids, mtp_cache),
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::LlavaQwen2(_)
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
+        }
+    }
+
     /// Forward pass returning both hidden states and logits for all positions.
     ///
     /// Used by MTP speculative decode for the verify pass.

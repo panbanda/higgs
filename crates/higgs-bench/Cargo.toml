@@ -31,5 +31,9 @@ name = "bench_decode"
 path = "src/bin/bench_decode.rs"
 
 [[bin]]
+name = "bench_speculative"
+path = "src/bin/bench_speculative.rs"
+
+[[bin]]
 name = "bench_summarize"
 path = "src/bin/bench_summarize.rs"
