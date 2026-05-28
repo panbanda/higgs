@@ -1,3 +1,4 @@
 reviews:
+  request_changes_workflow: true
   commit_status: false
   fail_commit_status: false
