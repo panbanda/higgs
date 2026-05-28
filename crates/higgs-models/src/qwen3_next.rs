@@ -6934,9 +6934,12 @@ mod tests {
     #[ignore = "benchmark, requires GPU"]
     fn bench_gather_qmm_loaded_vs_random() {
         use mlx_rs::Dtype;
-        let model_dir = "/Users/panbanda/.cache/huggingface/hub/models--mlx-community--Qwen3-Coder-Next-4bit/snapshots/7b9321eabb85ce79625cac3f61ea691e4ea984b5";
-        let shard = format!("{}/model-00001-of-00009.safetensors", model_dir);
-        let path = std::path::Path::new(&shard);
+        let Some(model_dir) = std::env::var_os("HIGGS_QWEN3_NEXT_BENCH_MODEL") else {
+            eprintln!("Skipping: set HIGGS_QWEN3_NEXT_BENCH_MODEL to a local model directory");
+            return;
+        };
+        let shard = std::path::PathBuf::from(model_dir).join("model-00001-of-00009.safetensors");
+        let path = shard.as_path();
         if !path.exists() {
             eprintln!("Skipping: model not found");
             return;
@@ -12447,13 +12450,17 @@ mod tests {
     #[test]
     #[ignore = "requires model files on disk"]
     fn bench_actual_model_forward() {
-        let model_path = "/Users/panbanda/.cache/huggingface/hub/models--mlx-community--Qwen3-Coder-Next-4bit/snapshots/7b9321eabb85ce79625cac3f61ea691e4ea984b5";
-        if !std::path::Path::new(model_path).exists() {
-            println!("Model not found at {model_path}, skipping");
+        let Some(model_path) = std::env::var_os("HIGGS_QWEN3_NEXT_BENCH_MODEL") else {
+            println!("Skipping: set HIGGS_QWEN3_NEXT_BENCH_MODEL to a local model directory");
+            return;
+        };
+        let model_path = std::path::PathBuf::from(model_path);
+        if !model_path.exists() {
+            println!("Model not found at {}, skipping", model_path.display());
             return;
         }
 
-        let mut model = load_qwen3_next_model(model_path).unwrap();
+        let mut model = load_qwen3_next_model(&model_path).unwrap();
         let mut cache: Vec<Option<LayerCache>> = Vec::new();
 
         // Prefill with a short prompt
