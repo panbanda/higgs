@@ -47,7 +47,11 @@ pub fn derive_model_name(model_path: &str) -> String {
 }
 
 fn looks_like_huggingface_repo_id(model_path: &str) -> bool {
-    if model_path.starts_with('/') || model_path.starts_with("./") || model_path.starts_with("../")
+    if model_path.starts_with('/')
+        || model_path.starts_with("./")
+        || model_path.starts_with("../")
+        || model_path.starts_with("~/")
+        || model_path.contains('\\')
     {
         return false;
     }
@@ -58,7 +62,14 @@ fn looks_like_huggingface_repo_id(model_path: &str) -> bool {
     let Some(name) = parts.next() else {
         return false;
     };
-    parts.next().is_none() && !owner.is_empty() && !name.is_empty()
+    if parts.next().is_some() || owner.is_empty() || name.is_empty() {
+        return false;
+    }
+
+    !matches!(
+        owner,
+        "model" | "models" | "checkpoint" | "checkpoints" | "cache" | "data" | "target"
+    )
 }
 
 /// Parses a comma-separated trial list.
@@ -154,6 +165,13 @@ mod tests {
         let model = derive_model_name("org/Qwen3.6-27B-mtp");
 
         assert_eq!(model, "org/Qwen3.6-27B-mtp");
+    }
+
+    #[test]
+    fn derive_model_name_uses_basename_for_common_relative_model_dirs() {
+        let model = derive_model_name("models/local-qwen");
+
+        assert_eq!(model, "local-qwen");
     }
 
     #[test]

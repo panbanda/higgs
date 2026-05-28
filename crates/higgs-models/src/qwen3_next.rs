@@ -3982,6 +3982,14 @@ impl Qwen3NextCausalLM {
 
         let seq_len = i32::try_from(next_token_ids.len())
             .map_err(|_| Exception::custom("MTP advance token batch exceeds i32 range"))?;
+        let expected_layers = self
+            .mtp
+            .as_ref()
+            .map(|mtp| mtp.layers.len())
+            .or_else(|| self.dense_mtp.as_ref().map(|mtp| mtp.layers.len()))
+            .ok_or_else(|| Exception::custom("MTP head not loaded"))?;
+        Self::validate_mtp_advance_many_inputs(hidden, mtp_cache, expected_layers, seq_len)?;
+
         let next_embed = self.embed_tokens_from_ids(next_token_ids)?;
         let mask = Self::mtp_attention_mask(seq_len, mtp_cache)?;
         let mask_ref = mask.as_ref();
@@ -4025,6 +4033,44 @@ impl Qwen3NextCausalLM {
         }
 
         let _ = mtp.norm.forward(&x)?;
+        Ok(())
+    }
+
+    fn validate_mtp_advance_many_inputs(
+        hidden: &Array,
+        mtp_cache: &[SteppingKeyValueCache],
+        expected_layers: usize,
+        seq_len: i32,
+    ) -> Result<(), Exception> {
+        Self::validate_mtp_advance_many_shape(
+            hidden.shape(),
+            mtp_cache.len(),
+            expected_layers,
+            seq_len,
+        )
+    }
+
+    fn validate_mtp_advance_many_shape(
+        hidden_shape: &[i32],
+        cache_layers: usize,
+        expected_layers: usize,
+        seq_len: i32,
+    ) -> Result<(), Exception> {
+        if cache_layers != expected_layers {
+            return Err(Exception::custom(format!(
+                "mtp_cache length ({cache_layers}) must match MTP layer count ({expected_layers})"
+            )));
+        }
+
+        let hidden_seq_len = *hidden_shape
+            .get(1)
+            .ok_or_else(|| Exception::custom("hidden must be [B, T, D]"))?;
+        if hidden_seq_len != seq_len {
+            return Err(Exception::custom(format!(
+                "hidden sequence length ({hidden_seq_len}) must match next_token_ids length ({seq_len})"
+            )));
+        }
+
         Ok(())
     }
 
@@ -5504,6 +5550,28 @@ mod tests {
 
             assert_eq!(mtp_cache[0].offset(), 2);
         });
+    }
+
+    #[test]
+    fn test_mtp_advance_many_rejects_cache_layer_mismatch() {
+        let err =
+            Qwen3NextCausalLM::validate_mtp_advance_many_shape(&[1, 1, 256], 0, 1, 1).unwrap_err();
+
+        assert!(
+            err.to_string().contains("mtp_cache length"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_mtp_advance_many_rejects_hidden_sequence_mismatch() {
+        let err =
+            Qwen3NextCausalLM::validate_mtp_advance_many_shape(&[1, 2, 256], 1, 1, 1).unwrap_err();
+
+        assert!(
+            err.to_string().contains("hidden sequence length"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

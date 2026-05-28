@@ -438,6 +438,7 @@ fn start_higgs_server(
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_stderr));
 
+    clear_speculative_env(&mut cmd);
     for (key, value) in &spec.env {
         cmd.env(key, value);
     }
@@ -484,6 +485,21 @@ fn sanitize_filename(value: &str) -> String {
         .collect()
 }
 
+fn clear_speculative_env(cmd: &mut Command) {
+    for key in SPECULATIVE_ENV_KEYS {
+        cmd.env_remove(key);
+    }
+}
+
+const SPECULATIVE_ENV_KEYS: &[&str] = &[
+    "HIGGS_MTP",
+    "HIGGS_MTP_DRAFT_N_MAX",
+    "HIGGS_PROMPT_LOOKUP",
+    "HIGGS_PROMPT_LOOKUP_UNCHECKED",
+    "HIGGS_MTP_PRIME_PREFILL",
+    "HIGGS_MTP_MIRROR_VERIFY",
+];
+
 fn read_filtered_telemetry(path: &Path) -> String {
     let Ok(body) = fs::read_to_string(path) else {
         return String::new();
@@ -494,4 +510,25 @@ fn read_filtered_telemetry(path: &Path) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SPECULATIVE_ENV_KEYS, clear_speculative_env};
+    use std::process::Command;
+
+    #[test]
+    fn clear_speculative_env_marks_all_flags_for_removal() {
+        let mut cmd = Command::new("higgs");
+
+        clear_speculative_env(&mut cmd);
+
+        for key in SPECULATIVE_ENV_KEYS {
+            assert!(
+                cmd.get_envs()
+                    .any(|(name, value)| name == *key && value.is_none()),
+                "expected {key} to be explicitly removed"
+            );
+        }
+    }
 }
