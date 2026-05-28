@@ -1501,18 +1501,33 @@ impl Qwen3NextAttention {
         queries = apply_rope(&queries, &self.rope, offset)?;
         keys = apply_rope(&keys, &self.rope, offset)?;
         let view = cache.update_and_view(keys, values)?;
-        let (cached_keys, cached_values) = view.into_dense()?;
-        let sdpa_mask = mask.map(fast::ScaledDotProductAttentionMask::from);
-        let output = fast::scaled_dot_product_attention(
-            queries,
-            cached_keys,
-            cached_values,
-            self.scale,
-            sdpa_mask,
-            None::<&Array>,
-        )?
-        .transpose_axes(&[0, 2, 1, 3])?
-        .reshape(&[B, L, -1])?;
+        let try_tq_decode = mask.is_none() && L == 1;
+        let output = match view {
+            crate::cache::KvCacheView::TurboQuant(tq_view) if try_tq_decode => {
+                let scores = tq_view.decode_scores(&queries, self.num_attention_heads)?;
+                let scale_arr = Array::from_f32(self.scale).as_dtype(scores.dtype())?;
+                let weights = ops::softmax_axis(&scores.multiply(&scale_arr)?, -1, true)?;
+                tq_view
+                    .decode_values(&weights, self.num_attention_heads)?
+                    .transpose_axes(&[0, 2, 1, 3])?
+                    .reshape(&[B, L, -1])?
+            }
+            other @ (crate::cache::KvCacheView::Dense { .. }
+            | crate::cache::KvCacheView::TurboQuant(_)) => {
+                let (cached_keys, cached_values) = other.into_dense()?;
+                let sdpa_mask = mask.map(fast::ScaledDotProductAttentionMask::from);
+                fast::scaled_dot_product_attention(
+                    queries,
+                    cached_keys,
+                    cached_values,
+                    self.scale,
+                    sdpa_mask,
+                    None::<&Array>,
+                )?
+                .transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[B, L, -1])?
+            }
+        };
         if L == 1 && async_layer_state_eval_enabled() {
             mlx_rs::transforms::async_eval(cache.eval_targets())?;
         }
@@ -4258,13 +4273,21 @@ fn checkpoint_mtp_weight_layout(model_path: &Path) -> Result<MtpWeightLayout, Mo
             return Ok(index_layout);
         }
 
-        for file_name in crate::AUXILIARY_SAFETENSORS_FILES {
-            let file_path = model_path.join(file_name);
-            if file_path.exists() {
-                let layout = safetensors_file_mtp_weight_layout(&file_path)?;
-                if layout != MtpWeightLayout::None {
-                    return Ok(layout);
-                }
+        let auxiliary_files: Vec<_> = crate::AUXILIARY_SAFETENSORS_FILES
+            .iter()
+            .map(|file_name| model_path.join(file_name))
+            .filter(|file_path| file_path.exists())
+            .collect();
+        if auxiliary_files.len() > 1 {
+            return Err(ModelError::UnsupportedModel(
+                "ambiguous MTP sidecars: both mtp.safetensors and model-mtp.safetensors are present; remove one".to_owned(),
+            ));
+        }
+
+        for file_path in auxiliary_files {
+            let layout = safetensors_file_mtp_weight_layout(&file_path)?;
+            if layout != MtpWeightLayout::None {
+                return Ok(layout);
             }
         }
 
@@ -7190,12 +7213,12 @@ mod tests {
             eprintln!("Skipping: set HIGGS_QWEN3_NEXT_BENCH_MODEL to a local model directory");
             return;
         };
-        let shard = std::path::PathBuf::from(model_dir).join("model-00001-of-00009.safetensors");
-        let path = shard.as_path();
-        if !path.exists() {
-            eprintln!("Skipping: model not found");
+        let model_dir = std::path::PathBuf::from(model_dir);
+        let Some(shard) = find_gather_qmm_bench_shard(&model_dir) else {
+            eprintln!("Skipping: no safetensors shard with switch_mlp gate weights found");
             return;
-        }
+        };
+        let path = shard.as_path();
 
         // Load one safetensors shard
         let loaded = Array::load_safetensors(path).unwrap();
@@ -7300,6 +7323,32 @@ mod tests {
             "gather_qmm single layer: loaded={loaded_us:.1}us random={random_us:.1}us ratio={:.2}x",
             loaded_us / random_us
         );
+    }
+
+    fn find_gather_qmm_bench_shard(model_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        let mut candidates: Vec<_> = std::fs::read_dir(model_dir)
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "safetensors"))
+            .collect();
+        candidates.sort_by(|a, b| {
+            let a_name = a.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            let b_name = b.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            let a_shard = a_name.starts_with("model-") && a_name.contains("-of-");
+            let b_shard = b_name.starts_with("model-") && b_name.contains("-of-");
+            b_shard.cmp(&a_shard).then_with(|| a_name.cmp(b_name))
+        });
+
+        candidates.into_iter().find(|path| {
+            Array::load_safetensors(path).ok().is_some_and(|loaded| {
+                loaded.keys().any(|key| {
+                    key.contains("switch_mlp")
+                        && key.contains("gate_proj")
+                        && key.contains(".weight")
+                })
+            })
+        })
     }
 
     /// Isolate what causes the module vs inline performance gap.

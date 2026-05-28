@@ -1274,13 +1274,31 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
 
 /// Collect safetensors file paths from a model directory.
 fn collect_safetensors_files(model_path: &Path) -> Result<Vec<std::path::PathBuf>, ModelError> {
-    fn append_existing_auxiliary_files(model_path: &Path, files: &mut Vec<std::path::PathBuf>) {
-        for file_name in AUXILIARY_SAFETENSORS_FILES {
-            let file_path = model_path.join(file_name);
-            if file_path.exists() && !files.iter().any(|path| path == &file_path) {
+    fn existing_auxiliary_files(model_path: &Path) -> Vec<std::path::PathBuf> {
+        AUXILIARY_SAFETENSORS_FILES
+            .iter()
+            .map(|file_name| model_path.join(file_name))
+            .filter(|file_path| file_path.exists())
+            .collect()
+    }
+
+    fn append_existing_auxiliary_files(
+        model_path: &Path,
+        files: &mut Vec<std::path::PathBuf>,
+    ) -> Result<(), ModelError> {
+        let auxiliary_files = existing_auxiliary_files(model_path);
+        if auxiliary_files.len() > 1 {
+            return Err(ModelError::UnsupportedModel(
+                "ambiguous MTP sidecars: both mtp.safetensors and model-mtp.safetensors are present; remove one".to_owned(),
+            ));
+        }
+
+        if let Some(file_path) = auxiliary_files.into_iter().next() {
+            if !files.iter().any(|path| path == &file_path) {
                 files.push(file_path);
             }
         }
+        Ok(())
     }
 
     let index_path = model_path.join("model.safetensors.index.json");
@@ -1293,14 +1311,14 @@ fn collect_safetensors_files(model_path: &Path) -> Result<Vec<std::path::PathBuf
             .map(|f| model_path.join(f))
             .collect();
         files.sort();
-        append_existing_auxiliary_files(model_path, &mut files);
+        append_existing_auxiliary_files(model_path, &mut files)?;
         files.sort();
         Ok(files)
     } else {
         let single_path = model_path.join("model.safetensors");
         if single_path.exists() {
             let mut files = vec![single_path];
-            append_existing_auxiliary_files(model_path, &mut files);
+            append_existing_auxiliary_files(model_path, &mut files)?;
             files.sort();
             Ok(files)
         } else {
@@ -1540,6 +1558,22 @@ mod tests {
                 .iter()
                 .any(|path| path.file_name().unwrap() == "model-mtp.safetensors")
         );
+    }
+
+    #[test]
+    fn collect_safetensors_rejects_ambiguous_mtp_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("model.safetensors"), b"dummy").unwrap();
+        std::fs::write(dir.path().join("mtp.safetensors"), b"dummy").unwrap();
+        std::fs::write(dir.path().join("model-mtp.safetensors"), b"dummy").unwrap();
+
+        let err = collect_safetensors_files(dir.path()).unwrap_err();
+
+        assert!(
+            matches!(err, ModelError::UnsupportedModel(_)),
+            "expected ambiguous sidecar error, got: {err:?}"
+        );
+        assert!(err.to_string().contains("ambiguous MTP sidecars"));
     }
 
     #[test]
