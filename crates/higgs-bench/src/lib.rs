@@ -128,15 +128,116 @@ fn hostname_for_output(hostname: String, include_hostname: bool) -> String {
     }
 }
 
+fn redact_arg_for_output(arg: &str) -> String {
+    if let Some((prefix, value)) = arg.split_once('=') {
+        if is_local_path_like(value) {
+            return format!("{prefix}={}", redacted_local_path_value(value));
+        }
+    }
+
+    if is_local_path_like(arg) {
+        redacted_local_path_value(arg)
+    } else {
+        arg.to_owned()
+    }
+}
+
+fn is_local_path_like(value: &str) -> bool {
+    let path = Path::new(value);
+    path.is_absolute()
+        || value.starts_with("./")
+        || value.starts_with("../")
+        || value.starts_with("~/")
+        || value.get(1..3) == Some(":\\")
+}
+
+fn redacted_local_path_value(value: &str) -> String {
+    if looks_like_hf_cache_path(value) {
+        let model_name = speculative::derive_model_name(value);
+        if model_name != value && !is_local_path_like(&model_name) {
+            return model_name;
+        }
+    }
+
+    let trimmed = value.trim_end_matches(['/', '\\']);
+    let basename = Path::new(trimmed)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("path");
+    format!("<local-path:{basename}>")
+}
+
+fn looks_like_hf_cache_path(value: &str) -> bool {
+    (value.contains("/models--") || value.contains("\\models--"))
+        && (value.contains("/snapshots/") || value.contains("\\snapshots\\"))
+}
+
+/// Returns a model reference suitable for benchmark output.
+///
+/// Hugging Face repo IDs are preserved. Local paths are reduced to either the
+/// explicit request model name or a derived basename/cache repo so benchmark
+/// JSON and markdown do not expose a developer's filesystem layout.
+#[must_use]
+pub fn public_model_ref(path: &str, request_model: &str) -> String {
+    if is_local_path_like(path) {
+        if request_model.is_empty() {
+            speculative::derive_model_name(path)
+        } else {
+            request_model.to_owned()
+        }
+    } else {
+        path.to_owned()
+    }
+}
+
+/// Formats generated artifact paths without exposing the absolute workspace.
+#[must_use]
+pub fn path_for_output(path: &Path) -> String {
+    if let Some(root) = workspace_root() {
+        if let Ok(relative) = path.strip_prefix(root) {
+            return relative.display().to_string();
+        }
+    }
+    redact_arg_for_output(&path.display().to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::hostname_for_output;
+    use super::{hostname_for_output, public_model_ref, redact_arg_for_output};
 
     #[test]
     fn benchmark_metadata_redacts_hostname_by_default() {
         assert_eq!(
             hostname_for_output("developer-laptop".to_owned(), false),
             "redacted"
+        );
+    }
+
+    #[test]
+    fn benchmark_metadata_redacts_absolute_path_args() {
+        assert_eq!(
+            redact_arg_for_output("/Users/alice/models/Qwen3.6-27B-mtp"),
+            "<local-path:Qwen3.6-27B-mtp>"
+        );
+        assert_eq!(
+            redact_arg_for_output("--manifest=/Users/alice/dev/higgs/benchmarks/models.toml"),
+            "--manifest=<local-path:models.toml>"
+        );
+    }
+
+    #[test]
+    fn model_refs_hide_local_absolute_paths() {
+        assert_eq!(
+            public_model_ref(
+                "/Users/alice/.cache/huggingface/hub/models--org--Qwen3.6-27B-mtp/snapshots/abcdef",
+                ""
+            ),
+            "org/Qwen3.6-27B-mtp"
+        );
+        assert_eq!(
+            public_model_ref("/Users/alice/models/private-qwen", "local-qwen"),
+            "local-qwen"
         );
     }
 }
@@ -201,7 +302,9 @@ impl RunMetadata {
             host: HostInfo::capture(),
             mlx_version: None,
             model: None,
-            args: std::env::args().collect(),
+            args: std::env::args()
+                .map(|arg| redact_arg_for_output(&arg))
+                .collect(),
         }
     }
 }

@@ -23,7 +23,7 @@ use clap::Parser;
 use futures::StreamExt;
 use higgs_bench::{
     BenchOutput, ModelInfo, OutputFormat, RunMetadata, default_manifest_path, format_json,
-    format_markdown, models, persist_result, server, stats,
+    format_markdown, models, path_for_output, persist_result, public_model_ref, server, stats,
 };
 use serde::Serialize;
 
@@ -159,9 +159,10 @@ async fn run(args: Args) -> Result<()> {
 
     let manifest_path = args.manifest.clone().unwrap_or_else(default_manifest_path);
     let model = models::find_by_key(&manifest_path, &args.model)?;
+    let public_model_path = public_model_ref(&model.path, "");
     metadata.model = Some(ModelInfo {
         key: model.key.clone(),
-        path: model.path.clone(),
+        path: public_model_path.clone(),
         quantization: model.quantization.clone(),
         approx_size_gb: model.approx_size_gb,
     });
@@ -218,7 +219,7 @@ async fn run(args: Args) -> Result<()> {
         host: args.host.clone(),
         port: args.port,
         model_key: model.key.clone(),
-        model_path: model.path.clone(),
+        model_path: public_model_path,
         max_tokens: args.max_tokens,
         warmup: args.warmup,
         trials: args.trials,
@@ -237,7 +238,7 @@ async fn run(args: Args) -> Result<()> {
     };
 
     let path = persist_result(&output)?;
-    eprintln!("[persisted] {}", path.display());
+    eprintln!("[persisted] {}", path_for_output(&path));
 
     let rendered = match args.format {
         OutputFormat::Json => format_json(&output)?,

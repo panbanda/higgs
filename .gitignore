@@ -15,6 +15,9 @@ bench/
 **/__pycache__/
 .claude/
 .planning/
+graphify-out/
+GRAPH_REPORT.md
+graph.json
 benchmarks/*.txt
 benchmarks/*.safetensors
 benchmarks/*.py

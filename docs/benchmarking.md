@@ -24,7 +24,8 @@ cargo run --release -p higgs-bench --bin bench_decode -- \
 
 - TTFT through the streaming API
 - decode throughput from server-reported token usage
-- reproducible JSON/Markdown output with redacted host metadata by default
+- reproducible JSON/Markdown output with redacted host metadata and local
+  filesystem paths by default
 
 ## MTP Draft-Depth Sweep
 
@@ -136,7 +137,10 @@ top-level keys: `metadata`, `params`, `results`.
 ```
 
 `metadata.git_commit` and `git_dirty` are captured at compile time via
-the `built` crate; you must rebuild the bench binary to refresh them.
+the `built` crate; you must rebuild the bench binary to refresh them. Benchmark
+metadata redacts hostnames by default and reduces local absolute paths in
+`args`, model refs, and persisted artifact messages to public model IDs,
+basenames, or relative `target/bench-results/...` paths.
 
 Every binary supports two output formats:
 

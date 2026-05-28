@@ -72,7 +72,7 @@ impl IntoResponse for ServerError {
                 (
                     StatusCode::BAD_GATEWAY,
                     "proxy_error",
-                    format!("Upstream provider error: {msg}"),
+                    "Upstream provider error".to_owned(),
                 )
             }
         };
@@ -225,11 +225,24 @@ mod tests {
 
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(body["error"]["type"].as_str().unwrap(), "proxy_error");
-        let message = body["error"]["message"].as_str().unwrap();
-        assert!(
-            message.contains("connection refused"),
-            "expected proxy detail in message: {message}"
+        assert_eq!(
+            body["error"]["message"].as_str().unwrap(),
+            "Upstream provider error"
         );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_error_masks_upstream_details() {
+        let error = ServerError::ProxyError(
+            "upstream returned HTTP 401: invalid api key provider-secret-token".to_owned(),
+        );
+        let resp = error.into_response();
+        let (status, body) = response_status_and_body(resp).await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let message = body["error"]["message"].as_str().unwrap();
+        assert_eq!(message, "Upstream provider error");
+        assert!(!message.contains("provider-secret-token"));
     }
 
     #[tokio::test]

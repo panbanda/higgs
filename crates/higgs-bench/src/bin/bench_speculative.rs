@@ -20,7 +20,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use higgs_bench::{
     BenchOutput, ModelInfo, OutputFormat, RunMetadata, default_manifest_path, format_json,
-    format_markdown, models, persist_result, results_dir, server, speculative, stats,
+    format_markdown, models, path_for_output, persist_result, public_model_ref, results_dir,
+    server, speculative, stats,
 };
 use serde::Serialize;
 
@@ -239,7 +240,7 @@ async fn run(args: Args) -> Result<()> {
     };
 
     let path = persist_result(&output)?;
-    eprintln!("[persisted] {}", path.display());
+    eprintln!("[persisted] {}", path_for_output(&path));
 
     let rendered = match args.format {
         OutputFormat::Json => format_json(&output)?,
@@ -370,14 +371,15 @@ fn resolve_model(args: &Args, manifest_path: &Path) -> Result<ResolvedModel> {
                 .model_name
                 .clone()
                 .unwrap_or_else(|| speculative::derive_model_name(&model.path));
+            let public_ref = public_model_ref(&model.path, &request_model);
             Ok(ResolvedModel {
                 key: Some(model.key.clone()),
                 serve_path: model.path.clone(),
-                public_ref: public_model_ref(&model.path, &request_model),
+                public_ref: public_ref.clone(),
                 request_model,
                 metadata: ModelInfo {
                     key: model.key,
-                    path: public_model_ref(&model.path, args.model_name.as_deref().unwrap_or("")),
+                    path: public_ref,
                     quantization: model.quantization,
                     approx_size_gb: model.approx_size_gb,
                 },
@@ -404,19 +406,6 @@ fn resolve_model(args: &Args, manifest_path: &Path) -> Result<ResolvedModel> {
         }
         (None, None) => anyhow::bail!("pass either --model <key> or --model-path <path>"),
         (Some(_), Some(_)) => anyhow::bail!("pass only one of --model or --model-path"),
-    }
-}
-
-fn public_model_ref(path: &str, request_model: &str) -> String {
-    let path_obj = Path::new(path);
-    if path_obj.is_absolute() || path.starts_with("./") || path.starts_with("../") {
-        if request_model.is_empty() {
-            speculative::derive_model_name(path)
-        } else {
-            request_model.to_owned()
-        }
-    } else {
-        path.to_owned()
     }
 }
 
