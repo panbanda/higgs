@@ -207,7 +207,7 @@ jobs:
 
             depends_on :macos
             depends_on arch: :arm64
-            depends_on "huggingface-cli"
+            depends_on "hf"
 
             url "https://github.com/panbanda/higgs/releases/download/${TAG}/higgs_${VERSION}_aarch64-apple-darwin.tar.gz"
             sha256 "${DARWIN_ARM64_SHA}"

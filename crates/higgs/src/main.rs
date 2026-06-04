@@ -261,23 +261,7 @@ fn load_engines(
                     is_interactive,
                     &mut std::io::stderr().lock(),
                     std::io::stdin().lock(),
-                    || {
-                        let status = std::process::Command::new("huggingface-cli")
-                            .args(["download", model_path])
-                            .status()
-                            .map_err(|e| {
-                                format!(
-                                    "failed to run huggingface-cli: {e}\nInstall with: brew install huggingface-cli"
-                                )
-                            })?;
-                        if status.success() {
-                            Ok(())
-                        } else {
-                            Err(format!(
-                                "huggingface-cli download failed for '{model_path}'"
-                            ))
-                        }
-                    },
+                    || download_via_hf_cli(model_path),
                 )?;
                 model_resolver::resolve(model_path)?
             }
@@ -341,6 +325,21 @@ fn ensure_local_runtime_ready(config: &HiggsConfig) -> Result<(), Box<dyn std::e
         }
     }
     Ok(())
+}
+
+fn download_via_hf_cli(model_path: &str) -> Result<(), String> {
+    const CMD: &str = "hf";
+
+    let status = std::process::Command::new(CMD)
+        .args(["download", model_path])
+        .status()
+        .map_err(|e| format!("failed to run {CMD}: {e}\nInstall with: brew install {CMD}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{CMD} download failed for '{model_path}'"))
+    }
 }
 
 #[cfg(target_os = "macos")]

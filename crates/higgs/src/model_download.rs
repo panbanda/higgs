@@ -3,7 +3,7 @@ use std::io::{BufRead, Write};
 /// Prompt the user to confirm downloading `model_id`, then call `run_download`.
 ///
 /// - `is_interactive`: if `false`, returns an error immediately with a hint to
-///   run `huggingface-cli download` manually (e.g. when stdin is not a TTY).
+///   run `hf download` manually (e.g. when stdin is not a TTY).
 /// - `out`: where the prompt is written (typically stderr).
 /// - `input`: where the user's response is read from (typically locked stdin).
 /// - `run_download`: called only when the user confirms; should execute the download.
@@ -21,7 +21,7 @@ where
 {
     if !is_interactive {
         return Err(format!(
-            "model '{model_id}' not found in HuggingFace cache; run: huggingface-cli download {model_id}"
+            "model '{model_id}' not found in HuggingFace cache; run: hf download {model_id}"
         ));
     }
 
@@ -64,7 +64,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("org/model"));
-        assert!(err.contains("huggingface-cli download"));
+        assert!(err.contains("hf download"));
     }
 
     #[test]
@@ -142,6 +142,6 @@ mod tests {
             ok_download,
         );
         let err = result.unwrap_err();
-        assert!(err.contains("huggingface-cli download myorg/mymodel"));
+        assert!(err.contains("hf download myorg/mymodel"));
     }
 }
