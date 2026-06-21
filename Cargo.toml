@@ -86,7 +86,7 @@ mlx-sys = { git = "https://github.com/oxideai/mlx-rs.git", rev = "f4aa309c79b6be
 axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
-tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "request-id", "auth"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "timeout", "request-id", "auth"] }
 governor = "0.10"
 
 # Serialization
