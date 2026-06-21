@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.0](https://github.com/panbanda/higgs/compare/higgs-v1.5.0...higgs-v1.6.0) (2026-06-21)
+
+
+### Miscellaneous Chores
+
+* **higgs:** Synchronize workspace versions
+
 ## [1.5.0](https://github.com/panbanda/higgs/compare/higgs-v1.4.0...higgs-v1.5.0) (2026-06-21)
 
 

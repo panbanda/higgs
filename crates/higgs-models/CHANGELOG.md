@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.6.0](https://github.com/panbanda/higgs/compare/higgs-models-v1.5.0...higgs-models-v1.6.0) (2026-06-21)
+
+
+### Features
+
+* **bonsai:** run Bonsai-Q1 bits=1 on vanilla MLX via JIT qmv_fast kernels (no mlx-rs fork) ([#182](https://github.com/panbanda/higgs/issues/182)) ([b604754](https://github.com/panbanda/higgs/commit/b604754cab79f3f91a95d863324db46e8765e14a))
+* enable MiniCPM5-1B (explicit head_dim + special-token decode + tojson kwarg + tool parser) ([#176](https://github.com/panbanda/higgs/issues/176)) ([05464e2](https://github.com/panbanda/higgs/commit/05464e22fd67a713ccf8a42d6547fab260d401cb))
+
 ## [1.5.0](https://github.com/panbanda/higgs/compare/higgs-models-v1.4.0...higgs-models-v1.5.0) (2026-06-21)
 
 
