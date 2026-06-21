@@ -1595,7 +1595,7 @@ dependencies = [
 
 [[package]]
 name = "higgs"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -1655,7 +1655,7 @@ dependencies = [
 
 [[package]]
 name = "higgs-engine"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "half",
  "higgs-models",
@@ -1675,7 +1675,7 @@ dependencies = [
 
 [[package]]
 name = "higgs-models"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "criterion",
  "half",

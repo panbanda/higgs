@@ -1,5 +1,5 @@
 {
-  "crates/higgs-models": "1.4.0",
-  "crates/higgs-engine": "1.4.0",
-  "crates/higgs": "1.4.0"
+  "crates/higgs-models": "1.5.0",
+  "crates/higgs-engine": "1.5.0",
+  "crates/higgs": "1.5.0"
 }

@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.5.0](https://github.com/panbanda/higgs/compare/higgs-v1.4.0...higgs-v1.5.0) (2026-06-21)
+
+
+### Features
+
+* **chat:** streaming tool-call deltas + Qwen-friendly arg normalisation ([#164](https://github.com/panbanda/higgs/issues/164)) ([8f01163](https://github.com/panbanda/higgs/commit/8f01163a0a60950c011048f8bd3c6d906b3e8a01))
+* **higgs:** migrate from huggingface-cli to hf ([#180](https://github.com/panbanda/higgs/issues/180)) ([aaecdb4](https://github.com/panbanda/higgs/commit/aaecdb4fa7225dc7fc5375982bc2f6c7945eaf2f))
+* **serve:** stream prefill progress (llama.cpp-compatible prompt_progress) ([#184](https://github.com/panbanda/higgs/issues/184)) ([e7b2c8a](https://github.com/panbanda/higgs/commit/e7b2c8a41689c7e8e1f1fc4d657a4fa17bba2a96))
+
 ## [1.4.0](https://github.com/panbanda/higgs/compare/higgs-v1.3.0...higgs-v1.4.0) (2026-06-21)
 
 

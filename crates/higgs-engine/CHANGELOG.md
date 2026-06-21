@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.5.0](https://github.com/panbanda/higgs/compare/higgs-engine-v1.4.0...higgs-engine-v1.5.0) (2026-06-21)
+
+
+### Features
+
+* **chat:** streaming tool-call deltas + Qwen-friendly arg normalisation ([#164](https://github.com/panbanda/higgs/issues/164)) ([8f01163](https://github.com/panbanda/higgs/commit/8f01163a0a60950c011048f8bd3c6d906b3e8a01))
+* **qwen35:** Qwen3.6 MoE MTP speculative decode + checkpoint memory-safety fix ([#183](https://github.com/panbanda/higgs/issues/183)) ([4989955](https://github.com/panbanda/higgs/commit/49899557c5e4fef561c6d79ab957ad0656f486ab))
+* **serve:** stream prefill progress (llama.cpp-compatible prompt_progress) ([#184](https://github.com/panbanda/higgs/issues/184)) ([e7b2c8a](https://github.com/panbanda/higgs/commit/e7b2c8a41689c7e8e1f1fc4d657a4fa17bba2a96))
+
 ## [1.4.0](https://github.com/panbanda/higgs/compare/higgs-engine-v1.3.0...higgs-engine-v1.4.0) (2026-06-21)
 
 
