@@ -18,7 +18,7 @@ env:
 jobs:
   test:
     name: Test
-    runs-on: macos-latest
+    runs-on: macos-15
     permissions:
       contents: read
 
@@ -39,7 +39,7 @@ jobs:
 
   build:
     name: Build
-    runs-on: macos-latest
+    runs-on: macos-15
     permissions:
       contents: read
 
@@ -60,7 +60,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: macos-latest
+    runs-on: macos-15
     permissions:
       contents: read
 
@@ -85,7 +85,7 @@ jobs:
 
   msrv:
     name: MSRV
-    runs-on: macos-latest
+    runs-on: macos-15
     permissions:
       contents: read
 
@@ -106,7 +106,7 @@ jobs:
 
   coverage:
     name: Coverage
-    runs-on: macos-latest
+    runs-on: macos-15
     permissions:
       contents: read
 
