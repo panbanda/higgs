@@ -1,6 +1,7 @@
 pub mod bonsai_q1;
 pub mod cache;
 pub mod deepseek_v2;
+pub mod dflash;
 pub mod error;
 pub mod gemma2;
 pub mod gemma3;
@@ -150,6 +151,22 @@ impl AnyCache {
             ),
         }
     }
+
+    /// Borrow the inner hybrid (KV+SSM) cache slice; errors on a KV-only cache.
+    pub fn as_hybrid(&self) -> Result<&[Option<LayerCache>], Exception> {
+        match self {
+            Self::Hybrid(c) => Ok(c),
+            Self::KV(_) => Err(Exception::custom("expected Hybrid cache, got KV")),
+        }
+    }
+
+    /// Mutably borrow the inner hybrid cache vec; errors on a KV-only cache.
+    pub fn as_hybrid_mut(&mut self) -> Result<&mut Vec<Option<LayerCache>>, Exception> {
+        match self {
+            Self::Hybrid(c) => Ok(c),
+            Self::KV(_) => Err(Exception::custom("expected Hybrid cache, got KV")),
+        }
+    }
 }
 
 /// Independent deep copy of an MTP head cache (`Vec<SteppingKeyValueCache>`).
@@ -257,6 +274,9 @@ fn make_turboquant_kv_cache(
     }
     Ok(AnyCache::KV(caches))
 }
+
+/// Output of [`AnyModel::forward_with_taps_tape`]: logits, tap hiddens, per-layer GDN tape.
+pub type TapsTapeOutput = (Array, Vec<Array>, Vec<Option<qwen3_next::GdnLayerTape>>);
 
 impl AnyModel {
     pub fn forward(
@@ -835,6 +855,176 @@ impl AnyModel {
             }
             _ => Err(Exception::custom(
                 "Model does not support multimodal forward",
+            )),
+        }
+    }
+
+    /// `DFlash`: forward returning logits + hidden states at `tap_layers` (drafter input).
+    pub fn forward_with_taps(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+    ) -> Result<(Array, Vec<Array>), Exception> {
+        if mask.is_some() {
+            return Err(Exception::custom(
+                "forward_with_taps does not support external masks",
+            ));
+        }
+
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.forward_with_taps(inputs, mask, c, tap_layers)
+            }
+            _ => Err(Exception::custom(
+                "forward_with_taps requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// `DFlash` verify: forward returning logits + tap hiddens + per-layer GDN tape (for cheap rollback).
+    pub fn forward_with_taps_tape(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+    ) -> Result<TapsTapeOutput, Exception> {
+        if mask.is_some() {
+            return Err(Exception::custom(
+                "forward_with_taps_tape does not support external masks",
+            ));
+        }
+
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.forward_with_taps_tape(inputs, mask, c, tap_layers)
+            }
+            _ => Err(Exception::custom(
+                "forward_with_taps_tape requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// Replay GDN innovation tape for accepted prefix on partial accept.
+    ///
+    /// Used by `DFlash` verify path: after partial acceptance, restore each
+    /// GDN layer's state from the tape's initial snapshot, replay only the
+    /// SSM recurrence kernel for `n_accepted` accepted positions, and roll
+    /// KV layers back by `kv_rollback`. Avoids the cost of a full rerun.
+    pub fn replay_tape_rollback(
+        &self,
+        layer_tapes: &[Option<qwen3_next::GdnLayerTape>],
+        cache: &mut AnyCache,
+        n_accepted: i32,
+        kv_rollback: i32,
+    ) -> Result<(), Exception> {
+        if n_accepted < 0 {
+            return Err(Exception::custom(format!(
+                "replay_tape_rollback requires n_accepted >= 0, got {n_accepted}"
+            )));
+        }
+
+        if kv_rollback < 0 {
+            return Err(Exception::custom(format!(
+                "replay_tape_rollback requires kv_rollback >= 0, got {kv_rollback}"
+            )));
+        }
+
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                if layer_tapes.len() != c.len() {
+                    return Err(Exception::custom(format!(
+                        "replay_tape_rollback layer_tapes length ({}) must match cache length ({})",
+                        layer_tapes.len(),
+                        c.len()
+                    )));
+                }
+
+                for (idx, (layer_cache, layer_tape)) in c.iter().zip(layer_tapes.iter()).enumerate()
+                {
+                    match (layer_cache, layer_tape) {
+                        (Some(LayerCache::Arrays(_)), Some(gdn_tape)) => {
+                            for (name, tensor) in [
+                                ("delta_tape", &gdn_tape.delta_tape),
+                                ("norm_k", &gdn_tape.norm_k),
+                                ("a_proj", &gdn_tape.a_proj),
+                            ] {
+                                let tape_len = *tensor.shape().get(1).ok_or_else(|| {
+                                    Exception::custom(format!(
+                                        "replay_tape_rollback layer {idx} {name} must have a sequence dimension"
+                                    ))
+                                })?;
+
+                                if n_accepted > tape_len {
+                                    return Err(Exception::custom(format!(
+                                        "replay_tape_rollback n_accepted ({n_accepted}) exceeds layer {idx} {name} sequence length ({tape_len})"
+                                    )));
+                                }
+                            }
+                        }
+                        (Some(LayerCache::Arrays(_)), None) => {
+                            return Err(Exception::custom(format!(
+                                "replay_tape_rollback missing GDN tape for Arrays cache layer {idx}"
+                            )));
+                        }
+                        (Some(LayerCache::KV(_)), Some(_)) => {
+                            return Err(Exception::custom(format!(
+                                "replay_tape_rollback got GDN tape for KV cache layer {idx}"
+                            )));
+                        }
+                        (None, Some(_)) => {
+                            return Err(Exception::custom(format!(
+                                "replay_tape_rollback got GDN tape for empty cache layer {idx}"
+                            )));
+                        }
+                        (Some(LayerCache::KV(_)) | None, None) => {}
+                    }
+                }
+
+                m.replay_tape_rollback(layer_tapes, c, n_accepted, kv_rollback)
+            }
+            _ => Err(Exception::custom(
+                "replay_tape_rollback requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// Embed raw token IDs through the target model's embedding layer.
+    pub fn embed_token_ids(&self, token_ids: &Array) -> Result<Array, Exception> {
+        match self {
+            Self::Qwen3Next(m) => m.embed_token_ids(token_ids),
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Gemma3(_)
+            | Self::Gemma4(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::LlavaQwen2(_)
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom(
+                "embed_token_ids only implemented for Qwen3Next",
+            )),
+        }
+    }
+
+    /// Apply only the `lm_head` to pre-computed hidden states.
+    pub fn forward_all_logits_from_hidden(&self, hidden: &Array) -> Result<Array, Exception> {
+        match self {
+            Self::Qwen3Next(m) => m.forward_all_logits_from_hidden(hidden),
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Gemma3(_)
+            | Self::Gemma4(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::LlavaQwen2(_)
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom(
+                "forward_all_logits_from_hidden only implemented for Qwen3Next",
             )),
         }
     }
