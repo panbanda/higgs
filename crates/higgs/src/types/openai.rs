@@ -505,7 +505,7 @@ mod tests {
         }"#;
         let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.max_tokens, Some(100));
-        assert!(req.stream == Some(true));
+        assert_eq!(req.stream, Some(true));
         assert!(req.reasoning.is_none());
     }
 
