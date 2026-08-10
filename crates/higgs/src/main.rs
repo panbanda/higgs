@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use clap::Parser;
-use higgs_engine::mlx_tuning::resolve_runtime_tuning;
 
 use higgs::{
     build_router,
@@ -18,7 +17,7 @@ use higgs::{
     },
     model_download, model_resolver,
     router::Router,
-    state::{AppState, Engine},
+    state::{AppState, Engine, build_engine},
 };
 
 #[tokio::main]
@@ -276,29 +275,7 @@ fn load_engines(
         };
 
         tracing::info!(model = %model_path, resolved = %resolved.display(), "Loading model");
-        if model_cfg.batch && !config::resolved_model_supports_batch(&resolved)? {
-            return Err(format!(
-                "batch=true is only supported for transformer models (llama, mistral, qwen2, qwen3); {model_path} is not supported"
-            )
-            .into());
-        }
-        let kv_cache_config = model_cfg.kv_cache_config();
-        let engine = if model_cfg.batch {
-            Engine::load_batch(&resolved, kv_cache_config, config.local.raise_wired_limit)?
-        } else {
-            let tuning =
-                resolve_runtime_tuning(&resolved, model_cfg.requested_mlx_profile(&config.local));
-            Engine::load_simple(
-                &resolved,
-                kv_cache_config,
-                tuning,
-                config.local.raise_wired_limit,
-            )?
-        };
-        let name = model_cfg
-            .name
-            .clone()
-            .unwrap_or_else(|| engine.model_name().to_owned());
+        let (name, engine) = build_engine(&resolved, model_cfg, &config.local)?;
         tracing::info!(model_name = %name, "Model loaded");
 
         if engines.insert(name.clone(), Arc::new(engine)).is_some() {

@@ -145,6 +145,9 @@ port = 8000
 
 # [local]
 # mlx_profile = "auto"
+# Allow loading/unloading models at runtime via POST/DELETE /v1/models.
+# Off by default; protect with server.api_key before enabling.
+# allow_runtime_model_load = false
 
 # --- Local models ---
 # Each [[models]] entry loads an MLX model into GPU memory.

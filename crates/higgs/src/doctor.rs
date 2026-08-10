@@ -52,6 +52,7 @@ pub async fn run_doctor(
     check_route_consistency(config, &mut result);
     check_default_provider(config, &mut result);
     check_auto_router(config, &mut result);
+    check_runtime_model_load(config, &mut result);
     check_port_availability(config, &mut result);
     check_orphaned_providers(config, &mut result);
 
@@ -327,6 +328,17 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
             }
             Err(err) => fail(&format!("model {label} not found: {err}"), result),
         }
+    }
+}
+
+fn check_runtime_model_load(config: &HiggsConfig, result: &mut DoctorResult) {
+    if config.local.allow_runtime_model_load {
+        warn(
+            "local.allow_runtime_model_load is enabled: POST/DELETE /v1/models can load and unload models at runtime; ensure server.api_key restricts this to trusted operators",
+            result,
+        );
+    } else {
+        pass("runtime model load/unload disabled", result);
     }
 }
 

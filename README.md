@@ -126,6 +126,7 @@ curl http://localhost:8000/v1/chat/completions \
 - Release artifacts bundle `mlx.metallib`.
 - Source builds also require `mlx.metallib` next to the executable. Higgs now restores it automatically from Cargo build output when possible, then fails loudly if it still cannot be found.
 - `[local].raise_wired_limit` defaults to `false`. Enable it only when you explicitly want MLX to raise the process wired-memory limit.
+- `[local].allow_runtime_model_load` defaults to `false`. Enable it to load/unload models at runtime via `POST`/`DELETE /v1/models`; protect it with `server.api_key`.
 - `batch=true` is only supported for transformer families with true batched decode support.
 
 ## Performance
@@ -198,8 +199,32 @@ Measured on DeepSeek-V2-Lite-4bit with global batch sorting before `gather_qmm`.
     llama.cpp-compatible `prompt_progress` chunks (`{total, cache, processed,
     time_ms}`) during chunked prefill.
 - Anthropic: `/v1/messages`, `/v1/messages/count_tokens`
+- Runtime model management (opt-in): `POST /v1/models`, `DELETE /v1/models/{name}`
 - Metrics: `/metrics`
 - Health: `/health`
+
+### Runtime model management
+
+By default the set of loaded models is fixed at startup. To add or remove models
+while the server runs, set `allow_runtime_model_load = true` under `[local]`
+(protect it with `server.api_key` -- the load endpoint can read local model
+directories and trigger downloads). Changes are in-memory only and do not persist
+to the config file.
+
+```bash
+# Load a model (body mirrors a [[models]] entry; path required)
+curl http://localhost:8000/v1/models \
+  -H "Authorization: Bearer $HIGGS_API_KEY" \
+  -d '{"path": "mlx-community/Llama-3.2-1B-Instruct-4bit", "name": "llama"}'
+
+# Unload it and free its GPU memory (204 once freed, 202 if a request is still in flight)
+curl -X DELETE http://localhost:8000/v1/models/llama \
+  -H "Authorization: Bearer $HIGGS_API_KEY"
+```
+
+An in-flight request keeps the model resident until it completes; `DELETE` removes
+it from routing immediately and frees memory once the last request drains. A model
+bound to the auto-router cannot be unloaded.
 
 **Core commands**
 

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use regex::Regex;
 use tracing::warn;
@@ -84,11 +84,17 @@ struct AutoRouteEntry {
 /// 3. Pattern matching (first match wins)
 /// 4. Default provider fallback
 pub struct Router {
-    local_engines: HashMap<String, Arc<Engine>>,
+    /// Loaded local engines, mutable at runtime via the load/unload endpoints.
+    /// Guarded by a `RwLock`: `resolve`/`list` take a read lock and clone the
+    /// `Arc` out, so an in-flight request is never tied to map membership.
+    local_engines: RwLock<HashMap<String, Arc<Engine>>>,
     compiled_routes: Vec<CompiledRoute>,
     auto_routes: Vec<AutoRouteEntry>,
     auto_candidates: Vec<RouteCandidate>,
     auto_router_engine: Option<Arc<Engine>>,
+    /// Map key bound to the auto-router model, if enabled. Unloading it is
+    /// refused because `auto_router_engine` keeps a separate `Arc` alive.
+    auto_router_model_name: Option<String>,
     auto_router_force: bool,
     auto_router_timeout_ms: u64,
     default_target: RouteTarget,
@@ -146,7 +152,7 @@ impl Router {
             }
         }
 
-        let auto_router_engine = if config.auto_router.enabled {
+        let (auto_router_engine, auto_router_model_name) = if config.auto_router.enabled {
             if config.auto_router.model.is_empty() {
                 return Err("auto_router.enabled is true but model is empty".to_owned());
             }
@@ -157,19 +163,20 @@ impl Router {
             let engine = engines.get(auto_model).cloned().ok_or_else(|| {
                 format!("auto_router model '{auto_model}' not found among loaded models")
             })?;
-            Some(engine)
+            (Some(engine), Some(auto_model.clone()))
         } else {
-            None
+            (None, None)
         };
 
         let default_target = build_route_target(&config.default.provider, None, config)?;
 
         Ok(Self {
-            local_engines: engines,
+            local_engines: RwLock::new(engines),
             compiled_routes,
             auto_routes,
             auto_candidates,
             auto_router_engine,
+            auto_router_model_name,
             auto_router_force: config.auto_router.force,
             auto_router_timeout_ms: config.auto_router.timeout_ms,
             default_target,
@@ -195,10 +202,13 @@ impl Router {
             // force mode: auto-routing returned nothing, fall through to normal resolution
         }
 
-        // Direct engine lookup
-        if let Some(engine) = self.local_engines.get(model) {
+        // Direct engine lookup. Clone the Arc out and drop the read guard
+        // immediately -- the in-flight request owns the engine independent of
+        // map membership, so a concurrent unload can never free it mid-request.
+        let direct = self.engines_read().get(model).cloned();
+        if let Some(engine) = direct {
             return Ok(ResolvedRoute::Higgs {
-                engine: Arc::clone(engine),
+                engine,
                 model_name: model.to_owned(),
                 routing_method: RoutingMethod::Direct,
             });
@@ -215,12 +225,55 @@ impl Router {
         self.resolve_target(&self.default_target, model, RoutingMethod::Default)
     }
 
-    /// Returns all loaded local engines.
-    pub const fn local_engines(&self) -> &HashMap<String, Arc<Engine>> {
-        &self.local_engines
+    /// Sorted names of all loaded local engines (snapshot under a read lock).
+    pub fn local_model_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.engines_read().keys().cloned().collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Whether a local engine is currently registered under `name`.
+    pub fn contains_engine(&self, name: &str) -> bool {
+        self.engines_read().contains_key(name)
+    }
+
+    /// Register a freshly-loaded engine. Returns `Err(name)` if the name is
+    /// already taken (checked under the write lock, so it is race-free against
+    /// concurrent loads).
+    pub fn insert_engine(&self, name: String, engine: Arc<Engine>) -> Result<(), String> {
+        let mut engines = self.engines_write();
+        if engines.contains_key(&name) {
+            return Err(name);
+        }
+        engines.insert(name, engine);
+        drop(engines);
+        Ok(())
+    }
+
+    /// Remove an engine from the routing table, returning it if present. The
+    /// caller is responsible for dropping it once no request still holds a clone.
+    pub fn remove_engine(&self, name: &str) -> Option<Arc<Engine>> {
+        self.engines_write().remove(name)
+    }
+
+    /// Map key bound to the auto-router model, if the auto-router is enabled.
+    pub fn auto_router_model_name(&self) -> Option<&str> {
+        self.auto_router_model_name.as_deref()
     }
 
     // -- Private helpers ---------------------------------------------------
+
+    fn engines_read(&self) -> RwLockReadGuard<'_, HashMap<String, Arc<Engine>>> {
+        self.local_engines
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn engines_write(&self) -> RwLockWriteGuard<'_, HashMap<String, Arc<Engine>>> {
+        self.local_engines
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
 
     async fn try_auto_route(
         &self,
@@ -265,21 +318,22 @@ impl Router {
         match target {
             RouteTarget::Higgs { model_rewrite } => {
                 let lookup_name = model_rewrite.as_deref().unwrap_or(model);
-                let (engine, resolved_name) =
-                    if let Some(engine) = self.local_engines.get(lookup_name) {
-                        (Arc::clone(engine), lookup_name.to_owned())
-                    } else if model == "auto" {
-                        // "auto" is a virtual model name; pick any loaded engine
-                        let (name, engine) =
-                            self.local_engines.iter().next().ok_or_else(|| {
-                                "no local models loaded for default route".to_owned()
-                            })?;
-                        (Arc::clone(engine), name.clone())
-                    } else {
-                        return Err(format!(
-                            "model '{lookup_name}' not found among loaded local models"
-                        ));
-                    };
+                let engines = self.engines_read();
+                let (engine, resolved_name) = if let Some(engine) = engines.get(lookup_name) {
+                    (Arc::clone(engine), lookup_name.to_owned())
+                } else if model == "auto" {
+                    // "auto" is a virtual model name; pick any loaded engine
+                    let (name, engine) = engines
+                        .iter()
+                        .next()
+                        .ok_or_else(|| "no local models loaded for default route".to_owned())?;
+                    (Arc::clone(engine), name.clone())
+                } else {
+                    return Err(format!(
+                        "model '{lookup_name}' not found among loaded local models"
+                    ));
+                };
+                drop(engines);
                 Ok(ResolvedRoute::Higgs {
                     engine,
                     model_name: resolved_name,
@@ -801,7 +855,7 @@ mod tests {
     }
 
     #[test]
-    fn local_engines_accessor_returns_engines() {
+    fn local_model_names_lists_engines() {
         let config = config_from_toml(
             r#"
             [[models]]
@@ -809,7 +863,51 @@ mod tests {
             "#,
         );
         let router = Router::from_config(&config, HashMap::new()).unwrap();
-        assert!(router.local_engines().is_empty());
+        assert!(router.local_model_names().is_empty());
+
+        let mut engines = HashMap::new();
+        engines.insert(
+            "b".to_owned(),
+            Arc::new(crate::state::Engine::test_stub("b")),
+        );
+        engines.insert(
+            "a".to_owned(),
+            Arc::new(crate::state::Engine::test_stub("a")),
+        );
+        let router = Router::from_config(&config, engines).unwrap();
+        assert_eq!(router.local_model_names(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn insert_remove_and_contains_engine() {
+        let config = config_from_toml(
+            r#"
+            [[models]]
+            path = "some/model"
+            "#,
+        );
+        let router = Router::from_config(&config, HashMap::new()).unwrap();
+
+        assert!(!router.contains_engine("x"));
+        router
+            .insert_engine(
+                "x".to_owned(),
+                Arc::new(crate::state::Engine::test_stub("x")),
+            )
+            .unwrap();
+        assert!(router.contains_engine("x"));
+
+        // Duplicate insert is rejected with the conflicting name.
+        let dup = router.insert_engine(
+            "x".to_owned(),
+            Arc::new(crate::state::Engine::test_stub("x")),
+        );
+        assert_eq!(dup, Err("x".to_owned()));
+
+        let removed = router.remove_engine("x");
+        assert!(removed.is_some());
+        assert!(!router.contains_engine("x"));
+        assert!(router.remove_engine("x").is_none());
     }
 
     #[tokio::test]

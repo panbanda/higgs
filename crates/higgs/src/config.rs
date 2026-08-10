@@ -363,6 +363,13 @@ pub struct LocalConfig {
     /// Raise MLX's wired memory limit to the device-recommended maximum.
     #[serde(default)]
     pub raise_wired_limit: bool,
+    /// Allow loading and unloading models at runtime via `POST`/`DELETE /v1/models`.
+    ///
+    /// Off by default: the load endpoint can read arbitrary local model
+    /// directories and trigger downloads, so it is opt-in and only reachable by
+    /// authenticated operators.
+    #[serde(default)]
+    pub allow_runtime_model_load: bool,
     /// Internal requested profile after resolving precedence (`model` > `--mlx-profile` > `HIGGS_MLX_PROFILE` > local default).
     #[serde(skip, default)]
     pub requested_mlx_profile: RequestedMlxProfile,
@@ -373,6 +380,7 @@ impl Default for LocalConfig {
         Self {
             mlx_profile: MlxProfile::Auto,
             raise_wired_limit: false,
+            allow_runtime_model_load: false,
             requested_mlx_profile: RequestedMlxProfile::Auto,
         }
     }
