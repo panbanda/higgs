@@ -146,7 +146,7 @@ impl Qwen3MoeAttention {
             rope: nn::RopeBuilder::new(head_dim)
                 .traditional(false)
                 .base(args.rope_theta)
-                .scale(1.0)
+                .scale(1.0_f32)
                 .build()
                 .map_err(|e| Exception::custom(format!("Failed to build RoPE: {e}")))?,
             num_attention_heads: args.num_attention_heads,

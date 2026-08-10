@@ -235,7 +235,7 @@ impl Gemma3Attention {
         let rope = nn::RopeBuilder::new(head_dim)
             .traditional(false)
             .base(rope_base)
-            .scale(1.0)
+            .scale(1.0_f32)
             .build()
             .map_err(|e| Exception::custom(format!("Failed to build RoPE: {e}")))?;
 
