@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use higgs_models::{
-    AnyModel, error::ModelError, load_tokenizer as shared_load_tokenizer, registry, transformer,
+    AnyModel, dflash, error::ModelError, load_tokenizer as shared_load_tokenizer, registry,
+    transformer,
 };
 
 use crate::error::EngineError;
@@ -148,6 +149,18 @@ fn is_bonsai_q1(dir: &Path) -> Result<bool, EngineError> {
 /// Load a tokenizer from a model directory.
 pub fn load_tokenizer<P: AsRef<Path>>(model_dir: P) -> Result<tokenizers::Tokenizer, EngineError> {
     shared_load_tokenizer(model_dir).map_err(|e| EngineError::Tokenization(e.to_string()))
+}
+
+/// Load a `DFlash` drafter from a model directory.
+///
+/// The drafter is a small block-diffusion model that the `SimpleEngine` uses to
+/// propose draft tokens which the target verifies in a single forward.
+pub fn load_dflash_drafter<P: AsRef<Path>, T: AsRef<Path>>(
+    model_dir: P,
+    target_dir: T,
+) -> Result<dflash::DFlashDrafter, EngineError> {
+    dflash::load_dflash_drafter_for_target(model_dir.as_ref(), target_dir.as_ref())
+        .map_err(EngineError::Model)
 }
 
 #[cfg(test)]

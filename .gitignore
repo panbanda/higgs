@@ -13,7 +13,8 @@ bench/
 .venv/
 .pytest_cache/
 **/__pycache__/
-.claude/
+.claude/*
+!.claude/settings.json
 .planning/
 graphify-out/
 GRAPH_REPORT.md

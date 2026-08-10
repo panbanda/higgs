@@ -1,3 +1,6 @@
+// Model forward passes eval under the engine MLX gate (structurally on-gate); see clippy.toml.
+#![allow(clippy::disallowed_methods)]
+
 //! `SigLIP` vision encoder for vision-language models.
 //!
 //! Implements the `SigLIP` Vision Transformer used in `nanoLLaVA` and similar

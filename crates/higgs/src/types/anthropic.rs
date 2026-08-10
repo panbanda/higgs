@@ -47,6 +47,11 @@ pub struct CreateMessageRequest {
     pub stop_sequences: Option<Vec<String>>,
     #[serde(default)]
     pub tools: Option<Vec<serde_json::Value>>,
+    /// Per-request speculative-decoding method: `auto` (default), `dflash`,
+    /// `mtp`, or `none`. `auto` uses the `DFlash` drafter when one is loaded
+    /// (including while streaming), else the built-in MTP head.
+    #[serde(default)]
+    pub speculation: Option<String>,
 }
 
 /// A message in the Anthropic format.

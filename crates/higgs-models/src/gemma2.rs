@@ -1,3 +1,6 @@
+// Model forward passes eval under the engine MLX gate (structurally on-gate); see clippy.toml.
+#![allow(clippy::disallowed_methods)]
+
 //! Gemma 2 model implementation.
 //!
 //! Differs from the standard transformer in several ways:

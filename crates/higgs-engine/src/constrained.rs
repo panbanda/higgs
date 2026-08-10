@@ -243,7 +243,12 @@ static BYTE_CHAR_MAP: std::sync::LazyLock<std::collections::HashMap<char, u8>> =
     });
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::disallowed_methods
+)]
 mod tests {
     use super::*;
 

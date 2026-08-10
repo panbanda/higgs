@@ -24,6 +24,11 @@ pub struct ChatCompletionRequest {
     pub frequency_penalty: Option<f32>,
     #[serde(default)]
     pub presence_penalty: Option<f32>,
+    /// Per-request speculative-decoding method: `auto` (default), `dflash`,
+    /// `mtp`, or `none`. `auto` uses the `DFlash` drafter when one is loaded
+    /// (including while streaming), else the built-in MTP head.
+    #[serde(default)]
+    pub speculation: Option<String>,
     #[serde(default)]
     pub stream: Option<bool>,
     #[serde(default)]
@@ -49,6 +54,39 @@ pub struct ChatCompletionRequest {
     /// processed, time_ms}`). Ignored for non-streaming requests.
     #[serde(default)]
     pub return_progress: Option<bool>,
+    /// Optional Higgs extension naming a disk prefix-cache checkpoint to load/store.
+    #[serde(default)]
+    pub checkpoint_id: Option<String>,
+    /// Max `<think>` tokens before `</think>` is force-closed (de-facto local
+    /// extension; sent by clients like nanobot's `/thinking N`). `None` falls
+    /// back to the engine default budget.
+    #[serde(default)]
+    pub reasoning_budget: Option<u32>,
+    /// Jinja chat-template kwargs (vLLM/Qwen convention). Only
+    /// `enable_thinking` is honored: it overrides per-request whether the model
+    /// reasons.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// Top-level alias for `chat_template_kwargs.enable_thinking`, accepted
+    /// because many OpenAI-compatible clients send the toggle here. When both
+    /// are present, `chat_template_kwargs.enable_thinking` wins; otherwise this
+    /// value is used.
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
+    /// Opt-in multi-turn KV-cache reuse. When set (non-streaming, Simple engine
+    /// only) the conversation's KV cache is retained across turns so that a
+    /// continued turn prefills only the new suffix instead of the full history.
+    /// Omitted by default — behavior is unchanged when absent.
+    #[serde(default)]
+    pub session_id: Option<u64>,
+}
+
+/// Subset of `chat_template_kwargs` that Higgs acts on.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatTemplateKwargs {
+    /// Per-request override for the model's reasoning mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_thinking: Option<bool>,
 }
 
 /// Optional request-level controls for streaming responses.
@@ -319,6 +357,9 @@ pub struct CompletionRequest {
     pub logprobs: Option<bool>,
     #[serde(default)]
     pub top_logprobs: Option<u32>,
+    /// Optional Higgs extension naming a disk prefix-cache checkpoint to load/store.
+    #[serde(default)]
+    pub checkpoint_id: Option<String>,
 }
 
 /// POST /v1/completions response (non-streaming).
@@ -373,6 +414,9 @@ pub struct CompletionUsage {
 pub struct ModelList {
     pub object: &'static str,
     pub data: Vec<ModelObject>,
+    /// higgs extension (additive, `OpenAI` clients ignore unknown keys): whether
+    /// runtime model load/switch is enabled (`local.allow_runtime_model_load`).
+    pub runtime_model_load: bool,
 }
 
 /// A model in the models list.
@@ -382,6 +426,8 @@ pub struct ModelObject {
     pub object: &'static str,
     pub created: i64,
     pub owned_by: String,
+    /// higgs extension (additive): whether this model accepts image input (VLM).
+    pub vision: bool,
 }
 
 /// POST /v1/embeddings request body.
@@ -572,7 +618,9 @@ mod tests {
                 object: "model",
                 created: 1_234_567_890,
                 owned_by: "local".to_owned(),
+                vision: false,
             }],
+            runtime_model_load: false,
         };
         let json = serde_json::to_string(&list).unwrap();
         assert!(json.contains("test-model"));

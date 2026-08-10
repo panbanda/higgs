@@ -1,0 +1,20 @@
+# Off-gate MLX evaluation is a process-global hazard.
+#
+# MLX submits GPU work through a single process-global Metal command buffer.
+# Two threads evaluating at once race inside `concatenate_gpu` and abort the
+# process with a native SIGABRT — no Rust panic, no unwinding. The engine
+# serializes evaluation behind `higgs_models::mlx_exec` (a process-global gate
+# Mutex + RAII token). The sanctioned wrappers `mlx_exec::eval` / `async_eval`
+# debug-assert the gate is held; raw `mlx_rs::transforms::eval` bypasses that
+# check and re-opens the race.
+#
+# This rule turns the "always go through the gate" convention into a compile
+# guarantee: a new raw eval fails the build (clippy nursery runs with
+# -Dwarnings) and must consciously either use the gate or carry an explicit
+# `#[allow(clippy::disallowed_methods)]` — visible in review — at a site already
+# proven to run under the model lock (forward passes, eval-before-share block
+# construction, single-threaded tests).
+disallowed-methods = [
+    { path = "mlx_rs::transforms::eval", reason = "raw MLX eval races the process-global Metal command buffer (SIGABRT under concurrency); use higgs_models::mlx_exec::eval, or #[allow] only at a site proven to hold the gate" },
+    { path = "mlx_rs::transforms::async_eval", reason = "raw MLX async_eval races the process-global Metal command buffer (SIGABRT under concurrency); use higgs_models::mlx_exec::async_eval, or #[allow] only at a site proven to hold the gate" },
+]

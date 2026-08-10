@@ -93,6 +93,141 @@ OpenAI-compatible server with Qwen thinking disabled via
 `draft-mtp` depth 2. On this run, Higgs MTP draft depth 2 was `1.05x` faster
 than llama.cpp `draft-mtp` depth 2 at the request level.
 
+## DFlash Speculative Decoding
+
+DFlash pairs the target model with a small tap-fed drafter (hidden states tapped
+from a handful of target layers feed a lightweight head that proposes a block of
+tokens, which the target then verifies in one batched pass). Higgs is, as far as
+we know, the first Rust+MLX DFlash engine; on its strong workloads it matches the
+acceptance of the community Python-MLX ports.
+
+### Characterization is by output entropy, not task label
+
+The single best predictor of DFlash acceptance is the **target's output entropy**,
+not the task name. The `dflash_entropy_sweep` harness (`#[ignore]`,
+`crates/higgs-engine/src/simple.rs`) measures, per prompt and gate-OFF (raw
+drafter capability): mean top-50 Shannon entropy of the target's greedy
+distribution (`H_bits`), top-1 probability, and the per-round accepted-token
+count (`accept_mean` + p10/p50/p90 + `accept_frac = accept_mean / block_size`).
+`byte_exact` flags whether the DFlash stream is prefix-consistent with the plain
+greedy AR stream.
+
+Reproduce (set the target + drafter dirs; `block_size` defaults to 16,
+`MAX_TOKENS=160`, `temperature=0`, thinking OFF):
+
+```bash
+HIGGS_DFLASH_TARGET_DIR=<target-mlx-dir> \
+HIGGS_DFLASH_DRAFTER_DIR=<dflash-drafter-dir> \
+cargo test --release -p higgs-engine dflash_entropy_sweep -- --ignored --nocapture
+```
+
+`accept_len`, entropy, and `byte_exact` are **thermal-independent** and carry the
+characterization. Absolute tok/s on a laptop is thermally confounded (this
+harness reloads the model several times and runs 16K-token prefills, so its
+per-row tok/s swings widely and is not used for headline numbers); derive speedup
+analytically from `accept_len` and use only paired AR/DFlash back-to-back runs on
+a non-throttling machine for tok/s.
+
+### Measured: accept_len vs entropy (M4 Max 128GB, `temperature=0`, 160 tokens)
+
+**Qwen3.6-35B-A3B-4bit (MoE) + `modal-labs/Qwen3.6-35B-A3B-DFlash`** — block 16:
+
+| task | H_bits | top1_prob | accept_mean | p10 | p50 | p90 | accept_frac | byte_exact |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| count 1..200 | 0.006 | 0.997 | 14.82 | 16 | 16 | 16 | 0.926 | true |
+| multiplication tables | 0.014 | 0.997 | 14.33 | 9 | 16 | 16 | 0.896 | true |
+| fixed-schema JSON | 0.019 | 0.994 | 14.00 | 10 | 16 | 16 | 0.875 | true |
+| capitals list | 0.032 | 0.992 | 7.17 | 3 | 8 | 9 | 0.448 | false |
+| struct getters | 0.041 | 0.989 | 7.90 | 2 | 6 | 16 | 0.494 | true |
+| iterative sort | 0.106 | 0.973 | 8.47 | 2 | 6 | 16 | 0.530 | true |
+| CSV table | 0.142 | 0.964 | 6.31 | 1 | 5 | 12 | 0.394 | true |
+| EN-FR translation | 0.154 | 0.971 | 2.79 | 1 | 3 | 4 | 0.174 | true |
+| unit conversion | 0.205 | 0.945 | 5.23 | 2 | 4 | 10 | 0.327 | false |
+| GSM8K word problem | 0.209 | 0.945 | 6.68 | 1 | 5 | 15 | 0.417 | false |
+| photosynthesis | 0.695 | 0.842 | 2.37 | 1 | 2 | 4 | 0.148 | false |
+| short story | 1.082 | 0.762 | 1.90 | 1 | 2 | 3 | 0.119 | false |
+
+**Qwen3.5-9B-MLX-4bit (dense) + `modal-labs/Qwen3.5-9B-DFlash`** — block 16:
+
+| task | H_bits | top1_prob | accept_mean | p10 | p50 | p90 | accept_frac | byte_exact |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| count 1..200 | 0.006 | 0.998 | 14.73 | 16 | 16 | 16 | 0.920 | true |
+| multiplication tables | 0.019 | 0.997 | 14.91 | 14 | 16 | 16 | 0.932 | true |
+| fixed-schema JSON | 0.035 | 0.992 | 15.36 | 13 | 16 | 16 | 0.960 | true |
+| capitals list | 0.064 | 0.984 | 8.58 | 2 | 8 | 16 | 0.536 | true |
+| unit conversion | 0.143 | 0.963 | 6.33 | 2 | 5 | 11 | 0.396 | true |
+| EN-FR translation | 0.242 | 0.953 | 3.00 | 2 | 3 | 4 | 0.188 | true |
+| struct getters | 0.258 | 0.940 | 6.54 | 1 | 5 | 16 | 0.409 | false |
+| CSV table | 0.288 | 0.922 | 5.73 | 1 | 4 | 12 | 0.358 | true |
+| iterative sort | 0.366 | 0.906 | 6.07 | 2 | 5 | 16 | 0.380 | false |
+| GSM8K word problem | 0.440 | 0.889 | 4.77 | 1 | 3 | 10 | 0.298 | false |
+| photosynthesis | 0.811 | 0.829 | 3.12 | 1 | 2 | 5 | 0.195 | false |
+| short story | 1.494 | 0.687 | 2.19 | 1 | 2 | 3 | 0.137 | false |
+
+Three regimes, consistent across both models:
+
+- **Deterministic** (`H < 0.04` bits, top1 ≈ 0.99): `accept_mean` saturates the
+  block at 14–15.4, `accept_frac` 0.88–0.96, byte-exact. Counting, tables,
+  fixed-schema JSON.
+- **Structured / constrained** (`H` ≈ 0.04–0.4 bits): `accept_mean` 5–9. Code
+  skeletons, CSV/unit tables, capitals, worked arithmetic.
+- **Prose / open generation** (`H > 0.7` bits): `accept_mean` ≈ 1.9–3.1,
+  `accept_frac` ≈ 0.12–0.20. Exposition, translation, story.
+
+The two models share the curve shape; **their `accept_len`-vs-entropy curves
+nearly coincide** rather than the MoE sitting above the dense model. At the
+deterministic end the dense 9B is marginally higher (JSON 15.36 vs 14.00). MoE's
+practical edge is therefore **economic, not higher acceptance**: with ~3B active
+parameters per token its verify pass is far cheaper to amortize, so the same
+`accept_len` converts into more wall-clock speedup than on a dense target.
+
+### Analytic speedup
+
+Each speculative round commits `accept_len` tokens for ~one batched target verify
+pass; plain AR commits one token per target pass. Decode speedup is therefore
+bounded above by `accept_len` and realized as roughly
+
+```
+speedup ≈ accept_len / (1 + c_draft·block + c_verify)
+```
+
+where `c_draft` is drafter cost and `c_verify` the batched-verify overhead,
+both relative to one target decode step. On the MoE the denominator is near 1
+(cheap active-param verify + small DFlash head), so deterministic workloads
+approach the acceptance ceiling, while prose floors near parity — which is why
+the production gate disables speculation once measured acceptance collapses.
+Prior paired AR/DFlash spot-checks on a non-throttling run landed near **2×**
+plain-AR (≈1.3× over MTP) for the 35B on low-entropy code, and **~2.5×** for the
+9B on low-entropy math; this harness's per-row tok/s is thermally confounded and
+is not quoted as a headline.
+
+### Context depth does not erode acceptance — entropy does
+
+Low-entropy acceptance holds flat as prompt depth grows to 16K tokens, validating
+the drafter sliding-window port (eviction active above 4096, absolute RoPE
+offset). High-entropy prose stays floored at every depth. Depth is not the
+variable; entropy is.
+
+| task | model | 512 | 4096 | 16384 |
+| --- | --- | ---: | ---: | ---: |
+| multiplication (low H) | MoE 35B | 14.08 | 12.92 | 14.91 |
+| multiplication (low H) | dense 9B | 13.67 | 13.67 | 14.00 |
+| story (high H) | MoE 35B | 2.01 | 2.18 | 2.09 |
+| story (high H) | dense 9B | 2.24 | 2.11 | 2.25 |
+
+### Block size trades fraction for raw accepted tokens
+
+On a fixed mid-entropy task (iterative sort), a larger block commits more raw
+tokens per round (`accept_mean` rises) but at a falling `accept_frac` — the
+drafter runs past its predictable runway. Block 16 maximizes `accept_mean` here;
+smaller blocks raise `accept_frac` (less wasted draft) at lower absolute throughput.
+
+| block | MoE accept_mean / frac | dense accept_mean / frac |
+| ---: | ---: | ---: |
+| 4 | 3.81 / 0.952 | 3.53 / 0.883 |
+| 8 | 7.23 / 0.903 | 5.12 / 0.641 |
+| 16 | 8.47 / 0.530 | 6.07 / 0.380 |
+
 ## Iterations
 
 The harness compares five iterations:

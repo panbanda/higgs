@@ -1,6 +1,7 @@
 pub mod bonsai_q1;
 pub mod cache;
 pub mod deepseek_v2;
+pub mod dflash;
 pub mod error;
 pub mod gemma2;
 pub mod gemma3;
@@ -8,8 +9,10 @@ pub mod gemma4;
 pub mod llava_qwen2;
 /// Internal: runtime JIT Metal kernels (Bonsai-Q1 bits=1 matvec/dequant).
 mod metal_kernel;
+pub mod mlx_exec;
 pub mod phi3;
 pub mod progress;
+pub mod quant_mode;
 pub mod qwen3_moe;
 pub mod qwen3_next;
 pub mod registry;
@@ -25,9 +28,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::mlx_exec::eval;
 use mlx_rs::module::ModuleParametersExt;
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::transforms::eval;
 use mlx_rs::{Array, argmax_axis, array, categorical, error::Exception};
 use serde::Deserialize;
 use serde_json::Value;
@@ -41,6 +44,54 @@ static BONSAI_IGNORED_MASK_WARNED: AtomicBool = AtomicBool::new(false);
 // SamplingParams -- configurable sampling parameters
 // ---------------------------------------------------------------------------
 
+/// Per-request speculative-decoding method selector.
+///
+/// The chosen method is otherwise fixed at model load (`DFlash` if a drafter is
+/// loaded, MTP otherwise); this lets a single loaded engine alternate per request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Speculation {
+    /// Use `DFlash` when a drafter is loaded, else the built-in MTP head (default).
+    #[default]
+    Auto,
+    /// Force the `DFlash` drafter; falls through to the non-DFlash path if none is loaded.
+    DFlash,
+    /// Force the built-in MTP head (reachable even when a `DFlash` drafter is loaded).
+    Mtp,
+    /// Disable speculation entirely; plain autoregressive decode.
+    None,
+}
+
+impl Speculation {
+    /// Parse a request value; absent (`None`) → [`Speculation::Auto`].
+    ///
+    /// # Errors
+    /// Returns the offending value when it is not one of `auto|dflash|mtp|none`.
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        let Some(raw) = value else {
+            return Ok(Self::Auto);
+        };
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Ok(Self::Auto),
+            "dflash" => Ok(Self::DFlash),
+            "mtp" => Ok(Self::Mtp),
+            "none" | "off" => Ok(Self::None),
+            other => Err(other.to_owned()),
+        }
+    }
+
+    /// Whether the `DFlash` drafter may be used (when one is loaded).
+    #[must_use]
+    pub const fn allows_dflash(self) -> bool {
+        matches!(self, Self::Auto | Self::DFlash)
+    }
+
+    /// Whether the MTP / prompt-lookup speculative paths may be used.
+    #[must_use]
+    pub const fn allows_mtp(self) -> bool {
+        matches!(self, Self::Auto | Self::Mtp)
+    }
+}
+
 /// Parameters controlling token sampling behavior.
 #[derive(Debug, Clone)]
 pub struct SamplingParams {
@@ -51,6 +102,11 @@ pub struct SamplingParams {
     pub repetition_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
     pub presence_penalty: Option<f32>,
+    /// Per-request speculative-decoding method (defaults to [`Speculation::Auto`]).
+    pub speculation: Speculation,
+    /// Max tokens of `<think>` reasoning before `</think>` is force-closed.
+    /// `None` falls back to the engine's default budget.
+    pub thinking_budget: Option<u32>,
 }
 
 impl Default for SamplingParams {
@@ -63,6 +119,8 @@ impl Default for SamplingParams {
             repetition_penalty: None,
             frequency_penalty: None,
             presence_penalty: None,
+            speculation: Speculation::Auto,
+            thinking_budget: None,
         }
     }
 }
@@ -82,7 +140,12 @@ impl SamplingParams {
     }
 }
 
-pub use qwen3_next::{LayerCache, MtpHead, Qwen3NextCausalLM};
+pub use qwen3_next::{
+    DiagGdnCapture, DiagLayer, LayerCache, MtpHead, Qwen3NextCausalLM, diag_report_attn_diff,
+    diag_report_gdn_diff, diag_report_hidden_diff, diag_request_attn_capture,
+    diag_request_gdn_capture, diag_request_hidden_capture, diag_take_attn_capture,
+    diag_take_gdn_capture, diag_take_hidden_capture,
+};
 pub use transformer::{Model, ModelArgs};
 
 /// MTP (Multi-Token Prediction) KV cache — one `SteppingKeyValueCache` per MTP layer.
@@ -123,32 +186,295 @@ impl AnyCache {
         }
     }
 
-    /// An **independent** deep copy for use as a speculative-decode checkpoint.
-    /// KV layers are deep-cloned (their in-place `slice_update` buffers must not
-    /// be shared — see [`cache::SteppingKeyValueCache::deep_clone`]); GDN/SSM
-    /// (`Arrays`) layers update by full reassignment, never in place, so a cheap
-    /// shallow `clone()` of those is safe.
+    /// Resident token count (the dense KV offset) of the first KV layer, or 0.
+    /// All KV layers advance in lockstep, so layer 0 is representative.
     #[must_use]
-    pub fn deep_clone(&self) -> Self {
+    pub fn resident_len(&self) -> i32 {
         match self {
-            Self::KV(layers) => Self::KV(
-                layers
-                    .iter()
-                    .map(|l| l.as_ref().map(cache::SteppingKeyValueCache::deep_clone))
-                    .collect(),
-            ),
-            Self::Hybrid(layers) => Self::Hybrid(
-                layers
-                    .iter()
-                    .map(|l| {
-                        l.as_ref().map(|lc| match lc {
-                            LayerCache::KV(kv) => LayerCache::KV(kv.deep_clone()),
-                            recurrent @ LayerCache::Arrays(_) => recurrent.clone(),
-                        })
-                    })
-                    .collect(),
-            ),
+            Self::KV(layers) => layers
+                .iter()
+                .flatten()
+                .next()
+                .map_or(0, cache::KeyValueCache::offset),
+            Self::Hybrid(layers) => layers
+                .iter()
+                .flatten()
+                .find_map(|l| match l {
+                    LayerCache::KV(kv) => Some(cache::KeyValueCache::offset(kv)),
+                    LayerCache::Arrays(_) => None,
+                })
+                .unwrap_or(0),
         }
+    }
+
+    /// Validate that every target-cache layer represents one exact absolute
+    /// token boundary.
+    ///
+    /// Unlike [`Self::resident_len`], this checks every KV layer and every
+    /// recurrent `ArraysCache` offset. Missing layers are rejected because a
+    /// paired target/drafter snapshot must never publish partially-advanced
+    /// target state.
+    pub fn validate_absolute_boundary(&self, expected: i32) -> Result<(), Exception> {
+        if expected < 0 {
+            return Err(Exception::custom(format!(
+                "cache absolute boundary must be non-negative, got {expected}"
+            )));
+        }
+        match self {
+            Self::KV(layers) => {
+                if layers.is_empty() {
+                    return Err(Exception::custom(
+                        "cache has no KV layers to validate at an absolute boundary",
+                    ));
+                }
+                for (index, layer) in layers.iter().enumerate() {
+                    let Some(layer) = layer else {
+                        return Err(Exception::custom(format!(
+                            "cache missing layer {index} at absolute boundary {expected}"
+                        )));
+                    };
+                    let actual = cache::KeyValueCache::offset(layer);
+                    if actual != expected {
+                        return Err(Exception::custom(format!(
+                            "cache layer {index} KV offset {actual} does not match absolute boundary {expected}"
+                        )));
+                    }
+                }
+            }
+            Self::Hybrid(layers) => {
+                if layers.is_empty() {
+                    return Err(Exception::custom(
+                        "cache has no hybrid layers to validate at an absolute boundary",
+                    ));
+                }
+                for (index, layer) in layers.iter().enumerate() {
+                    let Some(layer) = layer else {
+                        return Err(Exception::custom(format!(
+                            "cache missing layer {index} at absolute boundary {expected}"
+                        )));
+                    };
+                    let (kind, actual) = match layer {
+                        LayerCache::KV(kv) => ("KV", cache::KeyValueCache::offset(kv)),
+                        LayerCache::Arrays(arrays) => ("GDN", arrays.offset),
+                    };
+                    if actual != expected {
+                        return Err(Exception::custom(format!(
+                            "cache layer {index} {kind} offset {actual} does not match absolute boundary {expected}"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Force-evaluate every array this cache holds. Required before the cache is
+    /// shared across threads — e.g. stashed for a later turn that resumes on a
+    /// different blocking-pool thread, or after a lazy `quantize_for_retention`.
+    /// Sharing a pending lazy MLX graph across threads is a data race; evaluating
+    /// first makes the handoff a read-only transfer of concrete buffers. No-op
+    /// for an empty cache.
+    pub fn eval(&self) -> Result<(), Exception> {
+        let mut targets: Vec<&Array> = Vec::new();
+        match self {
+            Self::KV(layers) => {
+                for layer in layers.iter().flatten() {
+                    targets.extend(layer.eval_targets());
+                }
+            }
+            Self::Hybrid(layers) => {
+                for layer in layers.iter().flatten() {
+                    match layer {
+                        LayerCache::KV(kv) => targets.extend(kv.eval_targets()),
+                        LayerCache::Arrays(a) => {
+                            if let Some(ref cs) = a.conv_state {
+                                targets.push(cs);
+                            }
+                            if let Some(ref ss) = a.ssm_state {
+                                targets.push(ss);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+        crate::mlx_exec::eval(targets)
+    }
+
+    /// Prune the token span `[a, b)` from every dense KV layer, compacting
+    /// survivors and renumbering positions (see
+    /// [`cache::SteppingKeyValueCache::prune_span`]). Recurrent (SSM) layers are
+    /// left untouched — like [`Self::trim_by`], their state can't be sliced by
+    /// offset. Returns the first layer error, if any.
+    pub fn prune_span(&mut self, a: i32, b: i32, rope: cache::RopeShift) -> Result<(), Exception> {
+        match self {
+            Self::KV(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    layer.prune_span(a, b, rope)?;
+                }
+            }
+            Self::Hybrid(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    if let LayerCache::KV(kv) = layer {
+                        kv.prune_span(a, b, rope)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Compress every dense KV layer into `TurboQuant` storage for cheap
+    /// between-turn retention (see
+    /// [`cache::SteppingKeyValueCache::quantize_for_retention`]). Recurrent
+    /// (SSM/`Arrays`) layers are left untouched — they have no dense KV to pack.
+    ///
+    /// `config` supplies the TurboQuant bit-widths/seed for layers that were
+    /// created dense; layers already on a TurboQuant config reuse their own.
+    /// Returns the number of layers actually compressed (0 when every layer was
+    /// already TQ-active, empty, or otherwise left dense). Best-effort: a layer
+    /// that cannot be packed (e.g. non-power-of-2 `head_dim`) stays dense and is
+    /// simply not counted, so a continuation still works — just uncompressed.
+    #[allow(clippy::doc_markdown)]
+    pub fn quantize_for_retention(&mut self, config: KvCacheConfig) -> Result<usize, Exception> {
+        let mut compressed = 0usize;
+        match self {
+            Self::KV(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    if layer.quantize_for_retention(config)? {
+                        compressed += 1;
+                    }
+                }
+            }
+            Self::Hybrid(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    if let LayerCache::KV(kv) = layer {
+                        if kv.quantize_for_retention(config)? {
+                            compressed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(compressed)
+    }
+
+    /// An **independent** deep copy for use as a speculative-decode checkpoint
+    /// or cross-turn prefix snapshot. KV layers are deep-cloned because their
+    /// in-place `slice_update` buffers must not be shared (see
+    /// [`cache::SteppingKeyValueCache::deep_clone`]). Hybrid GDN/SSM (`Arrays`)
+    /// state is deep-cloned too: MLX `Array::clone()` is a shared handle, and a
+    /// boundary snapshot must remain independent of the suffix/decode forwards
+    /// that continue mutating the live cache.
+    #[must_use]
+    #[allow(clippy::expect_used)]
+    pub fn deep_clone(&self) -> Self {
+        self.try_deep_clone()
+            .expect("device copy failed for cache checkpoint")
+    }
+
+    /// Fallible independent device-side copy for retained/prefix snapshots.
+    pub fn try_deep_clone(&self) -> Result<Self, Exception> {
+        match self {
+            Self::KV(layers) => Ok(Self::KV(
+                layers
+                    .iter()
+                    .map(|layer| {
+                        layer
+                            .as_ref()
+                            .map(cache::SteppingKeyValueCache::try_deep_clone)
+                            .transpose()
+                    })
+                    .collect::<Result<Vec<_>, Exception>>()?,
+            )),
+            Self::Hybrid(layers) => Ok(Self::Hybrid(
+                layers
+                    .iter()
+                    .map(|layer| {
+                        layer
+                            .as_ref()
+                            .map(|cache| match cache {
+                                LayerCache::KV(kv) => kv.try_deep_clone().map(LayerCache::KV),
+                                LayerCache::Arrays(arrays) => {
+                                    arrays.try_deep_clone().map(LayerCache::Arrays)
+                                }
+                            })
+                            .transpose()
+                    })
+                    .collect::<Result<Vec<_>, Exception>>()?,
+            )),
+        }
+    }
+
+    /// Estimated device bytes retained by all cache arrays.
+    #[must_use]
+    pub fn estimated_bytes(&self) -> usize {
+        match self {
+            Self::KV(layers) => layers.iter().flatten().fold(0usize, |total, cache| {
+                total.saturating_add(cache.estimated_bytes())
+            }),
+            Self::Hybrid(layers) => layers.iter().flatten().fold(0usize, |total, cache| {
+                total.saturating_add(match cache {
+                    LayerCache::KV(kv) => kv.estimated_bytes(),
+                    LayerCache::Arrays(arrays) => arrays.estimated_bytes(),
+                })
+            }),
+        }
+    }
+
+    /// Borrow the inner hybrid (KV+SSM) cache slice; errors on a KV-only cache.
+    pub fn as_hybrid(&self) -> Result<&[Option<LayerCache>], Exception> {
+        match self {
+            Self::Hybrid(c) => Ok(c),
+            Self::KV(_) => Err(Exception::custom("expected Hybrid cache, got KV")),
+        }
+    }
+
+    /// Mutably borrow the inner hybrid cache vec; errors on a KV-only cache.
+    pub fn as_hybrid_mut(&mut self) -> Result<&mut Vec<Option<LayerCache>>, Exception> {
+        match self {
+            Self::Hybrid(c) => Ok(c),
+            Self::KV(_) => Err(Exception::custom("expected Hybrid cache, got KV")),
+        }
+    }
+}
+
+impl qwen3_next::ArraysCache {
+    /// Independent copy of recurrent Hybrid state for cross-turn cache storage.
+    /// Device-side copy — see [`cache::try_eval_deep_clone`].
+    #[must_use]
+    #[allow(clippy::expect_used)]
+    pub fn deep_clone(&self) -> Self {
+        self.try_deep_clone()
+            .expect("device copy failed for recurrent cache checkpoint")
+    }
+
+    pub fn try_deep_clone(&self) -> Result<Self, Exception> {
+        Ok(Self {
+            conv_state: self
+                .conv_state
+                .as_ref()
+                .map(cache::try_eval_deep_clone)
+                .transpose()?,
+            ssm_state: self
+                .ssm_state
+                .as_ref()
+                .map(cache::try_eval_deep_clone)
+                .transpose()?,
+            conv_pos: self.conv_pos,
+            offset: self.offset,
+        })
+    }
+
+    #[must_use]
+    pub fn estimated_bytes(&self) -> usize {
+        self.conv_state
+            .as_ref()
+            .map_or(0, mlx_rs::Array::nbytes)
+            .saturating_add(self.ssm_state.as_ref().map_or(0, mlx_rs::Array::nbytes))
     }
 }
 
@@ -258,7 +584,21 @@ fn make_turboquant_kv_cache(
     Ok(AnyCache::KV(caches))
 }
 
+/// Output of [`AnyModel::forward_with_taps_tape`]: logits, tap hiddens, per-layer GDN tape.
+pub type TapsTapeOutput = (Array, Vec<Array>, Vec<Option<qwen3_next::GdnLayerTape>>);
+
 impl AnyModel {
+    /// Whether the target is the PrismML Bonsai-27B style Qwen3Next checkpoint
+    /// using affine 1-bit weights. Standalone legacy `BonsaiQ1` is excluded:
+    /// the row4/dSpark defaults below are validated on the Qwen3.5 text
+    /// backbone path.
+    pub fn is_qwen3next_affine_1bit(&self) -> bool {
+        match self {
+            Self::Qwen3Next(m) => m.args.default_quant_spec().bits == 1,
+            _ => false,
+        }
+    }
+
     pub fn forward(
         &mut self,
         inputs: &Array,
@@ -835,6 +1175,189 @@ impl AnyModel {
             }
             _ => Err(Exception::custom(
                 "Model does not support multimodal forward",
+            )),
+        }
+    }
+
+    /// `DFlash`: forward returning logits + hidden states at `tap_layers` (drafter input).
+    pub fn forward_with_taps(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+    ) -> Result<(Array, Vec<Array>), Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.forward_with_taps(inputs, mask, c, tap_layers)
+            }
+            _ => Err(Exception::custom(
+                "forward_with_taps requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// Run a Qwen3Next backbone with tap capture but without the vocabulary
+    /// projection, for chunked drafter-context prefill.
+    pub fn forward_raw_with_taps(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+    ) -> Result<(Array, Vec<Array>), Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(model), AnyCache::Hybrid(cache)) => {
+                model.forward_raw_with_taps(inputs, mask, cache, tap_layers)
+            }
+            _ => Err(Exception::custom(
+                "forward_raw_with_taps requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// Apply the target's final norm and vocabulary head to one raw hidden row.
+    pub fn project_raw_hidden_last(&mut self, hidden: &Array) -> Result<Array, Exception> {
+        match self {
+            Self::Qwen3Next(model) => model.project_raw_hidden_last(hidden),
+            _ => Err(Exception::custom(
+                "project_raw_hidden_last requires Qwen3Next",
+            )),
+        }
+    }
+
+    /// Forward returning raw hidden + logits + tap hiddens: one backbone pass
+    /// feeding both hidden-consuming (MTP head) and tap-consuming (`DFlash`
+    /// drafter context) speculation.
+    pub fn forward_with_hidden_taps(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+    ) -> Result<(Array, Array, Vec<Array>), Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.forward_with_hidden_taps(inputs, mask, c, tap_layers)
+            }
+            _ => Err(Exception::custom(
+                "forward_with_hidden_taps requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// `DFlash` verify: forward returning logits + tap hiddens + per-layer GDN tape (for cheap rollback).
+    pub fn forward_with_taps_tape(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+    ) -> Result<TapsTapeOutput, Exception> {
+        self.forward_with_taps_tape_n(inputs, mask, cache, tap_layers, None)
+    }
+
+    /// Tape-recording verify with optional early exit after `max_layers`.
+    pub fn forward_with_taps_tape_n(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+        max_layers: Option<usize>,
+    ) -> Result<TapsTapeOutput, Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.forward_with_taps_tape_n(inputs, mask, c, tap_layers, max_layers)
+            }
+            _ => Err(Exception::custom(
+                "forward_with_taps_tape requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// Tape-recording verify with an explicit short-row numerical schedule.
+    pub fn forward_with_taps_tape_scheduled(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+        max_layers: Option<usize>,
+        row_schedule: qwen3_next::DFlashRowSchedule,
+    ) -> Result<TapsTapeOutput, Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward_with_taps_tape_scheduled(
+                inputs,
+                mask,
+                c,
+                tap_layers,
+                max_layers,
+                row_schedule,
+            ),
+            _ => Err(Exception::custom(
+                "forward_with_taps_tape_scheduled requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// Replay GDN innovation tape for accepted prefix on partial accept.
+    ///
+    /// Used by `DFlash` verify path: after partial acceptance, restore each
+    /// GDN layer's state from the tape's initial snapshot, replay only the
+    /// SSM recurrence kernel for `n_accepted` accepted positions, and roll
+    /// KV layers back by `kv_rollback`. Avoids the cost of a full rerun.
+    pub fn replay_tape_rollback(
+        &self,
+        layer_tapes: &[Option<qwen3_next::GdnLayerTape>],
+        cache: &mut AnyCache,
+        n_accepted: i32,
+        kv_rollback: i32,
+    ) -> Result<(), Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.replay_tape_rollback(layer_tapes, c, n_accepted, kv_rollback)
+            }
+            _ => Err(Exception::custom(
+                "replay_tape_rollback requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// Embed raw token IDs through the target model's embedding layer.
+    pub fn embed_token_ids(&self, token_ids: &Array) -> Result<Array, Exception> {
+        match self {
+            Self::Qwen3Next(m) => m.embed_token_ids(token_ids),
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Gemma3(_)
+            | Self::Gemma4(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::LlavaQwen2(_)
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom(
+                "embed_token_ids only implemented for Qwen3Next",
+            )),
+        }
+    }
+
+    /// Apply only the `lm_head` to pre-computed hidden states.
+    pub fn forward_all_logits_from_hidden(&self, hidden: &Array) -> Result<Array, Exception> {
+        match self {
+            Self::Qwen3Next(m) => m.forward_all_logits_from_hidden(hidden),
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Gemma3(_)
+            | Self::Gemma4(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::LlavaQwen2(_)
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom(
+                "forward_all_logits_from_hidden only implemented for Qwen3Next",
             )),
         }
     }
@@ -1460,43 +1983,23 @@ pub(crate) fn checkpoint_has_key_suffix(model_path: &Path, suffix: &str) -> bool
     })
 }
 
-/// Collect safetensors file paths from a model directory.
-pub(crate) fn collect_safetensors_files(
+/// Collect only the base checkpoint safetensors selected by the loader.
+/// Auxiliary MTP sidecars are deliberately excluded so artifact bindings can
+/// attest the target model independently of optional speculation heads.
+pub(crate) fn collect_base_safetensors_files(
     model_path: &Path,
 ) -> Result<Vec<std::path::PathBuf>, ModelError> {
-    fn existing_auxiliary_files(model_path: &Path) -> Vec<std::path::PathBuf> {
-        AUXILIARY_SAFETENSORS_FILES
-            .iter()
-            .map(|file_name| model_path.join(file_name))
-            .filter(|file_path| file_path.exists())
-            .collect()
-    }
-
-    fn append_existing_auxiliary_files(
-        model_path: &Path,
-        files: &mut Vec<std::path::PathBuf>,
-    ) -> Result<(), ModelError> {
-        let auxiliary_files = existing_auxiliary_files(model_path);
-        if auxiliary_files.len() > 1 {
-            return Err(ModelError::UnsupportedModel(
-                "ambiguous MTP sidecars: both mtp.safetensors and model-mtp.safetensors are present; remove one".to_owned(),
-            ));
-        }
-
-        if let Some(file_path) = auxiliary_files.into_iter().next() {
-            if !files.iter().any(|path| path == &file_path) {
-                files.push(file_path);
-            }
-        }
-        Ok(())
-    }
-
     let index_path = model_path.join("model.safetensors.index.json");
     let single_path = model_path.join("model.safetensors");
     if index_path.exists() {
         let json = std::fs::read_to_string(&index_path)?;
         let index: WeightMapIndex = serde_json::from_str(&json)?;
         let weight_files: HashSet<&String> = index.weight_map.values().collect();
+        if weight_files.is_empty() {
+            return Err(ModelError::MissingWeight(
+                "Safetensors index contains no weight files".to_owned(),
+            ));
+        }
         let mut files: Vec<_> = weight_files
             .into_iter()
             .map(|f| model_path.join(f))
@@ -1508,19 +2011,38 @@ pub(crate) fn collect_safetensors_files(
             files = vec![single_path];
         }
         files.sort();
-        append_existing_auxiliary_files(model_path, &mut files)?;
-        files.sort();
         Ok(files)
     } else if single_path.exists() {
-        let mut files = vec![single_path];
-        append_existing_auxiliary_files(model_path, &mut files)?;
-        files.sort();
-        Ok(files)
+        Ok(vec![single_path])
     } else {
         Err(ModelError::MissingWeight(
             "No safetensors files found".to_owned(),
         ))
     }
+}
+
+/// Collect base checkpoint files plus at most one optional MTP sidecar.
+pub(crate) fn collect_safetensors_files(
+    model_path: &Path,
+) -> Result<Vec<std::path::PathBuf>, ModelError> {
+    let mut files = collect_base_safetensors_files(model_path)?;
+    let auxiliary_files = AUXILIARY_SAFETENSORS_FILES
+        .iter()
+        .map(|file_name| model_path.join(file_name))
+        .filter(|file_path| file_path.exists())
+        .collect::<Vec<_>>();
+    if auxiliary_files.len() > 1 {
+        return Err(ModelError::UnsupportedModel(
+            "ambiguous MTP sidecars: both mtp.safetensors and model-mtp.safetensors are present; remove one".to_owned(),
+        ));
+    }
+    if let Some(file_path) = auxiliary_files.into_iter().next()
+        && !files.iter().any(|path| path == &file_path)
+    {
+        files.push(file_path);
+    }
+    files.sort();
+    Ok(files)
 }
 
 /// Remap a safetensors key for quantized model parameter names.
@@ -1545,7 +2067,12 @@ fn remap_quantized_key(key: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::disallowed_methods
+)]
 mod tests {
     use super::*;
     use crate::cache::KeyValueCache;
@@ -1556,6 +2083,27 @@ mod tests {
             top_p,
             ..SamplingParams::default()
         }
+    }
+
+    #[test]
+    fn speculation_parse_known_absent_and_invalid() {
+        assert_eq!(Speculation::parse(None), Ok(Speculation::Auto));
+        assert_eq!(Speculation::parse(Some("")), Ok(Speculation::Auto));
+        assert_eq!(Speculation::parse(Some("AUTO")), Ok(Speculation::Auto));
+        assert_eq!(
+            Speculation::parse(Some(" DFlash ")),
+            Ok(Speculation::DFlash)
+        );
+        assert_eq!(Speculation::parse(Some("mtp")), Ok(Speculation::Mtp));
+        assert_eq!(Speculation::parse(Some("none")), Ok(Speculation::None));
+        assert_eq!(Speculation::parse(Some("off")), Ok(Speculation::None));
+        assert_eq!(Speculation::parse(Some("bogus")), Err("bogus".to_owned()));
+        // Default carrier value rides on SamplingParams.
+        assert_eq!(SamplingParams::default().speculation, Speculation::Auto);
+        assert!(Speculation::Auto.allows_dflash() && Speculation::Auto.allows_mtp());
+        assert!(Speculation::DFlash.allows_dflash() && !Speculation::DFlash.allows_mtp());
+        assert!(!Speculation::Mtp.allows_dflash() && Speculation::Mtp.allows_mtp());
+        assert!(!Speculation::None.allows_dflash() && !Speculation::None.allows_mtp());
     }
 
     fn assert_sample_shape(
@@ -1743,6 +2291,20 @@ mod tests {
     }
 
     #[test]
+    fn collect_safetensors_rejects_empty_index() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"metadata":{},"weight_map":{}}"#,
+        )
+        .unwrap();
+
+        let error = collect_base_safetensors_files(dir.path()).unwrap_err();
+        assert!(matches!(error, ModelError::MissingWeight(_)));
+        assert!(error.to_string().contains("contains no weight files"));
+    }
+
+    #[test]
     fn collect_safetensors_index_json_includes_auxiliary_mtp_file() {
         let dir = tempfile::tempdir().unwrap();
         let index_json = r#"{
@@ -1823,6 +2385,91 @@ mod tests {
     fn any_cache_hybrid_variant() {
         let cache = AnyCache::Hybrid(Vec::new());
         assert!(matches!(cache, AnyCache::Hybrid(_)));
+    }
+
+    #[test]
+    fn arrays_cache_deep_clone_materializes_both_recurrent_states() {
+        let _exec = crate::mlx_exec::acquire();
+        let live = qwen3_next::ArraysCache {
+            conv_state: Some(
+                Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4])
+                    .as_dtype(mlx_rs::Dtype::Float16)
+                    .unwrap(),
+            ),
+            ssm_state: Some(Array::from_slice(&[5.0_f32, 6.0, 7.0, 8.0], &[1, 2, 2])),
+            conv_pos: 3,
+            offset: 11,
+        };
+        let checkpoint = live.try_deep_clone().unwrap();
+
+        assert_eq!(checkpoint.conv_pos, live.conv_pos);
+        assert_eq!(checkpoint.offset, live.offset);
+        let live_conv = live.conv_state.as_ref().unwrap();
+        let copied_conv = checkpoint.conv_state.as_ref().unwrap();
+        assert_eq!(copied_conv.dtype(), live_conv.dtype());
+        assert_eq!(copied_conv.shape(), live_conv.shape());
+        assert_ne!(
+            copied_conv.as_slice::<half::f16>().as_ptr(),
+            live_conv.as_slice::<half::f16>().as_ptr()
+        );
+
+        let live_ssm = live.ssm_state.as_ref().unwrap();
+        let copied_ssm = checkpoint.ssm_state.as_ref().unwrap();
+        assert_eq!(copied_ssm.as_slice::<f32>(), live_ssm.as_slice::<f32>());
+        assert_ne!(
+            copied_ssm.as_slice::<f32>().as_ptr(),
+            live_ssm.as_slice::<f32>().as_ptr()
+        );
+    }
+
+    fn kv_cache_at(offset: i32) -> cache::SteppingKeyValueCache {
+        let mut kv = cache::SteppingKeyValueCache::new();
+        if offset > 0 {
+            let keys = Array::zeros::<f32>(&[1, 1, offset, 4]).unwrap();
+            let values = Array::zeros::<f32>(&[1, 1, offset, 4]).unwrap();
+            kv.update_and_fetch(keys, values).unwrap();
+        }
+        kv
+    }
+
+    #[test]
+    fn any_cache_absolute_boundary_checks_every_hybrid_layer() {
+        let mut aligned_arrays = qwen3_next::ArraysCache::new();
+        aligned_arrays.offset = 3;
+        let aligned = AnyCache::Hybrid(vec![
+            Some(LayerCache::KV(kv_cache_at(3))),
+            Some(LayerCache::Arrays(aligned_arrays)),
+        ]);
+        aligned.validate_absolute_boundary(3).unwrap();
+
+        let mut stale_arrays = qwen3_next::ArraysCache::new();
+        stale_arrays.offset = 2;
+        let stale_gdn = AnyCache::Hybrid(vec![
+            Some(LayerCache::KV(kv_cache_at(3))),
+            Some(LayerCache::Arrays(stale_arrays)),
+        ]);
+        let error = stale_gdn.validate_absolute_boundary(3).unwrap_err();
+        assert!(error.to_string().contains("layer 1"));
+
+        let mut aligned_arrays = qwen3_next::ArraysCache::new();
+        aligned_arrays.offset = 3;
+        let stale_kv = AnyCache::Hybrid(vec![
+            Some(LayerCache::KV(kv_cache_at(2))),
+            Some(LayerCache::Arrays(aligned_arrays)),
+        ]);
+        let error = stale_kv.validate_absolute_boundary(3).unwrap_err();
+        assert!(error.to_string().contains("layer 0"));
+    }
+
+    #[test]
+    fn any_cache_absolute_boundary_rejects_missing_or_negative_state() {
+        let missing = AnyCache::Hybrid(vec![Some(LayerCache::KV(kv_cache_at(0))), None]);
+        let error = missing.validate_absolute_boundary(0).unwrap_err();
+        assert!(error.to_string().contains("missing layer 1"));
+
+        let populated = AnyCache::KV(vec![Some(kv_cache_at(0))]);
+        let error = populated.validate_absolute_boundary(-1).unwrap_err();
+        assert!(error.to_string().contains("non-negative"));
     }
 
     #[test]

@@ -9,6 +9,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
 
+use higgs_models::mlx_exec::{async_eval, eval};
 use higgs_models::{
     AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample,
     turboquant::KvCacheConfig,
@@ -16,7 +17,6 @@ use higgs_models::{
 use mlx_rs::{
     Array, Stream,
     ops::indexing::{IndexOp, NewAxis},
-    transforms::{async_eval, eval},
     with_new_default_stream,
 };
 use tokenizers::Tokenizer;
@@ -409,6 +409,15 @@ fn worker_loop(
 ) {
     let mut prefix_cache = PrefixCache::new(DEFAULT_PREFIX_CACHE_SIZE);
     let mut active: Vec<ActiveRequest> = Vec::new();
+
+    // This dedicated worker thread is the sole owner of `model` (it was moved
+    // in), so it is already serialized by single-thread ownership. Hold the
+    // MLX-execution gate for its entire life anyway: it is uncontended here
+    // (no other thread evals while BatchEngine is the active engine — the two
+    // engines are mutually exclusive), so it is free, and it keeps the
+    // sanctioned-eval invariant uniform — the `eval`/`async_eval` wrappers'
+    // debug_assert holds without a BatchEngine carve-out.
+    let _mlx_gate = higgs_models::mlx_exec::acquire();
 
     loop {
         // 1. Prefill at most one pending request per iteration.

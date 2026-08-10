@@ -1,3 +1,6 @@
+// Model forward passes eval under the engine MLX gate (structurally on-gate); see clippy.toml.
+#![allow(clippy::disallowed_methods)]
+
 //! Gemma 4 (text) model implementation.
 //!
 //! Key differences from Gemma 2/3:

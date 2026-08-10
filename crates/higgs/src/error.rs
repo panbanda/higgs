@@ -31,6 +31,12 @@ pub enum ServerError {
     #[error("Model not found: {0}")]
     ModelNotFound(String),
 
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+
     #[error("Internal error: {0}")]
     InternalError(String),
 
@@ -59,6 +65,8 @@ impl IntoResponse for ServerError {
                 "model_not_found",
                 format!("Model '{model}' is not loaded"),
             ),
+            Self::Conflict(msg) => (StatusCode::CONFLICT, "conflict", msg.clone()),
+            Self::Forbidden(msg) => (StatusCode::FORBIDDEN, "forbidden", msg.clone()),
             Self::InternalError(msg) => {
                 tracing::error!(error = %msg, "Internal error");
                 (

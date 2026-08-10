@@ -102,7 +102,7 @@ pub fn cmd_stop(profile: Option<&str>, force: bool) -> i32 {
     }
 }
 
-#[allow(clippy::print_stderr)]
+#[allow(clippy::print_stderr, clippy::too_many_lines)]
 pub fn cmd_init(profile: Option<&str>) {
     let dir = config::config_dir();
     let filename = profile.map_or_else(
@@ -145,6 +145,9 @@ port = 8000
 
 # [local]
 # mlx_profile = "auto"
+# Allow loading/unloading models at runtime via POST/DELETE /v1/models.
+# Off by default; protect with server.api_key before enabling.
+# allow_runtime_model_load = false
 
 # --- Local models ---
 # Each [[models]] entry loads an MLX model into GPU memory.
@@ -155,6 +158,10 @@ port = 8000
 # name = "llama"
 # mlx_profile = "throughput"
 # batch = false
+# # Cache-resident multi-turn KV retention limits (bound resident memory):
+# kv_max_sessions = 8           # max retained conversations, LRU-evicted (>= 1)
+# kv_max_session_tokens = 0     # drop a conversation's KV past N tokens (0 = unlimited)
+# kv_retained_idle_secs = 1800  # evict KV idle longer than N seconds (0 = never)
 
 # --- Remote providers ---
 # Forward requests to external APIs via proxy routes.

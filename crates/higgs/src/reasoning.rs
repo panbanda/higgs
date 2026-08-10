@@ -24,9 +24,16 @@ pub fn effective_thinking_enabled(
     engine_default: bool,
     model_names: &[&str],
     reasoning: Option<&ReasoningConfig>,
+    explicit: Option<bool>,
 ) -> bool {
     if !engine_default {
         return false;
+    }
+
+    // An explicit per-request toggle (`chat_template_kwargs.enable_thinking`,
+    // e.g. nanobot's `/thinking on|off`) wins over OpenAI `reasoning.effort`.
+    if let Some(want) = explicit {
+        return want;
     }
 
     match reasoning.and_then(|r| r.effort.as_deref()) {
@@ -47,6 +54,7 @@ mod tests {
             true,
             &["mlx-community/Qwen3.5-foo"],
             None,
+            None,
         ));
     }
 
@@ -55,6 +63,7 @@ mod tests {
         assert!(!effective_thinking_enabled(
             true,
             &["mlx-community/Qwen3.6-35B-A3B-4bit"],
+            None,
             None,
         ));
     }
@@ -65,6 +74,7 @@ mod tests {
             true,
             &["qwen", "mlx-community/Qwen3.6-35B-A3B-4bit"],
             None,
+            None,
         ));
     }
 
@@ -73,6 +83,7 @@ mod tests {
         assert!(effective_thinking_enabled(
             true,
             &["mlx-community/Qwen3.65-35B-A3B-4bit"],
+            None,
             None,
         ));
     }
@@ -85,6 +96,7 @@ mod tests {
             Some(&ReasoningConfig {
                 effort: Some("none".to_owned()),
             }),
+            None,
         ));
     }
 
@@ -96,6 +108,7 @@ mod tests {
             Some(&ReasoningConfig {
                 effort: Some(String::new()),
             }),
+            None,
         ));
     }
 
@@ -107,6 +120,7 @@ mod tests {
             Some(&ReasoningConfig {
                 effort: Some("low".to_owned()),
             }),
+            None,
         ));
     }
 
@@ -118,6 +132,42 @@ mod tests {
             Some(&ReasoningConfig {
                 effort: Some("low".to_owned()),
             }),
+            None,
+        ));
+    }
+
+    #[test]
+    fn explicit_enable_thinking_true_overrides_qwen36_default() {
+        // chat_template_kwargs.enable_thinking=true turns reasoning on even for
+        // a model that defaults off.
+        assert!(effective_thinking_enabled(
+            true,
+            &["mlx-community/Qwen3.6-35B-A3B-4bit"],
+            None,
+            Some(true),
+        ));
+    }
+
+    #[test]
+    fn explicit_enable_thinking_false_overrides_reasoning_effort() {
+        // /thinking off wins even when reasoning.effort asked for thinking.
+        assert!(!effective_thinking_enabled(
+            true,
+            &["mlx-community/Qwen3.5-foo"],
+            Some(&ReasoningConfig {
+                effort: Some("high".to_owned()),
+            }),
+            Some(false),
+        ));
+    }
+
+    #[test]
+    fn explicit_true_cannot_force_a_non_thinking_engine() {
+        assert!(!effective_thinking_enabled(
+            false,
+            &["mlx-community/Qwen3.5-foo"],
+            None,
+            Some(true),
         ));
     }
 }

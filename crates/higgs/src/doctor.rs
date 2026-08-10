@@ -45,6 +45,7 @@ pub async fn run_doctor(
 
     check_config_valid(&mut result);
     check_config_file_permissions(config, config_path, &mut result);
+    check_misplaced_local_keys(config_path, &mut result);
     check_server_section(config, &mut result);
     check_models(config, &mut result);
     check_duplicate_models(config, &mut result);
@@ -52,6 +53,7 @@ pub async fn run_doctor(
     check_route_consistency(config, &mut result);
     check_default_provider(config, &mut result);
     check_auto_router(config, &mut result);
+    check_runtime_model_load(config, &mut result);
     check_port_availability(config, &mut result);
     check_orphaned_providers(config, &mut result);
 
@@ -262,6 +264,7 @@ fn model_label(model: &crate::config::ModelConfig) -> String {
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
     for model in &config.models {
         let label = model_label(model);
@@ -275,6 +278,28 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                 continue;
             }
         }
+        // Cache-resident retention limits: catch values that "work" but quietly
+        // defeat the cache (a too-low cap drops it almost every turn → constant
+        // full-prefill). 0 = disabled, which is fine.
+        let kv = model.kv_cache_config();
+        if kv.max_session_tokens > 0 && kv.max_session_tokens < 512 {
+            warn(
+                &format!(
+                    "model {label} kv_max_session_tokens={} is very low — most turns will drop the retained cache and full-prefill (use 0 to disable the cap, or a larger value)",
+                    kv.max_session_tokens
+                ),
+                result,
+            );
+        }
+        if kv.retained_idle_secs > 0 && kv.retained_idle_secs < 30 {
+            warn(
+                &format!(
+                    "model {label} kv_retained_idle_secs={} is very low — retained caches will be evicted almost immediately (use 0 to disable idle eviction, or a larger value)",
+                    kv.retained_idle_secs
+                ),
+                result,
+            );
+        }
         if model.batch && model.kv_cache_config().is_turboquant() {
             fail(
                 &format!(
@@ -283,6 +308,37 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                 result,
             );
             continue;
+        }
+        if model.kv_cache_config().is_turboquant() {
+            let tq_default = higgs_models::cache::DEFAULT_TURBOQUANT_ACTIVATE_AT;
+            warn(
+                &format!(
+                    "model {label} sets kv_cache=turboquant: its custom Metal decode kernels are \
+                     ~20-25% slower than dense SDPA until the activation threshold (default \
+                     {tq_default} tokens; override with HIGGS_TURBOQUANT_MIN_TOKENS), plus a \
+                     first-token stall when prefilled KV is bulk-quantized. Dense KV is only \
+                     ~10 KB/token — prefer it unless very long context threatens memory."
+                ),
+                result,
+            );
+        }
+        if let Some(ref drafter) = model.draft_model {
+            if !std::path::Path::new(drafter).exists() {
+                fail(
+                    &format!("model {label} draft_model path does not exist: {drafter}"),
+                    result,
+                );
+                continue;
+            }
+            if model.batch {
+                fail(
+                    &format!(
+                        "model {label} sets draft_model but DFlash is simple-engine only (batch=true)"
+                    ),
+                    result,
+                );
+                continue;
+            }
         }
         match model_resolver::resolve(&model.path) {
             Ok(resolved) => {
@@ -327,6 +383,56 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
             }
             Err(err) => fail(&format!("model {label} not found: {err}"), result),
         }
+    }
+}
+
+/// Catch `[local]` keys mistakenly written under `[server]`.
+///
+/// `local.allow_runtime_model_load = true` placed below a `[server]` header is
+/// parsed by TOML as `server.local.*` -- an unknown key serde silently drops, so
+/// the setting never takes effect. This is only visible in the raw file; the
+/// parsed [`HiggsConfig`] no longer carries the stray key.
+fn check_misplaced_local_keys(config_path: Option<&std::path::Path>, result: &mut DoctorResult) {
+    let Some(path) = config_path else { return };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(doc) = raw.parse::<toml_edit::DocumentMut>() else {
+        return;
+    };
+    let Some(server) = doc.get("server").and_then(|item| item.as_table()) else {
+        return;
+    };
+
+    let stray: Vec<&str> = [
+        "local",
+        "allow_runtime_model_load",
+        "raise_wired_limit",
+        "mlx_profile",
+    ]
+    .into_iter()
+    .filter(|key| server.contains_key(key))
+    .collect();
+    if stray.is_empty() {
+        pass("no misplaced [local] keys under [server]", result);
+    } else {
+        warn(
+            &format!(
+                "{stray:?} found under [server]: TOML reads these as server.* and silently ignores them, so the setting never applies. Move them to a top-level [local] table."
+            ),
+            result,
+        );
+    }
+}
+
+fn check_runtime_model_load(config: &HiggsConfig, result: &mut DoctorResult) {
+    if config.local.allow_runtime_model_load {
+        warn(
+            "local.allow_runtime_model_load is enabled: POST/DELETE /v1/models can load and unload models at runtime; ensure server.api_key restricts this to trusted operators",
+            result,
+        );
+    } else {
+        pass("runtime model load/unload disabled", result);
     }
 }
 
@@ -584,6 +690,37 @@ mod tests {
         assert_eq!(result.failures, 1);
     }
 
+    // -- Misplaced [local] keys under [server] --
+
+    fn write_config(toml: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), toml).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_local_key_under_server_warns() {
+        // The exact footgun: dotted `local.*` written below [server] parses as
+        // server.local.* and is silently dropped.
+        let dir =
+            write_config("[server]\nhost = \"0.0.0.0\"\nlocal.allow_runtime_model_load = true\n");
+        let mut result = empty_result();
+        check_misplaced_local_keys(Some(&dir.path().join("config.toml")), &mut result);
+        assert_eq!(result.warnings, 1);
+        assert_eq!(result.passes, 0);
+    }
+
+    #[test]
+    fn test_correct_local_table_passes() {
+        let dir = write_config(
+            "[server]\nhost = \"0.0.0.0\"\n\n[local]\nallow_runtime_model_load = true\n",
+        );
+        let mut result = empty_result();
+        check_misplaced_local_keys(Some(&dir.path().join("config.toml")), &mut result);
+        assert_eq!(result.passes, 1);
+        assert_eq!(result.warnings, 0);
+    }
+
     // -- Duplicate model detection --
 
     #[test]
@@ -592,29 +729,11 @@ mod tests {
             models: vec![
                 ModelConfig {
                     path: "org/model-a".to_owned(),
-                    name: None,
-                    mlx_profile: None,
-                    batch: false,
-                    kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                    kv_bits: 3,
-                    kv_seed: 0,
-                    kv_key_bits: None,
-                    kv_value_bits: None,
-                    kv_norm_correction: true,
-                    kv_adaptive_dense_layers: 0,
+                    ..Default::default()
                 },
                 ModelConfig {
                     path: "org/model-b".to_owned(),
-                    name: None,
-                    mlx_profile: None,
-                    batch: false,
-                    kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                    kv_bits: 3,
-                    kv_seed: 0,
-                    kv_key_bits: None,
-                    kv_value_bits: None,
-                    kv_norm_correction: true,
-                    kv_adaptive_dense_layers: 0,
+                    ..Default::default()
                 },
             ],
             ..HiggsConfig::default()
@@ -631,29 +750,11 @@ mod tests {
             models: vec![
                 ModelConfig {
                     path: "org/model-a".to_owned(),
-                    name: None,
-                    mlx_profile: None,
-                    batch: false,
-                    kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                    kv_bits: 3,
-                    kv_seed: 0,
-                    kv_key_bits: None,
-                    kv_value_bits: None,
-                    kv_norm_correction: true,
-                    kv_adaptive_dense_layers: 0,
+                    ..Default::default()
                 },
                 ModelConfig {
                     path: "org/model-a".to_owned(),
-                    name: None,
-                    mlx_profile: None,
-                    batch: false,
-                    kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                    kv_bits: 3,
-                    kv_seed: 0,
-                    kv_key_bits: None,
-                    kv_value_bits: None,
-                    kv_norm_correction: true,
-                    kv_adaptive_dense_layers: 0,
+                    ..Default::default()
                 },
             ],
             ..HiggsConfig::default()
@@ -1119,16 +1220,7 @@ mod tests {
             },
             models: vec![ModelConfig {
                 path: "org/other-model".to_owned(),
-                name: None,
-                mlx_profile: None,
-                batch: false,
-                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                kv_bits: 3,
-                kv_seed: 0,
-                kv_key_bits: None,
-                kv_value_bits: None,
-                kv_norm_correction: true,
-                kv_adaptive_dense_layers: 0,
+                ..Default::default()
             }],
             ..HiggsConfig::default()
         };
@@ -1149,16 +1241,7 @@ mod tests {
             },
             models: vec![ModelConfig {
                 path: "org/router-model".to_owned(),
-                name: None,
-                mlx_profile: None,
-                batch: false,
-                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                kv_bits: 3,
-                kv_seed: 0,
-                kv_key_bits: None,
-                kv_value_bits: None,
-                kv_norm_correction: true,
-                kv_adaptive_dense_layers: 0,
+                ..Default::default()
             }],
             ..HiggsConfig::default()
         };
@@ -1181,16 +1264,7 @@ mod tests {
             },
             models: vec![ModelConfig {
                 path: "org/router-model".to_owned(),
-                name: None,
-                mlx_profile: None,
-                batch: false,
-                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                kv_bits: 3,
-                kv_seed: 0,
-                kv_key_bits: None,
-                kv_value_bits: None,
-                kv_norm_correction: true,
-                kv_adaptive_dense_layers: 0,
+                ..Default::default()
             }],
             routes: vec![RouteConfig {
                 name: Some("test".to_owned()),
