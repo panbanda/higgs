@@ -293,7 +293,7 @@ impl DeepSeekV2Attention {
                     Some(QLinear::new(ql, qb)?),
                     Some(
                         nn::RmsNormBuilder::new(args.q_lora_rank.unwrap_or(0))
-                            .eps(1e-6)
+                            .eps(1e-6_f32)
                             .build()?,
                     ),
                     Some(QLinear::new(ql, qb)?),
@@ -367,7 +367,7 @@ impl DeepSeekV2Attention {
             q_proj,
             kv_a_proj_with_mqa: QLinear::new(ql, qb)?,
             kv_a_layernorm: nn::RmsNormBuilder::new(args.kv_lora_rank)
-                .eps(1e-6)
+                .eps(1e-6_f32)
                 .build()?,
             kv_b_proj: QLinear::new(ql, qb)?,
             o_proj: QLinear::new(ql, qb)?,
