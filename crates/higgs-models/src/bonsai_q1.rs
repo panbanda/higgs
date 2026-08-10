@@ -700,7 +700,10 @@ impl BonsaiQ1Gpu {
         h.eval()?;
         times.add("embed_rows", t0.elapsed().as_nanos());
 
-        let mask = create_attention_mask(&h, cache, None)?;
+        // Prefill (T>1) needs a causal mask. Request the Array form: the cached
+        // SDPA path below consumes Option<&Array> and applies no causal masking
+        // itself, so the Causal variant would be dropped to None (= no mask).
+        let mask = create_attention_mask(&h, cache, Some(true))?;
 
         let heads = i32::try_from(self.config.heads)
             .map_err(|_| Exception::custom("heads overflows i32"))?;
@@ -865,7 +868,10 @@ pub fn forward_trunk_free(
 
     let mut h = gpu.embed_rows(inputs)?; // [B, L, hidden]
 
-    let mask = create_attention_mask(&h, cache, None)?;
+    // Prefill (T>1) needs a causal mask. Request the Array form: the cached
+    // SDPA path below consumes Option<&Array> and applies no causal masking
+    // itself, so the Causal variant would be dropped to None (= no mask).
+    let mask = create_attention_mask(&h, cache, Some(true))?;
 
     let heads =
         i32::try_from(gpu.config.heads).map_err(|_| Exception::custom("heads overflows i32"))?;

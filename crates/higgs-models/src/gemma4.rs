@@ -639,7 +639,7 @@ impl Gemma4Attention {
         let rope = nn::RopeBuilder::new(rope_dims)
             .traditional(false)
             .base(rope_theta)
-            .scale(1.0)
+            .scale(1.0_f32)
             .build()
             .map_err(|e| Exception::custom(format!("Failed to build RoPE: {e}")))?;
 
@@ -686,7 +686,7 @@ impl Gemma4Attention {
         let rope = nn::RopeBuilder::new(rope_dims)
             .traditional(false)
             .base(rope_theta)
-            .scale(1.0)
+            .scale(1.0_f32)
             .build()
             .map_err(|e| Exception::custom(format!("Failed to build RoPE: {e}")))?;
 
