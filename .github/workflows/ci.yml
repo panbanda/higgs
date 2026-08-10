@@ -18,7 +18,7 @@ env:
 jobs:
   test:
     name: Test
-    runs-on: macos-latest
+    runs-on: macos-15 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
     permissions:
       contents: read
 
@@ -33,13 +33,17 @@ jobs:
 
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Bust cache poisoned by mlx-sys .air built on a different Xcode/macOS
+          # image (AIR 2.8 vs 2.7 link mismatch). Bump when the pinned image changes.
+          prefix-key: "v1-mlx-air-macos15"
 
       - name: Run tests
         run: cargo test --all-features -- --test-threads=1
 
   build:
     name: Build
-    runs-on: macos-latest
+    runs-on: macos-15 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
     permissions:
       contents: read
 
@@ -54,13 +58,17 @@ jobs:
 
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Bust cache poisoned by mlx-sys .air built on a different Xcode/macOS
+          # image (AIR 2.8 vs 2.7 link mismatch). Bump when the pinned image changes.
+          prefix-key: "v1-mlx-air-macos15"
 
       - name: Build release
         run: cargo build --release
 
   lint:
     name: Lint
-    runs-on: macos-latest
+    runs-on: macos-15 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
     permissions:
       contents: read
 
@@ -76,6 +84,10 @@ jobs:
 
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Bust cache poisoned by mlx-sys .air built on a different Xcode/macOS
+          # image (AIR 2.8 vs 2.7 link mismatch). Bump when the pinned image changes.
+          prefix-key: "v1-mlx-air-macos15"
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -85,7 +97,7 @@ jobs:
 
   msrv:
     name: MSRV
-    runs-on: macos-latest
+    runs-on: macos-15 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
     permissions:
       contents: read
 
@@ -100,13 +112,17 @@ jobs:
 
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Bust cache poisoned by mlx-sys .air built on a different Xcode/macOS
+          # image (AIR 2.8 vs 2.7 link mismatch). Bump when the pinned image changes.
+          prefix-key: "v1-mlx-air-macos15"
 
       - name: Check MSRV
         run: cargo check --all-features
 
   coverage:
     name: Coverage
-    runs-on: macos-latest
+    runs-on: macos-15 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
     permissions:
       contents: read
 
@@ -126,6 +142,10 @@ jobs:
 
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Bust cache poisoned by mlx-sys .air built on a different Xcode/macOS
+          # image (AIR 2.8 vs 2.7 link mismatch). Bump when the pinned image changes.
+          prefix-key: "v1-mlx-air-macos15"
 
       - name: Generate coverage and enforce threshold
         run: |
