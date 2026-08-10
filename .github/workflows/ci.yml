@@ -32,7 +32,7 @@ jobs:
           toolchain: stable
 
       - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           # Bust cache poisoned by mlx-sys .air built on a different Xcode/macOS
           # image (AIR 2.8 vs 2.7 link mismatch). Bump when the pinned image changes.
@@ -57,7 +57,7 @@ jobs:
           toolchain: stable
 
       - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           # Bust cache poisoned by mlx-sys .air built on a different Xcode/macOS
           # image (AIR 2.8 vs 2.7 link mismatch). Bump when the pinned image changes.
@@ -83,7 +83,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           # Bust cache poisoned by mlx-sys .air built on a different Xcode/macOS
           # image (AIR 2.8 vs 2.7 link mismatch). Bump when the pinned image changes.
@@ -111,7 +111,7 @@ jobs:
           toolchain: "1.97.0"
 
       - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           # Bust cache poisoned by mlx-sys .air built on a different Xcode/macOS
           # image (AIR 2.8 vs 2.7 link mismatch). Bump when the pinned image changes.
@@ -141,7 +141,7 @@ jobs:
           tool: cargo-llvm-cov
 
       - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           # Bust cache poisoned by mlx-sys .air built on a different Xcode/macOS
           # image (AIR 2.8 vs 2.7 link mismatch). Bump when the pinned image changes.
