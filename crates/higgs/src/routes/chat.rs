@@ -463,7 +463,7 @@ fn chat_completions_stream(
     let prompt_tools = req
         .tools
         .as_deref()
-        .and_then(|t| if t.is_empty() { None } else { Some(t) });
+        .filter(|t| !t.is_empty());
     let mut prompt_tokens = engine
         .prepare_chat_prompt_with_thinking(&messages, prompt_tools, thinking_enabled_stream)
         .map_err(ServerError::Engine)?;
