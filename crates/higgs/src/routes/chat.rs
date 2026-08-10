@@ -460,10 +460,7 @@ fn chat_completions_stream(
     // [`StreamingToolCallTracker`] below intercepts `<tool_call>…
     // </tool_call>` blocks the model produces and turns them into
     // structured `ToolCallDelta` SSE events.
-    let prompt_tools = req
-        .tools
-        .as_deref()
-        .and_then(|t| if t.is_empty() { None } else { Some(t) });
+    let prompt_tools = req.tools.as_deref().filter(|t| !t.is_empty());
     let mut prompt_tokens = engine
         .prepare_chat_prompt_with_thinking(&messages, prompt_tools, thinking_enabled_stream)
         .map_err(ServerError::Engine)?;
