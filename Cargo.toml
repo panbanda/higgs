@@ -130,7 +130,7 @@ thiserror = "2"
 async-stream = "0.3"
 
 # Benchmarking
-criterion = { version = "0.5", default-features = false }
+criterion = { version = "0.8", default-features = false }
 
 # Image processing
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

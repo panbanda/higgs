@@ -14,7 +14,9 @@
     clippy::unusual_byte_groupings
 )]
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use higgs_models::{SamplingParams, sample};
 use mlx_rs::Array;
 use mlx_rs::transforms::eval;
