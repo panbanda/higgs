@@ -217,7 +217,8 @@ pub(crate) fn create_batched_decode_mask(
     clippy::suboptimal_flops,
     clippy::unnecessary_cast,
     clippy::cast_lossless,
-    clippy::doc_markdown
+    clippy::doc_markdown,
+    clippy::disallowed_methods
 )]
 mod tests {
     use super::*;

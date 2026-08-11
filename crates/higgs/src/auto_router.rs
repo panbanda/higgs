@@ -133,10 +133,21 @@ pub fn classify_local(
         repetition_penalty: None,
         frequency_penalty: None,
         presence_penalty: None,
+        speculation: higgs_models::Speculation::Auto,
+        thinking_budget: None,
     };
 
-    let output = match engine.generate(&prompt_tokens, 64, &sampling, &[], false, None, None, None)
-    {
+    let output = match engine.generate(
+        &prompt_tokens,
+        64,
+        &sampling,
+        &[],
+        false,
+        None,
+        None,
+        None,
+        None,
+    ) {
         Ok(o) => o,
         Err(e) => {
             warn!(error = %e, "auto-router generation failed");

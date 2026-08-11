@@ -23,12 +23,8 @@ use higgs::types::openai::{
     EmbeddingUsage, MessageContent, ModelList, ModelObject, ToolCall, ToolCallFunction,
 };
 
-const fn make_usage(prompt: u32, completion: u32) -> CompletionUsage {
-    CompletionUsage {
-        prompt_tokens: prompt,
-        completion_tokens: completion,
-        total_tokens: prompt + completion,
-    }
+fn make_usage(prompt: u32, completion: u32) -> CompletionUsage {
+    CompletionUsage::new(prompt, completion, 0)
 }
 
 const fn make_anthropic_usage(input: u32, output: u32) -> AnthropicUsage {
@@ -276,14 +272,20 @@ fn model_list_serialization() {
             object: "model",
             created: 1_700_000_000,
             owned_by: "local".to_owned(),
+            vision: true,
         }],
+        runtime_model_load: true,
     };
     let json: serde_json::Value = serde_json::to_value(&list).unwrap();
 
+    // OpenAI-standard fields unchanged.
     assert_eq!(json["object"], "list");
     assert_eq!(json["data"][0]["id"], "my-model");
     assert_eq!(json["data"][0]["object"], "model");
     assert_eq!(json["data"][0]["owned_by"], "local");
+    // higgs additive capability extensions.
+    assert_eq!(json["data"][0]["vision"], true);
+    assert_eq!(json["runtime_model_load"], true);
 }
 
 // ---------------------------------------------------------------------------

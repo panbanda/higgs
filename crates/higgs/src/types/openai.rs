@@ -24,6 +24,11 @@ pub struct ChatCompletionRequest {
     pub frequency_penalty: Option<f32>,
     #[serde(default)]
     pub presence_penalty: Option<f32>,
+    /// Per-request speculative-decoding method: `auto` (default), `dflash`,
+    /// `mtp`, or `none`. `auto` uses the `DFlash` drafter when one is loaded
+    /// (including while streaming), else the built-in MTP head.
+    #[serde(default)]
+    pub speculation: Option<String>,
     #[serde(default)]
     pub stream: Option<bool>,
     #[serde(default)]
@@ -49,6 +54,39 @@ pub struct ChatCompletionRequest {
     /// processed, time_ms}`). Ignored for non-streaming requests.
     #[serde(default)]
     pub return_progress: Option<bool>,
+    /// Optional Higgs extension naming a disk prefix-cache checkpoint to load/store.
+    #[serde(default)]
+    pub checkpoint_id: Option<String>,
+    /// Max `<think>` tokens before `</think>` is force-closed (de-facto local
+    /// extension; sent by clients like nanobot's `/thinking N`). `None` falls
+    /// back to the engine default budget.
+    #[serde(default)]
+    pub reasoning_budget: Option<u32>,
+    /// Jinja chat-template kwargs (vLLM/Qwen convention). Only
+    /// `enable_thinking` is honored: it overrides per-request whether the model
+    /// reasons.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// Top-level alias for `chat_template_kwargs.enable_thinking`, accepted
+    /// because many OpenAI-compatible clients send the toggle here. When both
+    /// are present, `chat_template_kwargs.enable_thinking` wins; otherwise this
+    /// value is used.
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
+    /// Opt-in multi-turn KV-cache reuse. When set (non-streaming, Simple engine
+    /// only) the conversation's KV cache is retained across turns so that a
+    /// continued turn prefills only the new suffix instead of the full history.
+    /// Omitted by default — behavior is unchanged when absent.
+    #[serde(default)]
+    pub session_id: Option<u64>,
+}
+
+/// Subset of `chat_template_kwargs` that Higgs acts on.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatTemplateKwargs {
+    /// Per-request override for the model's reasoning mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_thinking: Option<bool>,
 }
 
 /// Optional request-level controls for streaming responses.
@@ -319,6 +357,9 @@ pub struct CompletionRequest {
     pub logprobs: Option<bool>,
     #[serde(default)]
     pub top_logprobs: Option<u32>,
+    /// Optional Higgs extension naming a disk prefix-cache checkpoint to load/store.
+    #[serde(default)]
+    pub checkpoint_id: Option<String>,
 }
 
 /// POST /v1/completions response (non-streaming).
@@ -360,12 +401,43 @@ pub struct CompletionChunkChoice {
     pub finish_reason: Option<String>,
 }
 
+/// Breakdown of the prompt token count (OpenAI `prompt_tokens_details`).
+///
+/// Only `cached_tokens` is populated: the number of prompt tokens served from
+/// reused KV state (session continuation or radix prefix cache) instead of being
+/// re-prefilled this turn. Clients read this as `usage.prompt_tokens_details.cached_tokens`.
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptTokensDetails {
+    pub cached_tokens: u32,
+}
+
 /// Token usage statistics.
 #[derive(Debug, Clone, Serialize)]
 pub struct CompletionUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// OpenAI-shape prompt breakdown. Omitted from the wire when no prompt
+    /// tokens were served from cache, so `cached_tokens: 0` never masquerades as
+    /// a measured zero for paths that don't track reuse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+impl CompletionUsage {
+    /// Build a usage block. `cached_tokens` is the count of prompt tokens
+    /// served from reused KV; when it is 0 the `prompt_tokens_details` field is
+    /// omitted entirely (OpenAI clients treat a missing block as "no reuse").
+    #[must_use]
+    pub fn new(prompt_tokens: u32, completion_tokens: u32, cached_tokens: u32) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            prompt_tokens_details: (cached_tokens > 0)
+                .then_some(PromptTokensDetails { cached_tokens }),
+        }
+    }
 }
 
 /// GET /v1/models response.
@@ -373,6 +445,9 @@ pub struct CompletionUsage {
 pub struct ModelList {
     pub object: &'static str,
     pub data: Vec<ModelObject>,
+    /// higgs extension (additive, `OpenAI` clients ignore unknown keys): whether
+    /// runtime model load/switch is enabled (`local.allow_runtime_model_load`).
+    pub runtime_model_load: bool,
 }
 
 /// A model in the models list.
@@ -382,6 +457,8 @@ pub struct ModelObject {
     pub object: &'static str,
     pub created: i64,
     pub owned_by: String,
+    /// higgs extension (additive): whether this model accepts image input (VLM).
+    pub vision: bool,
 }
 
 /// POST /v1/embeddings request body.
@@ -431,6 +508,20 @@ pub struct EmbeddingUsage {
 mod tests {
     use super::*;
 
+    #[test]
+    fn usage_reports_cached_tokens_only_when_nonzero() {
+        // Reuse happened: OpenAI-shape `prompt_tokens_details.cached_tokens`.
+        let reused = serde_json::to_value(CompletionUsage::new(100, 20, 80)).unwrap();
+        assert_eq!(reused["prompt_tokens"], 100);
+        assert_eq!(reused["total_tokens"], 120);
+        assert_eq!(reused["prompt_tokens_details"]["cached_tokens"], 80);
+
+        // Cold prefill: the block is omitted so a client never reads a
+        // fabricated `cached_tokens: 0`.
+        let cold = serde_json::to_value(CompletionUsage::new(100, 20, 0)).unwrap();
+        assert!(cold.get("prompt_tokens_details").is_none());
+    }
+
     /// Deserialize a chat completion request from JSON with a single user message
     /// and one extra field merged in (e.g., `"max_tokens": 0`).
     fn chat_request_with(extra_field: &str) -> ChatCompletionRequest {
@@ -474,11 +565,7 @@ mod tests {
     }
 
     fn make_usage(prompt: u32, completion: u32) -> CompletionUsage {
-        CompletionUsage {
-            prompt_tokens: prompt,
-            completion_tokens: completion,
-            total_tokens: prompt + completion,
-        }
+        CompletionUsage::new(prompt, completion, 0)
     }
 
     #[test]
@@ -572,7 +659,9 @@ mod tests {
                 object: "model",
                 created: 1_234_567_890,
                 owned_by: "local".to_owned(),
+                vision: false,
             }],
+            runtime_model_load: false,
         };
         let json = serde_json::to_string(&list).unwrap();
         assert!(json.contains("test-model"));

@@ -51,7 +51,7 @@ pub fn install_prefill_progress_sink(sink: Sink) -> PrefillSinkGuard {
 ///
 /// The sink is invoked while the thread-local is `borrow_mut`-held, so the
 /// sink must not call back into this function or reinstall the sink.
-pub(crate) fn report_prefill_progress(processed: i32, total: i32) {
+pub fn report_prefill_progress(processed: i32, total: i32) {
     PREFILL_SINK.with(|s| {
         if let Some(f) = s.borrow_mut().as_mut() {
             f(processed, total);

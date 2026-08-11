@@ -17,6 +17,7 @@ mlx-sys.workspace = true
 safetensors = "0.8"
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 tokenizers.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

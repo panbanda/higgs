@@ -41,6 +41,7 @@ This document collects the full CLI, environment, and config-file reference for 
 - `HIGGS_MTP_DRAFT_N_MAX` controls the maximum MTP draft tokens per speculative cycle. The default is `2` for huge checkpoints and `1` otherwise, clamped to `1..=8`.
 - `HIGGS_MTP_ADAPTIVE_DRAFT=1` lets the decode loop increase or decrease the MTP draft window based on recent verifier acceptance.
 - `HIGGS_MTP_PROMPT_LOOKUP=1` enables a hybrid MTP loop that tries verified prompt-lookup drafts when the prompt/history has a repeated suffix, then keeps the MTP cache synchronized for later MTP-head cycles.
+- Per request, the OpenAI and Anthropic bodies accept `"speculation": "auto" | "dflash" | "mtp" | "none"` to choose the speculative method for that request. `auto` (default) uses the DFlash drafter when one is loaded — including while streaming — and otherwise the MTP head; `mtp` forces the MTP head even when a drafter is loaded; `none` forces plain autoregressive decode. (DFlash requires `draft_model` and the simple engine; it is unavailable under `batch = true`.)
 - `HIGGS_CLEAR_CACHE_AFTER_PREFILL` overrides the selected MLX profile behavior for cache clearing.
 - `HIGGS_TURBOQUANT_MIN_TOKENS` overrides the TurboQuant activation threshold. The default is `2048`.
 - `HIGGS_EXPERIMENTAL_PAGED_KV=1` enables the experimental paged-KV path.
@@ -76,6 +77,7 @@ path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
 # name = "llama"
 # mlx_profile = "throughput"
 # batch = false
+# draft_model = "/path/to/dflash-drafter"   # enables DFlash speculative decoding (simple engine only)
 # kv_cache = "turboquant"
 # kv_bits = 3
 # kv_key_bits = 2
@@ -83,6 +85,10 @@ path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
 # kv_norm_correction = true
 # kv_adaptive_dense_layers = 0
 # kv_seed = 0
+# # Cache-resident multi-turn KV retention limits (bound resident KV memory):
+# kv_max_sessions = 8           # max retained conversations, LRU-evicted (>= 1)
+# kv_max_session_tokens = 0     # drop a conversation's KV past N tokens (0 = unlimited)
+# kv_retained_idle_secs = 1800  # evict KV idle longer than N seconds (0 = never)
 
 # --- Remote providers ---
 [provider.anthropic]
@@ -122,6 +128,8 @@ provider = "higgs"
 # timeout_ms = 2000
 
 # --- Metrics & dashboard ---
+# [retention] controls how long request metrics are kept for the dashboard.
+# It is NOT the KV cache retention — that is per-model (kv_retained_idle_secs above).
 [retention]
 enabled = true
 minutes = 60
@@ -186,6 +194,29 @@ That means Higgs supports:
 - `higgs doctor` and server startup now reject unsupported `batch=true` combinations instead of silently degrading.
 - `[local].raise_wired_limit` defaults to `false`. Turn it on only when you explicitly want MLX to raise the process wired-memory limit.
 - Source builds on macOS require `mlx.metallib`. Higgs restores it from Cargo build output when possible and fails startup if it still cannot be resolved.
+- The `session_id` chat-request field opts a conversation into cache-resident multi-turn reuse (prefill only the new turn instead of the whole history). It is a **best-effort latency optimization, not exact replay** — the retained KV is TurboQuant-compressed, so a continued turn's output may differ slightly from a stateless full prefill. Omit `session_id` for bit-identical output; the radix prefix cache on the normal path reuses dense KV exactly. Per-conversation KV is bounded by the `kv_max_sessions` / `kv_max_session_tokens` / `kv_retained_idle_secs` model settings above.
+
+### Compressive prefill (PFlash) — experimental
+
+A second, optional `prefill_drafter` (distinct from the decode-speculation `draft_model`) scores the prompt with a small dense model and the target then prefills only the kept fraction. This is the SpecPrefill algorithm (arXiv:2502.02789); see `.planning/DESIGN-pflash-higgs.md` and `docs/RESEARCH-pflash-prior-art.md`.
+
+```toml
+# [[models]]
+# path = "..."
+# draft_model     = "/path/to/dspark-drafter"        # decode speculation (dFlash/dSpark)
+# prefill_drafter = "mlx-community/Qwen3-0.6B-4bit"  # compressive prefill (PFlash)
+# prefill_compression = "off"                        # off | auto | always
+# prefill_threshold   = 4096                         # auto: enable above this many prompt tokens
+# prefill_keep_ratio  = 0.10                         # fraction kept (~10x prefill at 0.10)
+# prefill_chunk = 32                                 # survivor block size (SpecPrefill default)
+# prefill_avgpool = 13                               # importance smoothing kernel
+# prefill_lookahead = 8                              # lookahead decoded tokens for scoring
+```
+
+- **Off by default.** When `off` (or no `prefill_drafter` is set) behavior is byte-identical to today.
+- **Output is NOT byte-identical to uncompressed** when active — the target sees a subset of tokens. `higgs doctor` warns when PFlash is enabled.
+- **Quality vs keep_ratio** (from published evidence): retrieval stays intact down to ~5%; multi-doc QA and code-debug are flat to ~10–20% then degrade. `0.10` is the default "highest tradable point"; raise it to `0.20` for coding-heavy workloads. Agent/multi-step loops have thin published evidence below 10% — validate on your traffic.
+- **Simple engine only** (`batch=true` rejects it), and v1 excludes multimodal, grammar-constrained, `logprobs`, and `session_id` requests (fail-closed to the uncompressed path).
 
 ## Shell Integration
 

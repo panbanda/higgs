@@ -1,3 +1,6 @@
+// Model forward passes eval under the engine MLX gate (structurally on-gate); see clippy.toml.
+#![allow(clippy::disallowed_methods)]
+
 //! LLaVA-Qwen2 vision-language model (nanoLLaVA architecture).
 //!
 //! Combines a `SigLIP` vision encoder with a Qwen2 language model through an

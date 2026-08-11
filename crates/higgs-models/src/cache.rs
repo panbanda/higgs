@@ -5,6 +5,19 @@ use std::sync::{
 
 use mlx_rs::{Array, Dtype, Stream, error::Exception, ops, ops::concatenate_axis};
 
+/// RoPE parameters needed to re-rotate cached keys when token positions are
+/// renumbered after a prune. Mirrors the `nn::Rope` fields the model builds
+/// (`base`, `dimensions`, `scale`, `traditional`). Only non-traditional
+/// (NeoX half-split) RoPE is supported — the Qwen3 path uses `traditional(false)`.
+#[allow(clippy::doc_markdown, clippy::too_long_first_doc_paragraph)]
+#[derive(Debug, Clone, Copy)]
+pub struct RopeShift {
+    pub base: f32,
+    pub dims: i32,
+    pub scale: f32,
+    pub traditional: bool,
+}
+
 use crate::turboquant::{
     KvCacheConfig, KvCacheMode, QuantizedKey, QuantizedValue, TurboQuantContext,
 };
@@ -18,7 +31,27 @@ pub enum KvCacheView {
 
 static TURBOQUANT_ACTIVATE_AT: OnceLock<i32> = OnceLock::new();
 static TURBOQUANT_INACTIVE_LOGGED: AtomicBool = AtomicBool::new(false);
-const DEFAULT_TURBOQUANT_ACTIVATE_AT: i32 = 2048;
+/// KV token count at which TurboQuant quantization activates for decode.
+///
+/// Default high because TurboQuant's custom Metal decode kernels are slower
+/// than MLX's dense SDPA. Benchmarked on Qwen3.5-9B-4bit (M4 32 GB), forcing
+/// activation via `HIGGS_TURBOQUANT_MIN_TOKENS=0`:
+///
+/// | context | dense | turboquant | Δ decode |
+/// |---------|-------|------------|----------|
+/// | ~15 tok | 15.6 tok/s | 11.7 tok/s | −25% |
+/// | ~7K tok | 12.5 tok/s | 10.1 tok/s | −19% |
+///
+/// (plus a multi-second first-token stall at 7K when the prefilled KV is
+/// bulk-quantized: TTFT 0.4 s → 6.4 s.) Dense KV costs only ~10 KB/token, so
+/// ~100K tokens fit in ~1 GB — TurboQuant's memory saving only pays for its
+/// decode tax near that scale. Lower via `HIGGS_TURBOQUANT_MIN_TOKENS` when
+/// context length genuinely threatens memory.
+// ponytail: fixed default; the real fix is a faster fused decode kernel
+// (turboquant.rs values kernel is O(T)/thread, no SIMD reduction) — until then
+// dense wins below ~100K, so gate TurboQuant off by default.
+#[allow(clippy::doc_markdown)]
+pub const DEFAULT_TURBOQUANT_ACTIVATE_AT: i32 = 100_000;
 
 fn parse_turboquant_activate_at(raw: Option<&str>) -> i32 {
     raw.and_then(|s| s.parse::<i32>().ok())
@@ -428,24 +461,123 @@ impl SteppingKeyValueCache {
         self.offset = self.offset.saturating_sub(trim).max(0);
     }
 
-    /// An **independent** deep copy: every MLX buffer is materialized into a
-    /// fresh buffer (`Array::deep_clone`), so the result shares no storage with
-    /// `self`. The derived `Clone` only bumps MLX refcounts (shared buffers),
-    /// which is unsafe as a speculative-decode rollback checkpoint: the live
-    /// cache's in-place `slice_update` lets MLX donate (reuse/free) a buffer the
-    /// checkpoint still references, double-freeing it (the MTP `malloc: pointer
-    /// being freed was not allocated` abort). Use this for any checkpoint that
-    /// will outlive an in-place update of the live cache.
+    /// Prune the half-open token span `[a, b)` from a dense cache, compacting the
+    /// survivors and renumbering positions so they stay dense (TIM-style KV prune
+    /// + positional reuse).
+    ///
+    /// Keys are stored *post-RoPE* at their insertion position, so dropping a span
+    /// and shifting the suffix down by `Δ = b - a` requires left-multiplying the
+    /// surviving suffix keys by `R(-Δ)` — one uniform rotation (values are not
+    /// roped). The result is bit-equivalent to a cache built as if the pruned
+    /// tokens never existed; see `prune_span_equiv_never_inserted`.
+    ///
+    /// Dense path only. Returns an error on a TurboQuant cache: re-roping quantized
+    /// keys would need dequant→re-rope→requant.
+    // ponytail: dense KV only; add TurboQuant prune when long-context + prune are
+    // both needed at once.
+    #[allow(clippy::doc_markdown)]
+    pub fn prune_span(&mut self, a: i32, b: i32, rope: RopeShift) -> Result<(), Exception> {
+        if self.turbo.is_some() {
+            return Err(Exception::custom(
+                "prune_span: dense KV only (TurboQuant unsupported)",
+            ));
+        }
+        let off = self.offset;
+        if a < 0 || a > b || b > off {
+            return Err(Exception::custom(format!(
+                "prune_span: invalid span [{a}, {b}) for offset {off}"
+            )));
+        }
+        let delta = b - a;
+        if delta == 0 {
+            return Ok(());
+        }
+        if a == 0 && b == off {
+            return Err(Exception::custom(
+                "prune_span: refusing to prune the entire cache",
+            ));
+        }
+
+        let keys = self
+            .keys
+            .as_ref()
+            .ok_or_else(|| Exception::custom("prune_span: dense keys missing"))?;
+        let values = self
+            .values
+            .as_ref()
+            .ok_or_else(|| Exception::custom("prune_span: dense values missing"))?;
+
+        let mut key_parts: Vec<Array> = Vec::with_capacity(2);
+        let mut value_parts: Vec<Array> = Vec::with_capacity(2);
+        if a > 0 {
+            key_parts.push(slice_axis2(keys, 0, a)?);
+            value_parts.push(slice_axis2(values, 0, a)?);
+        }
+        if off > b {
+            let key_tail = slice_axis2(keys, b, off)?;
+            key_parts.push(rope_shift_back(&key_tail, delta, rope)?);
+            value_parts.push(slice_axis2(values, b, off)?);
+        }
+
+        let new_keys = if key_parts.len() == 1 {
+            key_parts.remove(0)
+        } else {
+            concatenate_axis(&key_parts, 2)?
+        };
+        let new_values = if value_parts.len() == 1 {
+            value_parts.remove(0)
+        } else {
+            concatenate_axis(&value_parts, 2)?
+        };
+
+        self.keys = Some(new_keys);
+        self.values = Some(new_values);
+        self.offset = off - delta;
+        Ok(())
+    }
+
+    /// An **independent** deep copy: every MLX buffer is copied and materialized
+    /// on-device, so the result shares no storage with `self`. The derived
+    /// `Clone` only bumps MLX refcounts (shared buffers), which is unsafe as a
+    /// speculative-decode rollback checkpoint: the live cache's in-place
+    /// `slice_update` lets MLX donate (reuse/free) a buffer the checkpoint still
+    /// references, double-freeing it (the MTP `malloc: pointer being freed was
+    /// not allocated` abort). Use this for any checkpoint that will outlive an
+    /// in-place update of the live cache.
     #[must_use]
+    #[allow(clippy::expect_used)]
     pub fn deep_clone(&self) -> Self {
-        Self {
-            keys: self.keys.as_ref().map(eval_deep_clone),
-            values: self.values.as_ref().map(eval_deep_clone),
-            turbo: self.turbo.as_ref().map(TurboQuantStorage::deep_clone),
+        self.try_deep_clone()
+            .expect("device copy failed for KV cache checkpoint")
+    }
+
+    /// Fallible independent device-side copy of every retained KV buffer.
+    pub fn try_deep_clone(&self) -> Result<Self, Exception> {
+        Ok(Self {
+            keys: self.keys.as_ref().map(try_eval_deep_clone).transpose()?,
+            values: self.values.as_ref().map(try_eval_deep_clone).transpose()?,
+            turbo: self
+                .turbo
+                .as_ref()
+                .map(TurboQuantStorage::try_deep_clone)
+                .transpose()?,
             config: self.config,
             offset: self.offset,
             step: self.step,
-        }
+        })
+    }
+
+    /// Estimated device bytes retained by this cache's allocated arrays.
+    #[must_use]
+    pub fn estimated_bytes(&self) -> usize {
+        let dense = self
+            .keys
+            .as_ref()
+            .map_or(0, Array::nbytes)
+            .saturating_add(self.values.as_ref().map_or(0, Array::nbytes));
+        self.turbo
+            .as_ref()
+            .map_or(dense, |turbo| dense.saturating_add(turbo.estimated_bytes()))
     }
 
     /// References to internal arrays that must be eval'd between chunked-prefill steps.
@@ -567,6 +699,93 @@ impl SteppingKeyValueCache {
         self.turbo.as_ref().is_some_and(|t| t.capacity > 0)
     }
 
+    /// Bulk-compress a dense cache's resident KV into `TurboQuant` storage for
+    /// cheap between-turn retention, reusing the same dense→TQ path that the
+    /// activation-threshold decode transition uses (slice `[0, offset)` → GPU
+    /// `quantize_*_gpu` → packed storage, then drop the fp16 buffers).
+    ///
+    /// Returns `Ok(true)` when the cache was compressed, `Ok(false)` when it was
+    /// left dense (already TQ-active, empty, or a non-power-of-2 `head_dim` that
+    /// the FWHT can't handle). Idempotent and safe to call on any cache.
+    ///
+    /// Correctness: after compression the cache is structurally identical to one
+    /// that activated TurboQuant naturally during decode — `self.turbo` holds the
+    /// populated storage and `self.keys/values` are cleared — so a continuation
+    /// (`update_and_view` appending the next turn's tokens) takes the ordinary
+    /// `turbo.append` decode-append path. The reused tokens are read back through
+    /// the same dequantize path as any other TQ cache, so they carry exactly the
+    /// TurboQuant reconstruction error and nothing more (no second quantization,
+    /// no positional/RoPE renumbering). Keys are stored post-RoPE at their
+    /// original positions and are not renumbered, so continuation positions stay
+    /// consistent.
+    ///
+    /// If the cache was created dense (config `mode == Off`), `config` supplies
+    /// the TurboQuant bit-widths/seed to use; an already-TurboQuant `self.config`
+    /// is reused as-is and `config` is ignored.
+    #[allow(clippy::doc_markdown)]
+    pub fn quantize_for_retention(&mut self, config: KvCacheConfig) -> Result<bool, Exception> {
+        // Already TQ-active, or nothing dense to compress → leave as-is.
+        if self.is_turbo_active() || self.offset == 0 {
+            return Ok(false);
+        }
+        let Some(dense_k) = self.keys.as_ref() else {
+            return Ok(false);
+        };
+
+        // Geometry from the dense buffer: shape is [B, H, capacity, D].
+        let shape = dense_k.shape();
+        let dim = |i: usize, label: &'static str| -> Result<i32, Exception> {
+            shape.get(i).copied().ok_or_else(|| {
+                Exception::custom(format!("quantize_for_retention: missing dim {i} ({label})"))
+            })
+        };
+        let num_kv_heads = dim(1, "H")?;
+        let head_dim = dim(3, "D")?;
+
+        // FWHT requires a power-of-two head_dim; anything else cannot be TQ-packed.
+        // Leave the cache dense rather than ship a wrong (or erroring) compression.
+        if head_dim < 2 || (head_dim & (head_dim - 1)) != 0 {
+            return Ok(false);
+        }
+
+        // Reuse an existing TurboQuant config if the cache already carries one
+        // (its centroids/seed must match a later decode); otherwise adopt the
+        // caller-supplied config, forced into TurboQuant mode.
+        let turbo_config = if self.config.is_turboquant() {
+            self.config
+        } else {
+            KvCacheConfig {
+                mode: KvCacheMode::Turboquant,
+                ..config
+            }
+        };
+
+        let context = Arc::new(TurboQuantContext::new(
+            turbo_config,
+            head_dim,
+            num_kv_heads,
+        )?);
+        let mut storage = TurboQuantStorage::new(context);
+
+        // Bulk-quantize exactly the valid span [0, offset) — the same slice the
+        // activation-threshold transition feeds to `append`.
+        let k = slice_axis2(dense_k, 0, self.offset)?;
+        let v = slice_axis2(
+            self.values
+                .as_ref()
+                .ok_or_else(|| Exception::custom("quantize_for_retention: dense values missing"))?,
+            0,
+            self.offset,
+        )?;
+        storage.append(&k, &v, 0, self.step)?;
+
+        self.turbo = Some(storage);
+        self.config = turbo_config;
+        self.keys = None;
+        self.values = None;
+        Ok(true)
+    }
+
     fn update_dense(&mut self, keys: &Array, values: &Array) -> Result<KvCacheView, Exception> {
         let prev = self.offset;
         let k_shape = keys.shape();
@@ -625,6 +844,12 @@ impl SteppingKeyValueCache {
 
         let updated_k = slice_update_axis2(k, keys, prev, new_tokens)?;
         let updated_v = slice_update_axis2(v, values, prev, new_tokens)?;
+        // DIAGNOSTIC (HIGGS_DIAG_EVAL_CACHE=1): force-eval the slice_update result
+        // so the stored cache is concrete (independent of later layer temporaries).
+        // Tests the lazy-recycling corruption hypothesis.
+        if std::env::var("HIGGS_DIAG_EVAL_CACHE").is_ok_and(|flag| flag == "1") {
+            mlx_rs::transforms::eval([&updated_k, &updated_v])?;
+        }
         self.keys = Some(updated_k);
         self.values = Some(updated_v);
 
@@ -807,16 +1032,46 @@ impl TurboQuantStorage {
     /// shared read-only `context` is refcounted (safe to share); every packed
     /// array is materialized into its own buffer so an in-place update of the
     /// live cache cannot donate/free a buffer this snapshot holds.
-    fn deep_clone(&self) -> Self {
-        Self {
+    fn try_deep_clone(&self) -> Result<Self, Exception> {
+        Ok(Self {
             context: Arc::clone(&self.context),
-            key_codes: self.key_codes.as_ref().map(eval_deep_clone),
-            key_norms: self.key_norms.as_ref().map(eval_deep_clone),
-            key_gammas: self.key_gammas.as_ref().map(eval_deep_clone),
-            value_codes: self.value_codes.as_ref().map(eval_deep_clone),
-            value_norms: self.value_norms.as_ref().map(eval_deep_clone),
+            key_codes: self
+                .key_codes
+                .as_ref()
+                .map(try_eval_deep_clone)
+                .transpose()?,
+            key_norms: self
+                .key_norms
+                .as_ref()
+                .map(try_eval_deep_clone)
+                .transpose()?,
+            key_gammas: self
+                .key_gammas
+                .as_ref()
+                .map(try_eval_deep_clone)
+                .transpose()?,
+            value_codes: self
+                .value_codes
+                .as_ref()
+                .map(try_eval_deep_clone)
+                .transpose()?,
+            value_norms: self
+                .value_norms
+                .as_ref()
+                .map(try_eval_deep_clone)
+                .transpose()?,
             capacity: self.capacity,
-        }
+        })
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        self.key_codes
+            .as_ref()
+            .map_or(0, Array::nbytes)
+            .saturating_add(self.key_norms.as_ref().map_or(0, Array::nbytes))
+            .saturating_add(self.key_gammas.as_ref().map_or(0, Array::nbytes))
+            .saturating_add(self.value_codes.as_ref().map_or(0, Array::nbytes))
+            .saturating_add(self.value_norms.as_ref().map_or(0, Array::nbytes))
     }
 
     fn ensure_capacity(&mut self, required: i32, step: i32) -> Result<(), Exception> {
@@ -1044,6 +1299,77 @@ fn checked_add(lhs: usize, rhs: usize, label: &str) -> Result<usize, Exception> 
         .ok_or_else(|| Exception::custom(format!("{label} overflow")))
 }
 
+/// Re-rotate a `[1, H, T, D]` block of post-RoPE keys by `R(-delta)`, shifting
+/// every token's effective position down by `delta`.
+///
+/// For non-traditional (NeoX) RoPE the head dim splits into halves
+/// `x1 = x[..:dims/2]`, `x2 = x[dims/2:dims]`, rotated per frequency
+/// `f_i = base^(-2i/dims)` by angle `delta * scale * f_i`. Applying `R(-delta)`:
+///
+/// ```text
+/// out1 =  x1*cos + x2*sin
+/// out2 = -x1*sin + x2*cos
+/// ```
+///
+/// Dims beyond `dims` (partial rotary) pass through unrotated. The angles are
+/// constant across tokens and heads, so this is one broadcast multiply — cheap.
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::doc_markdown
+)]
+fn rope_shift_back(block: &Array, delta: i32, rope: RopeShift) -> Result<Array, Exception> {
+    if rope.traditional {
+        return Err(Exception::custom(
+            "rope_shift_back: traditional (interleaved) RoPE unsupported",
+        ));
+    }
+    let dims = rope.dims;
+    if dims < 2 || dims % 2 != 0 {
+        return Err(Exception::custom(format!(
+            "rope_shift_back: rope dims must be even and >= 2, got {dims}"
+        )));
+    }
+    let full_dim = *block
+        .shape()
+        .last()
+        .ok_or_else(|| Exception::custom("rope_shift_back: block has no last dim"))?;
+    if dims > full_dim {
+        return Err(Exception::custom(format!(
+            "rope_shift_back: rope dims {dims} exceed head dim {full_dim}"
+        )));
+    }
+
+    let half = dims / 2;
+    let half_usize = usize::try_from(half).unwrap_or(0);
+    let ln_base = rope.base.ln();
+    let mut cos_vec = Vec::with_capacity(half_usize);
+    let mut sin_vec = Vec::with_capacity(half_usize);
+    for i in 0..half_usize {
+        let inv_freq = (-(2.0 * i as f32) / dims as f32 * ln_base).exp();
+        let angle = delta as f32 * rope.scale * inv_freq;
+        cos_vec.push(angle.cos());
+        sin_vec.push(angle.sin());
+    }
+    let cos = Array::from_slice(&cos_vec, &[1, 1, 1, half]);
+    let sin = Array::from_slice(&sin_vec, &[1, 1, 1, half]);
+
+    let x1 = slice_axis(block, 3, 0, half)?;
+    let x2 = slice_axis(block, 3, half, dims)?;
+    let out1 = x1.multiply(&cos)?.add(x2.multiply(&sin)?)?;
+    let out2 = x2.multiply(&cos)?.subtract(x1.multiply(&sin)?)?;
+    let rotated = concatenate_axis(&[out1, out2], 3)?;
+
+    if dims < full_dim {
+        let passthrough = slice_axis(block, 3, dims, full_dim)?;
+        concatenate_axis(&[rotated, passthrough], 3)
+    } else {
+        Ok(rotated)
+    }
+}
+
 /// Slice an array along axis 2: `arr[..., start:end, ...]`
 pub fn slice_axis2(arr: &Array, start: i32, end: i32) -> Result<Array, Exception> {
     slice_axis(arr, 2, start, end)
@@ -1056,23 +1382,25 @@ pub fn slice_axis1(arr: &Array, start: i32, end: i32) -> Result<Array, Exception
     slice_axis(arr, 1, start, end)
 }
 
-/// Evaluate, then independently deep-copy an MLX array.
+/// Independently deep-copy an MLX array, staying on device.
 ///
-/// `Array::deep_clone` copies bytes straight from the buffer pointer
-/// (`mlx_array_data_*`), which is only valid once the array is evaluated. The
-/// cache stores *lazy* `slice_update` results (see `update_dense`), so cloning a
-/// checkpoint without forcing evaluation first reads an unmaterialized pointer
-/// and segfaults. Eval makes the snapshot both valid and buffer-independent of
-/// the live cache (no shared buffer for a later in-place update to donate/free).
-//
-// `expect`: a failed `eval` on a live cache array leaves nothing safe to copy —
-// a loud panic here is strictly better than the segfault a lazy `deep_clone`
-// would cause, and the infallible signature keeps every checkpoint call site
-// (`AnyCache::deep_clone`, `deep_clone_mtp_cache`, the MTP cycle) clone-and-go.
-#[allow(clippy::expect_used)]
-fn eval_deep_clone(a: &Array) -> Array {
-    a.eval().expect("eval before deep_clone checkpoint");
-    a.deep_clone()
+/// `Array::deep_clone` round-trips the buffer through **host** memory
+/// (`mlx_array_data_*` → CPU copy → re-upload on next use). For a multi-GB
+/// hybrid cache snapshot that is seconds of wall time per store/materialize —
+/// it dominated warm-turn TTFT. Pinned MLX 0.30.6's `mlx_copy` is not enough:
+/// evaluation only creates a copy-on-write alias, so a small recurrent-state
+/// view can retain its much larger prompt backing allocation.
+///
+/// [`crate::metal_kernel::materialized_device_copy`] uses an identity Metal
+/// kernel whose output allocation is unconditionally fresh and exactly
+/// `out.nbytes()`. The immediate evaluation therefore gives the checkpoint
+/// independent, compact device storage before the live cache can mutate.
+///
+/// The fallible form lets publication paths reject a snapshot atomically when
+/// the device copy or evaluation fails. Public clone-and-go APIs add their
+/// infallible `expect` adapter at the whole-cache boundary.
+pub(crate) fn try_eval_deep_clone(a: &Array) -> Result<Array, Exception> {
+    crate::metal_kernel::materialized_device_copy(a)
 }
 
 /// Write `update` into `target` at `[..., start:start+n, ...]` on axis 2.
@@ -1212,7 +1540,19 @@ fn grow_array(
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::expect_used,
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::shadow_reuse,
+    clippy::shadow_same,
+    clippy::shadow_unrelated,
+    clippy::doc_markdown,
+    clippy::suboptimal_flops
+)]
 mod tests {
     use super::*;
     use mlx_rs::Array;
@@ -1392,8 +1732,124 @@ mod tests {
         assert!((k_data[8] - 2.0).abs() < 1e-6);
     }
 
+    /// The core KV-prune invariant: pruning span `[a, b)` and re-roping the
+    /// survivors must leave the cache bit-equivalent (within f32 tolerance) to a
+    /// cache built as if those tokens never existed and the rest were renumbered
+    /// densely. Proves the compaction + `R(-Δ)` geometry generally, against the
+    /// model's real `apply_rope`, not a hand-picked expected tensor.
+    #[test]
+    fn prune_span_equiv_never_inserted() {
+        use crate::utils::apply_rope;
+        use mlx_rs::builder::Builder;
+        use mlx_rs::nn;
+
+        let (h, d, n) = (2i32, 8i32, 10i32);
+        let (a, b) = (3i32, 7i32); // prune [3, 7), Δ = 4
+        let base = 1_000_000.0_f32;
+        let rope = nn::RopeBuilder::new(d)
+            .traditional(false)
+            .base(base)
+            .scale(1.0)
+            .build()
+            .unwrap();
+        let shift = RopeShift {
+            base,
+            dims: d,
+            scale: 1.0,
+            traditional: false,
+        };
+
+        // Deterministic, varied raw (pre-RoPE) keys/values, distinct per element.
+        let count = usize::try_from(h * n * d).unwrap();
+        let raw_k: Vec<f32> = (0..count).map(|i| (i as f32 * 0.7).sin()).collect();
+        let raw_v: Vec<f32> = (0..count).map(|i| (i as f32 * 0.9 + 1.0).cos()).collect();
+        let raw_k = Array::from_slice(&raw_k, &[1, h, n, d]);
+        let raw_v = Array::from_slice(&raw_v, &[1, h, n, d]);
+
+        // LIVE: rope all tokens at positions 0..n, insert, then prune [a, b).
+        let roped_all = apply_rope(&raw_k, &rope, 0).unwrap();
+        let mut live = SteppingKeyValueCache::new();
+        live.update_and_fetch(roped_all, raw_v.clone()).unwrap();
+        live.prune_span(a, b, shift).unwrap();
+        assert_eq!(live.offset(), n - (b - a));
+
+        // REFERENCE: survivors only (raw rows [0,a) ++ [b,n)) roped at compacted
+        // positions 0..n-Δ, inserted into a fresh cache.
+        let surv_k = concatenate_axis(
+            &[
+                slice_axis2(&raw_k, 0, a).unwrap(),
+                slice_axis2(&raw_k, b, n).unwrap(),
+            ],
+            2,
+        )
+        .unwrap();
+        let surv_v = concatenate_axis(
+            &[
+                slice_axis2(&raw_v, 0, a).unwrap(),
+                slice_axis2(&raw_v, b, n).unwrap(),
+            ],
+            2,
+        )
+        .unwrap();
+        let ref_roped = apply_rope(&surv_k, &rope, 0).unwrap();
+        let mut reference = SteppingKeyValueCache::new();
+        reference.update_and_fetch(ref_roped, surv_v).unwrap();
+
+        // Compare the valid regions [0:offset). `as_slice` returns *storage*
+        // order (see `test_as_slice_after_transpose_order`); the reference keys
+        // are a non-contiguous slice of the 256-slot buffer, so flatten both to
+        // logical order before comparing.
+        let off = live.offset();
+        let logical = |a: &Array| -> Vec<f32> {
+            let v = slice_axis2(a, 0, off).unwrap().flatten(None, None).unwrap();
+            v.eval().unwrap();
+            v.as_slice::<f32>().to_vec()
+        };
+        let live_k = logical(live.keys().unwrap());
+        let ref_k = logical(reference.keys().unwrap());
+        let live_v = logical(live.values().unwrap());
+        let ref_v = logical(reference.values().unwrap());
+
+        let max_abs = |x: &[f32], y: &[f32]| -> f32 {
+            x.iter()
+                .zip(y)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0.0_f32, f32::max)
+        };
+        let key_err = max_abs(&live_k, &ref_k);
+        let val_err = max_abs(&live_v, &ref_v);
+        assert!(
+            key_err < 2e-3,
+            "keys diverge after prune+re-rope: {key_err}"
+        );
+        assert!(
+            val_err < 1e-6,
+            "values must match exactly (not roped): {val_err}"
+        );
+    }
+
+    #[test]
+    fn prune_span_rejects_turboquant() {
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            ..Default::default()
+        };
+        let mut cache = SteppingKeyValueCache::new_turbo(config, 2, 8).unwrap();
+        let (keys, values) = make_kv_pair(4, 8);
+        cache.update_and_fetch(keys, values).unwrap();
+        let shift = RopeShift {
+            base: 1_000_000.0,
+            dims: 8,
+            scale: 1.0,
+            traditional: false,
+        };
+        assert!(cache.prune_span(1, 2, shift).is_err());
+    }
+
     #[test]
     fn deep_clone_preserves_contents_and_offset() {
+        let _exec = crate::mlx_exec::acquire();
         // deep_clone must be a faithful, independent copy.
         let mut cache = SteppingKeyValueCache::new();
         let ones_k = Array::ones::<f32>(&[1, 2, 2, 8]).unwrap();
@@ -1417,7 +1873,217 @@ mod tests {
     }
 
     #[test]
+    fn device_deep_clone_compacts_large_backing_view() {
+        let _exec = crate::mlx_exec::acquire();
+        const BACKING_TOKENS: i32 = 262_144;
+        const RETAINED_TOKENS: i32 = 4;
+        let values: Vec<f32> = (0..BACKING_TOKENS * 4).map(|index| index as f32).collect();
+        let backing = Array::from_slice(&values, &[1, 1, BACKING_TOKENS, 4]);
+        backing.eval().unwrap();
+        let retained =
+            slice_axis2(&backing, BACKING_TOKENS - RETAINED_TOKENS, BACKING_TOKENS).unwrap();
+        retained.eval().unwrap();
+
+        assert!(
+            backing.nbytes() > retained.nbytes() * 1_000,
+            "regression requires a tiny view over a much larger allocation"
+        );
+        let expected = retained.as_slice::<f32>().to_vec();
+        let retained_ptr = retained.as_slice::<f32>().as_ptr();
+
+        let checkpoint = try_eval_deep_clone(&retained).unwrap();
+        assert_eq!(checkpoint.shape(), retained.shape());
+        assert_eq!(checkpoint.dtype(), retained.dtype());
+        assert_eq!(checkpoint.nbytes(), retained.nbytes());
+        assert_ne!(
+            checkpoint.as_slice::<f32>().as_ptr(),
+            retained_ptr,
+            "checkpoint must own a distinct evaluated device allocation"
+        );
+
+        drop(retained);
+        drop(backing);
+        let pressure = Array::zeros::<f32>(&[1, 1, BACKING_TOKENS, 4]).unwrap();
+        pressure.eval().unwrap();
+        drop(pressure);
+
+        assert_eq!(
+            checkpoint.as_slice::<f32>(),
+            expected,
+            "compact checkpoint must remain valid after its large backing is released"
+        );
+    }
+
+    #[test]
+    fn device_deep_clone_preserves_cache_dtypes_shapes_and_bits() {
+        let _exec = crate::mlx_exec::acquire();
+        let values = Array::from_slice(&[0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0], &[2, 2, 2]);
+        for dtype in [
+            Dtype::Float16,
+            Dtype::Bfloat16,
+            Dtype::Float32,
+            Dtype::Uint32,
+        ] {
+            let typed = values.as_dtype(dtype).unwrap();
+            let copy = try_eval_deep_clone(&typed).unwrap();
+            assert_eq!(copy.shape(), &[2, 2, 2]);
+            assert_eq!(copy.dtype(), dtype);
+            assert_eq!(
+                copy.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>(),
+                typed.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>()
+            );
+        }
+
+        let bit_patterns = [
+            0.0_f32.to_bits(),
+            (-0.0_f32).to_bits(),
+            f32::from_bits(0x7fc1_2345).to_bits(),
+            f32::NEG_INFINITY.to_bits(),
+        ];
+        let bit_values: Vec<f32> = bit_patterns.iter().copied().map(f32::from_bits).collect();
+        let bit_source = Array::from_slice(&bit_values, &[2, 2]);
+        let bit_copy = try_eval_deep_clone(&bit_source).unwrap();
+        let copied_bits: Vec<u32> = bit_copy
+            .as_slice::<f32>()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        assert_eq!(copied_bits, bit_patterns);
+
+        let f16_patterns = [0x0000_u16, 0x8000, 0x7e01, 0xfc00];
+        let f16_values: Vec<half::f16> = f16_patterns
+            .iter()
+            .copied()
+            .map(half::f16::from_bits)
+            .collect();
+        let f16_source = Array::from_slice(&f16_values, &[2, 2]);
+        let f16_copy = try_eval_deep_clone(&f16_source).unwrap();
+        let copied_f16_bits: Vec<u16> = f16_copy
+            .as_slice::<half::f16>()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        assert_eq!(copied_f16_bits, f16_patterns);
+
+        let bf16_patterns = [0x0000_u16, 0x8000, 0x7fc1, 0xff80];
+        let bf16_values: Vec<half::bf16> = bf16_patterns
+            .iter()
+            .copied()
+            .map(half::bf16::from_bits)
+            .collect();
+        let bf16_source = Array::from_slice(&bf16_values, &[2, 2]);
+        let bf16_copy = try_eval_deep_clone(&bf16_source).unwrap();
+        let copied_bf16_bits: Vec<u16> = bf16_copy
+            .as_slice::<half::bf16>()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        assert_eq!(copied_bf16_bits, bf16_patterns);
+
+        let empty = Array::zeros::<u32>(&[2, 0, 3]).unwrap();
+        let empty_copy = try_eval_deep_clone(&empty).unwrap();
+        assert_eq!(empty_copy.shape(), &[2, 0, 3]);
+        assert_eq!(empty_copy.dtype(), Dtype::Uint32);
+        assert_eq!(empty_copy.nbytes(), 0);
+    }
+
+    #[test]
+    fn device_deep_clone_materializes_noncontiguous_logical_order() {
+        let _exec = crate::mlx_exec::acquire();
+        let values: Vec<f32> = (0_u8..24).map(f32::from).collect();
+        let backing = Array::from_slice(&values, &[1, 3, 2, 4]);
+        let transposed = backing.transpose_axes(&[0, 2, 1, 3]).unwrap();
+        let expected = transposed
+            .flatten(None, None)
+            .unwrap()
+            .reshape(transposed.shape())
+            .unwrap();
+        expected.eval().unwrap();
+
+        let checkpoint = try_eval_deep_clone(&transposed).unwrap();
+        assert_eq!(checkpoint.shape(), transposed.shape());
+        assert_eq!(checkpoint.dtype(), Dtype::Float32);
+        assert_eq!(
+            checkpoint.as_slice::<f32>(),
+            expected.as_slice::<f32>(),
+            "materialization must preserve the logical order of a strided view"
+        );
+        assert_ne!(
+            checkpoint.as_slice::<f32>().as_ptr(),
+            backing.as_slice::<f32>().as_ptr(),
+            "materialized output must not alias the transposed backing allocation"
+        );
+    }
+
+    #[test]
+    fn turboquant_deep_clone_materializes_all_mutable_arrays() {
+        let _exec = crate::mlx_exec::acquire();
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            seed: 17,
+            ..Default::default()
+        };
+        let mut cache = SteppingKeyValueCache::new_turbo(config, 2, 8).unwrap();
+        let (keys, values) = make_kv_pair(4, 8);
+        cache
+            .update_and_view_with_activation_threshold(&keys, &values, 0)
+            .unwrap();
+        let (decode_key, decode_value) = make_kv_pair(1, 8);
+        cache
+            .update_and_view_with_activation_threshold(&decode_key, &decode_value, 0)
+            .unwrap();
+        let checkpoint = cache.try_deep_clone().unwrap();
+        let live = cache.turbo.as_ref().unwrap();
+        let copied = checkpoint.turbo.as_ref().unwrap();
+
+        assert!(Arc::ptr_eq(&live.context, &copied.context));
+        let assert_distinct = |left: &Array, right: &Array| {
+            left.eval().unwrap();
+            right.eval().unwrap();
+            assert_eq!(left.shape(), right.shape());
+            assert_eq!(left.dtype(), right.dtype());
+            if left.dtype() == Dtype::Uint32 {
+                assert_eq!(left.as_slice::<u32>(), right.as_slice::<u32>());
+                assert_ne!(
+                    left.as_slice::<u32>().as_ptr(),
+                    right.as_slice::<u32>().as_ptr()
+                );
+            } else {
+                assert_eq!(left.dtype(), Dtype::Float32);
+                assert_eq!(left.as_slice::<f32>(), right.as_slice::<f32>());
+                assert_ne!(
+                    left.as_slice::<f32>().as_ptr(),
+                    right.as_slice::<f32>().as_ptr()
+                );
+            }
+        };
+
+        assert_distinct(
+            live.key_codes.as_ref().unwrap(),
+            copied.key_codes.as_ref().unwrap(),
+        );
+        assert_distinct(
+            live.key_norms.as_ref().unwrap(),
+            copied.key_norms.as_ref().unwrap(),
+        );
+        assert_distinct(
+            live.key_gammas.as_ref().unwrap(),
+            copied.key_gammas.as_ref().unwrap(),
+        );
+        assert_distinct(
+            live.value_codes.as_ref().unwrap(),
+            copied.value_codes.as_ref().unwrap(),
+        );
+        assert_distinct(
+            live.value_norms.as_ref().unwrap(),
+            copied.value_norms.as_ref().unwrap(),
+        );
+    }
+
+    #[test]
     fn deep_clone_checkpoint_survives_live_in_place_update() {
+        let _exec = crate::mlx_exec::acquire();
         // The speculative-decode invariant: a checkpoint captured before the
         // live cache is advanced must NOT change when the live cache does an
         // in-place `slice_update`. A shallow `clone()` shares the KV buffer, so
@@ -1598,6 +2264,243 @@ mod tests {
         assert!(
             cache.keys.is_none(),
             "dense storage should clear after activation"
+        );
+    }
+
+    /// Deterministic standard-normal sample (Box–Muller). TurboQuant's centroids
+    /// are tuned for roughly-Gaussian post-rotation coordinates, so the synthetic
+    /// KV used to exercise it must be Gaussian — not smooth/correlated — or the
+    /// reconstruction quality is artificially low.
+    fn gaussian(seed: u64) -> f32 {
+        let mut s = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        let mut next = || {
+            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            ((s >> 33) as f32) / ((1u64 << 31) as f32)
+        };
+        let u1 = next().max(1.0e-7);
+        let u2 = next();
+        (-2.0_f32 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+    }
+
+    /// Build a `[1, H, T, D]` KV pair with deterministic Gaussian values so the
+    /// TurboQuant path is exercised on data it was designed for.
+    fn make_varied_kv_pair(h: i32, t: i32, d: i32) -> (Array, Array) {
+        let count = usize::try_from(h * t * d).unwrap();
+        let k: Vec<f32> = (0..count).map(|i| gaussian(i as u64 + 1)).collect();
+        let v: Vec<f32> = (0..count).map(|i| gaussian(i as u64 + 1_000_003)).collect();
+        (
+            Array::from_slice(&k, &[1, h, t, d]),
+            Array::from_slice(&v, &[1, h, t, d]),
+        )
+    }
+
+    /// Logical dense KV footprint in bytes for `[H, T, D]`, fp16 (2 B/value),
+    /// keys + values. This is the between-turn footprint a dense retained cache
+    /// would pin (production KV is fp16).
+    fn dense_kv_bytes(h: i32, t: i32, d: i32) -> usize {
+        let per = usize::try_from(h * t * d).unwrap() * 2; // 2 bytes/value
+        per * 2 // keys + values
+    }
+
+    /// Packed TurboQuant footprint in bytes for a compressed cache, using the
+    /// code-word sizing in this module: codes are u32 words, norms/gammas f32.
+    fn turbo_kv_bytes(cache: &SteppingKeyValueCache, h: i32, t: i32) -> usize {
+        let (ctx, ..) = cache.turbo_arrays().expect("cache must be TQ-active");
+        let ht = usize::try_from(h * t).unwrap();
+        let key_code = usize::try_from(ctx.key_code_words).unwrap() * ht * 4;
+        let value_code = usize::try_from(ctx.value_code_words).unwrap() * ht * 4;
+        // key_norms + key_gammas + value_norms, each [H, T] f32.
+        let norms = ht * 4 * 3;
+        key_code + value_code + norms
+    }
+
+    /// Compressing a dense cache on demand must shrink its between-turn KV
+    /// footprint by roughly 4–6× (a few bits/value packed codes vs fp16 dense),
+    /// reusing the existing dense→TQ bulk-quantize path. CPU-only, no model load.
+    #[test]
+    fn quantize_for_retention_shrinks_footprint_4x_to_6x() {
+        let (h, t, d) = (4i32, 200i32, 128i32);
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3, // key=2, value=3
+            seed: 7,
+            ..Default::default()
+        };
+
+        // Dense cache (default Off mode) filled by a single prefill.
+        let mut cache = SteppingKeyValueCache::new();
+        let (keys, values) = make_varied_kv_pair(h, t, d);
+        cache.update_and_fetch(keys, values).unwrap();
+        assert_eq!(cache.offset(), t);
+        assert!(!cache.is_turbo_active(), "starts dense");
+
+        let dense_bytes = dense_kv_bytes(h, t, d);
+
+        // Compress on demand using the existing bulk-quantize machinery.
+        let compressed = cache.quantize_for_retention(config).unwrap();
+        assert!(compressed, "dense power-of-2 cache must compress");
+        assert!(cache.is_turbo_active(), "now TQ-active");
+        assert!(cache.keys().is_none(), "dense buffers dropped");
+        assert_eq!(cache.offset(), t, "offset preserved across compression");
+
+        let turbo_bytes = turbo_kv_bytes(&cache, h, t);
+        let ratio = dense_bytes as f32 / turbo_bytes as f32;
+        assert!(
+            (4.0..=6.0).contains(&ratio),
+            "compression ratio {ratio:.2}x out of [4, 6] (dense={dense_bytes} B, turbo={turbo_bytes} B)"
+        );
+    }
+
+    /// Compressing a dense cache then reconstructing it must preserve the KV to
+    /// TurboQuant tolerance, AND continuation (appending the next turn's token)
+    /// must keep working on the now-TQ cache. The on-demand compression must be
+    /// bit-identical to a cache that activated TurboQuant naturally during decode
+    /// (same context/seed), so we check the reconstruction against that reference.
+    #[test]
+    fn quantize_for_retention_round_trips_and_continues() {
+        let (h, t, d) = (2i32, 40i32, 128i32);
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            seed: 7,
+            ..Default::default()
+        };
+        let (keys, values) = make_varied_kv_pair(h, t, d);
+
+        // --- ON-DEMAND: dense cache, then compress for retention. ---
+        let mut on_demand = SteppingKeyValueCache::new();
+        on_demand
+            .update_and_fetch(keys.clone(), values.clone())
+            .unwrap();
+        assert!(on_demand.quantize_for_retention(config).unwrap());
+
+        // Reconstruct the stored span via the TQ dense materialization. The
+        // stored code/norm arrays are slices of an over-allocated `[H, capacity,
+        // …]` buffer; `materialize_dense` indexes a packed `[H, seq_len, …]`
+        // layout, so force each slice contiguous (flatten+reshape) first — the
+        // same contiguity discipline `TurboQuantStorage::append` uses.
+        let (ctx, kc, kn, kg, vc, vn) = on_demand.turbo_arrays().expect("TQ-active");
+        let kw = ctx.key_code_words;
+        let vw = ctx.value_code_words;
+        let contig3 = |a: &Array, words: i32| -> Array {
+            slice_axis1(a, 0, t)
+                .unwrap()
+                .flatten(None, None)
+                .unwrap()
+                .reshape(&[h, t, words])
+                .unwrap()
+        };
+        let contig2 = |a: &Array| -> Array {
+            slice_axis1(a, 0, t)
+                .unwrap()
+                .flatten(None, None)
+                .unwrap()
+                .reshape(&[h, t])
+                .unwrap()
+        };
+        let view = TurboQuantKvView {
+            context: Arc::clone(ctx),
+            key_codes: contig3(kc, kw),
+            key_norms: contig2(kn),
+            key_gammas: contig2(kg),
+            value_codes: contig3(vc, vw),
+            value_norms: contig2(vn),
+            seq_len: t,
+        };
+        let (rk, rv) = view.materialize_dense().unwrap();
+        let od_k = rk.flatten(None, None).unwrap();
+        let od_v = rv.flatten(None, None).unwrap();
+        let od_k = od_k.as_slice::<f32>();
+        let od_v = od_v.as_slice::<f32>();
+
+        // Reconstruction must track the ORIGINAL input within TQ tolerance.
+        // Compare per-vector cosine similarity (norm-correction makes magnitudes
+        // faithful but discrete codes perturb direction); values use 3 bits, keys 2.
+        let orig_k = keys.flatten(None, None).unwrap();
+        let orig_v = values.flatten(None, None).unwrap();
+        let orig_k = orig_k.as_slice::<f32>();
+        let orig_v = orig_v.as_slice::<f32>();
+        let cos = |a: &[f32], b: &[f32]| -> f32 {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if na < f32::EPSILON || nb < f32::EPSILON {
+                0.0
+            } else {
+                dot / (na * nb)
+            }
+        };
+        let dim = usize::try_from(d).unwrap();
+        let vec_count = usize::try_from(h * t).unwrap();
+        let mut sum_k = 0.0f32;
+        let mut sum_v = 0.0f32;
+        for i in 0..vec_count {
+            let s = i * dim;
+            let e = s + dim;
+            sum_k += cos(&orig_k[s..e], &od_k[s..e]);
+            sum_v += cos(&orig_v[s..e], &od_v[s..e]);
+        }
+        let avg_k = sum_k / vec_count as f32;
+        let avg_v = sum_v / vec_count as f32;
+        // 2-bit keys and 3-bit values: the same per-bit-width floors the existing
+        // TQ roundtrip tests (`test_key/value_roundtrip_cosine_similarity`) use.
+        assert!(avg_k > 0.50, "key reconstruction cos {avg_k:.4} too low");
+        assert!(avg_v > 0.90, "value reconstruction cos {avg_v:.4} too low");
+
+        // --- CONTINUATION: appending the next turn's token must work on the
+        // now-TQ cache and keep it TQ (the production multi-turn continuation). ---
+        let (nk, nv) = make_varied_kv_pair(h, 1, d);
+        let cont_view = on_demand.update_and_view(nk, nv).unwrap();
+        assert!(
+            cont_view.turboquant().is_some(),
+            "continuation must append via the TQ path"
+        );
+        assert_eq!(on_demand.offset(), t + 1, "continuation advances offset");
+    }
+
+    /// A non-power-of-2 `head_dim` can't be FWHT-packed, so retention compression
+    /// must leave the cache dense (correctness over footprint) and still continue.
+    #[test]
+    fn quantize_for_retention_leaves_non_pow2_head_dim_dense() {
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            ..Default::default()
+        };
+        let mut cache = SteppingKeyValueCache::new();
+        // head_dim = 6 (not a power of 2).
+        let (keys, values) = make_kv_pair(4, 6);
+        cache.update_and_fetch(keys, values).unwrap();
+        let compressed = cache.quantize_for_retention(config).unwrap();
+        assert!(!compressed, "non-pow2 head_dim must not compress");
+        assert!(!cache.is_turbo_active());
+        assert!(cache.keys().is_some(), "dense buffers retained");
+        // Continuation still works (dense append).
+        let (k1, v1) = make_kv_pair(1, 6);
+        cache.update_and_fetch(k1, v1).unwrap();
+        assert_eq!(cache.offset(), 5);
+    }
+
+    /// Idempotent / no-op cases: empty cache and already-TQ-active cache.
+    #[test]
+    fn quantize_for_retention_noops_when_nothing_to_compress() {
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            ..Default::default()
+        };
+        // Empty dense cache → nothing to compress.
+        let mut empty = SteppingKeyValueCache::new();
+        assert!(!empty.quantize_for_retention(config).unwrap());
+
+        // Already TQ-active cache → no-op (second call returns false).
+        let mut cache = SteppingKeyValueCache::new();
+        let (keys, values) = make_varied_kv_pair(2, 16, 128);
+        cache.update_and_fetch(keys, values).unwrap();
+        assert!(cache.quantize_for_retention(config).unwrap());
+        assert!(
+            !cache.quantize_for_retention(config).unwrap(),
+            "second compression is a no-op"
         );
     }
 

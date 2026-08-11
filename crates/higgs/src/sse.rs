@@ -333,11 +333,7 @@ mod tests {
         let id = "chatcmpl-x";
         let model = "m";
         let mut w = ChatChunkWriter::new(id, 7, model);
-        let usage = CompletionUsage {
-            prompt_tokens: 3,
-            completion_tokens: 5,
-            total_tokens: 8,
-        };
+        let usage = CompletionUsage::new(3, 5, 0);
         let got = w.write_usage(&usage).unwrap().to_owned();
         let expected = serde_json::to_string(&ChatCompletionChunk {
             id: id.to_owned(),
@@ -427,11 +423,7 @@ mod tests {
             tool_calls: None,
         };
         let chunks = ["Hello", ", ", "world!"];
-        let usage = CompletionUsage {
-            prompt_tokens: 7,
-            completion_tokens: 3,
-            total_tokens: 10,
-        };
+        let usage = CompletionUsage::new(7, 3, 0);
 
         // New path.
         let mut new_path = String::new();

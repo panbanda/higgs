@@ -224,10 +224,17 @@ async fn create_message_non_streaming(
     engine: Arc<Engine>,
 ) -> Result<CreateMessageResponse, ServerError> {
     let max_tokens = req.max_tokens;
+    let speculation =
+        higgs_models::Speculation::parse(req.speculation.as_deref()).map_err(|v| {
+            ServerError::BadRequest(format!(
+                "invalid 'speculation' value '{v}' (expected auto|dflash|mtp|none)"
+            ))
+        })?;
     let sampling = SamplingParams {
         temperature: req.temperature.unwrap_or(1.0),
         top_p: req.top_p.unwrap_or(1.0),
         top_k: req.top_k,
+        speculation,
         ..SamplingParams::default()
     };
     let stop_sequences = req.stop_sequences.unwrap_or_default();
@@ -237,6 +244,7 @@ async fn create_message_non_streaming(
     let thinking_enabled = crate::reasoning::effective_thinking_enabled(
         engine.enable_thinking(),
         &[engine.model_name(), req.model.as_str()],
+        None,
         None,
     );
 
@@ -253,6 +261,7 @@ async fn create_message_non_streaming(
             false,
             None,
             thinking_enabled,
+            None,
             None,
             None,
         )
@@ -310,10 +319,17 @@ fn create_message_stream(
     routing_method: crate::router::RoutingMethod,
 ) -> Result<impl Stream<Item = Result<Event, Infallible>>, ServerError> {
     let max_tokens = req.max_tokens;
+    let speculation =
+        higgs_models::Speculation::parse(req.speculation.as_deref()).map_err(|v| {
+            ServerError::BadRequest(format!(
+                "invalid 'speculation' value '{v}' (expected auto|dflash|mtp|none)"
+            ))
+        })?;
     let sampling = SamplingParams {
         temperature: req.temperature.unwrap_or(1.0),
         top_p: req.top_p.unwrap_or(1.0),
         top_k: req.top_k,
+        speculation,
         ..SamplingParams::default()
     };
     let stop_sequences = req.stop_sequences.unwrap_or_default();
@@ -323,6 +339,7 @@ fn create_message_stream(
     let thinking_enabled = crate::reasoning::effective_thinking_enabled(
         engine.enable_thinking(),
         &[engine.model_name(), req.model.as_str()],
+        None,
         None,
     );
 
@@ -350,6 +367,7 @@ fn create_message_stream(
             thinking_enabled,
             // Anthropic streaming does not surface prefill progress.
             false,
+            None,
             None,
             None,
         );
@@ -528,6 +546,7 @@ pub async fn count_tokens(
             let thinking_enabled = crate::reasoning::effective_thinking_enabled(
                 engine.enable_thinking(),
                 &[engine.model_name(), model_name.as_str()],
+                None,
                 None,
             );
 

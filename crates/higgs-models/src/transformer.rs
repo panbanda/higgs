@@ -691,7 +691,213 @@ impl Model {
         self.apply_lm_head(&out)
     }
 
+    /// PFlash scorer (SpecPrefill, RESEARCH-pflash-prior-art.md §2.1): per-token
+    /// importance via lookahead attention. Runs a dense forward over the prompt
+    /// capturing the pre-layer residual at `score_layers`, decodes `lookahead`
+    /// greedy tokens (capturing the same residuals at those positions), then
+    /// computes `mean_over_lookahead(max_over_layers_and_heads(attention))`.
+    ///
+    /// Returns `importance` of length = prompt token count. Memory is S-linear
+    /// in the scoring layers only — `layer_importance` materializes
+    /// `[n_heads, lah, S]`, never `[H, S, S]`.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::indexing_slicing,
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::shadow_reuse,
+        clippy::similar_names
+    )]
+    pub fn pflash_importance<C: KeyValueCache>(
+        &mut self,
+        inputs: &Array,
+        score_layers: &[usize],
+        lookahead: usize,
+        kv_cache: &mut Vec<Option<C>>,
+    ) -> Result<Array, Exception> {
+        use mlx_rs::ops::indexing::argmax_axis;
+
+        let layers = &self.model.layers;
+        let n_layers = layers.len();
+        if score_layers.is_empty() {
+            return Err(Exception::custom(
+                "pflash_importance: score_layers is empty",
+            ));
+        }
+        if score_layers.iter().any(|&l| l >= n_layers) {
+            return Err(Exception::custom(format!(
+                "pflash_importance: score_layer out of range (model has {n_layers} layers)"
+            )));
+        }
+        let score_set: std::collections::HashSet<usize> = score_layers.iter().copied().collect();
+        let head_dim = self
+            .args
+            .checked_head_dim()
+            .map_err(|e| Exception::custom(e.to_string()))?;
+        let n_heads = self.args.num_attention_heads;
+        let n_kv_heads = self.args.num_key_value_heads;
+        let scale = (head_dim as f32).sqrt().recip();
+
+        // --- Prompt forward, capturing pre-layer residuals at score_layers ---
+        let (logits, prompt_taps) = self.forward_tapping_residuals(inputs, kv_cache, &score_set)?;
+        let prompt_len = inputs
+            .shape()
+            .get(1)
+            .copied()
+            .ok_or_else(|| Exception::custom("pflash_importance: inputs must be [B, S]"))?;
+        let s = prompt_len;
+
+        // --- Lookahead greedy decode, capturing the same residuals per step ---
+        let mut lah_taps: Vec<(usize, Vec<Array>)> =
+            score_layers.iter().map(|&l| (l, Vec::new())).collect();
+        let mut next_tok_logits = logits;
+        for _ in 0..lookahead {
+            let last_logits = next_tok_logits.index((.., -1.., ..));
+            let next_id = argmax_axis(&last_logits, -1, false)?;
+            // Single-token forward; the tapped residuals are [B, 1, hidden] (the
+            // new position entering each scoring layer).
+            let (step_logits, step_taps) =
+                self.forward_tapping_residuals(&next_id, kv_cache, &score_set)?;
+            for (layer_idx, tap) in &step_taps {
+                if let Some(entry) = lah_taps.iter_mut().find(|(l, _)| l == layer_idx) {
+                    entry.1.push(tap.clone());
+                }
+            }
+            next_tok_logits = step_logits;
+        }
+
+        // --- Aggregate importance across scoring layers (max), then flatten ---
+        let mut importance: Option<Array> = None;
+        for (layer_idx, prompt_resid) in &prompt_taps {
+            let layer = &mut self.model.layers[*layer_idx];
+            // K from the prompt residual at this layer.
+            let normed_p = layer.input_layernorm.forward(prompt_resid)?;
+            let k_raw = layer.self_attn.k_proj.forward(&normed_p)?;
+            let k = Self::arrange_qk(
+                &k_raw,
+                layer.self_attn.n_kv_heads,
+                &mut layer.self_attn.k_norm,
+                &layer.self_attn.rope,
+                0,
+            )?;
+            // Q from the stacked lookahead residuals at this layer.
+            let lah_entry = lah_taps
+                .iter()
+                .find(|(l, _)| l == layer_idx)
+                .map(|(_, v)| v)
+                .ok_or_else(|| Exception::custom("pflash_importance: missing lah taps"))?;
+            if lah_entry.is_empty() {
+                return Err(Exception::custom(
+                    "pflash_importance: lookahead produced no taps",
+                ));
+            }
+            let lah_refs: Vec<&Array> = lah_entry.iter().collect();
+            let stacked = mlx_rs::ops::concatenate_axis(&lah_refs, 1)?; // [B, lah, hidden]
+            let normed_l = layer.input_layernorm.forward(&stacked)?;
+            let q_raw = layer.self_attn.q_proj.forward(&normed_l)?;
+            let q = Self::arrange_qk(
+                &q_raw,
+                layer.self_attn.n_heads,
+                &mut layer.self_attn.q_norm,
+                &layer.self_attn.rope,
+                s, // lookahead positions are S, S+1, ... (contiguous -> scalar offset S)
+            )?;
+            let imp = crate::spec_prefill::layer_importance(
+                &q, &k, n_heads, n_kv_heads, head_dim, scale,
+            )?;
+            importance = Some(match importance {
+                None => imp,
+                Some(prev) => mlx_rs::ops::maximum(&prev, &imp)?,
+            });
+        }
+        importance.ok_or_else(|| {
+            Exception::custom("pflash_importance: no scoring layers produced output")
+        })
+    }
+
+    /// One backbone forward that records the pre-layer residual stream entering
+    /// each layer in `score_set`. Returns `(logits_at_last_position, taps)` where
+    /// each tap is `[B, S, hidden]` (or `[B, 1, hidden]` for single-token inputs).
+    /// The KV cache is advanced in place (fresh on first call, grown on decode).
+    fn forward_tapping_residuals<C: KeyValueCache>(
+        &mut self,
+        inputs: &Array,
+        kv_cache: &mut Vec<Option<C>>,
+        score_set: &std::collections::HashSet<usize>,
+    ) -> Result<(Array, Vec<(usize, Array)>), Exception> {
+        if kv_cache.is_empty() {
+            *kv_cache = (0..self.model.layers.len()).map(|_| None).collect();
+        } else if kv_cache.len() != self.model.layers.len() {
+            return Err(Exception::custom(format!(
+                "kv_cache length ({}) must match num layers ({})",
+                kv_cache.len(),
+                self.model.layers.len()
+            )));
+        }
+        let mut h = self.model.embed_tokens.forward(inputs)?;
+        let mask = match create_attention_mask(&h, kv_cache, Some(true))? {
+            Some(AttentionMask::Array(a)) => Some(a),
+            Some(AttentionMask::Causal) => {
+                return Err(Exception::custom("Only Array mask is supported"));
+            }
+            None => None,
+        };
+        let mut taps: Vec<(usize, Array)> = Vec::new();
+        for (li, (layer, layer_cache)) in self
+            .model
+            .layers
+            .iter_mut()
+            .zip(kv_cache.iter_mut())
+            .enumerate()
+        {
+            if score_set.contains(&li) {
+                taps.push((li, h.clone()));
+            }
+            h = layer.forward(AttentionInput {
+                x: &h,
+                mask: mask.as_ref(),
+                cache: layer_cache.as_mut(),
+            })?;
+        }
+        let normed = self.model.norm.forward(&h)?;
+        let last_normed = normed.index((.., -1.., ..));
+        let last_logits = self.apply_lm_head(&last_normed)?;
+        Ok((last_logits, taps))
+    }
+
+    /// Reshape a Q/K projection `[B, L, n_heads * head_dim]` to `[n_heads, L, d]`,
+    /// apply the per-head RMSNorm and RoPE at `offset`, then drop the batch dim.
+    /// Mirrors `Attention::forward` (transformer.rs:283-301) but stops before the
+    /// attention reduction so the PFlash scorer can feed Q/K to `layer_importance`.
+    #[allow(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::indexing_slicing
+    )]
+    fn arrange_qk(
+        raw: &Array,
+        n_heads: i32,
+        norm: &mut Option<nn::RmsNorm>,
+        rope: &nn::Rope,
+        offset: i32,
+    ) -> Result<Array, Exception> {
+        let shape = raw.shape();
+        let (b, l, total) = (shape[0], shape[1], shape[2]);
+        let d = total / n_heads;
+        let reshaped = raw.reshape(&[b, l, n_heads, d])?;
+        let normed = match norm {
+            Some(n) => n.forward(&reshaped)?,
+            None => reshaped,
+        };
+        let transposed = normed.transpose_axes(&[0, 2, 1, 3])?; // [B, n_heads, L, d]
+        let roped = apply_rope(&transposed, rope, offset)?;
+        Ok(roped.squeeze_axes(&[0])?) // [n_heads, L, d]
+    }
+
     /// Batched decode: one forward pass for N requests each with 1 token.
+
     ///
     /// Heavy ops (projections, MLP, LM head) run batched. Per-request ops
     /// (`RoPE`, KV cache update) loop over individual requests since each has

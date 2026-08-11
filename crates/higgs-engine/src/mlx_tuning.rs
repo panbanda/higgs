@@ -127,6 +127,7 @@ enum ModelSizeClass {
 #[derive(Debug, Clone, Default)]
 struct ModelMetadata {
     model_type: Option<String>,
+    quantization_bits: Option<u8>,
     num_hidden_layers: Option<usize>,
     hidden_size: Option<usize>,
     max_position_embeddings: Option<usize>,
@@ -143,6 +144,11 @@ impl ModelMetadata {
 
         Self {
             model_type: config_lookup_str(&config, "model_type").map(str::to_owned),
+            quantization_bits: config
+                .get("quantization")
+                .and_then(|quantization| quantization.get("bits"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|bits| u8::try_from(bits).ok()),
             num_hidden_layers: config_lookup_u64(&config, "num_hidden_layers")
                 .and_then(|v| usize::try_from(v).ok()),
             hidden_size: config_lookup_u64(&config, "hidden_size")
@@ -191,6 +197,11 @@ impl ModelMetadata {
 
     fn is_long_context(&self) -> bool {
         self.max_position_embeddings.unwrap_or_default() >= 65_536
+    }
+
+    fn should_clear_cache_after_prefill(&self) -> bool {
+        matches!(self.model_type.as_deref(), Some("qwen3_5"))
+            && matches!(self.quantization_bits, Some(bits) if (1..=4).contains(&bits))
     }
 }
 
@@ -263,6 +274,7 @@ impl MlxRuntimeTuning {
             balanced_chunked_prefill(size_class, is_long_context, is_moe);
         let balanced_paged_kv = heuristic_paged_kv_target_bytes(metadata, size_class, is_moe);
         let default_mtp_draft_n_max = default_mtp_draft_n_max(size_class);
+        let clear_cache_after_prefill = metadata.should_clear_cache_after_prefill();
 
         match resolved_profile {
             ResolvedMlxProfile::Baseline => Self {
@@ -270,7 +282,7 @@ impl MlxRuntimeTuning {
                 resolved_profile,
                 chunked_prefill_threshold: DEFAULT_CHUNKED_PREFILL_THRESHOLD,
                 chunked_prefill_chunk_size: DEFAULT_CHUNKED_PREFILL_CHUNK_SIZE,
-                clear_cache_after_prefill: false,
+                clear_cache_after_prefill,
                 enable_mtp: false,
                 mtp_draft_n_max: 1,
                 paged_kv_target_bytes: DEFAULT_PAGED_KV_TARGET_BYTES,
@@ -280,7 +292,7 @@ impl MlxRuntimeTuning {
                 resolved_profile,
                 chunked_prefill_threshold: (balanced_threshold.saturating_mul(2)).min(4096),
                 chunked_prefill_chunk_size: balanced_chunk.max(768),
-                clear_cache_after_prefill: false,
+                clear_cache_after_prefill,
                 enable_mtp: true,
                 mtp_draft_n_max: default_mtp_draft_n_max,
                 paged_kv_target_bytes: clamp_paged_kv_target_bytes(
@@ -292,7 +304,7 @@ impl MlxRuntimeTuning {
                 resolved_profile,
                 chunked_prefill_threshold: balanced_threshold,
                 chunked_prefill_chunk_size: balanced_chunk,
-                clear_cache_after_prefill: false,
+                clear_cache_after_prefill,
                 enable_mtp: true,
                 mtp_draft_n_max: default_mtp_draft_n_max,
                 paged_kv_target_bytes: balanced_paged_kv,
@@ -302,7 +314,7 @@ impl MlxRuntimeTuning {
                 resolved_profile,
                 chunked_prefill_threshold: balanced_threshold.max(1024),
                 chunked_prefill_chunk_size: balanced_chunk.max(1024),
-                clear_cache_after_prefill: false,
+                clear_cache_after_prefill,
                 enable_mtp: true,
                 mtp_draft_n_max: default_mtp_draft_n_max,
                 paged_kv_target_bytes: clamp_paged_kv_target_bytes(
@@ -609,6 +621,55 @@ mod tests {
             resolve_profile_from_metadata(RequestedMlxProfile::Auto, &metadata),
             ResolvedMlxProfile::Throughput
         );
+    }
+
+    #[test]
+    fn test_qwen35_low_bit_affine_clears_prefill_allocator_cache_by_default() {
+        let metadata = ModelMetadata {
+            model_type: Some("qwen3_5".to_owned()),
+            quantization_bits: Some(1),
+            ..ModelMetadata::default()
+        };
+        let tuning = MlxRuntimeTuning::from_profile(
+            RequestedMlxProfile::Latency,
+            ResolvedMlxProfile::Latency,
+            &metadata,
+        );
+        assert!(tuning.clear_cache_after_prefill());
+
+        // Q1 through Q4 all dequantize large projections during prefill and need
+        // the allocator cache cleared to avoid multi-GB post-prefill residency.
+        for bits in [1, 2, 3, 4] {
+            let low_bit = ModelMetadata {
+                quantization_bits: Some(bits),
+                ..metadata.clone()
+            };
+            assert!(
+                low_bit.should_clear_cache_after_prefill(),
+                "bits={bits} should clear cache after prefill"
+            );
+        }
+
+        // Dense (bits=0) and 8-bit re-quant paths do not materialize oversized
+        // fp16 dequant projections and therefore should not trigger.
+        for bits in [0, 8] {
+            let dense_or_8bit = ModelMetadata {
+                quantization_bits: Some(bits),
+                ..metadata.clone()
+            };
+            assert!(
+                !dense_or_8bit.should_clear_cache_after_prefill(),
+                "bits={bits} should not clear cache after prefill"
+            );
+        }
+
+        // Non-Qwen3.5 architectures are out of domain regardless of bits.
+        let non_qwen35 = ModelMetadata {
+            model_type: Some("qwen3".to_owned()),
+            quantization_bits: Some(1),
+            ..metadata.clone()
+        };
+        assert!(!non_qwen35.should_clear_cache_after_prefill());
     }
 
     fn write_json(path: &std::path::Path, value: &serde_json::Value) -> std::io::Result<()> {

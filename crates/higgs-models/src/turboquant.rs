@@ -63,6 +63,21 @@ pub struct KvCacheConfig {
     /// historical default behavior when this field is omitted from config.
     #[serde(default)]
     pub seed: u64,
+    /// Max conversations whose live KV cache is retained between turns for
+    /// cache-resident multi-turn. LRU-evicted beyond this; bounds the *number*
+    /// of resident caches. Must be >= 1. Default 8.
+    #[serde(default = "default_max_retained_sessions")]
+    pub max_retained_sessions: usize,
+    /// Drop a conversation's retained KV once it covers more than this many
+    /// tokens (`0` = unlimited). Bounds a single conversation's resident KV; the
+    /// next turn then full-prefills. Default 0.
+    #[serde(default)]
+    pub max_session_tokens: usize,
+    /// Evict retained session KV and memory-only paired target+dSpark radix
+    /// endpoints idle longer than this many seconds (`0` = never). Frees memory
+    /// from abandoned conversations. Default 1800 (30 min).
+    #[serde(default = "default_retained_idle_secs")]
+    pub retained_idle_secs: u64,
 }
 
 const fn default_bits() -> u8 {
@@ -71,6 +86,14 @@ const fn default_bits() -> u8 {
 
 const fn default_norm_correction() -> bool {
     true
+}
+
+const fn default_max_retained_sessions() -> usize {
+    8
+}
+
+const fn default_retained_idle_secs() -> u64 {
+    1800
 }
 
 impl Default for KvCacheConfig {
@@ -83,6 +106,9 @@ impl Default for KvCacheConfig {
             norm_correction: true,
             adaptive_dense_layers: 0,
             seed: 0,
+            max_retained_sessions: default_max_retained_sessions(),
+            max_session_tokens: 0,
+            retained_idle_secs: default_retained_idle_secs(),
         }
     }
 }
@@ -109,6 +135,13 @@ impl KvCacheConfig {
                     "TurboQuant value bits must be in [2, 4], got {vb}"
                 )));
             }
+        }
+        // Retention limits apply regardless of TurboQuant mode (dense caches are
+        // retained too). A zero session cap would evict every cache immediately.
+        if self.max_retained_sessions == 0 {
+            return Err(Exception::custom(
+                "max_retained_sessions must be >= 1 (0 would retain nothing)",
+            ));
         }
         Ok(())
     }
@@ -2093,5 +2126,139 @@ mod tests {
                 "Batch CPU/GPU mismatch at idx={i}: cpu={c}, gpu={g}"
             );
         }
+    }
+
+    /// Phase 0 microbench — per-kernel decode timing (scores vs softmax vs values,
+    /// plus per-token append) across context lengths. Grounds the kernel-rewrite plan.
+    /// Ignored by default (timing, not correctness):
+    ///   cargo test -p higgs-models --release decode_kernel_timing -- --ignored --nocapture
+    ///
+    /// Raw `transforms::eval` is used deliberately (single-threaded test, no model lock
+    /// held) to batch-eval N outputs in one submission and amortize sync latency.
+    #[test]
+    #[ignore = "timing microbench; run explicitly with --ignored"]
+    #[allow(clippy::disallowed_methods, clippy::print_stdout, clippy::doc_markdown)]
+    fn decode_kernel_timing() {
+        use std::time::Instant;
+        let bits = 3_u8;
+        let head_dim = 128_i32;
+        let num_kv_heads = 2_i32;
+        let num_heads = 8_i32; // GQA = 4
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits,
+            seed: 42,
+            ..Default::default()
+        };
+        let ctx = TurboQuantContext::new(config, head_dim, num_kv_heads).unwrap();
+        let key_centroids = ctx.key_centroids_array().unwrap();
+        let value_centroids = ctx.value_centroids_array().unwrap();
+
+        // Per-kernel µs, amortizing CPU<->GPU sync: build N independent lazy outputs
+        // and eval them in ONE submission, dividing by N. A single eval is dominated by
+        // dispatch/sync latency (~hundreds of µs) that hides the actual kernel cost.
+        let n = 64_usize;
+        let time_us = |f: &dyn Fn() -> Array| -> f64 {
+            let warm: Vec<Array> = (0..n).map(|_| f()).collect();
+            mlx_rs::transforms::eval(warm.iter()).unwrap();
+            let mut best = f64::INFINITY;
+            for _ in 0..10 {
+                let outs: Vec<Array> = (0..n).map(|_| f()).collect();
+                let t0 = Instant::now();
+                mlx_rs::transforms::eval(outs.iter()).unwrap();
+                best = best.min(t0.elapsed().as_secs_f64() * 1e6 / n as f64);
+            }
+            best
+        };
+
+        // Per-token append cost (quantize 1 new K token into codes): runs EVERY decode
+        // step and is what dense KV does NOT pay. T-independent, so measure once.
+        let new_k_data = random_vector((num_kv_heads * head_dim) as usize, 777);
+        let new_k = Array::from_slice(&new_k_data, &[num_kv_heads, 1, head_dim]);
+        let append_us = time_us(&|| ctx.quantize_keys_gpu(&new_k).unwrap().2);
+
+        println!("  append/token (quantize 1 K): {append_us:.1} us\n");
+        println!("  T       scores_us  softmax_us   values_us   values/scores");
+        let mut scores_by_t: Vec<f64> = Vec::new();
+        let mut values_by_t: Vec<f64> = Vec::new();
+        for &t in &[512_i32, 2048, 7168] {
+            let kv = random_vector((num_kv_heads * t * head_dim) as usize, u64::from(t as u32));
+            let keys = Array::from_slice(&kv, &[num_kv_heads, t, head_dim]);
+            let values = Array::from_slice(&kv, &[num_kv_heads, t, head_dim]);
+            let (k_norms, _k_gammas, k_codes) = ctx.quantize_keys_gpu(&keys).unwrap();
+            let (v_norms, v_codes) = ctx.quantize_values_gpu(&values).unwrap();
+            for a in [&k_norms, &k_codes, &v_norms, &v_codes] {
+                a.eval().unwrap();
+            }
+            let q = random_vector((num_heads * head_dim) as usize, u64::from(t as u32) + 9);
+            let q_rot = Array::from_slice(&q, &[num_heads, head_dim]);
+
+            let scores_us = time_us(&|| {
+                decode_scores(
+                    &q_rot,
+                    &k_codes,
+                    &k_norms,
+                    &key_centroids,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    t,
+                    t,
+                    bits,
+                    ctx.key_code_words,
+                )
+                .unwrap()
+            });
+            let scores = decode_scores(
+                &q_rot,
+                &k_codes,
+                &k_norms,
+                &key_centroids,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                t,
+                t,
+                bits,
+                ctx.key_code_words,
+            )
+            .unwrap();
+            scores.eval().unwrap();
+            let softmax_us = time_us(&|| mlx_rs::ops::softmax_axis(&scores, -1, true).unwrap());
+            let weights = mlx_rs::ops::softmax_axis(&scores, -1, true).unwrap();
+            weights.eval().unwrap();
+            let values_us = time_us(&|| {
+                decode_weighted_values(
+                    &weights,
+                    &v_codes,
+                    &v_norms,
+                    &value_centroids,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    t,
+                    t,
+                    bits,
+                    ctx.value_code_words,
+                )
+                .unwrap()
+            });
+
+            println!(
+                "  {t:<6}  {scores_us:>9.1}  {softmax_us:>10.1}  {values_us:>10.1}   {:>5.1}x",
+                values_us / scores_us
+            );
+            scores_by_t.push(scores_us);
+            values_by_t.push(values_us);
+        }
+
+        // Diagnosis under test: the values kernel is the decode bottleneck at long
+        // context (fixed head_dim*num_heads grid, O(T)/thread, amplified reads), so at
+        // 7K it must clearly exceed the scores kernel. This premise drives the rewrite.
+        let (s_last, v_last) = (scores_by_t[2], values_by_t[2]);
+        assert!(
+            v_last > s_last * 1.3,
+            "values should dominate at 7K: scores={s_last:.1}us vs values={v_last:.1}us"
+        );
     }
 }

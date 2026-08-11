@@ -126,6 +126,7 @@ curl http://localhost:8000/v1/chat/completions \
 - Release artifacts bundle `mlx.metallib`.
 - Source builds also require `mlx.metallib` next to the executable. Higgs now restores it automatically from Cargo build output when possible, then fails loudly if it still cannot be found.
 - `[local].raise_wired_limit` defaults to `false`. Enable it only when you explicitly want MLX to raise the process wired-memory limit.
+- `[local].allow_runtime_model_load` defaults to `false`. Enable it to load/unload models at runtime via `POST`/`DELETE /v1/models`; protect it with `server.api_key`.
 - `batch=true` is only supported for transformer families with true batched decode support.
 
 ## Performance
@@ -198,8 +199,83 @@ Measured on DeepSeek-V2-Lite-4bit with global batch sorting before `gather_qmm`.
     llama.cpp-compatible `prompt_progress` chunks (`{total, cache, processed,
     time_ms}`) during chunked prefill.
 - Anthropic: `/v1/messages`, `/v1/messages/count_tokens`
+- OpenAI and Anthropic requests accept an optional `"speculation"` field
+  (`auto` | `dflash` | `mtp` | `none`) to pick the speculative-decode method per
+  request. `auto` (default) uses the DFlash drafter when one is loaded — including
+  while streaming — otherwise the MTP head; `none` disables speculation.
+- The dSpark (DFlash) verifier defaults to the block (`BatchedTape`) schedule for
+  the 2-bit Bonsai target (validated end-to-end) and to canonical S=1 for the
+  1-bit Bonsai target. Override per-process with `HIGGS_DFLASH_VERIFY_MODE`
+  (`block` | `canonical`).
+- Compressive prefill (PFlash, experimental): an optional `prefill_drafter`
+  (e.g. `mlx-community/Qwen3-0.6B-4bit`) scores the prompt so the target
+  prefills only a fraction of it (`prefill_compression`, `prefill_keep_ratio`).
+  Off by default; see `docs/configuration.md` and
+  `.planning/DESIGN-pflash-higgs.md`.
+- Runtime model management (opt-in): `POST /v1/models`, `DELETE /v1/models/{name}`
 - Metrics: `/metrics`
 - Health: `/health`
+
+### Reasoning / thinking budget
+
+For thinking-capable models, `/v1/chat/completions` accepts two extra body fields
+(additive, OpenAI clients ignore them):
+
+- **`reasoning_budget`** (int) — max `<think>` tokens before `</think>` is
+  force-closed. Omitted → engine default (256). Sent by clients like nanobot's
+  `/thinking N`.
+- **`chat_template_kwargs.enable_thinking`** (bool) — per-request override of the
+  model's reasoning mode; wins over `reasoning.effort`. `false` forces reasoning
+  off; `true` enables it on a thinking-capable model. A top-level
+  **`enable_thinking`** (bool) is accepted as an alias for clients that send it
+  there; `chat_template_kwargs.enable_thinking` takes precedence when both are set.
+
+```bash
+curl http://localhost:8000/v1/chat/completions -d '{
+  "model": "active", "messages": [{"role":"user","content":"hi"}],
+  "reasoning_budget": 1024,
+  "chat_template_kwargs": {"enable_thinking": true}
+}'
+```
+
+### Runtime model management
+
+By default the set of loaded models is fixed at startup. To add or remove models
+while the server runs, set `allow_runtime_model_load = true` under `[local]`
+(protect it with `server.api_key` -- the load endpoint can read local model
+directories and trigger downloads). Changes are in-memory only and do not persist
+to the config file.
+
+```bash
+# Load a model (body mirrors a [[models]] entry; path required)
+curl http://localhost:8000/v1/models \
+  -H "Authorization: Bearer $HIGGS_API_KEY" \
+  -d '{"path": "mlx-community/Llama-3.2-1B-Instruct-4bit", "name": "llama"}'
+
+# Unload it and free its GPU memory (204 once freed, 202 if a request is still in flight)
+curl -X DELETE http://localhost:8000/v1/models/llama \
+  -H "Authorization: Bearer $HIGGS_API_KEY"
+```
+
+An in-flight request keeps the model resident until it completes; `DELETE` removes
+it from routing immediately and frees memory once the last request drains. A model
+bound to the auto-router cannot be unloaded.
+
+**Capability discovery.** `GET /v1/models` adds two OpenAI-compatible *additive*
+fields (standard clients ignore unknown keys) so a client can check before acting:
+the top-level **`runtime_model_load`** (bool) mirrors `allow_runtime_model_load`
+-- if `false`, switch/load/unload will `403`; and per-model **`vision`** (bool)
+reports whether the model accepts image input (true only for VLMs).
+
+```jsonc
+{
+  "object": "list",
+  "runtime_model_load": true,
+  "data": [
+    { "id": "qwen36-35b", "object": "model", "created": 0, "owned_by": "local", "vision": false }
+  ]
+}
+```
 
 **Core commands**
 

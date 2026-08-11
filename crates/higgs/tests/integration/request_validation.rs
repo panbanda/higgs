@@ -59,6 +59,21 @@ fn chat_request_all_optional_fields() {
 }
 
 #[test]
+fn chat_request_accepts_session_id_extension() {
+    let json = r#"{
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": true,
+        "session_id": 42
+    }"#;
+
+    let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+
+    assert_eq!(req.session_id, Some(42));
+    assert_eq!(req.stream, Some(true));
+}
+
+#[test]
 fn chat_request_missing_model_fails() {
     let json = r#"{"messages": [{"role": "user", "content": "hi"}]}"#;
     let result = serde_json::from_str::<ChatCompletionRequest>(json);

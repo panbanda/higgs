@@ -24,7 +24,8 @@ use crate::{
     cache::{KeyValueCache, SteppingKeyValueCache},
     error::ModelError,
     qwen3_next::{
-        QEmbedding, QLinear, QuantizationConfig, SwitchMlpWeights, new_mlp_projections, swiglu,
+        QEmbedding, QLinear, QuantizationConfig, SwitchMlpWeights, new_mlp_projections_from_quant,
+        swiglu,
     },
     utils::{AttentionMask, create_attention_mask},
 };
@@ -577,7 +578,7 @@ impl DeepSeekV2MlpBlock {
                     .bias(false)
                     .build()?,
             ),
-            switch_mlp: Some(SwitchMlpWeights::new(ql, qb)?),
+            switch_mlp: Some(SwitchMlpWeights::from_quant(ql, qb)?),
             shared_experts: shared,
             gate_proj: None,
             down_proj: None,
@@ -590,7 +591,7 @@ impl DeepSeekV2MlpBlock {
     }
 
     fn new_dense(ql: i32, qb: i32) -> Result<Self, Exception> {
-        let (gate_proj, down_proj, up_proj) = new_mlp_projections(ql, qb)?;
+        let (gate_proj, down_proj, up_proj) = new_mlp_projections_from_quant(ql, qb)?;
         Ok(Self {
             gate: None,
             switch_mlp: None,
@@ -950,6 +951,7 @@ mod tests {
             quantization: Some(QuantizationConfig {
                 group_size: 64,
                 bits: 4,
+                mode: crate::quant_mode::QuantMode::Affine,
             }),
         }
     }

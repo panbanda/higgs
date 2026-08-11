@@ -5,11 +5,17 @@
 //! <https://github.com/jeffasante/cellm/blob/main/crates/cellm-cache/src/allocator.rs>
 
 pub mod allocator;
+pub mod disk_prefix_cache;
+pub mod disk_storage;
 pub mod paged;
 pub mod pagetable;
+pub(crate) mod paired;
 pub mod storage;
 
 pub use allocator::BlockAllocator;
+pub use disk_prefix_cache::{
+    DEFAULT_MAX_DISK_BLOCKS, DEFAULT_MIN_TOKENS_TO_PERSIST, DiskPrefixCache, DiskPrefixCacheConfig,
+};
 pub use paged::PagedKvCache;
 pub use pagetable::PageTable;
 pub use storage::{CpuKvStorage, KvCacheLayout};
