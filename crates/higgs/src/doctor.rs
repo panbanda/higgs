@@ -284,6 +284,19 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
             );
             continue;
         }
+        if model.kv_cache_config().is_turboquant() {
+            let tq_default = higgs_models::cache::DEFAULT_TURBOQUANT_ACTIVATE_AT;
+            warn(
+                &format!(
+                    "model {label} sets kv_cache=turboquant: its custom Metal decode kernels are \
+                     ~20-25% slower than dense SDPA until the activation threshold (default \
+                     {tq_default} tokens; override with HIGGS_TURBOQUANT_MIN_TOKENS), plus a \
+                     first-token stall when prefilled KV is bulk-quantized. Dense KV is only \
+                     ~10 KB/token — prefer it unless very long context threatens memory."
+                ),
+                result,
+            );
+        }
         match model_resolver::resolve(&model.path) {
             Ok(resolved) => {
                 if model.batch {

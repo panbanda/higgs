@@ -18,7 +18,27 @@ pub enum KvCacheView {
 
 static TURBOQUANT_ACTIVATE_AT: OnceLock<i32> = OnceLock::new();
 static TURBOQUANT_INACTIVE_LOGGED: AtomicBool = AtomicBool::new(false);
-const DEFAULT_TURBOQUANT_ACTIVATE_AT: i32 = 2048;
+/// KV token count at which TurboQuant quantization activates for decode.
+///
+/// Default high because TurboQuant's custom Metal decode kernels are slower
+/// than MLX's dense SDPA. Benchmarked on Qwen3.5-9B-4bit (M4 32 GB), forcing
+/// activation via `HIGGS_TURBOQUANT_MIN_TOKENS=0`:
+///
+/// | context | dense | turboquant | Δ decode |
+/// |---------|-------|------------|----------|
+/// | ~15 tok | 15.6 tok/s | 11.7 tok/s | −25% |
+/// | ~7K tok | 12.5 tok/s | 10.1 tok/s | −19% |
+///
+/// (plus a multi-second first-token stall at 7K when the prefilled KV is
+/// bulk-quantized: TTFT 0.4 s → 6.4 s.) Dense KV costs only ~10 KB/token, so
+/// ~100K tokens fit in ~1 GB — TurboQuant's memory saving only pays for its
+/// decode tax near that scale. Lower via `HIGGS_TURBOQUANT_MIN_TOKENS` when
+/// context length genuinely threatens memory.
+// ponytail: fixed default; the real fix is a faster fused decode kernel
+// (turboquant.rs values kernel is O(T)/thread, no SIMD reduction) — until then
+// dense wins below ~100K, so gate TurboQuant off by default.
+#[allow(clippy::doc_markdown)]
+pub const DEFAULT_TURBOQUANT_ACTIVATE_AT: i32 = 100_000;
 
 fn parse_turboquant_activate_at(raw: Option<&str>) -> i32 {
     raw.and_then(|s| s.parse::<i32>().ok())
