@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.6.1](https://github.com/panbanda/higgs/compare/higgs-models-v1.6.0...higgs-models-v1.6.1) (2026-08-11)
+
+
+### Bug Fixes
+
+* **bonsai:** apply causal mask during prefill ([#203](https://github.com/panbanda/higgs/issues/203)) ([ecd78e5](https://github.com/panbanda/higgs/commit/ecd78e58c959d375715dec16bbd3551a09c487f3))
+* **deps:** update rust crate safetensors to 0.8 ([#201](https://github.com/panbanda/higgs/issues/201)) ([27d20e2](https://github.com/panbanda/higgs/commit/27d20e2bc8bd4daba65b7ed29c2558ef9ae554a0))
+* suffix float literals for new float_literal_f32_fallback lint ([#230](https://github.com/panbanda/higgs/issues/230)) ([83029e4](https://github.com/panbanda/higgs/commit/83029e409cf0bbfbc03d363590edba920de3b1f4))
+
 ## [1.6.0](https://github.com/panbanda/higgs/compare/higgs-models-v1.5.0...higgs-models-v1.6.0) (2026-06-21)
 
 

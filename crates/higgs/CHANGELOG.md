@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.1](https://github.com/panbanda/higgs/compare/higgs-v1.6.0...higgs-v1.6.1) (2026-08-11)
+
+
+### Bug Fixes
+
+* suffix float literals for new float_literal_f32_fallback lint ([#230](https://github.com/panbanda/higgs/issues/230)) ([83029e4](https://github.com/panbanda/higgs/commit/83029e409cf0bbfbc03d363590edba920de3b1f4))
+
 ## [1.6.0](https://github.com/panbanda/higgs/compare/higgs-v1.5.0...higgs-v1.6.0) (2026-06-21)
 
 

@@ -1,6 +1,6 @@
 [package]
 name = "higgs"
-version = "1.6.0"
+version = "1.6.1"
 description = "OpenAI and Anthropic-compatible inference server for Apple Silicon, built on mlx-rs"
 edition.workspace = true
 license.workspace = true
