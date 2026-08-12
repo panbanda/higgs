@@ -1,18 +1,31 @@
 # Bonsai-Q1
 
-Bonsai-Q1 checkpoints are Qwen3-shaped models with MLX 1-bit affine
-quantization metadata:
+Higgs supports MLX affine 1-bit checkpoints with `quantization.bits = 1` and
+`quantization.group_size = 128` on the pinned upstream `oxideai/mlx-rs`
+revision. Upstream MLX does not ship the required 1-bit affine kernels, so Higgs
+provides runtime JIT Metal kernels for packed matvec and dequantization.
 
-- `model_type = "qwen3"`
-- `quantization.bits = 1`
-- `quantization.group_size = 128`
+Two layouts are supported:
 
-The Higgs workspace stays on the pinned upstream `oxideai/mlx-rs` dependency.
-That upstream revision does not yet include the MLX bits=1 affine Metal kernels,
-so `higgs-engine` detects Bonsai-Q1 configs and returns an explicit unsupported
-model error instead of routing them into the regular Qwen3 transformer loader.
+- Qwen3-shaped Bonsai checkpoints use the dedicated packed engine in
+  `crates/higgs-models/src/bonsai_q1.rs`.
+- Qwen3.5 hybrid checkpoints, including Bonsai-27B, use the existing
+  `qwen3_next` architecture with its affine 1-bit operations dispatched to the
+  same Higgs Metal kernels.
 
-The packed loader and engine live in `crates/higgs-models/src/bonsai_q1.rs` so
-the Rust-side code can be reviewed independently. Runtime enablement should wait
-until bits=1 affine quantization support lands upstream in the MLX dependency
-chain.
+Single-token decode and narrow multi-token forwards stay packed. For Qwen3.5,
+the packed Metal path covers up to 8 flattened rows by default, including the
+small verifier batches used by speculative decoding. Wider prefill inputs
+dequantize the selected matrix to the input dtype before using regular MLX
+matmul. Set `HIGGS_BONSAI_QMM_MAX_ROWS=0` to disable the narrow packed path, or
+raise it up to 64 for A/B testing.
+
+For Qwen3.5 Q1 checkpoints, the loader validates every affine scale/bias pair.
+When a tensor is exactly symmetric (`bias = -scale / 2`), Higgs releases its
+bias array and derives the bias in the Metal kernel. Any non-symmetric tensor
+keeps the general affine path. Set `HIGGS_BONSAI_SYMMETRIC_Q1=0` to retain all
+bias tensors for A/B debugging.
+
+Qwen3.5 checkpoints packaged as multimodal models currently load the text
+backbone only. Their vision tower is not exposed by Higgs, so image input remains
+unsupported for those checkpoints.
