@@ -99,8 +99,8 @@ fn build_groups(groups: HashMap<String, Vec<&crate::metrics::RequestRecord>>) ->
     out
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 

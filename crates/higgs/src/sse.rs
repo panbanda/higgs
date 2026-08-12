@@ -187,8 +187,8 @@ fn push_json_string(out: &mut String, s: &str) {
     }
 }
 
-#[cfg(test)]
 #[allow(clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::openai::{

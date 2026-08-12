@@ -479,7 +479,7 @@ fn create_sliding_window_mask(L: i32, S: i32, window: i32) -> Result<Array, Exce
     // For query at local index i (absolute position = offset + i),
     // key at index j is visible if j >= (offset + i) - window + 1 AND j <= (offset + i)
     // The causal mask already handles j <= (offset + i).
-    // We just need: j >= (offset + i) - window + 1
+    // The remaining constraint: j >= (offset + i) - window + 1
 
     let query_positions = mlx_rs::arange!(start = offset, stop = offset + L)?;
     let key_positions = mlx_rs::arange!(stop = S)?;
@@ -991,8 +991,8 @@ fn apply_rmsnorm_plus_one(model: &mut Gemma2CausalLM) -> Result<(), Exception> {
     Ok(())
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{

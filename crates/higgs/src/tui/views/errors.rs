@@ -61,8 +61,8 @@ pub fn draw(frame: &mut Frame, area: Rect, metrics: &Arc<MetricsStore>, scroll: 
     super::render_scrollbar(frame, area, count, scroll);
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};

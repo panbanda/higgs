@@ -837,7 +837,7 @@ impl BonsaiQ1Gpu {
 /// Lives at module scope (not as a method) so a **function pointer** to
 /// [`decode_step_free`] satisfies `compile_with_state`'s
 /// `F: Copy + 'static` bound — a closure capturing `&self` would not.
-/// All `self.xxx` access is replaced with `gpu.xxx`; `embed_rows`,
+/// All `self.*` access is replaced with `gpu.*`; `embed_rows`,
 /// `apply_rope`, and `project_logits` are called as methods on `gpu`
 /// (they are already `&self`-only, so no further plumbing is needed).
 #[allow(non_snake_case)]

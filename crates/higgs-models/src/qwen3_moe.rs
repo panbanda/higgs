@@ -608,8 +608,8 @@ pub fn load_qwen3_moe_model<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3MoeCaus
     Ok(model)
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
 

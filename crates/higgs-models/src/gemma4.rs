@@ -1757,7 +1757,6 @@ fn assign_param(
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
 #[allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -1777,6 +1776,7 @@ fn assign_param(
     clippy::doc_markdown,
     clippy::float_cmp
 )]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::cache::SteppingKeyValueCache;

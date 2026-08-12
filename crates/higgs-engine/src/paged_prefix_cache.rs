@@ -764,7 +764,6 @@ fn gather_tq_blocks(
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
 #[allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -772,6 +771,7 @@ fn gather_tq_blocks(
     clippy::indexing_slicing,
     clippy::shadow_unrelated
 )]
+#[cfg(test)]
 mod tests {
     use super::*;
     use higgs_models::cache::KeyValueCache;

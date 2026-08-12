@@ -150,8 +150,8 @@ pub fn load_tokenizer<P: AsRef<Path>>(model_dir: P) -> Result<tokenizers::Tokeni
     shared_load_tokenizer(model_dir).map_err(|e| EngineError::Tokenization(e.to_string()))
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use higgs_models::error::ModelError;

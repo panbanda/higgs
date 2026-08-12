@@ -5244,7 +5244,6 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     Ok(())
 }
 
-#[cfg(test)]
 #[allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -5286,6 +5285,7 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     clippy::used_underscore_binding,
     clippy::redundant_clone
 )]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::cache::KeyValueCache;

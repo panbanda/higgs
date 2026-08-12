@@ -190,10 +190,10 @@ jobs:
           fetch-depth: 0
 
       - name: Run Omen
-        uses: panbanda/omen@omen-v4.24.1
+        uses: panbanda/omen@omen-v4.28.0
         id: omen
         with:
-          version: "4.24.1"
+          version: "4.28.0"
           comment: false
           label: false
           check: false

@@ -36,8 +36,8 @@ pub fn effective_thinking_enabled(
     }
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
 

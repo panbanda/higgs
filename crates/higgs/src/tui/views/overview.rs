@@ -345,8 +345,8 @@ pub fn draw(frame: &mut Frame, area: Rect, metrics: &Arc<MetricsStore>, scroll: 
     draw_live_log(frame, chunks[3], &snap, scroll);
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};

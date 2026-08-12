@@ -215,8 +215,8 @@ impl StreamingReasoningTracker {
     }
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, clippy::shadow_unrelated)]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -344,7 +344,7 @@ mod tests {
         );
     }
 
-    /// When `</think>` is emitted twice (e.g. from a thinking budget bug),
+    /// When `</think>` is emitted twice (e.g. when budget enforcement misfires),
     /// the second `</think>` must NOT leak into visible output.
     #[test]
     fn streaming_tracker_double_close_does_not_leak() {
@@ -352,7 +352,7 @@ mod tests {
 
         // First close — legitimate end of thinking
         let (vis1, _reas1) = tracker.process("reasoning</think>");
-        // Second close — erroneous duplicate (from budget enforcement bug)
+        // Second close — erroneous duplicate (from budget enforcement misfiring)
         let (vis2, _reas2) = tracker.process("</think>answer");
         let (vis3, _reas3) = tracker.flush();
         let total_visible = format!("{vis1}{vis2}{vis3}");

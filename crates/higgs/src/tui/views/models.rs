@@ -141,8 +141,8 @@ pub fn draw(
     super::render_scrollbar(frame, area, total, scroll);
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};

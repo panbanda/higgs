@@ -1013,8 +1013,8 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<Model, ModelError> {
     Ok(model)
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
 

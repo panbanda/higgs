@@ -58,13 +58,13 @@ impl Engine {
         }
     }
 
-    #[cfg_attr(test, allow(clippy::panic))]
+    #[cfg_attr(test, allow(clippy::unreachable))]
     pub fn tokenizer(&self) -> &Tokenizer {
         match self {
             Self::Simple(e) => e.tokenizer(),
             Self::Batch(e) => e.tokenizer(),
             #[cfg(test)]
-            Self::Stub(_) => panic!("Engine::test_stub has no tokenizer"),
+            Self::Stub(_) => unreachable!("Engine::test_stub has no tokenizer"),
         }
     }
 

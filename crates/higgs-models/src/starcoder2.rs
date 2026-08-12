@@ -668,8 +668,8 @@ pub fn load_starcoder2_model<P: AsRef<Path>>(
     Ok(model)
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
 

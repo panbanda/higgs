@@ -323,7 +323,6 @@ impl PagedKvCache {
     }
 }
 
-#[cfg(test)]
 #[allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -333,6 +332,7 @@ impl PagedKvCache {
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
+#[cfg(test)]
 mod tests {
     use super::*;
 

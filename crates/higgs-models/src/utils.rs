@@ -11,7 +11,7 @@ use crate::cache::{KeyValueCache, KvCacheView};
 /// Apply `RoPE` directly without the 3D reshape in `nn::Rope::forward`.
 ///
 /// The mlx-rs `Rope` wrapper reshapes to 3D before calling `mlx_fast_rope`,
-/// which triggers a bug in MLX where batch elements beyond the first are
+/// which triggers a known MLX issue where batch elements beyond the first are
 /// zeroed when `seq_len=1`. Calling `mlx_fast_rope` on the original shape avoids this.
 pub(crate) fn apply_rope(x: &Array, rope: &nn::Rope, offset: i32) -> Result<Array, Exception> {
     mlx_rs::fast::rope(
@@ -200,7 +200,6 @@ pub(crate) fn create_batched_decode_mask(
     mask.reshape(&[n, 1, 1, max_kv_len])
 }
 
-#[cfg(test)]
 #[allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -219,6 +218,7 @@ pub(crate) fn create_batched_decode_mask(
     clippy::cast_lossless,
     clippy::doc_markdown
 )]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{

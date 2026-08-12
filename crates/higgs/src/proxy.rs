@@ -276,8 +276,8 @@ pub fn extract_usage(body: &[u8]) -> (u64, u64) {
     (input, output)
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+#[cfg(test)]
 mod tests {
     use super::*;
 

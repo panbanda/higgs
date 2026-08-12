@@ -275,7 +275,6 @@ impl MetricsStore {
     }
 }
 
-#[cfg(test)]
 #[allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -283,6 +282,7 @@ impl MetricsStore {
     clippy::expect_used,
     clippy::unchecked_time_subtraction
 )]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;

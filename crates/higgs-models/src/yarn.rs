@@ -152,7 +152,6 @@ pub(crate) fn apply_yarn_rope(
     )
 }
 
-#[cfg(test)]
 #[allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -164,6 +163,7 @@ pub(crate) fn apply_yarn_rope(
     clippy::cast_sign_loss,
     clippy::cast_lossless
 )]
+#[cfg(test)]
 mod tests {
     use super::*;
     use mlx_rs::random;

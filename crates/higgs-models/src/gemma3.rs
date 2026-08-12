@@ -770,7 +770,7 @@ pub fn load_gemma3_model_args<P: AsRef<Path>>(model_dir: P) -> Result<Gemma3Mode
     let raw: serde_json::Value = serde_json::from_str(&text)?;
 
     // Detect wrapping: if a `text_config` object exists, deserialize from it
-    // and fill in `model_type` from the top level when absent.
+    // and take `model_type` from the top level when absent.
     let top: Gemma3TopLevel = serde_json::from_str(&text)?;
 
     let mut args: Gemma3ModelArgs = if let Some(inner) = top.text_config {
@@ -896,7 +896,6 @@ fn apply_rmsnorm_plus_one(model: &mut Gemma3CausalLM) -> Result<(), Exception> {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
 #[allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -915,6 +914,7 @@ fn apply_rmsnorm_plus_one(model: &mut Gemma3CausalLM) -> Result<(), Exception> {
     clippy::cast_lossless,
     clippy::doc_markdown
 )]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::cache::SteppingKeyValueCache;

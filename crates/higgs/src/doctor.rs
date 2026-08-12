@@ -537,8 +537,8 @@ fn check_orphaned_providers(config: &HiggsConfig, result: &mut DoctorResult) {
     }
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{

@@ -940,8 +940,8 @@ fn current_unix_timestamp() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
 

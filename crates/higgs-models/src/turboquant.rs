@@ -1480,7 +1480,6 @@ pub(crate) fn pack_indices_gpu(
     result
 }
 
-#[cfg(test)]
 #[allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -1488,6 +1487,7 @@ pub(crate) fn pack_indices_gpu(
     clippy::float_cmp,
     clippy::cast_precision_loss
 )]
+#[cfg(test)]
 mod tests {
     use super::*;
     use rand::SeedableRng;

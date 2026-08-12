@@ -949,8 +949,8 @@ fn materialize_decode_step(
     finished || disconnected
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+#[cfg(test)]
 mod tests {
     use super::*;
 

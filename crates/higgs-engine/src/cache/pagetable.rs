@@ -52,7 +52,6 @@ impl PageTable {
     }
 }
 
-#[cfg(test)]
 #[allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -88,6 +87,7 @@ impl PageTable {
     clippy::if_then_some_else_none,
     clippy::redundant_type_annotations
 )]
+#[cfg(test)]
 mod tests {
     use super::*;
 

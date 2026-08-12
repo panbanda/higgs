@@ -254,7 +254,7 @@ pub struct SimpleEngine {
     /// Whether to enable thinking mode (Qwen3.5 `<think>` tags).
     enable_thinking: bool,
     /// Token ID for `</think>`, resolved from the tokenizer at load time.
-    /// `None` if the tokenizer doesn't know this token (thinking will be disabled).
+    /// `None` if the tokenizer doesn't know this token (thinking is unavailable).
     think_close_token: Option<u32>,
     /// Number of trailing tokens added by `add_generation_prompt=true`.
     /// Stripped from the prefix cache key so that multi-turn conversations
@@ -2931,8 +2931,8 @@ fn chat_template_mentions_enable_thinking(model_dir: &Path) -> bool {
     false
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::{
         IncrementalDetok, Tokenizer, adaptive_draft_depth_for_cap, check_stop_sequences,

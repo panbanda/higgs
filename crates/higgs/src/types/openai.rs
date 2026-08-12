@@ -426,8 +426,8 @@ pub struct EmbeddingUsage {
     pub total_tokens: u32,
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+#[cfg(test)]
 mod tests {
     use super::*;
 

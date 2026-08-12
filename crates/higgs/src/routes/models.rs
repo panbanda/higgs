@@ -28,8 +28,8 @@ fn model_objects_sorted<'a>(names: impl Iterator<Item = &'a str>) -> Vec<ModelOb
         .collect()
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
 

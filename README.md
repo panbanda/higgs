@@ -4,6 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/panbanda/higgs)](https://github.com/panbanda/higgs/releases)
 [![Crates.io](https://img.shields.io/crates/v/higgs)](https://crates.io/crates/higgs)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#license)
+[![Omen Score](https://img.shields.io/badge/omen%20score-89.6%20(B)-green)](https://github.com/panbanda/omen)
 
 Run open-weight MLX models locally on Apple Silicon, route requests across local and remote providers, and expose everything through one endpoint.
 

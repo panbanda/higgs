@@ -218,8 +218,8 @@ fn draw_bottom_panels(frame: &mut Frame, area: Rect, config: &TuiConfig, sidebar
     frame.render_widget(providers_list, cols[1]);
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::tui::{TuiAutoRouter, TuiConfig, TuiRoute};

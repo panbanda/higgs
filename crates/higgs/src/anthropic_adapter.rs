@@ -57,8 +57,8 @@ pub fn anthropic_messages_to_engine(
     result
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::anthropic::ContentBlock;

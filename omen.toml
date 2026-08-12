@@ -1,36 +1,28 @@
-exclude_patterns = [
+exclude = [
   "target/**",
   "*.lock",
   ".github/**",
   "docs/**",
+  # Integration tests and benches idiomatically use unwrap()/panic! (the same
+  # code clippy's unwrap_used allow covers); score shipped code only.
+  "crates/*/tests/**",
+  "crates/*/benches/**",
 ]
 
 [complexity]
-cyclomatic_warn = 10
 cyclomatic_error = 20
-cognitive_warn = 15
 cognitive_error = 30
-max_nesting = 5
 
 [churn]
-period = "6m"
+since = "6m"
 top = 20
 
 [duplicates]
 min_tokens = 50
-similarity_threshold = 0.85
+min_similarity = 0.85
 
 [hotspot]
 top = 20
 
 [score]
 fail_under = 85
-
-[score.thresholds]
-complexity = 80.0
-duplication = 65.0
-satd = 75.0
-tdg = 80.0
-coupling = 70.0
-smells = 85.0
-cohesion = 75.0

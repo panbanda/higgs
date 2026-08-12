@@ -121,8 +121,8 @@ fn hf_cache_from_env(
     None
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -1015,8 +1015,8 @@ fn copy_optional_field(source: &serde_json::Value, target: &mut serde_json::Valu
     }
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+#[cfg(test)]
 mod tests {
     use super::*;
 

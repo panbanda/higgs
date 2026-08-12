@@ -83,8 +83,8 @@ pub fn render_scrollbar(frame: &mut Frame, area: Rect, total_rows: usize, scroll
     }
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -49,8 +49,8 @@ pub fn is_supported(model_type: &str) -> bool {
     )
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
 

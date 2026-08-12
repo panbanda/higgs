@@ -160,8 +160,8 @@ async fn rate_limit_middleware(
     }
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod cors_tests {
     use super::build_cors_layer;
 

@@ -310,8 +310,8 @@ impl PrefixCache {
     }
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use higgs_models::AnyCache;

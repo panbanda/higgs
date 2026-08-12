@@ -1544,8 +1544,8 @@ fn remap_quantized_key(key: &str) -> Option<String> {
     }
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::cache::KeyValueCache;
@@ -2052,7 +2052,7 @@ mod tests {
         mlx_rs::transforms::eval([&result]).unwrap();
         let vals = result.as_slice::<f32>();
         // token 0 (positive, seen): 4.0 / 2.0 = 2.0
-        // token 1 (positive, unseen): 2.0 (unchanged)
+        // token 1 (positive, unseen): stays 2.0
         // token 2 (positive, seen): 6.0 / 2.0 = 3.0
         assert!((vals[0] - 2.0).abs() < 1e-5);
         assert!((vals[1] - 2.0).abs() < 1e-5);
@@ -2070,7 +2070,7 @@ mod tests {
         mlx_rs::transforms::eval([&result]).unwrap();
         let vals = result.as_slice::<f32>();
         // token 0 (negative, seen): -4.0 * 2.0 = -8.0 (more negative = less likely)
-        // token 1 (positive, unseen): 2.0 (unchanged)
+        // token 1 (positive, unseen): stays 2.0
         // token 2 (negative, seen): -6.0 * 2.0 = -12.0 (more negative = less likely)
         assert!((vals[0] - (-8.0)).abs() < 1e-5);
         assert!((vals[1] - 2.0).abs() < 1e-5);
@@ -2088,7 +2088,7 @@ mod tests {
         let result = apply_penalties(&logits, &[1, 1, 2], &p).unwrap();
         mlx_rs::transforms::eval([&result]).unwrap();
         let vals = result.as_slice::<f32>();
-        // token 0: 4.0 (unchanged)
+        // token 0: stays 4.0
         // token 1: 2.0 - 1.0*2 = 0.0
         // token 2: 6.0 - 1.0*1 = 5.0
         assert!((vals[0] - 4.0).abs() < 1e-5);
@@ -2107,7 +2107,7 @@ mod tests {
         mlx_rs::transforms::eval([&result]).unwrap();
         let vals = result.as_slice::<f32>();
         // token 0: 4.0 - 1.5 = 2.5
-        // token 1: 2.0 (unchanged)
+        // token 1: stays 2.0
         // token 2: 6.0 - 1.5 = 4.5
         assert!((vals[0] - 2.5).abs() < 1e-5);
         assert!((vals[1] - 2.0).abs() < 1e-5);

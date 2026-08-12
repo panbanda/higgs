@@ -633,7 +633,7 @@ impl DeepSeekV2MlpBlock {
 
         // Scale scores
         let scaled_scores = if (self.scaling_factor - 1.0).abs() > f32::EPSILON {
-            // Preserve top_scores dtype; same fp16->f32 promotion bug as apply_deepseek_rope.
+            // Preserve top_scores dtype; same fp16->f32 promotion quirk as apply_deepseek_rope.
             let scalar = Array::from_f32(self.scaling_factor).as_dtype(top_scores.dtype())?;
             top_scores.multiply(&scalar)?
         } else {
@@ -912,8 +912,8 @@ pub fn load_deepseek_v2_model<P: AsRef<Path>>(
     Ok(model)
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
 

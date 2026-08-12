@@ -690,8 +690,8 @@ pub async fn await_shutdown_signal() {
     }
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, unsafe_code)]
+#[cfg(test)]
 mod tests {
     use super::*;
 

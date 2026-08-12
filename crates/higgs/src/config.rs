@@ -185,7 +185,7 @@ pub struct ServeArgs {
     #[arg(long)]
     pub api_key: Option<String>,
 
-    /// Rate limit (requests per minute per client, 0 = disabled).
+    /// Rate limit (requests per minute per client, 0 turns it off).
     #[arg(long)]
     pub rate_limit: Option<u32>,
 
@@ -1045,8 +1045,8 @@ pub type ServerConfig = ServerSection;
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
 
