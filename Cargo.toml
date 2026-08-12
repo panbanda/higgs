@@ -136,7 +136,7 @@ criterion = { version = "0.8", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 # Encoding
-base64 = "0.22"
+base64 = "0.23"
 
 # Utilities
 uuid = { version = "1.23", features = ["v4"] }
