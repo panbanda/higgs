@@ -66,8 +66,10 @@ download_model() {
     if [[ -d "$model_dir" ]] && [[ -n "$(find "$model_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
         return
     fi
-    if command -v huggingface-cli >/dev/null 2>&1; then tool="huggingface-cli"; elif command -v hf >/dev/null 2>&1; then tool="hf"; else
-        echo "missing model download tool: install huggingface-cli or hf" >&2
+    # Prefer hf: huggingface-cli is deprecated and newer installs ship a stub
+    # that exits with an error telling you to use hf.
+    if command -v hf >/dev/null 2>&1; then tool="hf"; elif command -v huggingface-cli >/dev/null 2>&1; then tool="huggingface-cli"; else
+        echo "missing model download tool: install hf (huggingface_hub)" >&2
         exit 1
     fi
     mkdir -p "$model_dir"
