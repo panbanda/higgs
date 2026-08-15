@@ -29,7 +29,14 @@ impl TensorQuant {
 ///
 /// Scalar `group_size` and `bits` entries specify the fallback. Any other
 /// key is a checkpoint tensor path and either overrides that fallback or is
-/// `false` when the tensor is stored densely.
+/// `false` when the tensor is stored densely. An object entry (explicit
+/// `{"group_size": ..., "bits": ...}`) whose values exactly equal the
+/// scalar fallback is treated as a no-op, identically to `true` — `mlx_lm`'s
+/// converter can emit a *complete* per-tensor map where every path is
+/// listed explicitly, even when most of them just restate the default it
+/// was quantized with, and an architecture that never threads a given path
+/// through per-tensor resolution shouldn't have to "support" an override
+/// that resolves to the same thing either way.
 ///
 /// Routed `MoE` expert weights are stored as one stacked tensor per projection
 /// and dispatched through a fused gather kernel. Consequently, all experts in
@@ -77,6 +84,11 @@ impl QuantizationSettings {
     /// Explicit per-tensor overrides from the checkpoint config.
     pub fn overridden_paths(&self) -> impl Iterator<Item = &str> {
         self.tensors.keys().map(String::as_str)
+    }
+
+    /// Whether `path` carries an explicit, non-default-equal override.
+    pub fn is_overridden(&self, path: &str) -> bool {
+        self.tensors.contains_key(path)
     }
 
     /// Resolve a fused tensor group, rejecting mixed storage formats.
@@ -178,6 +190,16 @@ impl<'de> Deserialize<'de> for QuantizationSettings {
                                 "quantization.{path}.bits must be an i32"
                             ))
                         })?;
+                    if tensor_group_size == group_size && tensor_bits == bits {
+                        // An object entry that merely restates the scalar
+                        // default is semantically identical to `true` (see
+                        // above): mlx_lm.convert's quant_predicate can emit
+                        // a *complete* per-tensor map where most entries
+                        // just echo the defaults it was called with, and an
+                        // architecture that never threads that particular
+                        // path shouldn't have to "support" a no-op.
+                        continue;
+                    }
                     TensorQuant::Quantized {
                         group_size: tensor_group_size,
                         bits: tensor_bits,
@@ -364,6 +386,78 @@ mod tests {
 
         let consumed: HashSet<String> = std::iter::once("lm_head".to_owned()).collect();
         assert!(settings.assert_all_overrides_consumed(&consumed).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn default_equal_object_entries_are_excluded_from_overridden_paths()
+    -> Result<(), serde_json::Error> {
+        // mlx_lm.convert can emit a *complete* per-tensor map (every path
+        // listed explicitly) where most entries just restate the scalar
+        // default as an object rather than `true`. Those must be treated
+        // as no-ops exactly like `true`, alongside a genuinely differing
+        // override on a supported path.
+        let settings: QuantizationSettings = serde_json::from_str(
+            r#"{
+                "group_size": 64,
+                "bits": 6,
+                "model.layers.0.self_attn.o_proj": {"group_size": 64, "bits": 6},
+                "model.embed_tokens": {"group_size": 64, "bits": 6},
+                "model.layers.1.mlp.experts.0.gate_proj": {"group_size": 64, "bits": 4}
+            }"#,
+        )?;
+
+        assert_eq!(
+            settings.overridden_paths().collect::<Vec<_>>(),
+            ["model.layers.1.mlp.experts.0.gate_proj"],
+            "object entries equal to the scalar default must not count as overrides"
+        );
+        assert_eq!(
+            settings.resolve("model.layers.0.self_attn.o_proj"),
+            TensorQuant::Quantized {
+                group_size: 64,
+                bits: 6
+            },
+            "resolve() must still return the same value whether or not the \
+             entry was recorded as an override"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn default_equal_entry_for_unsupported_path_does_not_trip_assert_all_overrides_consumed()
+    -> Result<(), serde_json::Error> {
+        // (c) An architecture that never threads self_attn.o_proj through
+        // per-tensor resolution must still accept a config where that path
+        // is explicitly set to exactly the scalar default -- it's a no-op,
+        // not an unsupported override.
+        let settings: QuantizationSettings = serde_json::from_str(
+            r#"{"group_size": 64, "bits": 6, "model.layers.0.self_attn.o_proj": {"group_size": 64, "bits": 6}}"#,
+        )?;
+
+        assert!(
+            settings
+                .assert_all_overrides_consumed(&HashSet::new())
+                .is_ok()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn differing_entry_for_unsupported_path_still_rejected() -> Result<(), serde_json::Error> {
+        // (b) A genuinely differing override on a path the architecture
+        // never threads through per-tensor resolution must still be
+        // rejected loudly, naming the tensor -- only default-equal entries
+        // are treated as no-ops.
+        let settings: QuantizationSettings = serde_json::from_str(
+            r#"{"group_size": 64, "bits": 6, "model.layers.0.self_attn.o_proj": {"group_size": 64, "bits": 4}}"#,
+        )?;
+
+        let err = settings
+            .assert_all_overrides_consumed(&HashSet::new())
+            .err()
+            .ok_or_else(|| serde_json::Error::io(std::io::Error::other("expected an error")))?;
+        assert!(err.contains("model.layers.0.self_attn.o_proj"));
         Ok(())
     }
 }
