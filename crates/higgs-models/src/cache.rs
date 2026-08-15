@@ -23,8 +23,11 @@ static MLA_LATENT_CACHE_ENABLED: OnceLock<bool> = OnceLock::new();
 const DEFAULT_MLA_LATENT_CACHE_ENABLED: bool = false;
 
 fn parse_mla_latent_cache_enabled(raw: Option<&str>) -> bool {
-    raw.and_then(|value| value.parse::<bool>().ok())
-        .unwrap_or(DEFAULT_MLA_LATENT_CACHE_ENABLED)
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("1" | "true" | "on" | "yes") => true,
+        Some("0" | "false" | "off" | "no") => false,
+        _ => DEFAULT_MLA_LATENT_CACHE_ENABLED,
+    }
 }
 
 /// Whether `DeepSeek` MLA caches should store compressed latent rows.
@@ -1800,6 +1803,16 @@ mod tests {
         );
         assert_eq!(parse_turboquant_activate_at(Some("-5")), 0);
         assert_eq!(parse_turboquant_activate_at(Some("8192")), 8192);
+    }
+
+    #[test]
+    fn parse_mla_latent_cache_enabled_accepts_common_flag_values() {
+        assert!(parse_mla_latent_cache_enabled(Some("1")));
+        assert!(!parse_mla_latent_cache_enabled(Some("0")));
+        assert!(parse_mla_latent_cache_enabled(Some("on")));
+        assert!(parse_mla_latent_cache_enabled(Some("TRUE")));
+        assert!(!parse_mla_latent_cache_enabled(Some("no")));
+        assert!(!parse_mla_latent_cache_enabled(Some("garbage")));
     }
 
     #[test]
