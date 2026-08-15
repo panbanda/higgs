@@ -3,7 +3,10 @@
 set -euo pipefail
 
 run_side() {
-    local side="$1" bin_dir="$2" port="$3" pid="" log_file="$OUT_DIR/raw/$side-server.log"
+    # Separate declarations: macOS bash 3.2 + set -u rejects a `local` line
+    # whose later assignments expand variables assigned earlier in that line.
+    local side="$1" bin_dir="$2" port="$3" pid=""
+    local log_file="$OUT_DIR/raw/$side-server.log"
     local deadline ready=0 health_status
 
     cleanup_server() {
