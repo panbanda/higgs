@@ -109,25 +109,31 @@ per-channel quantization error.
 ```
 python3 make_recipe.py \
   --imatrix imatrix.json \
-  --target-avg-bits 3.75 \
+  --granularity layer \
+  --target-effective-bpw 4.45 \
   --expert-bits-low 3 --expert-bits-high 4 \
   --other-bits 6 \
   --group-size 64 \
   --out recipe.json
 ```
 
-Routed expert projections default to `--expert-bits-low`, except the
-most-frequently-routed experts in each layer (by `expert_topk_freq`),
-which get `--expert-bits-high`. Everything else -- attention, shared
+`--granularity layer` is the default and the one that reflects real
+output bytes (see "Known granularity limitation" below for why). Each
+MoE layer's *entire* fused `switch_mlp.{gate,up,down}_proj` tensor gets
+one bit width: `--expert-bits-high` by default, dropped to
+`--expert-bits-low` for the least-salient layers -- ranked ascending by
+`input_sq_mean`, ties toward keeping more layers at full precision --
+until the projected whole-model parameter-weighted **effective** bits per
+weight (`bits + 2*16/group_size`, i.e. including the fp16 scale + fp16
+zero-point every quantization group carries) drops to
+`<= --target-effective-bpw`. Everything else -- attention, shared
 experts, embeddings, lm_head -- gets `--other-bits` via the recipe's
 `"default"` bucket (router gate weights are never quantized by mlx_lm in
 the first place: `MoEGate` stores its weight as a plain `mx.array`, not an
 `nn.Linear`, so it has no `to_quantized` method and `nn.quantize` skips it
 automatically).
 
-The fraction of "high" experts per layer is solved so the
-**parameter-weighted** average bits across the whole model is
-`<= target-avg-bits`. Per-tensor parameter counts are estimated from
+Per-tensor parameter counts feeding that projection are estimated from
 `config.json` dims rather than read from actual safetensors (acceptable
 per the ds4 P2 spec); see the docstrings on `expert_param_count`,
 `attention_param_count`, `dense_mlp_param_count`, and
@@ -137,25 +143,54 @@ per the ds4 P2 spec); see the docstrings on `expert_param_count`,
 `3 * hidden_size * moe_intermediate_size` per expert for
 `gate_proj + up_proj + down_proj`).
 
-Output (`recipe.json`):
+The default `--target-effective-bpw 4.45` was chosen to sit safely under
+uniform 4-bit group_size=64's 4.5 effective bpw (`4 + 32/64`), so an
+asymmetric checkpoint built this way should come out no larger than a
+plain uniform-4-bit conversion. Measured on DeepSeek-Coder-V2-Lite: with
+`--expert-bits-low 3 --expert-bits-high 4 --other-bits 6 --group-size 64`,
+the solver picked 7 of 26 MoE layers for 3-bit (projected effective bpw
+4.42), and a real `convert_with_recipe.py` run against the bf16 source
+produced safetensors totaling 8,682,671,902 bytes versus
+8,840,088,702 bytes for the cached uniform-4-bit
+`mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx` checkpoint --
+about 1.8% smaller, despite `--other-bits 6` spending considerably more
+than the baseline's 4-bit on attention/embeddings/lm_head, because those
+tensors are a small (~8%) share of total parameters. If a given
+model/target combination doesn't leave enough room (e.g. `--other-bits`
+set very high on a model with unusually large non-expert parameter
+share), `make_recipe.py` prints a warning when even flipping every MoE
+layer to `--expert-bits-low` can't reach the target; lower `--other-bits`,
+lower `--expert-bits-low`, or raise `--target-effective-bpw` and treat the
+result as informational only, verifying actual bytes with a real
+conversion before trusting it.
+
+Output (`recipe.json`, layer granularity):
 
 ```json
 {
   "default": {"group_size": 64, "bits": 6},
   "rules": [
-    {"path": "model.layers.1.mlp.experts.0.gate_proj", "group_size": 64, "bits": 4},
-    {"path": "model.layers.1.mlp.experts.0.up_proj", "group_size": 64, "bits": 4},
-    {"path": "model.layers.1.mlp.experts.0.down_proj", "group_size": 64, "bits": 4},
+    {"path": "model.layers.1.mlp.switch_mlp.gate_proj", "group_size": 64, "bits": 3},
+    {"path": "model.layers.1.mlp.switch_mlp.up_proj", "group_size": 64, "bits": 3},
+    {"path": "model.layers.1.mlp.switch_mlp.down_proj", "group_size": 64, "bits": 3},
     ...
   ]
 }
 ```
 
-Tensor paths use higgs's own per-expert convention
-(`model.layers.N.mlp.experts.M.{gate,up,down}_proj`) -- the same one
-`crates/higgs-models/src/deepseek_v2.rs` constructs when resolving
-per-tensor overrides, and the same one exercised by
-`crates/higgs-models/tests/fixtures/mixed_quant_config.json`.
+Rules target mlx_lm's real fused tensor paths directly, so
+`convert_with_recipe.py` applies them with no collapsing.
+
+**`--granularity expert` (secondary mode).** `make_recipe.py` can also
+emit rules at true per-expert granularity
+(`model.layers.N.mlp.experts.M.{gate,up,down}_proj` -- higgs's own
+per-tensor loader convention, the same one `crates/higgs-models/src/
+deepseek_v2.rs` constructs when resolving per-tensor overrides and the
+same one exercised by `crates/higgs-models/tests/fixtures/
+mixed_quant_config.json`), solved via `--target-avg-bits` (a raw,
+group-overhead-free parameter-weighted average). This mode exists as the
+more expressive artifact for a future unfused conversion path, but it
+does **not** reflect real output bytes today:
 
 **Known granularity limitation.** mlx_lm's DeepSeek-V2 implementation
 stores all routed experts for one layer/projection as a single *fused*
@@ -168,14 +203,17 @@ mlx 0.32 and the cached
 per-expert ones), there is **no supported way to apply two different bit
 widths within one fused tensor at conversion time** -- `quant_predicate`
 sees one path per layer/projection covering all 64 experts, not one path
-per expert. `recipe.json` is still generated at true per-expert
-granularity because that's the more useful long-term artifact (it matches
-higgs's own loader convention and documents the intended salience-guided
-split precisely), but `convert_with_recipe.py` has to *collapse* per-expert
-rules into one per-layer decision before handing them to
-`mlx_lm.convert` -- see its docstring. If a future mlx_lm version (or a
-custom unfused conversion path) exposes per-expert leaf modules, the
-collapse step becomes unnecessary and `recipe.json` can be applied as-is.
+per expert. An `expert`-granularity `recipe.json` still resolves rules at
+that finer level, but `convert_with_recipe.py` has to *collapse* them into
+one per-layer majority-vote decision before handing them to
+`mlx_lm.convert` -- which means the byte budget the `expert`-granularity
+solve targets is not the budget a real conversion run actually produces.
+That mismatch is exactly what motivated adding `--granularity layer`:
+solving directly at the granularity mlx_lm.convert can deliver, so the
+projected size and the real output size agree. If a future mlx_lm version
+(or a custom unfused conversion path) exposes per-expert leaf modules, the
+collapse step becomes unnecessary and an `expert`-granularity recipe can
+be applied as-is.
 
 ### 3. Convert
 
@@ -188,12 +226,15 @@ python3 convert_with_recipe.py \
 
 Calls `mlx_lm.convert(..., quantize=True, q_group_size=<default group_size>,
 q_bits=<default bits>, quant_predicate=<fn>)`. The predicate returns the
-recipe's exact `{group_size, bits}` dict for tensors it has a rule for
-(non-MoE tensors match directly; fused `switch_mlp.*` tensors get the
-majority-vote collapse described above, ties broken toward the higher bit
-width), and falls back to `True` (the scalar defaults) for everything else.
-Prints a summary of tensor counts per bits bucket and an (unweighted)
-average bits estimate afterward.
+recipe's exact `{group_size, bits}` dict for tensors it has a rule for --
+for a `layer`-granularity recipe this is always a direct path match
+(including fused `switch_mlp.*` tensors, since those rules target the
+fused path directly); for an `expert`-granularity recipe, fused
+`switch_mlp.*` tensors fall through to the majority-vote collapse
+described above, ties broken toward the higher bit width -- and falls
+back to `True` (the scalar defaults) for everything else. Prints a
+summary of tensor counts per bits bucket and an (unweighted) average bits
+estimate afterward.
 
 Pass `--dry-run` to see the predicate's decisions (and the collapse count)
 without downloading or converting anything -- note this only reports
