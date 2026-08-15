@@ -55,6 +55,8 @@ run_side() {
 
     "$bin_dir/bench_decode" --host 127.0.0.1 --port "$port" --model "$MODEL_KEY" \
         --manifest "$REPO_ROOT/benchmarks/models.toml" --warmup 1 --trials "$RUNS" --format json \
+        --prompt "Write a detailed essay about the history of computing, covering mechanical calculators, vacuum tubes, transistors, integrated circuits, microprocessors, and modern GPUs. Be thorough and do not stop early." \
+        --max-tokens 512 --temperature 0.0 \
         >"$OUT_DIR/raw/$side.json"
 }
 

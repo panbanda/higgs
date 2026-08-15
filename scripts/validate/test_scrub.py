@@ -2,11 +2,35 @@
 """Unit tests for validation report PII scrubbing."""
 
 import unittest
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 
 from scrub import scrub
 
 
 class ScrubTests(unittest.TestCase):
+    def test_report_rejects_trials_that_finish_too_early(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            raw = out_dir / "raw"
+            raw.mkdir()
+            payload = {"results": {"trials": [{"decode_tokps": 100.0, "tokens_after_first": 1}]}}
+            for side in ("baseline", "candidate"):
+                (raw / f"{side}.json").write_text(json.dumps(payload))
+
+            result = subprocess.run(
+                [sys.executable, "report.py", "--out-dir", str(out_dir), "--pr-id", "test"],
+                cwd=Path(__file__).parent,
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("workload finished too early to measure decode throughput", result.stderr)
+
     def test_redacts_paths_users_hosts_network_and_secrets(self):
         source = """
 path=/Users/alice/project /home/bob/work

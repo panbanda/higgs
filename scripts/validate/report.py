@@ -12,7 +12,14 @@ from scrub import scrub
 
 def values_for(path):
     payload = json.loads(path.read_text())
-    return [float(trial["decode_tokps"]) for trial in payload["results"]["trials"]]
+    trials = payload["results"]["trials"]
+    for index, trial in enumerate(trials, 1):
+        if trial["tokens_after_first"] < 64:
+            raise ValueError(
+                f"{path} trial {index}: workload finished too early to measure decode throughput "
+                f"(tokens_after_first={trial['tokens_after_first']}, minimum=64)"
+            )
+    return [float(trial["decode_tokps"]) for trial in trials]
 
 
 def stats(values):
@@ -31,8 +38,11 @@ def main():
     parser.add_argument("--threshold", type=float, default=-5.0, help="minimum acceptable median delta percent")
     args = parser.parse_args()
     raw = args.out_dir / "raw"
-    baseline = values_for(raw / "baseline.json")
-    candidate = values_for(raw / "candidate.json")
+    try:
+        baseline = values_for(raw / "baseline.json")
+        candidate = values_for(raw / "candidate.json")
+    except ValueError as error:
+        raise SystemExit(error)
     base_stats, candidate_stats = stats(baseline), stats(candidate)
     delta = (candidate_stats["median"] / base_stats["median"] - 1.0) * 100.0
     verdict = "PASS" if delta >= args.threshold else "FAIL"

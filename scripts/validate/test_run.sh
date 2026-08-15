@@ -32,5 +32,7 @@ grep -Fq 'SERVER_PIDS=' "$SMOKE_SUITE"
 grep -Fq 'http://127.0.0.1:$port/health' "$SMOKE_SUITE"
 grep -Fq 'sleep 2' "$SMOKE_SUITE"
 grep -Fq '300' "$SMOKE_SUITE"
+grep -Fq -- '--prompt "Write a detailed essay about the history of computing' "$SMOKE_SUITE"
+grep -Fq -- '--max-tokens 512 --temperature 0.0' "$SMOKE_SUITE"
 
 echo "validation runner regression checks passed"

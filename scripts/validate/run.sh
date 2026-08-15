@@ -25,7 +25,7 @@ import json
 import sys
 for path, values in zip(sys.argv[1:3], ([100.0, 101.0], [102.0, 103.0])):
     with open(path, "w") as handle:
-        json.dump({"results": {"trials": [{"decode_tokps": value} for value in values]}}, handle)
+        json.dump({"results": {"trials": [{"decode_tokps": value, "tokens_after_first": 64} for value in values]}}, handle)
 with open(sys.argv[3], "w") as handle:
     json.dump({"machine": "/Users/alice@buildbox.local 192.168.1.5", "token": "ghp_abcdefghijklmnopqrstuvwxyz123456"}, handle)
 PY
