@@ -38,7 +38,14 @@ set +e
 status=$?
 set -e
 
-if [ "$status" -ne 0 ]; then
-  printf 'quality gate failed; machine-readable result: %s\n' "$result" >&2
+# Exit code 1 is quality_gate's contract for "ran fine, verdict failed" (see
+# Ok(false) in quality_gate.rs) — result is valid JSON with passed=false, so
+# let run.sh continue to report.py, which renders the FAIL verdict. Any other
+# nonzero status is a real error (bad args, crash) with no reliable JSON on
+# stdout, so that one still aborts the suite.
+if [ "$status" -eq 1 ]; then
+  printf 'quality gate check FAILED (regression detected); see %s for details\n' "$result" >&2
+elif [ "$status" -ne 0 ]; then
+  printf 'quality gate check errored (exit %s); machine-readable result: %s\n' "$status" "$result" >&2
   exit "$status"
 fi

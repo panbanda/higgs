@@ -80,6 +80,7 @@ build_ref() {
     local build_dir="$BUILD_CACHE/$sha"
     local shared_target_dir="$CACHE_ROOT/target"
     local metallib_path
+    local build_marker=""
     if [[ "$sha" != "$CANDIDATE_SHA" ]]; then
         source_dir="$WORKTREE_CACHE/$sha"
         if [[ ! -e "$source_dir/.git" ]]; then
@@ -88,6 +89,10 @@ build_ref() {
         fi
     fi
     if [[ ! -x "$build_dir/release/higgs" ]] || [[ ! -x "$build_dir/release/bench_decode" ]]; then
+        # Touched before the build starts so we can tell a binary this build
+        # actually produced apart from a stale one left in the shared target
+        # dir by a *different* sha's build (CARGO_TARGET_DIR is shared).
+        build_marker="$(mktemp "${TMPDIR:-/tmp}/higgs-validate-build.XXXXXX")"
         (cd "$source_dir" && CARGO_TARGET_DIR="$shared_target_dir" cargo build --release -p higgs -p higgs-bench)
         mkdir -p "$build_dir/release"
         cp "$shared_target_dir/release/higgs" "$build_dir/release/higgs"
@@ -96,10 +101,14 @@ build_ref() {
     if [[ -f "$shared_target_dir/release/mlx.metallib" ]]; then
         cp "$shared_target_dir/release/mlx.metallib" "$build_dir/release/mlx.metallib"
     fi
-    # quality_gate postdates some baseline SHAs; copy it when the shared build produced one.
-    if [[ -f "$shared_target_dir/release/quality_gate" ]]; then
+    # quality_gate postdates some baseline SHAs; a sha that predates it won't
+    # produce one from the cargo build above, but the shared target dir may
+    # still hold a stale copy from a newer sha's build. Only trust it when
+    # it's newer than our build marker, i.e. this build actually produced it.
+    if [[ -n "${build_marker:-}" ]] && [[ -f "$shared_target_dir/release/quality_gate" ]] && [[ "$shared_target_dir/release/quality_gate" -nt "$build_marker" ]]; then
         cp "$shared_target_dir/release/quality_gate" "$build_dir/release/quality_gate"
     fi
+    [[ -n "${build_marker:-}" ]] && rm -f "$build_marker"
     metallib_path="$(find "$shared_target_dir/release/build" -path "*/mlx-sys-*/out/build/lib/mlx.metallib" -type f -exec ls -t {} + 2>/dev/null | head -n 1 || true)"
     if [[ -z "$metallib_path" ]]; then
         echo "missing mlx.metallib in shared target directory: $shared_target_dir" >&2
