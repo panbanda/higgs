@@ -591,17 +591,24 @@ impl SimpleEngine {
                 match model.make_cache_with_config(self.kv_cache_config) {
                     Ok(prototype) => match store.load_cache(prompt_tokens, &prototype) {
                         Ok(Some((prefix_len, cache))) => {
-                            tracing::debug!(
-                                prefix_len,
-                                total_len = prompt_tokens.len(),
-                                "Disk prefix cache hit"
-                            );
                             let mut pc = self.prefix_cache.lock().map_err(|e| {
                                 EngineError::Generation(format!("Cache lock poisoned: {e}"))
                             })?;
                             pc.store(prompt_tokens.get(..prefix_len).unwrap_or_default(), &cache);
                             prefix_match = pc.find_longest_prefix(prompt_tokens);
                             disk_loaded = prefix_match.is_some();
+                            if let Some(ref matched) = prefix_match {
+                                tracing::info!(
+                                    token_count = matched.prefix_len,
+                                    total_len = prompt_tokens.len(),
+                                    "Disk prefix hit"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    prefix_len,
+                                    "Disk prefix cache entry was not consumable after materialization"
+                                );
+                            }
                         }
                         Ok(None) => {}
                         Err(error) => {

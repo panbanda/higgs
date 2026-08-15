@@ -171,10 +171,15 @@ impl DiskPrefixStore {
         block_size: u32,
         cache: &AnyCache,
     ) -> std::io::Result<()> {
-        let token_count = u32::try_from(tokens.len())
+        let block_size_usize = usize::try_from(block_size)
+            .map_err(|_| std::io::Error::other("block size overflow"))?;
+        if block_size_usize == 0 {
+            return Err(std::io::Error::other("block size must be positive"));
+        }
+        let token_count = u32::try_from(tokens.len() / block_size_usize * block_size_usize)
             .map_err(|_| std::io::Error::other("token count overflow"))?;
         let layers = cache_layers(cache)?;
-        let key = key(tokens, block_size as usize);
+        let key = key(tokens, block_size_usize);
         let path = self.path_for(&key);
         let parent = path
             .parent()
@@ -254,15 +259,7 @@ impl DiskPrefixStore {
             .map_err(|_| std::io::Error::other("block size overflow"))?;
         let token_count = usize::try_from(token_count)
             .map_err(|_| std::io::Error::other("token count overflow"))?;
-        if block_size == 0
-            || token_count > tokens.len()
-            || token_count % block_size != 0
-            || key(&tokens[..token_count], block_size)
-                != path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or_default()
-        {
+        if !Self::matches_request(path, tokens, block_size, token_count) {
             return Ok(None);
         }
         let count = usize::try_from(
@@ -271,6 +268,12 @@ impl DiskPrefixStore {
         .map_err(|_| std::io::Error::other("layer count overflow"))?;
         let configs = prototype_layers(prototype)?;
         if count != configs.len() {
+            tracing::debug!(
+                stored_layers = count,
+                prototype_layers = configs.len(),
+                reason = "cache layer count mismatch",
+                "Disk prefix cache entry rejected"
+            );
             return Ok(None);
         }
         let mut layers = Vec::with_capacity(count);
@@ -300,10 +303,21 @@ impl DiskPrefixStore {
                     )
                     .map_err(mlx_error)?,
                 )),
-                _ => return Ok(None),
+                _ => {
+                    tracing::debug!(
+                        tag = tag[0],
+                        reason = "cache layer layout mismatch",
+                        "Disk prefix cache entry rejected"
+                    );
+                    return Ok(None);
+                }
             });
         }
         if file.read(&mut [0; 1])? != 0 {
+            tracing::debug!(
+                reason = "trailing cache data",
+                "Disk prefix cache entry rejected"
+            );
             return Ok(None);
         }
         match prototype {
@@ -322,6 +336,48 @@ impl DiskPrefixStore {
             AnyCache::Hybrid(_) => Ok(Some((token_count, AnyCache::Hybrid(layers)))),
         }
     }
+
+    fn matches_request(path: &Path, tokens: &[u32], block_size: usize, token_count: usize) -> bool {
+        if block_size == 0 {
+            tracing::debug!(
+                reason = "zero block size",
+                "Disk prefix cache entry rejected"
+            );
+            return false;
+        }
+        if token_count > tokens.len() {
+            tracing::debug!(
+                token_count,
+                prompt_tokens = tokens.len(),
+                reason = "stored prefix is longer than request",
+                "Disk prefix cache entry rejected"
+            );
+            return false;
+        }
+        if token_count % block_size != 0 {
+            tracing::debug!(
+                token_count,
+                block_size,
+                reason = "stored token count is not block-aligned",
+                "Disk prefix cache entry rejected"
+            );
+            return false;
+        }
+        if key(&tokens[..token_count], block_size)
+            != path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+        {
+            tracing::debug!(
+                reason = "prompt token hash mismatch",
+                "Disk prefix cache entry rejected"
+            );
+            return false;
+        }
+        true
+    }
+
     fn read_payload(&self, path: &Path, tokens: &[u32]) -> Option<DensePayload> {
         let mut file = File::open(path).ok()?;
         let mut magic = [0; 4];
@@ -558,21 +614,62 @@ fn read_header<R: Read>(
     identity: &StoreIdentity,
 ) -> std::io::Result<Option<(u32, u32)>> {
     let mut magic = [0; 4];
-    if r.read_exact(&mut magic).is_err() || &magic != MAGIC || read_u32(r) != Some(version) {
+    if r.read_exact(&mut magic).is_err() {
+        tracing::debug!(
+            reason = "truncated header",
+            "Disk prefix cache entry rejected"
+        );
         return Ok(None);
     }
-    if read_string(r).as_deref() != Some(&identity.model_id)
-        || read_string(r).as_deref() != Some(&identity.quant)
-    {
+    if &magic != MAGIC {
+        tracing::debug!(
+            reason = "magic mismatch",
+            "Disk prefix cache entry rejected"
+        );
         return Ok(None);
     }
-    for expected in [
-        &identity.config_hash,
-        &identity.tokenizer_hash,
-        &identity.chat_template_hash,
+    if read_u32(r) != Some(version) {
+        tracing::debug!(
+            reason = "format version mismatch",
+            "Disk prefix cache entry rejected"
+        );
+        return Ok(None);
+    }
+    if read_string(r).as_deref() != Some(&identity.model_id) {
+        tracing::debug!(
+            reason = "StoreIdentity model_id mismatch",
+            "Disk prefix cache entry rejected"
+        );
+        return Ok(None);
+    }
+    if read_string(r).as_deref() != Some(&identity.quant) {
+        tracing::debug!(
+            reason = "StoreIdentity quant mismatch",
+            "Disk prefix cache entry rejected"
+        );
+        return Ok(None);
+    }
+    for (expected, reason) in [
+        (&identity.config_hash, "StoreIdentity config hash mismatch"),
+        (
+            &identity.tokenizer_hash,
+            "StoreIdentity tokenizer hash mismatch",
+        ),
+        (
+            &identity.chat_template_hash,
+            "StoreIdentity chat template hash mismatch",
+        ),
     ] {
         let mut actual = [0; 32];
-        if r.read_exact(&mut actual).is_err() || actual != *expected {
+        if r.read_exact(&mut actual).is_err() {
+            tracing::debug!(
+                reason = "truncated StoreIdentity",
+                "Disk prefix cache entry rejected"
+            );
+            return Ok(None);
+        }
+        if actual != *expected {
+            tracing::debug!(%reason, "Disk prefix cache entry rejected");
             return Ok(None);
         }
     }
@@ -883,7 +980,11 @@ fn touch(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use higgs_models::{AnyCache, cache::SteppingKeyValueCache};
+    use crate::paged_prefix_cache::{DEFAULT_BLOCK_SIZE, PagedPrefixCache};
+    use higgs_models::{
+        AnyCache,
+        cache::{KeyValueCache, SteppingKeyValueCache},
+    };
     use mlx_rs::Array;
     use tempfile::tempdir;
     fn identity() -> StoreIdentity {
@@ -956,6 +1057,41 @@ mod tests {
                 .collect::<Vec<_>>(),
             values.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
         );
+    }
+    #[test]
+    fn restart_restores_an_unaligned_prompt_into_the_paged_prefix_cache() {
+        let dir = tempdir().unwrap();
+        let prompt: Vec<u32> = (0..99).collect();
+        let cache = AnyCache::KV(vec![Some(
+            SteppingKeyValueCache::from_arrays(
+                Array::zeros::<f32>(&[1, 2, 99, 8]).unwrap(),
+                Array::zeros::<f32>(&[1, 2, 99, 8]).unwrap(),
+            )
+            .unwrap(),
+        )]);
+
+        DiskPrefixStore::new(dir.path(), 1024 * 1024, identity())
+            .unwrap()
+            .store_cache(&prompt, u32::try_from(DEFAULT_BLOCK_SIZE).unwrap(), &cache)
+            .unwrap();
+
+        let restarted_store = DiskPrefixStore::new(dir.path(), 1024 * 1024, identity()).unwrap();
+        let prototype = AnyCache::KV(vec![Some(SteppingKeyValueCache::new())]);
+        let Some((prefix_len, restored)) = restarted_store.load_cache(&prompt, &prototype).unwrap()
+        else {
+            panic!("restart should restore the block-aligned prefix");
+        };
+        let mut paged_cache = PagedPrefixCache::new(1, DEFAULT_BLOCK_SIZE);
+        paged_cache.store(&prompt[..prefix_len], &restored);
+        let Some(consumed) = paged_cache.find_longest_prefix(&prompt) else {
+            panic!("materialized disk cache should be consumable");
+        };
+
+        assert_eq!(consumed.prefix_len, 96);
+        let AnyCache::KV(layers) = consumed.cache else {
+            panic!("expected KV cache")
+        };
+        assert_eq!(layers[0].as_ref().unwrap().offset(), 96);
     }
     #[test]
     fn invalid_headers_are_clean_misses() {
