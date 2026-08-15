@@ -31,10 +31,39 @@ fn parse_mla_latent_cache_enabled(raw: Option<&str>) -> bool {
 }
 
 /// Whether `DeepSeek` MLA caches should store compressed latent rows.
+///
+/// Env-only decision used by the standalone lazy-init cache path
+/// ([`crate::deepseek_v2::DeepSeekV2::make_cache`] and the cache-recreation
+/// branch of `forward_hidden`), which has no `KvCacheConfig` to consult. The
+/// config-aware path is [`resolve_mla_latent_cache`].
 pub fn mla_latent_cache_enabled() -> bool {
     *MLA_LATENT_CACHE_ENABLED.get_or_init(|| {
         parse_mla_latent_cache_enabled(std::env::var("HIGGS_MLA_LATENT_CACHE").ok().as_deref())
     })
+}
+
+fn parse_mla_latent_cache_override(raw: Option<&str>) -> Option<bool> {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("1" | "true" | "on" | "yes") => Some(true),
+        Some("0" | "false" | "off" | "no") => Some(false),
+        _ => None,
+    }
+}
+
+/// Resolve the effective MLA latent-cache decision for engine-managed caches
+/// built from a [`KvCacheConfig`].
+///
+/// Precedence: `HIGGS_MLA_LATENT_CACHE`, when set to a recognized value,
+/// always wins (forcing latent caching on or off); otherwise
+/// `config_enabled` (typically `KvCacheConfig::mla_latent`, derived from
+/// `ModelConfig::mla_latent_cache`) decides; if neither is set, latent
+/// caching stays off.
+///
+/// Unlike [`mla_latent_cache_enabled`], this re-reads the env var on every
+/// call rather than caching it, since the config value can differ per model.
+pub fn resolve_mla_latent_cache(config_enabled: bool) -> bool {
+    parse_mla_latent_cache_override(std::env::var("HIGGS_MLA_LATENT_CACHE").ok().as_deref())
+        .unwrap_or(config_enabled)
 }
 
 fn parse_turboquant_activate_at(raw: Option<&str>) -> i32 {
@@ -1838,6 +1867,45 @@ mod tests {
         assert!(parse_mla_latent_cache_enabled(Some("TRUE")));
         assert!(!parse_mla_latent_cache_enabled(Some("no")));
         assert!(!parse_mla_latent_cache_enabled(Some("garbage")));
+    }
+
+    #[test]
+    fn parse_mla_latent_cache_override_recognizes_explicit_values_only() {
+        assert_eq!(parse_mla_latent_cache_override(Some("1")), Some(true));
+        assert_eq!(parse_mla_latent_cache_override(Some("true")), Some(true));
+        assert_eq!(parse_mla_latent_cache_override(Some("0")), Some(false));
+        assert_eq!(parse_mla_latent_cache_override(Some("off")), Some(false));
+        assert_eq!(parse_mla_latent_cache_override(Some("garbage")), None);
+        assert_eq!(parse_mla_latent_cache_override(None), None);
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn resolve_mla_latent_cache_prefers_config_when_no_env_override() {
+        // SAFETY: test-only env mutation; higgs-models tests run single-threaded
+        // (--test-threads=1) so there is no cross-test interleaving.
+        unsafe {
+            std::env::remove_var("HIGGS_MLA_LATENT_CACHE");
+        }
+        assert!(resolve_mla_latent_cache(true));
+        assert!(!resolve_mla_latent_cache(false));
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn resolve_mla_latent_cache_env_override_wins_over_config() {
+        // SAFETY: test-only env mutation; see note above.
+        unsafe {
+            std::env::set_var("HIGGS_MLA_LATENT_CACHE", "0");
+        }
+        assert!(!resolve_mla_latent_cache(true));
+        unsafe {
+            std::env::set_var("HIGGS_MLA_LATENT_CACHE", "1");
+        }
+        assert!(resolve_mla_latent_cache(false));
+        unsafe {
+            std::env::remove_var("HIGGS_MLA_LATENT_CACHE");
+        }
     }
 
     #[test]

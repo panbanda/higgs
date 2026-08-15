@@ -424,6 +424,14 @@ pub struct ModelConfig {
     /// Maximum disk-prefix-store size in MiB.
     #[serde(default = "default_kv_disk_space_mb")]
     pub kv_disk_space_mb: u64,
+    /// Store `DeepSeek`-V2 MLA caches as compressed latent rows.
+    ///
+    /// `None` defers to the `HIGGS_MLA_LATENT_CACHE` env var (default off).
+    /// When set, `HIGGS_MLA_LATENT_CACHE` (if also set to a recognized
+    /// value) still overrides this either way. Ignored for non-`DeepSeek`-V2
+    /// architectures. Mutually exclusive with `kv_cache = "turboquant"`.
+    #[serde(default)]
+    pub mla_latent_cache: Option<bool>,
 }
 
 const fn default_norm_correction() -> bool {
@@ -464,6 +472,10 @@ impl ModelConfig {
             norm_correction: self.kv_norm_correction,
             adaptive_dense_layers: self.kv_adaptive_dense_layers,
             seed: self.kv_seed,
+            mla_latent: match self.mla_latent_cache {
+                Some(v) => v,
+                None => false,
+            },
         }
     }
 
@@ -699,6 +711,7 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             kv_seed: args.kv_seed.unwrap_or_default(),
             kv_disk_dir: None,
             kv_disk_space_mb: default_kv_disk_space_mb(),
+            mla_latent_cache: None,
         })
         .collect();
 
@@ -789,6 +802,7 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                     kv_seed: serve_args.kv_seed.unwrap_or_default(),
                     kv_disk_dir: None,
                     kv_disk_space_mb: default_kv_disk_space_mb(),
+                    mla_latent_cache: None,
                 })
                 .collect();
             let mut existing = figment
@@ -963,6 +977,7 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         kv_seed: 0,
         kv_disk_dir: None,
         kv_disk_space_mb: default_kv_disk_space_mb(),
+        mla_latent_cache: None,
     });
     config.auto_router.model = name;
 }
@@ -1696,6 +1711,64 @@ mod tests {
         assert_eq!(model.kv_cache, KvCacheMode::Turboquant);
         assert_eq!(model.kv_bits, 4);
         assert_eq!(model.kv_seed, 123);
+    }
+
+    #[test]
+    fn test_config_file_parses_mla_latent_cache_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[models]]
+            path = "some/model"
+            mla_latent_cache = true
+            "#,
+        )
+        .unwrap();
+
+        let config = load_config_file(&path, None).unwrap();
+        let model = config.models.first().unwrap();
+        assert_eq!(model.mla_latent_cache, Some(true));
+        assert!(model.kv_cache_config().mla_latent);
+    }
+
+    #[test]
+    fn test_config_file_defaults_mla_latent_cache_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[models]]
+            path = "some/model"
+            "#,
+        )
+        .unwrap();
+
+        let config = load_config_file(&path, None).unwrap();
+        let model = config.models.first().unwrap();
+        assert_eq!(model.mla_latent_cache, None);
+        assert!(!model.kv_cache_config().mla_latent);
+    }
+
+    #[test]
+    fn test_config_file_rejects_mla_latent_cache_with_turboquant() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[models]]
+            path = "some/model"
+            kv_cache = "turboquant"
+            mla_latent_cache = true
+            "#,
+        )
+        .unwrap();
+
+        let err = load_config_file(&path, None).unwrap_err();
+        assert!(err.contains("MLA latent cache cannot be combined with TurboQuant KV cache"));
     }
 
     #[test]

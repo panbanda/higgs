@@ -833,7 +833,7 @@ impl AnyModel {
                         "TurboQuant is only supported for standard KV transformer models",
                     ));
                 }
-                Ok(AnyCache::KV(m.make_cache()?))
+                Ok(AnyCache::KV(m.make_cache_with_config(kv_cache_config)?))
             }
             Self::Qwen3Next(m) => {
                 if kv_cache_config.is_turboquant() {

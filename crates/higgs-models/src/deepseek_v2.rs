@@ -21,7 +21,9 @@ use mlx_rs::{
 use serde::Deserialize;
 
 use crate::{
-    cache::{KeyValueCache, SteppingKeyValueCache, mla_latent_cache_enabled},
+    cache::{
+        KeyValueCache, SteppingKeyValueCache, mla_latent_cache_enabled, resolve_mla_latent_cache,
+    },
     error::ModelError,
     qwen3_next::{
         QEmbedding, QLinear, QuantizationConfig, SwitchMlpWeights, new_mlp_projections, swiglu,
@@ -1001,6 +1003,13 @@ impl DeepSeekV2CausalLM {
         })
     }
 
+    /// Build caches using the env-only MLA decision.
+    ///
+    /// This is the standalone lazy-init path: it has no `KvCacheConfig` to
+    /// consult, so it only honors `HIGGS_MLA_LATENT_CACHE`. Callers that have
+    /// a `KvCacheConfig` (e.g. the engine's `make_cache_with_config` flow)
+    /// should use [`Self::make_cache_with_config`] instead, which is
+    /// authoritative for engine-managed caches.
     pub fn make_cache(&self) -> Result<Vec<Option<SteppingKeyValueCache>>, Exception> {
         (0..self.args.num_hidden_layers)
             .map(|_| {
@@ -1009,6 +1018,31 @@ impl DeepSeekV2CausalLM {
                         self.args.kv_lora_rank,
                         self.args.qk_rope_head_dim,
                         KvCacheConfig::default(),
+                    )
+                } else {
+                    Ok(SteppingKeyValueCache::new())
+                }
+                .map(Some)
+            })
+            .collect()
+    }
+
+    /// Build caches using `kv_cache_config.mla_latent`, with
+    /// `HIGGS_MLA_LATENT_CACHE` (when set to a recognized value) overriding
+    /// it either way. This is the authoritative path for engine-managed
+    /// caches — see [`AnyModel::make_cache_with_config`](crate::AnyModel::make_cache_with_config).
+    pub fn make_cache_with_config(
+        &self,
+        kv_cache_config: KvCacheConfig,
+    ) -> Result<Vec<Option<SteppingKeyValueCache>>, Exception> {
+        let mla_enabled = resolve_mla_latent_cache(kv_cache_config.mla_latent);
+        (0..self.args.num_hidden_layers)
+            .map(|_| {
+                if mla_enabled {
+                    SteppingKeyValueCache::new_mla(
+                        self.args.kv_lora_rank,
+                        self.args.qk_rope_head_dim,
+                        kv_cache_config,
                     )
                 } else {
                     Ok(SteppingKeyValueCache::new())

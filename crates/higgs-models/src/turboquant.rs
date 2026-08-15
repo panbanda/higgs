@@ -63,6 +63,10 @@ pub struct KvCacheConfig {
     /// historical default behavior when this field is omitted from config.
     #[serde(default)]
     pub seed: u64,
+    /// Store `DeepSeek`-V2-style MLA caches as compressed latent rows instead
+    /// of dense per-head KV tensors. Mutually exclusive with `TurboQuant`.
+    #[serde(default)]
+    pub mla_latent: bool,
 }
 
 const fn default_bits() -> u8 {
@@ -83,6 +87,7 @@ impl Default for KvCacheConfig {
             norm_correction: true,
             adaptive_dense_layers: 0,
             seed: 0,
+            mla_latent: false,
         }
     }
 }
@@ -93,6 +98,11 @@ impl KvCacheConfig {
     }
 
     pub fn validate(self) -> Result<(), Exception> {
+        if self.mla_latent && self.is_turboquant() {
+            return Err(Exception::custom(
+                "MLA latent cache cannot be combined with TurboQuant KV cache",
+            ));
+        }
         if self.is_turboquant() {
             if self.bits == 0 {
                 return Err(Exception::custom("TurboQuant bits must be >= 1, got 0"));
@@ -1650,6 +1660,30 @@ mod tests {
             ..Default::default()
         };
         assert!(asym.validate().is_ok());
+    }
+
+    #[test]
+    fn test_mla_latent_rejects_turboquant_combination() {
+        let conflicting = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            mla_latent: true,
+            ..Default::default()
+        };
+        let err = conflicting.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("MLA latent cache cannot be combined with TurboQuant KV cache")
+        );
+    }
+
+    #[test]
+    fn test_mla_latent_alone_is_valid() {
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Off,
+            mla_latent: true,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]

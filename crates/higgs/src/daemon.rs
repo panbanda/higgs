@@ -158,6 +158,7 @@ port = 8000
 # kv_disk_dir = "/var/lib/higgs/prefix-kv" # optional durable prefix cache
 # kv_disk_space_mb = 4096                # LRU budget; minimum 64 MiB
 # prefill_yield_tokens = 512 # optional: interleave decode during long prefills
+# mla_latent_cache = true # DeepSeek-V2 only: compressed latent KV cache; cannot combine with kv_cache = "turboquant"
 
 # --- Remote providers ---
 # Forward requests to external APIs via proxy routes.

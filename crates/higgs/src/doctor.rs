@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use higgs_engine::mlx_tuning::resolve_effective_mlx_profile;
+use higgs_engine::{mlx_tuning::resolve_effective_mlx_profile, model_loader};
 
 use crate::config::HiggsConfig;
 use crate::model_resolver;
@@ -286,6 +286,47 @@ fn check_prefill_yield_tokens(
     true
 }
 
+/// Warn (not fail) when `mla_latent_cache=true` is set for a model whose
+/// architecture isn't `deepseek_v2`. The flag is a no-op for other
+/// architectures at runtime -- `KvCacheConfig::mla_latent` is only consulted
+/// by `DeepSeekV2::make_cache_with_config` -- so this is advisory, not a
+/// hard failure.
+fn check_mla_latent_cache_architecture(
+    label: &str,
+    model: &crate::config::ModelConfig,
+    resolved: &std::path::Path,
+    result: &mut DoctorResult,
+) {
+    if model.mla_latent_cache != Some(true) {
+        return;
+    }
+    match model_loader::ModelConfig::from_dir(resolved) {
+        Ok(inspected) if inspected.model_type == "deepseek_v2" => {
+            pass(
+                &format!("model {label} mla_latent_cache=true (deepseek_v2)"),
+                result,
+            );
+        }
+        Ok(inspected) => {
+            warn(
+                &format!(
+                    "model {label} enables mla_latent_cache=true but architecture '{}' is not deepseek_v2; the flag is a no-op at runtime",
+                    inspected.model_type
+                ),
+                result,
+            );
+        }
+        Err(err) => {
+            warn(
+                &format!(
+                    "model {label} enables mla_latent_cache=true but its architecture could not be determined: {err}"
+                ),
+                result,
+            );
+        }
+    }
+}
+
 fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
     for model in &config.models {
         let label = model_label(model);
@@ -342,6 +383,7 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                         }
                     }
                 }
+                check_mla_latent_cache_architecture(&label, model, &resolved, result);
                 let requested_profile = model.requested_mlx_profile(&config.local);
                 let profile_msg = if model.batch {
                     "batch=true; batched decode supported".to_owned()
@@ -662,6 +704,7 @@ mod tests {
                     kv_adaptive_dense_layers: 0,
                     kv_disk_dir: None,
                     kv_disk_space_mb: 4096,
+                    mla_latent_cache: None,
                 },
                 ModelConfig {
                     path: "org/model-b".to_owned(),
@@ -678,6 +721,7 @@ mod tests {
                     kv_adaptive_dense_layers: 0,
                     kv_disk_dir: None,
                     kv_disk_space_mb: 4096,
+                    mla_latent_cache: None,
                 },
             ],
             ..HiggsConfig::default()
@@ -707,6 +751,7 @@ mod tests {
                     kv_adaptive_dense_layers: 0,
                     kv_disk_dir: None,
                     kv_disk_space_mb: 4096,
+                    mla_latent_cache: None,
                 },
                 ModelConfig {
                     path: "org/model-a".to_owned(),
@@ -723,6 +768,7 @@ mod tests {
                     kv_adaptive_dense_layers: 0,
                     kv_disk_dir: None,
                     kv_disk_space_mb: 4096,
+                    mla_latent_cache: None,
                 },
             ],
             ..HiggsConfig::default()
@@ -1201,6 +1247,7 @@ mod tests {
                 kv_adaptive_dense_layers: 0,
                 kv_disk_dir: None,
                 kv_disk_space_mb: 4096,
+                mla_latent_cache: None,
             }],
             ..HiggsConfig::default()
         };
@@ -1234,6 +1281,7 @@ mod tests {
                 kv_adaptive_dense_layers: 0,
                 kv_disk_dir: None,
                 kv_disk_space_mb: 4096,
+                mla_latent_cache: None,
             }],
             ..HiggsConfig::default()
         };
@@ -1269,6 +1317,7 @@ mod tests {
                 kv_adaptive_dense_layers: 0,
                 kv_disk_dir: None,
                 kv_disk_space_mb: 4096,
+                mla_latent_cache: None,
             }],
             routes: vec![RouteConfig {
                 name: Some("test".to_owned()),
@@ -1309,5 +1358,94 @@ mod tests {
         check_providers(&config, &mut result).await;
         assert_eq!(result.warnings, 1);
         assert_eq!(result.passes, 0);
+    }
+
+    // -- mla_latent_cache --
+
+    fn model_with_path(path: String) -> ModelConfig {
+        ModelConfig {
+            path,
+            name: None,
+            mlx_profile: None,
+            batch: false,
+            prefill_yield_tokens: None,
+            kv_cache: higgs_models::turboquant::KvCacheMode::Off,
+            kv_bits: 3,
+            kv_seed: 0,
+            kv_key_bits: None,
+            kv_value_bits: None,
+            kv_norm_correction: true,
+            kv_adaptive_dense_layers: 0,
+            kv_disk_dir: None,
+            kv_disk_space_mb: 4096,
+            mla_latent_cache: None,
+        }
+    }
+
+    fn write_model_config_json(dir: &std::path::Path, model_type: &str) {
+        std::fs::write(
+            dir.join("config.json"),
+            format!(r#"{{"model_type": "{model_type}"}}"#),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_mla_latent_cache_turboquant_conflict_fails_in_check_models() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model_config_json(dir.path(), "deepseek_v2");
+        let mut model = model_with_path(dir.path().to_str().unwrap().to_owned());
+        model.kv_cache = higgs_models::turboquant::KvCacheMode::Turboquant;
+        model.mla_latent_cache = Some(true);
+        let config = HiggsConfig {
+            models: vec![model],
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_models(&config, &mut result);
+        assert_eq!(result.failures, 1);
+        assert_eq!(result.warnings, 0);
+    }
+
+    #[test]
+    fn test_mla_latent_cache_architecture_passes_for_deepseek_v2() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model_config_json(dir.path(), "deepseek_v2");
+        let model = ModelConfig {
+            mla_latent_cache: Some(true),
+            ..model_with_path(dir.path().to_str().unwrap().to_owned())
+        };
+        let mut result = empty_result();
+        check_mla_latent_cache_architecture("test-model", &model, dir.path(), &mut result);
+        assert_eq!(result.passes, 1);
+        assert_eq!(result.warnings, 0);
+        assert_eq!(result.failures, 0);
+    }
+
+    #[test]
+    fn test_mla_latent_cache_architecture_warns_for_non_deepseek() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model_config_json(dir.path(), "qwen2");
+        let model = ModelConfig {
+            mla_latent_cache: Some(true),
+            ..model_with_path(dir.path().to_str().unwrap().to_owned())
+        };
+        let mut result = empty_result();
+        check_mla_latent_cache_architecture("test-model", &model, dir.path(), &mut result);
+        assert_eq!(result.passes, 0);
+        assert_eq!(result.warnings, 1);
+        assert_eq!(result.failures, 0);
+    }
+
+    #[test]
+    fn test_mla_latent_cache_architecture_noop_when_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model_config_json(dir.path(), "qwen2");
+        let model = model_with_path(dir.path().to_str().unwrap().to_owned());
+        let mut result = empty_result();
+        check_mla_latent_cache_architecture("test-model", &model, dir.path(), &mut result);
+        assert_eq!(result.passes, 0);
+        assert_eq!(result.warnings, 0);
+        assert_eq!(result.failures, 0);
     }
 }

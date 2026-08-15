@@ -656,6 +656,7 @@ mod tests {
                 kv_adaptive_dense_layers: 0,
                 kv_disk_dir: None,
                 kv_disk_space_mb: 4096,
+                mla_latent_cache: None,
             }],
             ..HiggsConfig::default()
         }
