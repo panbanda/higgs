@@ -293,3 +293,29 @@ Two ds4-server ideas for `batch_engine.rs`:
 Per project policy, each landed item that adds config surface must update
 `doctor.rs` validation, `README.md`, and the `higgs init` template in
 `daemon.rs`.
+
+## 5. Results: claimed vs measured (2026-08-15, Apple M4 Max 128 GB, macOS 26.5.1)
+
+Every "Adopt" item (P1-P9) was implemented and validated on hardware against pre-registered
+acceptance criteria. Negative results are recorded as first-class outcomes. Per-PR evidence is
+committed under validation/ on each branch.
+
+| Item | PR | Claimed | Measured | Verdict |
+| --- | --- | --- | --- | --- |
+| P7 quality regression harness | #252 | deterministic gates; perturbation trips | 3 consecutive checks byte-identical; perturbation probe exits non-zero; baselines recorded for Qwen3-1.7B-4bit + DeepSeek-V2-Lite-4bit | SHIPPED |
+| P8 frontier benchmarking | #253 | stable per-frontier measurement | A/A median deltas 0.2-1.9% per frontier; measured KV bytes/token exactly matches analytic (114,688 B/tok for Qwen3-1.7B) | SHIPPED |
+| P1 MLA latent KV cache | #254 | ~9x KV; decode wins at long ctx | 8.9x KV bytes/token (276,480 -> 31,104); decode 1.36x @8k, 1.71x @16k, 2.19x @32k; dense 3x32k sweep OOM-killed while MLA completed; 11/12 prompts token-exact vs decompressed baseline (drift 0.01-0.06 logprob, one near-tie flip) | PASS (opt-in, default off) |
+| P4 disk-backed KV store | #257 | restart-resume TTFT >= 10x at 8k+ | 17.7x (9.30 s -> 0.53 s, ~7100-token prompt); restored output byte-identical to the in-memory prefix-hit path; corruption suite green | PASS |
+| P9 serving-loop yield quantum | #259 | decode stall during long prefill cut >= 2x | inter-token p95 during a 6k prefill: 2640.8 ms -> 196.9 ms (13.4x); greedy outputs byte-identical; steady-state unchanged | PASS |
+| P2 asymmetric MoE quantization | #260 | per-tensor loading + asymmetric >= uniform quality | Loader half PASS: real mixed checkpoint crashes main, loads + generates on the branch; width validation turns silent garbage into load errors. Calibration half + quality claim DEFERRED: needs ~45 GB scratch, host had 5.4 GB free | PARTIAL (loader merged-scope; quality claim deferred, unproven claims do not merge) |
+| P3 structural greedy sampling | #255 (draft) | malformed tool calls decrease at temp | malformed-syntax base rate ~0% on Qwen3-class at temp 1.0 (2/150 vs 3/150; all residual failures are wrapper omission, out of mechanism's reach); throughput unchanged | NEGATIVE - do not merge |
+| P5 exact tool-call replay | #256 (draft) | tool-turn prefix breaks ~0; TTFT improves | mechanism works (replay hits recorded, byte-identical splice, decoy-guarded) but TTFT delta ~0: thinking-token divergence precedes tool calls; 64-token block quantization hides sub-block extensions; typical calls span <= 1 block | NEGATIVE - do not merge |
+| P6 confidence-gated drafts | #258 (draft) | fewer wasted drafts -> throughput | +0.25% to +0.8% (pre-registered floor: +5% on one suite); adaptive depth + batched verify already make wasted drafts cheap | NEGATIVE - do not merge |
+
+Methodology notes carried forward: all A/B comparisons are medians of >= 3 post-warmup runs
+(single-run spreads up to ~8% from desktop background load); token-identity claims are greedy-only;
+two apparent effects during validation turned out to be measurement confounds and were re-run
+(thinking-mode max_tokens truncation in P3; a stale server process answering on a reused port in the
+harness). Review-cycle catches before any merge: a per-head weight-layout scramble in the P1
+absorption (parity delta 210), a disk store that never restored (unaligned key length) in P4, and a
+request-time crash on mixed checkpoints for plain-transformer models in P2.
