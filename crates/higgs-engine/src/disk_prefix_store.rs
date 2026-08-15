@@ -27,7 +27,7 @@
 //! least recently touched entries until the configured budget is respected.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -336,6 +336,20 @@ impl DiskPrefixStore {
         let token_count = usize::try_from(token_count)
             .map_err(|_| std::io::Error::other("token count overflow"))?;
         if !Self::matches_request(path, tokens, block_size, token_count) {
+            return Ok(None);
+        }
+        // Bound the allocation by what the file could actually contain: a
+        // corrupted or adversarial payload_len must become a clean miss,
+        // never an OOM/capacity-overflow panic from an oversized `vec![]`.
+        let file_len = file.metadata()?.len();
+        let remaining = file_len.saturating_sub(file.stream_position()?);
+        if payload_len > remaining {
+            tracing::debug!(
+                payload_len,
+                remaining,
+                reason = "payload length exceeds remaining file size",
+                "Disk prefix cache entry rejected"
+            );
             return Ok(None);
         }
         let payload_len_usize = usize::try_from(payload_len)
@@ -1318,6 +1332,43 @@ mod tests {
         bytes[last] ^= 1;
         fs::write(&path, bytes).unwrap();
 
+        assert!(store.load_cache(&tokens, 2, &cache).unwrap().is_none());
+    }
+    #[test]
+    fn absurd_payload_len_is_a_clean_miss_not_a_panic() {
+        let dir = tempdir().unwrap();
+        let store = DiskPrefixStore::new(dir.path(), 1024 * 1024, identity()).unwrap();
+        let tokens = vec![1, 2, 3, 4];
+        let keys = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4, 1]);
+        let values = Array::from_slice(&[5.0_f32, 6.0, 7.0, 8.0], &[1, 1, 4, 1]);
+        let cache = AnyCache::KV(vec![Some(
+            SteppingKeyValueCache::from_arrays(keys, values).unwrap(),
+        )]);
+        store.store_cache(&tokens, 2, &cache).unwrap();
+
+        let path = store
+            .files()
+            .unwrap()
+            .into_iter()
+            .next()
+            .map(|(p, _)| p)
+            .unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        // payload_len (u64 LE) is the last 8 bytes of the header, i.e. the 8
+        // bytes immediately preceding the tensor payload. `identity()` uses
+        // the fixed test model_id/quant strings, so the header layout (and
+        // therefore this offset) is deterministic:
+        // magic(4) + version(4) + model_id(4+10) + quant(4+5) +
+        // config_hash(32) + tokenizer_hash(32) + chat_template_hash(32) +
+        // weights_hash(32) + block_size(4) + token_count(4) +
+        // payload_checksum(32) = 199, then payload_len occupies 199..207.
+        let payload_len_offset = 199;
+        bytes[payload_len_offset..payload_len_offset + 8]
+            .copy_from_slice(&(u64::MAX / 2).to_le_bytes());
+        fs::write(&path, bytes).unwrap();
+
+        // Must not panic (e.g. from an oversized allocation) and must be a
+        // clean cache miss.
         assert!(store.load_cache(&tokens, 2, &cache).unwrap().is_none());
     }
     #[test]
