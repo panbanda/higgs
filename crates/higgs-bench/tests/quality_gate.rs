@@ -1,4 +1,9 @@
-#![allow(clippy::expect_used, clippy::print_stderr, clippy::unwrap_used)]
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::print_stderr,
+    clippy::unwrap_used
+)]
 
 #[cfg(test)]
 mod tests {
@@ -41,9 +46,17 @@ mod tests {
                 "--fixture",
                 fixture.to_str().unwrap(),
             ])
-            .status()
+            .output()
             .unwrap();
-        assert!(check.success());
+        assert!(check.status.success());
+        let summary: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+        assert!(
+            summary["prompts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|prompt| prompt["token_exact"] == true)
+        );
 
         let perturbed = Command::new(binary)
             .args([
