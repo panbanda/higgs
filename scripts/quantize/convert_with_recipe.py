@@ -78,7 +78,13 @@ def build_quant_predicate(recipe: dict, n_routed_experts: int | None):
         summary["collapsed_layers"].add((layer_idx, projection))
         return {"group_size": expert_rules[0]["group_size"], "bits": majority_bits}
 
-    def predicate(path, module, config):
+    def predicate(path, module, config=None):
+        # The installed mlx_lm (mlx_lm/utils.py quantize_model.wrapped_predicate)
+        # calls quant_predicate(path, module) -- two args, no config -- even
+        # though mlx_lm.convert's public type hint advertises a 3-arg
+        # Callable[[str, nn.Module, dict], ...]. Accept both call shapes;
+        # config is unused here (n_routed_experts is captured via closure
+        # from the --hf-path config.json read in main()).
         if not hasattr(module, "to_quantized"):
             return False
 
