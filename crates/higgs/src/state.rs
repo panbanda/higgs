@@ -6,7 +6,7 @@ use higgs_engine::chat_template::ChatMessage;
 use higgs_engine::engine::{GenerationOutput, StreamingOutput};
 use higgs_engine::error::EngineError;
 use higgs_engine::mlx_tuning::MlxRuntimeTuning;
-use higgs_engine::simple::SimpleEngine;
+use higgs_engine::simple::{SimpleEngine, StructuralGreedy};
 use higgs_engine::tokenizers::Tokenizer;
 use higgs_models::SamplingParams;
 use higgs_models::turboquant::KvCacheConfig;
@@ -243,6 +243,7 @@ impl Engine {
             false,
             constraint,
             pixel_values,
+            StructuralGreedy::Disabled,
         )
     }
 
@@ -260,6 +261,7 @@ impl Engine {
         return_progress: bool,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
+        structural_greedy: StructuralGreedy,
     ) -> Result<(), EngineError> {
         match self {
             Self::Simple(e) => e.generate_streaming_with_thinking(
@@ -274,6 +276,7 @@ impl Engine {
                 return_progress,
                 constraint,
                 pixel_values,
+                structural_greedy,
             ),
             Self::Batch(e) => e.generate_streaming_with_thinking(
                 prompt_tokens,
@@ -287,6 +290,7 @@ impl Engine {
                 return_progress,
                 constraint,
                 pixel_values,
+                structural_greedy,
             ),
             #[cfg(test)]
             Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),

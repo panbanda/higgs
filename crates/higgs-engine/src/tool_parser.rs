@@ -47,6 +47,180 @@ pub struct ToolParseResult {
 const TOOL_CALL_OPEN: &str = "<tool_call>";
 const TOOL_CALL_CLOSE: &str = "</tool_call>";
 
+/// The sampling policy appropriate at the current generated-text position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallRegion {
+    Outside,
+    Structural,
+    Value,
+}
+
+#[derive(Clone, Copy)]
+enum JsonContainer {
+    Object { expecting_key: bool },
+    Array,
+}
+
+#[derive(Clone, Copy)]
+enum JsonScan {
+    Structural,
+    Key { escaped: bool },
+    StringValue { escaped: bool },
+    Number,
+}
+
+/// Incrementally classifies generated tool-call JSON without retaining output.
+///
+/// Feed the stable text emitted by `IncrementalDetok`; call [`Self::region`]
+/// before choosing the next token's sampling policy.
+pub struct ToolCallRegionClassifier {
+    in_tool_call: bool,
+    suffix: String,
+    scan: JsonScan,
+    containers: Vec<JsonContainer>,
+}
+
+impl ToolCallRegionClassifier {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            in_tool_call: false,
+            suffix: String::new(),
+            scan: JsonScan::Structural,
+            containers: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub const fn region(&self) -> ToolCallRegion {
+        if !self.in_tool_call {
+            ToolCallRegion::Outside
+        } else if matches!(self.scan, JsonScan::StringValue { .. } | JsonScan::Number) {
+            ToolCallRegion::Value
+        } else {
+            ToolCallRegion::Structural
+        }
+    }
+
+    /// Feed stable decoded text. It is intentionally character-based so
+    /// wrapper and JSON tokens may arrive split across tokenizer boundaries.
+    pub fn push_str(&mut self, text: &str) {
+        for ch in text.chars() {
+            self.push_char(ch);
+        }
+    }
+
+    pub fn push_char(&mut self, ch: char) {
+        if !self.in_tool_call {
+            self.push_suffix(ch);
+            if self.suffix.ends_with(TOOL_CALL_OPEN) {
+                self.in_tool_call = true;
+                self.suffix.clear();
+                self.scan = JsonScan::Structural;
+                self.containers.clear();
+            }
+            return;
+        }
+
+        self.push_suffix(ch);
+        if self.suffix.ends_with(TOOL_CALL_CLOSE) {
+            self.in_tool_call = false;
+            self.suffix.clear();
+            self.scan = JsonScan::Structural;
+            self.containers.clear();
+            return;
+        }
+
+        match self.scan {
+            JsonScan::Key { escaped } => {
+                if escaped {
+                    self.scan = JsonScan::Key { escaped: false };
+                } else if ch == '\\' {
+                    self.scan = JsonScan::Key { escaped: true };
+                } else if ch == '"' {
+                    self.scan = JsonScan::Structural;
+                }
+            }
+            JsonScan::StringValue { escaped } => {
+                if escaped {
+                    self.scan = JsonScan::StringValue { escaped: false };
+                } else if ch == '\\' {
+                    self.scan = JsonScan::StringValue { escaped: true };
+                } else if ch == '"' {
+                    self.scan = JsonScan::Structural;
+                    self.value_complete();
+                }
+            }
+            JsonScan::Number => {
+                if !matches!(ch, '0'..='9' | '-' | '+' | '.' | 'e' | 'E') {
+                    self.scan = JsonScan::Structural;
+                    self.value_complete();
+                    self.push_structural(ch);
+                }
+            }
+            JsonScan::Structural => self.push_structural(ch),
+        }
+    }
+
+    fn push_suffix(&mut self, ch: char) {
+        self.suffix.push(ch);
+        let max = TOOL_CALL_CLOSE.len();
+        while self.suffix.len() > max {
+            self.suffix.remove(0);
+        }
+    }
+
+    fn push_structural(&mut self, ch: char) {
+        match ch {
+            '{' => self.containers.push(JsonContainer::Object {
+                expecting_key: true,
+            }),
+            '[' => self.containers.push(JsonContainer::Array),
+            '}' | ']' => {
+                self.containers.pop();
+                self.value_complete();
+            }
+            ':' => {
+                if let Some(JsonContainer::Object { expecting_key }) = self.containers.last_mut() {
+                    *expecting_key = false;
+                }
+            }
+            ',' => {
+                if let Some(JsonContainer::Object { expecting_key }) = self.containers.last_mut() {
+                    *expecting_key = true;
+                }
+            }
+            '"' => {
+                let is_key = matches!(
+                    self.containers.last(),
+                    Some(JsonContainer::Object {
+                        expecting_key: true
+                    })
+                );
+                self.scan = if is_key {
+                    JsonScan::Key { escaped: false }
+                } else {
+                    JsonScan::StringValue { escaped: false }
+                };
+            }
+            '-' | '0'..='9' => self.scan = JsonScan::Number,
+            _ => {}
+        }
+    }
+
+    fn value_complete(&mut self) {
+        if let Some(JsonContainer::Object { expecting_key }) = self.containers.last_mut() {
+            *expecting_key = false;
+        }
+    }
+}
+
+impl Default for ToolCallRegionClassifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Hard cap on bytes buffered while inside an unclosed `<tool_call>`.
 ///
 /// Without a cap, a model that emits `<tool_call>` and never closes the tag
@@ -743,6 +917,45 @@ impl StreamingToolCallTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structural_region_classifier_distinguishes_tool_json_values() {
+        let input = "before <tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"San Francisco\", \"n\": 3}}</tool_call> after";
+        let mut classifier = ToolCallRegionClassifier::new();
+        let mut regions = Vec::new();
+        for ch in input.chars() {
+            regions.push(classifier.region());
+            classifier.push_char(ch);
+        }
+
+        let at = |needle: &str| input.find(needle).unwrap();
+        assert_eq!(regions[at("before")], ToolCallRegion::Outside);
+        assert_eq!(regions[at("<tool_call>")], ToolCallRegion::Outside);
+        assert_eq!(regions[at("{")], ToolCallRegion::Structural);
+        assert_eq!(regions[at("\"name\"")], ToolCallRegion::Structural);
+        assert_eq!(regions[at("get_weather")], ToolCallRegion::Value);
+        assert_eq!(regions[at("\"arguments\"")], ToolCallRegion::Structural);
+        assert_eq!(regions[at("San Francisco")], ToolCallRegion::Value);
+        assert_eq!(regions[at("3}") + 1], ToolCallRegion::Value);
+        assert_eq!(classifier.region(), ToolCallRegion::Outside);
+    }
+
+    #[test]
+    fn structural_region_classifier_handles_escaped_quotes_and_nested_objects() {
+        let input = "<tool_call>{\"arguments\":{\"nested\":{\"message\":\"say \\\"hi\\\"\"},\"n\":-1.5e2}}</tool_call>";
+        let mut classifier = ToolCallRegionClassifier::new();
+        let mut regions = Vec::new();
+        for ch in input.chars() {
+            regions.push(classifier.region());
+            classifier.push_char(ch);
+        }
+        let at = |needle: &str| input.find(needle).unwrap();
+        assert_eq!(regions[at("nested")], ToolCallRegion::Structural);
+        assert_eq!(regions[at("say")], ToolCallRegion::Value);
+        assert_eq!(regions[at("hi")], ToolCallRegion::Value);
+        assert_eq!(regions[at("-1.5e2") + 1], ToolCallRegion::Value);
+        assert_eq!(classifier.region(), ToolCallRegion::Outside);
+    }
 
     /// Parse input and assert expected tool call count and optional text fragment.
     fn assert_parse(

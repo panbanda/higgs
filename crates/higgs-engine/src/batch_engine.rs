@@ -310,6 +310,7 @@ impl BatchEngine {
             false,
             constraint,
             pixel_values,
+            crate::simple::StructuralGreedy::Disabled,
         )
     }
 
@@ -329,6 +330,9 @@ impl BatchEngine {
         _return_progress: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<mlx_rs::Array>,
+        // Structural greedy is currently implemented by SimpleEngine's normal
+        // decode loop; batched/speculative verification keeps target sampling.
+        _structural_greedy: crate::simple::StructuralGreedy,
     ) -> Result<(), EngineError> {
         if pixel_values.is_some() {
             return Err(EngineError::Generation(

@@ -526,6 +526,7 @@ fn chat_completions_stream(
             return_progress,
             constraint,
             pixel_values,
+            (stream_includes_tools && sampling.temperature > 0.0).into(),
         );
         if let Err(e) = result {
             tracing::error!(error = %e, "Generation error during streaming");

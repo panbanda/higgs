@@ -30,11 +30,68 @@ use crate::{
     model_loader,
     paged_prefix_cache::{DEFAULT_BLOCK_SIZE, PagedPrefixCache},
     scheduler::RoundRobinScheduler,
+    tool_parser::{ToolCallRegion, ToolCallRegionClassifier},
 };
 
 /// Default maximum number of cached prefixes.
 const DEFAULT_PREFIX_CACHE_SIZE: usize = 8;
 const DEFAULT_PAGED_KV_BLOCK_SIZE: usize = 64;
+
+/// Whether generation should greedily select JSON structure in tool calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuralGreedy {
+    /// Preserve the configured sampling policy throughout generation.
+    Disabled,
+    /// Sample text values but select tool-call JSON structure greedily.
+    Enabled,
+}
+
+impl From<bool> for StructuralGreedy {
+    fn from(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+}
+
+fn structural_greedy_enabled() -> bool {
+    std::env::var("HIGGS_STRUCTURAL_GREEDY").map_or(true, |value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        )
+    })
+}
+
+struct StructuralSamplingController {
+    enabled: bool,
+    classifier: ToolCallRegionClassifier,
+}
+
+impl StructuralSamplingController {
+    fn new(policy: StructuralGreedy) -> Self {
+        Self {
+            enabled: policy == StructuralGreedy::Enabled && structural_greedy_enabled(),
+            classifier: ToolCallRegionClassifier::new(),
+        }
+    }
+
+    fn observe(&mut self, text: &str) {
+        if self.enabled {
+            self.classifier.push_str(text);
+        }
+    }
+
+    const fn should_sample(&self) -> bool {
+        !self.enabled
+            || matches!(
+                self.classifier.region(),
+                ToolCallRegion::Outside | ToolCallRegion::Value
+            )
+    }
+}
 
 /// Acquire a `Mutex` lock, recovering from poison by reusing the inner data.
 /// Used in this crate to keep session-management methods infallible while
@@ -2151,6 +2208,7 @@ impl SimpleEngine {
             false,
             constraint,
             pixel_values,
+            StructuralGreedy::Disabled,
         )
     }
 
@@ -2168,6 +2226,7 @@ impl SimpleEngine {
         return_progress: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
+        structural_greedy: StructuralGreedy,
     ) -> Result<(), EngineError> {
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
@@ -2199,6 +2258,7 @@ impl SimpleEngine {
                 return_progress,
                 constraint,
                 pixel_values,
+                structural_greedy,
             )
         })
     }
@@ -2221,6 +2281,7 @@ impl SimpleEngine {
         return_progress: bool,
         mut constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
+        structural_greedy: StructuralGreedy,
     ) -> Result<(), EngineError> {
         let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
 
@@ -2298,6 +2359,7 @@ impl SimpleEngine {
             0,
             std::sync::Arc::clone(&self.decode_skip_ids),
         );
+        let mut structural_sampling = StructuralSamplingController::new(structural_greedy);
         let first_new_text = detok.append(&self.tokenizer, &all_tokens)?;
         let first_emitted_before = detok.text.len() - first_new_text.len();
         let (mut first_text, first_hit_stop) = if stop_sequences.is_empty() {
@@ -2327,6 +2389,8 @@ impl SimpleEngine {
             .as_ref()
             .map(|lp| lp.materialize(first_token_id));
 
+        structural_sampling.observe(&first_text);
+
         if sender
             .blocking_send(StreamingOutput {
                 new_text: first_text,
@@ -2351,6 +2415,9 @@ impl SimpleEngine {
         if finished {
             return Ok(());
         }
+
+        let mut greedy_params = params.clone();
+        greedy_params.temperature = 0.0;
 
         // MTP speculative decode (streaming): greedy, no constraints, no logprobs.
         #[allow(clippy::float_cmp)]
@@ -2394,7 +2461,11 @@ impl SimpleEngine {
             &current_token,
             &mut prepared.model,
             &mut prepared.cache,
-            params,
+            if structural_sampling.should_sample() {
+                params
+            } else {
+                &greedy_params
+            },
             &all_tokens,
             logprob_top_n,
             constraint.as_ref(),
@@ -2423,7 +2494,11 @@ impl SimpleEngine {
                 &next_token,
                 &mut prepared.model,
                 &mut prepared.cache,
-                params,
+                if structural_sampling.should_sample() {
+                    params
+                } else {
+                    &greedy_params
+                },
                 &all_tokens,
                 logprob_top_n,
                 constraint.as_ref(),
@@ -2471,6 +2546,7 @@ impl SimpleEngine {
             let completion_len = Self::completion_len(&all_tokens)?;
 
             let new_text = detok.append(&self.tokenizer, &all_tokens)?;
+            structural_sampling.observe(&new_text);
             let emitted_before = detok.text.len() - new_text.len();
 
             let (mut final_new_text, hit_stop_seq) = if stop_sequences.is_empty() {
@@ -2935,10 +3011,38 @@ fn chat_template_mentions_enable_thinking(model_dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        IncrementalDetok, Tokenizer, adaptive_draft_depth_for_cap, check_stop_sequences,
-        derive_model_name, detect_thinking_support, estimate_paged_kv_blocks, extract_eos_tokens,
-        find_stop_in_tail, parse_enabled_flag,
+        IncrementalDetok, StructuralSamplingController, Tokenizer, adaptive_draft_depth_for_cap,
+        check_stop_sequences, derive_model_name, detect_thinking_support, estimate_paged_kv_blocks,
+        extract_eos_tokens, find_stop_in_tail, parse_enabled_flag,
     };
+
+    #[test]
+    fn structural_greedy_decision_follows_scripted_decode() {
+        let mut controller = StructuralSamplingController {
+            enabled: true,
+            classifier: crate::tool_parser::ToolCallRegionClassifier::new(),
+        };
+        let script = [
+            ("text ", true),
+            ("<tool_call>{\"name\":", false),
+            ("\"", true),
+            ("get_weather\"", false),
+            (",\"arguments\":{\"city\":", false),
+            ("\"", true),
+            ("San Francisco\"", false),
+            (",\"n\":", false),
+            ("3", true),
+            ("}}</tool_call> text", true),
+        ];
+        for (text, expected_sample) in script {
+            controller.observe(text);
+            assert_eq!(
+                controller.should_sample(),
+                expected_sample,
+                "after {text:?}"
+            );
+        }
+    }
     use std::path::Path;
 
     /// Write a config.json file into the given directory with the provided JSON content.

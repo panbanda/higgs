@@ -352,6 +352,7 @@ fn create_message_stream(
             false,
             None,
             None,
+            false.into(),
         );
         if let Err(e) = result {
             tracing::error!(error = %e, "Generation error during Anthropic streaming");
