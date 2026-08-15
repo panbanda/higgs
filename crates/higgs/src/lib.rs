@@ -17,6 +17,7 @@ pub mod routes;
 #[doc(hidden)]
 pub mod sse;
 pub mod state;
+pub mod tool_replay;
 pub mod translate;
 pub mod tui;
 pub mod types;

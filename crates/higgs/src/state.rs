@@ -313,6 +313,8 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     /// Request metrics (present in config mode, absent in simple mode).
     pub metrics: Option<Arc<MetricsStore>>,
+    /// Per-model exact tool-call serialization replay state.
+    pub tool_replay: crate::tool_replay::ToolReplayRegistry,
 }
 
 /// Type alias for the shared state used by Axum handlers.

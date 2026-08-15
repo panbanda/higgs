@@ -115,6 +115,7 @@ pub fn classify_local(
         role: "user".to_owned(),
         content: prompt,
         tool_calls: None,
+        raw_tool_call_text: None,
     }];
 
     let prompt_tokens = match engine.prepare_chat_prompt(&chat_messages, None) {

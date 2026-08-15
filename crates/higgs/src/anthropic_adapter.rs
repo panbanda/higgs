@@ -22,6 +22,7 @@ pub fn anthropic_messages_to_engine(
             role: "system".to_owned(),
             content: sys.to_text(),
             tool_calls: None,
+            raw_tool_call_text: None,
         });
     }
 
@@ -51,6 +52,7 @@ pub fn anthropic_messages_to_engine(
             role: msg.role.clone(),
             content,
             tool_calls: None,
+            raw_tool_call_text: None,
         });
     }
 

@@ -352,6 +352,7 @@ impl SimpleEngine {
                     role: "user".to_owned(),
                     content: "x".to_owned(),
                     tool_calls: None,
+                    raw_tool_call_text: None,
                 }];
                 let with_gen = tmpl
                     .apply_with_thinking(&test_msg, None, true, enable_thinking)

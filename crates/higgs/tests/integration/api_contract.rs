@@ -48,6 +48,7 @@ fn build_test_state(metrics: Option<Arc<MetricsStore>>) -> Arc<AppState> {
         config,
         http_client: reqwest::Client::new(),
         metrics,
+        tool_replay: higgs::tool_replay::ToolReplayRegistry::new(16),
     })
 }
 

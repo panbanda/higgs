@@ -14,6 +14,9 @@ pub struct MetricsResponse {
     pub tokens_per_minute: Vec<u64>,
     pub models: Vec<MetricsGroup>,
     pub providers: Vec<MetricsGroup>,
+    /// Exact tool-call replay cache outcomes across local models.
+    pub tool_replay_hits: u64,
+    pub tool_replay_misses: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -41,10 +44,13 @@ pub async fn metrics(
     let Some(metrics) = state.metrics.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
-    Ok(Json(build_metrics_response(metrics)))
+    Ok(Json(build_metrics_response(metrics, &state.tool_replay)))
 }
 
-fn build_metrics_response(metrics: &MetricsStore) -> MetricsResponse {
+fn build_metrics_response(
+    metrics: &MetricsStore,
+    replay: &crate::tool_replay::ToolReplayRegistry,
+) -> MetricsResponse {
     let snapshot = metrics.snapshot();
     let input_tokens: u64 = snapshot.iter().map(|r| r.input_tokens).sum();
     let output_tokens: u64 = snapshot.iter().map(|r| r.output_tokens).sum();
@@ -64,6 +70,8 @@ fn build_metrics_response(metrics: &MetricsStore) -> MetricsResponse {
         tokens_per_minute: MetricsStore::tokens_per_minute(&snapshot, num_buckets),
         models: build_groups(MetricsStore::group_by(&snapshot, |r| r.model.clone())),
         providers: build_groups(MetricsStore::group_by(&snapshot, |r| r.provider.clone())),
+        tool_replay_hits: replay.counters().0,
+        tool_replay_misses: replay.counters().1,
     }
 }
 
@@ -134,7 +142,8 @@ mod tests {
         metrics.record(sample_record("model-a", "higgs", 500));
         metrics.record(sample_record("model-b", "openai", 200));
 
-        let response = build_metrics_response(&metrics);
+        let replay = crate::tool_replay::ToolReplayRegistry::new(16);
+        let response = build_metrics_response(&metrics, &replay);
         assert_eq!(response.totals.requests, 3);
         assert_eq!(response.totals.input_tokens, 30);
         assert_eq!(response.totals.output_tokens, 60);

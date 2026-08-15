@@ -33,6 +33,8 @@
 pub struct ParsedToolCall {
     pub name: String,
     pub arguments: serde_json::Value,
+    /// Exact model-emitted call text, including its wrapper tags.
+    pub raw_text: String,
 }
 
 /// Result of parsing model output for tool calls.
@@ -88,7 +90,8 @@ pub fn parse_tool_calls(text: &str, schema: Option<&ToolSchema>) -> ToolParseRes
                 let raw_block = after_open.get(..end_pos).unwrap_or_default();
                 let call_content = raw_block.trim();
 
-                if let Some(parsed) = parse_tool_call_block(call_content, schema) {
+                if let Some(mut parsed) = parse_tool_call_block(call_content, schema) {
+                    parsed.raw_text = format!("{TOOL_CALL_OPEN}{raw_block}{TOOL_CALL_CLOSE}");
                     tool_calls.push(parsed);
                 } else {
                     result_text.push_str(TOOL_CALL_OPEN);
@@ -127,7 +130,11 @@ fn try_parse_tool_call(content: &str) -> Option<ParsedToolCall> {
         .cloned()
         .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
 
-    Some(ParsedToolCall { name, arguments })
+    Some(ParsedToolCall {
+        name,
+        arguments,
+        raw_text: String::new(),
+    })
 }
 
 const FUNCTION_OPEN: &str = "<function=";
@@ -337,6 +344,7 @@ fn parse_xml_tool_call(content: &str, schema: Option<&ToolSchema>) -> Option<Par
     Some(ParsedToolCall {
         name,
         arguments: serde_json::Value::Object(map),
+        raw_text: String::new(),
     })
 }
 
@@ -450,6 +458,7 @@ fn parse_minicpm_function(block: &str, schema: Option<&ToolSchema>) -> Option<Pa
     Some(ParsedToolCall {
         name,
         arguments: serde_json::Value::Object(map),
+        raw_text: String::new(),
     })
 }
 
@@ -475,7 +484,8 @@ fn parse_minicpm_tool_calls(text: &str, schema: Option<&ToolSchema>) -> ToolPars
         };
 
         let block = block_region.get(..end).unwrap_or_default();
-        if let Some(parsed) = parse_minicpm_function(block, schema) {
+        if let Some(mut parsed) = parse_minicpm_function(block, schema) {
+            parsed.raw_text = format!("{block}{FUNCTION_CLOSE}");
             tool_calls.push(parsed);
         } else {
             result_text.push_str(block);
@@ -642,9 +652,11 @@ impl StreamingToolCallTracker {
                     if let Some(end) = self.buffer.find(TOOL_CALL_CLOSE) {
                         let raw_block = self.buffer.get(..end).unwrap_or_default();
                         let call_content = raw_block.trim();
-                        if let Some(parsed) =
+                        if let Some(mut parsed) =
                             parse_tool_call_block(call_content, self.schema.as_ref())
                         {
+                            parsed.raw_text =
+                                format!("{TOOL_CALL_OPEN}{raw_block}{TOOL_CALL_CLOSE}");
                             out.new_tool_calls.push(parsed);
                             self.completed_count += 1;
                         } else {
@@ -677,7 +689,10 @@ impl StreamingToolCallTracker {
                     // CDATA-aware `</function>`.
                     if let Some(end) = minicpm_function_end(&self.buffer) {
                         let block = self.buffer.get(..end).unwrap_or_default();
-                        if let Some(parsed) = parse_minicpm_function(block, self.schema.as_ref()) {
+                        if let Some(mut parsed) =
+                            parse_minicpm_function(block, self.schema.as_ref())
+                        {
+                            parsed.raw_text = format!("{block}{FUNCTION_CLOSE}");
                             out.new_tool_calls.push(parsed);
                             self.completed_count += 1;
                         } else {
@@ -743,6 +758,22 @@ impl StreamingToolCallTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parsed_tool_calls_keep_exact_wrapped_spans() {
+        let text = "before<tool_call>\n{\"name\":\"first\", \"arguments\": {\"b\":2,\"a\":1}}\n</tool_call>middle<tool_call>{\"name\":\"second\",\"arguments\":{}}</tool_call>after";
+        let result = parse_tool_calls(text, None);
+
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(
+            result.tool_calls[0].raw_text,
+            "<tool_call>\n{\"name\":\"first\", \"arguments\": {\"b\":2,\"a\":1}}\n</tool_call>"
+        );
+        assert_eq!(
+            result.tool_calls[1].raw_text,
+            "<tool_call>{\"name\":\"second\",\"arguments\":{}}</tool_call>"
+        );
+    }
 
     /// Parse input and assert expected tool call count and optional text fragment.
     fn assert_parse(

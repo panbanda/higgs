@@ -220,6 +220,7 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
         config: higgs_config,
         http_client,
         metrics,
+        tool_replay: higgs::tool_replay::ToolReplayRegistry::from_env(),
     });
 
     // Build router with middleware

@@ -64,6 +64,7 @@ fn build_test_state(mock_url: &str, format: ApiFormat) -> Arc<AppState> {
         config,
         http_client: reqwest::Client::new(),
         metrics: Some(metrics),
+        tool_replay: higgs::tool_replay::ToolReplayRegistry::new(16),
     })
 }
 
@@ -214,6 +215,7 @@ async fn proxy_model_rewrite() {
         config,
         http_client: reqwest::Client::new(),
         metrics: Some(metrics),
+        tool_replay: higgs::tool_replay::ToolReplayRegistry::new(16),
     });
     let app = build_app(state);
 

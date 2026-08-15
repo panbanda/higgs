@@ -266,7 +266,7 @@ async fn chat_completions_non_streaming(
         inject_image_placeholders(&req.messages)
     };
 
-    let messages = convert_messages(&effective_messages);
+    let messages = convert_messages(&effective_messages, &state.tool_replay, &req.model);
     // Treat an empty `tools: []` as absent (mirrors the streaming path) so it
     // doesn't define `tools` in the template context or trigger tool parsing.
     let tools = req.tools.as_deref().filter(|t| !t.is_empty());
@@ -372,6 +372,11 @@ async fn chat_completions_non_streaming(
                     },
                 })
                 .collect();
+            for (call, parsed_call) in calls.iter().zip(&parsed.tool_calls) {
+                state
+                    .tool_replay
+                    .insert(&req.model, call.id.clone(), parsed_call);
+            }
             let text = if parsed.text.is_empty() {
                 None
             } else {
@@ -448,7 +453,7 @@ fn chat_completions_stream(
         inject_image_placeholders(&req.messages)
     };
 
-    let messages = convert_messages(&effective_messages);
+    let messages = convert_messages(&effective_messages, &state.tool_replay, &req.model);
     let thinking_enabled_stream = crate::reasoning::effective_thinking_enabled(
         engine.enable_thinking(),
         &[engine.model_name(), req.model.as_str()],
@@ -570,10 +575,12 @@ fn chat_completions_stream(
         // Closure that turns a `ParsedToolCall` into the OpenAI streaming
         // delta shape. Index is the running zero-based position of the
         // call in this response.
-        let make_tool_delta = |index: u32, parsed: &higgs_engine::tool_parser::ParsedToolCall| {
+        let make_tool_delta = |index: u32,
+                               id: String,
+                               parsed: &higgs_engine::tool_parser::ParsedToolCall| {
             ToolCallDelta {
                 index,
-                id: Some(format!("call_{index}_{}", uuid::Uuid::new_v4())),
+                id: Some(id),
                 r#type: Some("function".to_owned()),
                 function: Some(ToolCallFunctionDelta {
                     name: Some(parsed.name.clone()),
@@ -632,11 +639,13 @@ fn chat_completions_stream(
             for (i, parsed) in tool_out.new_tool_calls.iter().enumerate() {
                 #[allow(clippy::cast_possible_truncation)]
                 let idx = u32::try_from(base_index + i).unwrap_or(u32::MAX);
+                let id = format!("call_{idx}_{}", uuid::Uuid::new_v4());
+                state.tool_replay.insert(&model, id.clone(), parsed);
                 let d = ChatCompletionDelta {
                     role: None,
                     content: None,
                     reasoning_content: None,
-                    tool_calls: Some(vec![make_tool_delta(idx, parsed)]),
+                    tool_calls: Some(vec![make_tool_delta(idx, id, parsed)]),
                 };
                 emit_delta!(&d, None, None);
             }
@@ -678,11 +687,13 @@ fn chat_completions_stream(
         for (i, parsed) in flush_tool_out.new_tool_calls.iter().enumerate() {
             #[allow(clippy::cast_possible_truncation)]
             let idx = u32::try_from(flush_base_index + i).unwrap_or(u32::MAX);
+            let id = format!("call_{idx}_{}", uuid::Uuid::new_v4());
+            state.tool_replay.insert(&model, id.clone(), parsed);
             let d = ChatCompletionDelta {
                 role: None,
                 content: None,
                 reasoning_content: None,
-                tool_calls: Some(vec![make_tool_delta(idx, parsed)]),
+                tool_calls: Some(vec![make_tool_delta(idx, id, parsed)]),
             };
             emit_delta!(&d, None, None);
         }
@@ -751,6 +762,8 @@ fn chat_completions_stream(
 
 fn convert_messages(
     messages: &[ChatCompletionMessage],
+    replay: &crate::tool_replay::ToolReplayRegistry,
+    model: &str,
 ) -> Vec<higgs_engine::chat_template::ChatMessage> {
     messages
         .iter()
@@ -772,6 +785,16 @@ fn convert_messages(
                     })
                     .collect()
             });
+            let raw_tool_call_text = m.tool_calls.as_ref().and_then(|calls| {
+                let raw_calls: Vec<_> = calls
+                    .iter()
+                    .map(|call| {
+                        let arguments = serde_json::from_str(&call.function.arguments).ok()?;
+                        replay.matching_raw(model, &call.id, &call.function.name, &arguments)
+                    })
+                    .collect();
+                raw_calls.iter().any(Option::is_some).then_some(raw_calls)
+            });
             let content = m
                 .content
                 .as_ref()
@@ -780,6 +803,7 @@ fn convert_messages(
                 role: m.role.clone(),
                 content,
                 tool_calls: tool_calls_json,
+                raw_tool_call_text,
             }
         })
         .collect()
@@ -976,13 +1000,18 @@ mod tests {
         }
     }
 
+    fn replay_registry() -> crate::tool_replay::ToolReplayRegistry {
+        crate::tool_replay::ToolReplayRegistry::new(16)
+    }
+
     #[test]
     fn test_convert_messages() {
         let msgs = vec![
             simple_message("user", Some("Hello")),
             simple_message("assistant", None),
         ];
-        let converted = convert_messages(&msgs);
+        let replay = replay_registry();
+        let converted = convert_messages(&msgs, &replay, "test");
         assert_eq!(converted.len(), 2);
         assert_eq!(converted.first().map(|m| m.role.as_str()), Some("user"));
         assert_eq!(converted.first().map(|m| m.content.as_str()), Some("Hello"));
@@ -1002,7 +1031,8 @@ mod tests {
             "assistant",
             vec![tool_call("call_1", "get_weather", r#"{"city":"NYC"}"#)],
         )];
-        let converted = convert_messages(&msgs);
+        let replay = replay_registry();
+        let converted = convert_messages(&msgs, &replay, "test");
         assert_eq!(converted.len(), 1);
         let calls = converted
             .first()
@@ -1013,14 +1043,16 @@ mod tests {
 
     #[test]
     fn test_convert_messages_empty_list() {
-        let result = convert_messages(&[]);
+        let replay = replay_registry();
+        let result = convert_messages(&[], &replay, "test");
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_convert_messages_with_null_content() {
         let msgs = vec![simple_message("assistant", None)];
-        let converted = convert_messages(&msgs);
+        let replay = replay_registry();
+        let converted = convert_messages(&msgs, &replay, "test");
         assert_eq!(converted.len(), 1);
         assert_eq!(converted.first().map(|m| m.content.as_str()), Some(""));
     }
@@ -1038,13 +1070,60 @@ mod tests {
                 tool_call("call_2", "calculate", r#"{"expression":"2+2"}"#),
             ],
         )];
-        let converted = convert_messages(&msgs);
+        let replay = replay_registry();
+        let converted = convert_messages(&msgs, &replay, "test");
         assert_eq!(converted.len(), 1);
         let calls = converted
             .first()
             .and_then(|m| m.tool_calls.as_ref())
             .unwrap();
         assert_eq!(calls.len(), 2);
+    }
+
+    #[test]
+    fn replays_matching_tool_call_and_rejects_different_arguments() {
+        let replay = replay_registry();
+        replay.insert(
+            "test",
+            "call_1".to_owned(),
+            &higgs_engine::tool_parser::ParsedToolCall {
+                name: "get_weather".to_owned(),
+                arguments: serde_json::json!({"city": "Denver", "units": "c"}),
+                raw_text: "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"units\": \"c\", \"city\": \"Denver\"}}\n</tool_call>".to_owned(),
+            },
+        );
+        let matching = vec![tool_message(
+            "assistant",
+            vec![tool_call(
+                "call_1",
+                "get_weather",
+                r#"{"city":"Denver","units":"c"}"#,
+            )],
+        )];
+        assert!(
+            convert_messages(&matching, &replay, "test")
+                .first()
+                .unwrap()
+                .raw_tool_call_text
+                .is_some()
+        );
+
+        let different = vec![tool_message(
+            "assistant",
+            vec![tool_call(
+                "call_1",
+                "get_weather",
+                r#"{"city":"Boulder","units":"c"}"#,
+            )],
+        )];
+        assert!(
+            convert_messages(&different, &replay, "test")
+                .first()
+                .unwrap()
+                .raw_tool_call_text
+                .is_none()
+        );
+        assert_eq!(replay.counters(), (1, 1));
     }
 
     #[test]

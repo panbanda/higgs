@@ -11,6 +11,15 @@ pub struct ChatMessage {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<serde_json::Value>>,
+    /// Exact model-emitted `<tool_call>…</tool_call>` text, when it is safe
+    /// to replay instead of the template's normalized serialization.
+    ///
+    /// This is intentionally not exposed to the Jinja template. After normal
+    /// rendering, [`ChatTemplateRenderer`] replaces only a matching tool-call
+    /// wrapper region. Thus replay is an optimization: a template without the
+    /// expected wrapper remains byte-for-byte on its normal rendering path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_tool_call_text: Option<Vec<Option<String>>>,
 }
 
 /// Upper bound on template-engine instructions per render. Generous enough
@@ -176,9 +185,50 @@ impl ChatTemplateRenderer {
             },
         );
 
-        tmpl.render(context)
-            .map_err(|e| EngineError::Template(e.to_string()))
+        let rendered = tmpl
+            .render(context)
+            .map_err(|e| EngineError::Template(e.to_string()))?;
+        Ok(replay_tool_call_text(rendered, messages))
     }
+}
+
+/// Replace normalized Qwen-style tool-call regions with the exact bytes the
+/// model previously emitted. The replacement is deliberately narrow: if the
+/// rendered prompt does not contain a complete `<tool_call>…</tool_call>`
+/// region for a requested replay, it is left unchanged. This guarantees that
+/// replay cannot alter semantic prompt content for templates it does not
+/// recognize.
+fn replay_tool_call_text(mut rendered: String, messages: &[ChatMessage]) -> String {
+    const OPEN: &str = "<tool_call>";
+    const CLOSE: &str = "</tool_call>";
+    let mut search_from = 0;
+
+    for message in messages {
+        let call_count = message.tool_calls.as_ref().map_or(0, Vec::len);
+        for call_index in 0..call_count {
+            let Some(start_relative) = rendered.get(search_from..).and_then(|s| s.find(OPEN))
+            else {
+                return rendered;
+            };
+            let start = search_from + start_relative;
+            let Some(end_relative) = rendered.get(start..).and_then(|s| s.find(CLOSE)) else {
+                return rendered;
+            };
+            let end = start + end_relative + CLOSE.len();
+            let replay_text = message
+                .raw_tool_call_text
+                .as_ref()
+                .and_then(|calls| calls.get(call_index))
+                .and_then(Option::as_deref);
+            if let Some(raw) = replay_text {
+                rendered.replace_range(start..end, raw);
+                search_from = start.saturating_add(raw.len());
+            } else {
+                search_from = end;
+            }
+        }
+    }
+    rendered
 }
 
 /// Normalise a tool-call JSON object so Qwen-Hermes-style chat templates
@@ -308,6 +358,7 @@ mod tests {
             role: role.to_owned(),
             content: content.to_owned(),
             tool_calls: None,
+            raw_tool_call_text: None,
         }
     }
 
@@ -510,9 +561,75 @@ TOOLS:{{ tools | length }}
                 "type": "function",
                 "function": {"name": "get_weather", "arguments": "{\"city\":\"NYC\"}"}
             })]),
+            raw_tool_call_text: None,
         }];
         let result = renderer.apply(&messages, None, false).unwrap();
         assert!(result.contains("[tools]"));
+    }
+
+    #[test]
+    fn replayed_tool_call_is_rendered_verbatim() {
+        let template = "{% for message in messages %}{{ message.role }}: {% for tool_call in message.tool_calls %}<tool_call>\n{{ tool_call | tojson }}\n</tool_call>{% endfor %}{% endfor %}";
+        let renderer = ChatTemplateRenderer::new(template).unwrap();
+        let messages = vec![ChatMessage {
+            role: "assistant".to_owned(),
+            content: String::new(),
+            tool_calls: Some(vec![serde_json::json!({
+                "name": "weather",
+                "arguments": {"city": "Denver"}
+            })]),
+            raw_tool_call_text: Some(vec![Some(
+                "<tool_call>\n{\"arguments\":{\"city\":\"Denver\"},\"name\":\"weather\"}\n</tool_call>"
+                    .to_owned(),
+            )]),
+        }];
+
+        assert_eq!(
+            renderer.apply(&messages, None, false).unwrap(),
+            "assistant: <tool_call>\n{\"arguments\":{\"city\":\"Denver\"},\"name\":\"weather\"}\n</tool_call>"
+        );
+    }
+
+    #[test]
+    fn replay_keeps_turn_one_prefix_for_qwen_style_template() {
+        let template = "{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}{% for tool_call in message.tool_calls %}<tool_call>\n{{ tool_call | tojson }}\n</tool_call>{% endfor %}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+        let renderer = ChatTemplateRenderer::new(template).unwrap();
+        let turn_one = vec![ChatMessage {
+            role: "user".to_owned(),
+            content: "weather?".to_owned(),
+            tool_calls: None,
+            raw_tool_call_text: None,
+        }];
+        let generated = "<tool_call>\n{\"name\": \"weather\", \"arguments\": {\"city\": \"Denver\"}}\n</tool_call>";
+        let turn_one_prefix = format!(
+            "{}{}",
+            renderer.apply(&turn_one, None, true).unwrap(),
+            generated
+        );
+        let turn_two = vec![
+            turn_one.first().cloned().unwrap(),
+            ChatMessage {
+                role: "assistant".to_owned(),
+                content: String::new(),
+                tool_calls: Some(vec![serde_json::json!({
+                    "name": "weather",
+                    "arguments": {"city": "Denver"}
+                })]),
+                raw_tool_call_text: Some(vec![Some(generated.to_owned())]),
+            },
+            ChatMessage {
+                role: "tool".to_owned(),
+                content: "sunny".to_owned(),
+                tool_calls: None,
+                raw_tool_call_text: None,
+            },
+        ];
+        let turn_two_prompt = renderer.apply(&turn_two, None, true).unwrap();
+        assert!(
+            turn_two_prompt
+                .as_bytes()
+                .starts_with(turn_one_prefix.as_bytes())
+        );
     }
 
     #[test]
