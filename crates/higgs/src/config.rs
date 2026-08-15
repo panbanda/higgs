@@ -393,6 +393,10 @@ pub struct ModelConfig {
     /// Enable the separate batch engine for this model.
     #[serde(default)]
     pub batch: bool,
+    /// Maximum prompt tokens to prefill per batch-loop iteration. `None` and
+    /// `0` retain synchronous prefill behavior.
+    #[serde(default)]
+    pub prefill_yield_tokens: Option<u32>,
     /// KV-cache storage mode.
     #[serde(default)]
     pub kv_cache: KvCacheMode,
@@ -685,6 +689,7 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             name: None,
             mlx_profile: None,
             batch: args.batch,
+            prefill_yield_tokens: None,
             kv_cache,
             kv_bits: args.kv_bits.unwrap_or(default_kv_bits()),
             kv_key_bits: args.kv_key_bits,
@@ -774,6 +779,7 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                     name: None,
                     mlx_profile: None,
                     batch: serve_args.batch,
+                    prefill_yield_tokens: None,
                     kv_cache,
                     kv_bits: serve_args.kv_bits.unwrap_or(default_kv_bits()),
                     kv_key_bits: serve_args.kv_key_bits,
@@ -947,6 +953,7 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         name: Some(name.clone()),
         mlx_profile: None,
         batch: false,
+        prefill_yield_tokens: None,
         kv_cache: KvCacheMode::Off,
         kv_bits: default_kv_bits(),
         kv_key_bits: None,

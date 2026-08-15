@@ -646,6 +646,7 @@ mod tests {
                 name: None,
                 mlx_profile: None,
                 batch: false,
+                prefill_yield_tokens: None,
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
                 kv_seed: 0,

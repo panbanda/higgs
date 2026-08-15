@@ -76,6 +76,7 @@ path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
 # name = "llama"
 # mlx_profile = "throughput"
 # batch = false
+# prefill_yield_tokens = 512 # 0 or omitted keeps synchronous prefill
 # kv_cache = "turboquant"
 # kv_bits = 3
 # kv_key_bits = 2

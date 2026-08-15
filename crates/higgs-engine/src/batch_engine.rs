@@ -7,7 +7,7 @@
 //! waiting for prior requests to fully complete.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use higgs_models::{
     AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample,
@@ -35,6 +35,7 @@ const DEFAULT_PREFIX_CACHE_SIZE: usize = 8;
 
 /// Maximum number of pending requests in the submission queue.
 const REQUEST_QUEUE_CAPACITY: usize = 128;
+static NEXT_PREFILL_ID: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------------------
 // Request types
@@ -67,6 +68,34 @@ struct ActiveRequest {
     detok: IncrementalDetok,
 }
 
+/// A request whose prompt is being fed through the model over multiple turns
+/// of the worker loop.
+struct PendingPrefill {
+    request_id: u64,
+    req: BatchRequest,
+    prompt_len: u32,
+    tokens: Vec<u32>,
+    offset: usize,
+    cache: AnyCache,
+}
+
+enum PrefillAdvance {
+    InFlight(PendingPrefill),
+    Complete(Option<ActiveRequest>),
+}
+
+#[cfg(test)]
+fn prefill_chunk_ranges(token_count: usize, quantum: usize) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while start < token_count {
+        let end = start.saturating_add(quantum).min(token_count);
+        ranges.push(start..end);
+        start = end;
+    }
+    ranges
+}
+
 // ---------------------------------------------------------------------------
 // BatchEngine
 // ---------------------------------------------------------------------------
@@ -91,6 +120,7 @@ impl BatchEngine {
         dir: P,
         kv_cache_config: KvCacheConfig,
         raise_wired_limit: bool,
+        prefill_yield_tokens: Option<u32>,
     ) -> Result<Self, EngineError> {
         if kv_cache_config.is_turboquant() {
             return Err(EngineError::Generation(
@@ -117,7 +147,13 @@ impl BatchEngine {
         std::thread::Builder::new()
             .name("batch-engine".into())
             .spawn(move || {
-                worker_loop(model, &tok, &eos_ids, request_rx);
+                worker_loop(
+                    model,
+                    &tok,
+                    &eos_ids,
+                    request_rx,
+                    prefill_yield_tokens.unwrap_or(0),
+                );
             })
             .map_err(|e| EngineError::Generation(format!("Failed to spawn worker: {e}")))?;
 
@@ -401,39 +437,90 @@ impl BatchEngine {
 // Background worker loop
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 fn worker_loop(
     mut model: AnyModel,
     tokenizer: &Tokenizer,
     eos_token_ids: &[u32],
     mut request_rx: tokio::sync::mpsc::Receiver<BatchRequest>,
+    prefill_yield_tokens: u32,
 ) {
     let mut prefix_cache = PrefixCache::new(DEFAULT_PREFIX_CACHE_SIZE);
     let mut active: Vec<ActiveRequest> = Vec::new();
+    let mut pending_prefill: Option<PendingPrefill> = None;
 
     loop {
         // 1. Prefill at most one pending request per iteration.
         //    This interleaves prefill with decode so long prefills don't
         //    starve active requests, keeping TTFT low for new arrivals
         //    while maintaining token throughput for in-flight requests.
-        if let Ok(req) = request_rx.try_recv() {
-            match prefill_request(&mut model, &mut prefix_cache, tokenizer, eos_token_ids, req) {
-                Ok(Some(ar)) => active.push(ar),
-                Ok(None) => {}
-                Err(e) => tracing::error!(error = %e, "Prefill failed"),
+        if pending_prefill.is_none() {
+            if let Ok(req) = request_rx.try_recv() {
+                if prefill_yield_tokens == 0 {
+                    match prefill_request(
+                        &mut model,
+                        &mut prefix_cache,
+                        tokenizer,
+                        eos_token_ids,
+                        req,
+                    ) {
+                        Ok(Some(ar)) => active.push(ar),
+                        Ok(None) => {}
+                        Err(e) => tracing::error!(error = %e, "Prefill failed"),
+                    }
+                } else {
+                    match start_prefill(&model, &mut prefix_cache, req) {
+                        Ok(prefill) => pending_prefill = Some(prefill),
+                        Err(e) => tracing::error!(error = %e, "Prefill failed"),
+                    }
+                }
+            }
+        }
+
+        if let Some(prefill) = pending_prefill.take() {
+            match advance_prefill(
+                &mut model,
+                &mut prefix_cache,
+                tokenizer,
+                eos_token_ids,
+                prefill,
+                prefill_yield_tokens,
+            ) {
+                Ok(PrefillAdvance::InFlight(resumed_prefill)) => {
+                    pending_prefill = Some(resumed_prefill);
+                }
+                Ok(PrefillAdvance::Complete(Some(ar))) => active.push(ar),
+                Ok(PrefillAdvance::Complete(None)) => {}
+                Err(e) => {
+                    tracing::error!(error = %e, "Prefill failed");
+                }
             }
         }
 
         // 2. If no active requests, block until one arrives.
-        if active.is_empty() {
+        if active.is_empty() && pending_prefill.is_none() {
             if let Some(req) = request_rx.blocking_recv() {
-                match prefill_request(&mut model, &mut prefix_cache, tokenizer, eos_token_ids, req)
-                {
-                    Ok(Some(ar)) => active.push(ar),
-                    Ok(None) => continue,
-                    Err(e) => {
-                        tracing::error!(error = %e, "Prefill failed");
-                        continue;
+                if prefill_yield_tokens == 0 {
+                    match prefill_request(
+                        &mut model,
+                        &mut prefix_cache,
+                        tokenizer,
+                        eos_token_ids,
+                        req,
+                    ) {
+                        Ok(Some(ar)) => active.push(ar),
+                        Ok(None) => continue,
+                        Err(e) => {
+                            tracing::error!(error = %e, "Prefill failed");
+                            continue;
+                        }
                     }
+                } else {
+                    match start_prefill(&model, &mut prefix_cache, req) {
+                        Ok(prefill) => pending_prefill = Some(prefill),
+                        Err(e) => tracing::error!(error = %e, "Prefill failed"),
+                    }
+                    continue;
                 }
             } else {
                 tracing::info!("Request channel closed, worker shutting down");
@@ -643,10 +730,101 @@ fn run_batched_decode_round(
     Ok(())
 }
 
-/// Prefill a new request: run the full prompt through the model and sample
-/// the first token. Returns `None` if the request completed immediately
-/// (first token is EOS or hit a stop sequence).
-#[allow(clippy::too_many_lines)]
+/// Set up cache reuse once, before the prompt begins advancing through chunks.
+fn start_prefill(
+    model: &AnyModel,
+    prefix_cache: &mut PrefixCache,
+    req: BatchRequest,
+) -> Result<PendingPrefill, EngineError> {
+    let prompt_len = req
+        .prompt_tokens
+        .len()
+        .try_into()
+        .map_err(|_| EngineError::Generation("Prompt too long".to_owned()))?;
+    let prefix_match = prefix_cache.find_longest_prefix(&req.prompt_tokens);
+    let (tokens, cache) = if let Some(matched) = prefix_match {
+        let suffix = req
+            .prompt_tokens
+            .get(matched.prefix_len..)
+            .unwrap_or_default();
+        if suffix.is_empty() {
+            // We don't cache logits, so an exact match must be replayed.
+            (
+                req.prompt_tokens.clone(),
+                model.make_cache().map_err(EngineError::Mlx)?,
+            )
+        } else {
+            (suffix.to_vec(), matched.cache)
+        }
+    } else {
+        (
+            req.prompt_tokens.clone(),
+            model.make_cache().map_err(EngineError::Mlx)?,
+        )
+    };
+
+    Ok(PendingPrefill {
+        request_id: NEXT_PREFILL_ID.fetch_add(1, Ordering::Relaxed),
+        req,
+        prompt_len,
+        tokens,
+        offset: 0,
+        cache,
+    })
+}
+
+fn advance_prefill(
+    model: &mut AnyModel,
+    prefix_cache: &mut PrefixCache,
+    tokenizer: &Tokenizer,
+    eos_token_ids: &[u32],
+    mut prefill: PendingPrefill,
+    quantum: u32,
+) -> Result<PrefillAdvance, EngineError> {
+    let start = prefill.offset;
+    let end = start
+        .saturating_add(usize::try_from(quantum).unwrap_or(usize::MAX))
+        .min(prefill.tokens.len());
+    let is_complete = end == prefill.tokens.len();
+
+    with_new_default_stream(Stream::new(), || {
+        let tokens = prefill
+            .tokens
+            .get(start..end)
+            .ok_or_else(|| EngineError::Generation("Invalid prefill progress".to_owned()))?;
+        let input = Array::from(tokens).index(NewAxis);
+        let logits = model
+            .forward(&input, None, &mut prefill.cache)
+            .map_err(EngineError::Mlx)?;
+        let last_logits = logits.index((.., -1, ..));
+        prefill.offset = end;
+
+        tracing::debug!(
+            request_id = prefill.request_id,
+            tokens_advanced = end - start,
+            remaining = prefill.tokens.len() - end,
+            "Prefill yield"
+        );
+
+        if !is_complete {
+            eval([&last_logits]).map_err(EngineError::Mlx)?;
+            return Ok(PrefillAdvance::InFlight(prefill));
+        }
+
+        complete_prefill(
+            prefix_cache,
+            tokenizer,
+            eos_token_ids,
+            prefill.req,
+            prefill.prompt_len,
+            prefill.cache,
+            last_logits,
+        )
+        .map(PrefillAdvance::Complete)
+    })
+}
+
+/// Prefill synchronously when yielding is disabled.
 fn prefill_request(
     model: &mut AnyModel,
     prefix_cache: &mut PrefixCache,
@@ -654,44 +832,34 @@ fn prefill_request(
     eos_token_ids: &[u32],
     req: BatchRequest,
 ) -> Result<Option<ActiveRequest>, EngineError> {
-    let prompt_len: u32 = req
-        .prompt_tokens
-        .len()
-        .try_into()
-        .map_err(|_| EngineError::Generation("Prompt too long".to_owned()))?;
+    let prefill = start_prefill(model, prefix_cache, req)?;
+    match advance_prefill(
+        model,
+        prefix_cache,
+        tokenizer,
+        eos_token_ids,
+        prefill,
+        u32::MAX,
+    )? {
+        PrefillAdvance::Complete(active) => Ok(active),
+        PrefillAdvance::InFlight(_) => Err(EngineError::Generation(
+            "Synchronous prefill did not complete".to_owned(),
+        )),
+    }
+}
 
-    with_new_default_stream(Stream::new(), || {
-        // Check prefix cache
-        let prefix_match = prefix_cache.find_longest_prefix(&req.prompt_tokens);
-        let (actual_tokens, mut cache) = if let Some(matched) = prefix_match {
-            let suffix = req
-                .prompt_tokens
-                .get(matched.prefix_len..)
-                .unwrap_or_default();
-            if suffix.is_empty() {
-                // Exact prefix match. Currently falls back to full prefill
-                // because we don't store logits alongside the cache.
-                (
-                    req.prompt_tokens.clone(),
-                    model.make_cache().map_err(EngineError::Mlx)?,
-                )
-            } else {
-                (suffix.to_vec(), matched.cache)
-            }
-        } else {
-            (
-                req.prompt_tokens.clone(),
-                model.make_cache().map_err(EngineError::Mlx)?,
-            )
-        };
-
-        let prompt_array = Array::from(actual_tokens.as_slice()).index(NewAxis);
-
-        // Prefill forward pass
-        let logits = model
-            .forward(&prompt_array, None, &mut cache)
-            .map_err(EngineError::Mlx)?;
-        let last_logits = logits.index((.., -1, ..));
+/// Finish a prefill after its final forward pass has produced logits.
+#[allow(clippy::too_many_lines)]
+fn complete_prefill(
+    prefix_cache: &mut PrefixCache,
+    tokenizer: &Tokenizer,
+    eos_token_ids: &[u32],
+    req: BatchRequest,
+    prompt_len: u32,
+    cache: AnyCache,
+    last_logits: Array,
+) -> Result<Option<ActiveRequest>, EngineError> {
+    {
         let current_token = sample(&last_logits, &req.params).map_err(EngineError::Mlx)?;
 
         let logprob_top_n = req.logprobs.then(|| req.top_logprobs.unwrap_or(0));
@@ -811,7 +979,7 @@ fn prefill_request(
             prompt_len,
             detok,
         }))
-    })
+    }
 }
 
 /// Lazy arrays from building a decode step's computation graph.
@@ -1064,5 +1232,11 @@ mod tests {
         let all_unconstrained = true;
         let use_batched = n_active > 1 && supports_batched && all_unconstrained;
         assert!(use_batched);
+    }
+
+    #[test]
+    fn prefill_chunk_ranges_cover_each_token_once() {
+        let ranges = prefill_chunk_ranges(10, 4);
+        assert_eq!(ranges, vec![0..4, 4..8, 8..10]);
     }
 }

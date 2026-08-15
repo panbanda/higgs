@@ -284,7 +284,12 @@ fn load_engines(
         }
         let kv_cache_config = model_cfg.kv_cache_config();
         let engine = if model_cfg.batch {
-            Engine::load_batch(&resolved, kv_cache_config, config.local.raise_wired_limit)?
+            Engine::load_batch(
+                &resolved,
+                kv_cache_config,
+                config.local.raise_wired_limit,
+                model_cfg.prefill_yield_tokens,
+            )?
         } else {
             let tuning =
                 resolve_runtime_tuning(&resolved, model_cfg.requested_mlx_profile(&config.local));

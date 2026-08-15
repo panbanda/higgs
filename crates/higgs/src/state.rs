@@ -49,8 +49,15 @@ impl Engine {
         dir: P,
         kv_cache_config: KvCacheConfig,
         raise_wired_limit: bool,
+        prefill_yield_tokens: Option<u32>,
     ) -> Result<Self, EngineError> {
-        BatchEngine::load(dir, kv_cache_config, raise_wired_limit).map(|e| Self::Batch(Box::new(e)))
+        BatchEngine::load(
+            dir,
+            kv_cache_config,
+            raise_wired_limit,
+            prefill_yield_tokens,
+        )
+        .map(|e| Self::Batch(Box::new(e)))
     }
 
     #[cfg(test)]

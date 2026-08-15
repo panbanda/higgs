@@ -262,6 +262,30 @@ fn model_label(model: &crate::config::ModelConfig) -> String {
     )
 }
 
+fn check_prefill_yield_tokens(
+    label: &str,
+    prefill_yield_tokens: Option<u32>,
+    result: &mut DoctorResult,
+) -> bool {
+    let Some(tokens) = prefill_yield_tokens else {
+        return true;
+    };
+    if tokens != 0 && tokens < 128 {
+        fail(
+            &format!("model {label} prefill_yield_tokens={tokens} must be 0 or at least 128"),
+            result,
+        );
+        return false;
+    }
+    if tokens != 0 && tokens < 512 {
+        warn(
+            &format!("model {label} prefill_yield_tokens={tokens} is below the recommended 512"),
+            result,
+        );
+    }
+    true
+}
+
 fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
     for model in &config.models {
         let label = model_label(model);
@@ -272,6 +296,9 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                 &format!("model {label} disk prefix store is writable"),
                 result,
             );
+        }
+        if !check_prefill_yield_tokens(&label, model.prefill_yield_tokens, result) {
+            continue;
         }
         match model.kv_cache_config().validate() {
             Ok(()) => {}
@@ -592,6 +619,28 @@ mod tests {
         assert_eq!(result.failures, 1);
     }
 
+    #[test]
+    fn prefill_yield_tokens_rejects_small_nonzero_values() {
+        let mut result = empty_result();
+        assert!(!check_prefill_yield_tokens("test", Some(127), &mut result));
+        assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn prefill_yield_tokens_warns_below_recommended_quantum() {
+        let mut result = empty_result();
+        assert!(check_prefill_yield_tokens("test", Some(128), &mut result));
+        assert_eq!(result.warnings, 1);
+    }
+
+    #[test]
+    fn prefill_yield_tokens_accepts_disabled_quantum() {
+        let mut result = empty_result();
+        assert!(check_prefill_yield_tokens("test", Some(0), &mut result));
+        assert_eq!(result.failures, 0);
+        assert_eq!(result.warnings, 0);
+    }
+
     // -- Duplicate model detection --
 
     #[test]
@@ -603,6 +652,7 @@ mod tests {
                     name: None,
                     mlx_profile: None,
                     batch: false,
+                    prefill_yield_tokens: None,
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
@@ -618,6 +668,7 @@ mod tests {
                     name: None,
                     mlx_profile: None,
                     batch: false,
+                    prefill_yield_tokens: None,
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
@@ -646,6 +697,7 @@ mod tests {
                     name: None,
                     mlx_profile: None,
                     batch: false,
+                    prefill_yield_tokens: None,
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
@@ -661,6 +713,7 @@ mod tests {
                     name: None,
                     mlx_profile: None,
                     batch: false,
+                    prefill_yield_tokens: None,
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
@@ -1138,6 +1191,7 @@ mod tests {
                 name: None,
                 mlx_profile: None,
                 batch: false,
+                prefill_yield_tokens: None,
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
                 kv_seed: 0,
@@ -1170,6 +1224,7 @@ mod tests {
                 name: None,
                 mlx_profile: None,
                 batch: false,
+                prefill_yield_tokens: None,
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
                 kv_seed: 0,
@@ -1204,6 +1259,7 @@ mod tests {
                 name: None,
                 mlx_profile: None,
                 batch: false,
+                prefill_yield_tokens: None,
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
                 kv_seed: 0,
