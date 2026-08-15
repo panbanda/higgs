@@ -4,8 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
-DEFAULT_CACHE="$HOME/.cache/higgs-validate"
-CACHE_ROOT="${HF_HOME:-$DEFAULT_CACHE}"
+CACHE_ROOT="$HOME/.cache/higgs-validate"
 MODEL_CACHE="$CACHE_ROOT/models"
 BUILD_CACHE="$CACHE_ROOT/builds"
 WORKTREE_CACHE="$CACHE_ROOT/worktrees"
@@ -34,7 +33,7 @@ PY
     python3 "$SCRIPT_DIR/report.py" --out-dir "$out" --pr-id self-test --threshold -5
     test -s "$out/report.md"
     test -s "$out/runs.csv"
-    if rg -q 'alice|buildbox|192\.168\.1\.5|ghp_' "$out/report.md" "$out/runs.csv"; then
+    if grep -Eq 'alice|buildbox|192\.168\.1\.5|ghp_' "$out/report.md" "$out/runs.csv"; then
         echo "self-test failed: PII remained in rendered output" >&2
         return 1
     fi
