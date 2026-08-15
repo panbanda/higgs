@@ -148,6 +148,17 @@ impl<'de> Deserialize<'de> for QuantizationSettings {
             }
             let setting = match value {
                 serde_json::Value::Bool(false) => TensorQuant::Unquantized,
+                // `true` means "quantize with the scalar defaults" in
+                // real mlx-community complete-predicate-map configs
+                // (every tensor path explicitly listed, e.g.
+                // mlx-community/Qwen3-30B-A3B-3bit). That's identical to
+                // the key being absent, so skip inserting it: `resolve`
+                // already falls back to the scalar default for untracked
+                // paths, and leaving it out of `tensors` means it never
+                // appears in `overridden_paths`/`assert_all_overrides_consumed`
+                // — an architecture doesn't need to explicitly thread a
+                // path whose override is "do the default thing".
+                serde_json::Value::Bool(true) => continue,
                 serde_json::Value::Object(map) => {
                     let tensor_group_size = map
                         .get("group_size")
@@ -173,12 +184,11 @@ impl<'de> Deserialize<'de> for QuantizationSettings {
                     }
                 }
                 serde_json::Value::Null
-                | serde_json::Value::Bool(_)
                 | serde_json::Value::Number(_)
                 | serde_json::Value::String(_)
                 | serde_json::Value::Array(_) => {
                     return Err(serde::de::Error::custom(format!(
-                        "quantization.{path} must be false or an object with group_size and bits"
+                        "quantization.{path} must be true, false, or an object with group_size and bits"
                     )));
                 }
             };
@@ -230,9 +240,70 @@ mod tests {
     #[test]
     fn rejects_unknown_tensor_quantization_shapes() {
         let result = serde_json::from_str::<QuantizationSettings>(
-            r#"{"group_size": 64, "bits": 4, "lm_head": true}"#,
+            r#"{"group_size": 64, "bits": 4, "lm_head": 42}"#,
         );
         assert!(result.is_err_and(|err| err.to_string().contains("lm_head")));
+    }
+
+    #[test]
+    fn accepts_true_as_default_quantization() -> Result<(), serde_json::Error> {
+        // Real mlx-community configs (e.g. Qwen3-30B-A3B-3bit) use a complete
+        // predicate map where every tensor path is listed explicitly: `true`
+        // means "quantize with the scalar defaults", `false` means dense.
+        let settings: QuantizationSettings = serde_json::from_str(
+            r#"{
+                "group_size": 64,
+                "bits": 4,
+                "model.layers.0.self_attn.q_proj": true,
+                "model.layers.0.self_attn.k_proj": true,
+                "model.layers.0.self_attn.v_proj": true,
+                "model.layers.0.self_attn.o_proj": true,
+                "model.layers.1.self_attn.q_proj": true,
+                "lm_head": false
+            }"#,
+        )?;
+
+        assert_eq!(
+            settings.resolve("model.layers.0.self_attn.q_proj"),
+            TensorQuant::Quantized {
+                group_size: 64,
+                bits: 4
+            }
+        );
+        assert_eq!(settings.resolve("lm_head"), TensorQuant::Unquantized);
+        Ok(())
+    }
+
+    #[test]
+    fn true_entries_are_excluded_from_overridden_paths() -> Result<(), serde_json::Error> {
+        let settings: QuantizationSettings = serde_json::from_str(
+            r#"{"group_size": 64, "bits": 4, "model.layers.0.self_attn.q_proj": true, "lm_head": false}"#,
+        )?;
+
+        assert_eq!(
+            settings.overridden_paths().collect::<Vec<_>>(),
+            ["lm_head"],
+            "a `true` entry means default behavior and must not be treated as an override"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn true_entries_do_not_trip_assert_all_overrides_consumed() -> Result<(), serde_json::Error> {
+        // An architecture that never threads `self_attn.q_proj` per-tensor
+        // must still accept a config where that path is explicitly `true`
+        // (default behavior), since `true` carries no architecture-specific
+        // meaning to honor.
+        let settings: QuantizationSettings = serde_json::from_str(
+            r#"{"group_size": 64, "bits": 4, "model.layers.0.self_attn.q_proj": true}"#,
+        )?;
+
+        assert!(
+            settings
+                .assert_all_overrides_consumed(&HashSet::new())
+                .is_ok()
+        );
+        Ok(())
     }
 
     #[test]

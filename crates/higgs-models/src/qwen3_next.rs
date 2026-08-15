@@ -1819,6 +1819,21 @@ pub(crate) fn consumed_quantization_paths(
                     ));
                 }
             }
+            // `gate_quantization_override` (see `load_qwen3_next_args_from_value`)
+            // reads only layer 0's `mlp.gate` override and applies it
+            // uniformly as the scalar `gate_quantization` fallback for
+            // every router gate and shared-expert gate — real
+            // mlx-community checkpoints (e.g. Qwen3-Next 5-bit) still list
+            // a per-layer override for both projections at every MoE
+            // layer. Those per-layer entries are read (layer 0) or
+            // deliberately superseded by the uniform fallback (other
+            // layers), not silently dropped — mark them all consumed.
+            for prefix in ["model", "language_model.model"] {
+                consumed.insert(format!("{prefix}.layers.{layer_idx}.mlp.gate"));
+                consumed.insert(format!(
+                    "{prefix}.layers.{layer_idx}.mlp.shared_expert_gate"
+                ));
+            }
         }
     }
 
@@ -5676,6 +5691,33 @@ mod tests {
     }
 
     #[test]
+    fn test_causal_lm_accepts_real_checkpoint_per_layer_router_gate_overrides() {
+        // Mirrors real mlx-community Qwen3-Next 5-bit checkpoints (e.g.
+        // Qwen3-Next-80B-A3B-Thinking-5bit), which carry a per-layer 8-bit
+        // router override for both `mlp.gate` and `mlp.shared_expert_gate`
+        // at every MoE layer, not just layer 0.
+        let mut args = valid_causal_lm_args();
+        args.quantization = Some(
+            serde_json::from_str(
+                r#"{
+                    "group_size": 64,
+                    "bits": 4,
+                    "model.layers.0.mlp.gate": {"group_size": 64, "bits": 8},
+                    "model.layers.0.mlp.shared_expert_gate": {"group_size": 64, "bits": 8},
+                    "model.layers.1.mlp.gate": {"group_size": 64, "bits": 8},
+                    "model.layers.1.mlp.shared_expert_gate": {"group_size": 64, "bits": 8},
+                    "model.layers.2.mlp.gate": {"group_size": 64, "bits": 8},
+                    "model.layers.2.mlp.shared_expert_gate": {"group_size": 64, "bits": 8},
+                    "model.layers.3.mlp.gate": {"group_size": 64, "bits": 8},
+                    "model.layers.3.mlp.shared_expert_gate": {"group_size": 64, "bits": 8}
+                }"#,
+            )
+            .unwrap(),
+        );
+        Qwen3NextCausalLM::new(args).unwrap();
+    }
+
+    #[test]
     fn test_causal_lm_rejects_zero_conv_kernel_dim() {
         let mut args = valid_causal_lm_args();
         args.linear_conv_kernel_dim = 0;
@@ -5789,6 +5831,49 @@ mod tests {
         let gate_q = args.gate_quantization.unwrap();
         assert_eq!(gate_q.group_size, 64);
         assert_eq!(gate_q.bits, 8);
+    }
+
+    #[test]
+    fn test_real_checkpoint_style_config_loads_end_to_end() {
+        // Full pipeline (config.json -> args -> model) for a config shaped
+        // like a real mlx-community Qwen3-Next 5-bit checkpoint: per-layer
+        // router gate overrides at every MoE layer, not just layer 0.
+        let config = serde_json::json!({
+            "model_type": "qwen3_next",
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 1024,
+            "max_position_embeddings": 4096,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 4,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+            "num_experts": 8,
+            "num_experts_per_tok": 2,
+            "decoder_sparse_step": 1,
+            "shared_expert_intermediate_size": 32,
+            "moe_intermediate_size": 32,
+            "full_attention_interval": 4,
+            "quantization": {
+                "group_size": 64,
+                "bits": 4,
+                "model.layers.0.mlp.gate": {"group_size": 64, "bits": 8},
+                "model.layers.0.mlp.shared_expert_gate": {"group_size": 64, "bits": 8},
+                "model.layers.1.mlp.gate": {"group_size": 64, "bits": 8},
+                "model.layers.1.mlp.shared_expert_gate": {"group_size": 64, "bits": 8},
+                "model.embed_tokens": true,
+                "lm_head": false
+            }
+        });
+
+        let args = load_qwen3_next_args_from_value(config).unwrap();
+        Qwen3NextCausalLM::new(args).unwrap();
     }
 
     #[test]
