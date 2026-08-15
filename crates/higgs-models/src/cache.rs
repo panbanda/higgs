@@ -1,9 +1,9 @@
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc, OnceLock,
+    atomic::{AtomicBool, Ordering},
 };
 
-use mlx_rs::{error::Exception, ops, ops::concatenate_axis, Array, Dtype, Stream};
+use mlx_rs::{Array, Dtype, Stream, error::Exception, ops, ops::concatenate_axis};
 
 use crate::turboquant::{
     KvCacheConfig, KvCacheMode, QuantizedKey, QuantizedValue, TurboQuantContext,
@@ -19,6 +19,20 @@ pub enum KvCacheView {
 static TURBOQUANT_ACTIVATE_AT: OnceLock<i32> = OnceLock::new();
 static TURBOQUANT_INACTIVE_LOGGED: AtomicBool = AtomicBool::new(false);
 const DEFAULT_TURBOQUANT_ACTIVATE_AT: i32 = 2048;
+static MLA_LATENT_CACHE_ENABLED: OnceLock<bool> = OnceLock::new();
+const DEFAULT_MLA_LATENT_CACHE_ENABLED: bool = false;
+
+fn parse_mla_latent_cache_enabled(raw: Option<&str>) -> bool {
+    raw.and_then(|value| value.parse::<bool>().ok())
+        .unwrap_or(DEFAULT_MLA_LATENT_CACHE_ENABLED)
+}
+
+/// Whether DeepSeek MLA caches should store compressed latent rows.
+pub fn mla_latent_cache_enabled() -> bool {
+    *MLA_LATENT_CACHE_ENABLED.get_or_init(|| {
+        parse_mla_latent_cache_enabled(std::env::var("HIGGS_MLA_LATENT_CACHE").ok().as_deref())
+    })
+}
 
 fn parse_turboquant_activate_at(raw: Option<&str>) -> i32 {
     raw.and_then(|s| s.parse::<i32>().ok())
@@ -217,6 +231,10 @@ impl TurboQuantKvView {
 
 /// Trait for key-value caches used in autoregressive generation.
 pub trait KeyValueCache {
+    /// Whether this cache stores MLA compressed rows.
+    fn is_mla(&self) -> bool {
+        false
+    }
     /// Whether the cache stores quantized KV pairs.
     fn is_quantized(&self) -> bool {
         false
@@ -262,6 +280,10 @@ impl<T> KeyValueCache for &'_ mut T
 where
     T: KeyValueCache,
 {
+    fn is_mla(&self) -> bool {
+        T::is_mla(self)
+    }
+
     fn is_quantized(&self) -> bool {
         T::is_quantized(self)
     }
@@ -1129,6 +1151,9 @@ impl TurboQuantStorage {
 }
 
 impl KeyValueCache for SteppingKeyValueCache {
+    fn is_mla(&self) -> bool {
+        self.is_mla()
+    }
     fn is_quantized(&self) -> bool {
         self.config.is_turboquant()
     }
@@ -1706,7 +1731,7 @@ mod tests {
             .unwrap();
         let turbo = decode_view.turboquant().unwrap();
         assert_eq!(turbo.seq_len, 3); // 2 prefill + 1 decode
-                                      // head_dim=8, key_bits=2: ceil(8*2/32) = 1 u32 word
+        // head_dim=8, key_bits=2: ceil(8*2/32) = 1 u32 word
         assert_eq!(turbo.key_codes.shape(), &[2, 3, 1]);
         // head_dim=8, bits=3: ceil(8*3/32) = 1 u32 word
         assert_eq!(turbo.value_codes.shape(), &[2, 3, 1]);

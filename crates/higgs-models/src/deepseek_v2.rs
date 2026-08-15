@@ -21,7 +21,7 @@ use mlx_rs::{
 use serde::Deserialize;
 
 use crate::{
-    cache::{KeyValueCache, SteppingKeyValueCache},
+    cache::{KeyValueCache, SteppingKeyValueCache, mla_latent_cache_enabled},
     error::ModelError,
     qwen3_next::{
         QEmbedding, QLinear, QuantizationConfig, SwitchMlpWeights, new_mlp_projections, swiglu,
@@ -274,6 +274,8 @@ struct DeepSeekV2Attention {
     yarn_freqs: Option<Array>,
     yarn_mscale: f32,
     use_compressed_query: bool,
+    absorbed_k: Option<Array>,
+    absorbed_v: Option<Array>,
 }
 
 impl DeepSeekV2Attention {
@@ -381,7 +383,57 @@ impl DeepSeekV2Attention {
             yarn_freqs,
             yarn_mscale,
             use_compressed_query,
+            absorbed_k: None,
+            absorbed_v: None,
         })
+    }
+
+    fn absorbed_weights(&mut self, dtype: mlx_rs::Dtype) -> Result<(&Array, &Array), Exception> {
+        if self.absorbed_k.is_none() || self.absorbed_v.is_none() {
+            let weight = ops::dequantize(
+                &self.kv_b_proj.weight,
+                &self.kv_b_proj.scales,
+                &*self.kv_b_proj.biases,
+                self.kv_b_proj.group_size,
+                self.kv_b_proj.bits,
+            )?;
+            let k_width = self.num_heads * self.qk_nope_head_dim;
+            let k = weight.index((..k_width, ..)).reshape(&[
+                1,
+                self.num_heads,
+                self.qk_nope_head_dim,
+                self.kv_lora_rank,
+            ])?;
+            let v = weight
+                .index((k_width.., ..))
+                .reshape(&[1, self.num_heads, self._v_head_dim, self.kv_lora_rank])?
+                .transpose_axes(&[0, 1, 3, 2])?;
+            self.absorbed_k = Some(k);
+            self.absorbed_v = Some(v);
+        }
+        let k = self
+            .absorbed_k
+            .as_ref()
+            .ok_or_else(|| Exception::custom("absorbed K missing"))?;
+        let v = self
+            .absorbed_v
+            .as_ref()
+            .ok_or_else(|| Exception::custom("absorbed V missing"))?;
+        // Keep this cast here: MLX scalar/rope operations can promote fp16 inputs
+        // to fp32, which otherwise changes both cache residency and QLinear input dtype.
+        if k.dtype() != dtype || v.dtype() != dtype {
+            self.absorbed_k = Some(k.as_dtype(dtype)?);
+            self.absorbed_v = Some(v.as_dtype(dtype)?);
+        }
+        let k = self
+            .absorbed_k
+            .as_ref()
+            .ok_or_else(|| Exception::custom("absorbed K missing after cast"))?;
+        let v = self
+            .absorbed_v
+            .as_ref()
+            .ok_or_else(|| Exception::custom("absorbed V missing after cast"))?;
+        Ok((k, v))
     }
 
     #[allow(non_snake_case)]
@@ -441,14 +493,8 @@ impl DeepSeekV2Attention {
             .reshape(&[B, L, 1, self.qk_rope_head_dim])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        // Decompress KV
-        let kv = self
-            .kv_b_proj
-            .forward(&self.kv_a_layernorm.forward(&kv_latent)?)?
-            .reshape(&[B, L, self.num_heads, -1])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let k_nope = kv.index((.., .., .., ..self.qk_nope_head_dim));
-        let v_decompressed = kv.index((.., .., .., self.qk_nope_head_dim..));
+        let use_absorbed = cache.as_ref().is_some_and(|c| KeyValueCache::is_mla(*c));
+        let latent = self.kv_a_layernorm.forward(&kv_latent)?;
 
         // Apply RoPE
         let offset = cache.as_ref().map_or(0, |c| KeyValueCache::offset(*c));
@@ -469,6 +515,42 @@ impl DeepSeekV2Attention {
             self.yarn_mscale,
             offset,
         )?;
+
+        if use_absorbed {
+            let kv_lora_rank = self.kv_lora_rank;
+            let scale = self.scale;
+            let (absorbed_k, absorbed_v) = self.absorbed_weights(q_nope.dtype())?;
+            let q_latent = q_nope.matmul(absorbed_k)?;
+            let queries = ops::concatenate_axis(&[&q_latent, &q_pe], -1)?;
+            let rows =
+                ops::concatenate_axis(&[&latent.reshape(&[B, 1, L, kv_lora_rank])?, &k_pe], -1)?;
+            let (history, _) = cache
+                .ok_or_else(|| Exception::custom("MLA latent path requires a cache"))?
+                .update_latent_and_fetch(rows)?;
+            let values = history.index((.., .., .., ..kv_lora_rank));
+            let sdpa_mask = mask.map(fast::ScaledDotProductAttentionMask::from);
+            let output = fast::scaled_dot_product_attention(
+                queries,
+                history,
+                values,
+                scale,
+                sdpa_mask,
+                None::<&Array>,
+            )?
+            .matmul(absorbed_v)?
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[B, L, -1])?;
+            return self.o_proj.forward(&output);
+        }
+
+        // Decompress KV (the legacy dense cache path).
+        let kv = self
+            .kv_b_proj
+            .forward(&latent)?
+            .reshape(&[B, L, self.num_heads, -1])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let k_nope = kv.index((.., .., .., ..self.qk_nope_head_dim));
+        let v_decompressed = kv.index((.., .., .., self.qk_nope_head_dim..));
 
         // Repeat k_pe for all heads: [B, 1, L, D] -> [B, num_heads, L, D]
         let k_pe_expanded =
@@ -807,6 +889,23 @@ impl DeepSeekV2CausalLM {
         })
     }
 
+    pub fn make_cache(&self) -> Result<Vec<Option<SteppingKeyValueCache>>, Exception> {
+        (0..self.args.num_hidden_layers)
+            .map(|_| {
+                if mla_latent_cache_enabled() {
+                    SteppingKeyValueCache::new_mla(
+                        self.args.kv_lora_rank,
+                        self.args.qk_rope_head_dim,
+                        Default::default(),
+                    )
+                } else {
+                    Ok(SteppingKeyValueCache::new())
+                }
+                .map(Some)
+            })
+            .collect()
+    }
+
     #[allow(non_snake_case)]
     pub fn forward_hidden(
         &mut self,
@@ -823,8 +922,19 @@ impl DeepSeekV2CausalLM {
 
         if kv_cache.is_empty() {
             *kv_cache = (0..self.model.layers.len())
-                .map(|_| Some(SteppingKeyValueCache::new()))
-                .collect();
+                .map(|_| {
+                    if mla_latent_cache_enabled() {
+                        SteppingKeyValueCache::new_mla(
+                            self.args.kv_lora_rank,
+                            self.args.qk_rope_head_dim,
+                            Default::default(),
+                        )
+                    } else {
+                        Ok(SteppingKeyValueCache::new())
+                    }
+                    .map(Some)
+                })
+                .collect::<Result<_, _>>()?;
         } else if kv_cache.len() != self.model.layers.len() {
             return Err(Exception::custom(format!(
                 "kv_cache length ({}) must match num layers ({})",
