@@ -19,6 +19,8 @@ grep -Fq 'CARGO_TARGET_DIR="$shared_target_dir" cargo build --release -p higgs -
 grep -Fq 'cp "$shared_target_dir/release/higgs" "$build_dir/release/higgs"' "$RUNNER"
 grep -Fq 'cp "$shared_target_dir/release/bench_decode" "$build_dir/release/bench_decode"' "$RUNNER"
 grep -Fq 'cp "$shared_target_dir/release/mlx.metallib" "$build_dir/release/mlx.metallib"' "$RUNNER"
+grep -Fq 'if [[ -f "$shared_target_dir/release/quality_gate" ]]; then' "$RUNNER"
+grep -Fq 'cp "$shared_target_dir/release/quality_gate" "$build_dir/release/quality_gate"' "$RUNNER"
 grep -Fq 'find "$shared_target_dir/release/build" -path "*/mlx-sys-*/out/build/lib/mlx.metallib"' "$RUNNER"
 grep -Fq 'metallib_path="$(find' "$RUNNER"
 grep -Fq 'missing mlx.metallib in shared target directory' "$RUNNER"

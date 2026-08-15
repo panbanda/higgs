@@ -96,6 +96,10 @@ build_ref() {
     if [[ -f "$shared_target_dir/release/mlx.metallib" ]]; then
         cp "$shared_target_dir/release/mlx.metallib" "$build_dir/release/mlx.metallib"
     fi
+    # quality_gate postdates some baseline SHAs; copy it when the shared build produced one.
+    if [[ -f "$shared_target_dir/release/quality_gate" ]]; then
+        cp "$shared_target_dir/release/quality_gate" "$build_dir/release/quality_gate"
+    fi
     metallib_path="$(find "$shared_target_dir/release/build" -path "*/mlx-sys-*/out/build/lib/mlx.metallib" -type f -exec ls -t {} + 2>/dev/null | head -n 1 || true)"
     if [[ -z "$metallib_path" ]]; then
         echo "missing mlx.metallib in shared target directory: $shared_target_dir" >&2

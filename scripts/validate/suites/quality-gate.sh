@@ -8,18 +8,28 @@ set -euo pipefail
 : "${MODEL_DIR:?MODEL_DIR is required}"
 : "${OUT_DIR:?OUT_DIR is required}"
 : "${RUNS:?RUNS is required}"
+: "${MODEL_KEY:?MODEL_KEY is required}"
 
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 raw_dir="$OUT_DIR/raw"
 fixture="$raw_dir/quality-fixture.json"
 result="$raw_dir/quality.json"
 prompts="$root_dir/benchmarks/quality/prompts.json"
+committed_fixture="$root_dir/benchmarks/quality/baselines/$MODEL_KEY.json"
 
 mkdir -p "$raw_dir"
-"$BASELINE_BIN_DIR/quality_gate" record \
-  --model-dir "$MODEL_DIR" \
-  --prompts "$prompts" \
-  --out "$fixture"
+if [[ -f "$committed_fixture" ]]; then
+  fixture="$committed_fixture"
+else
+  if [[ ! -x "$BASELINE_BIN_DIR/quality_gate" ]]; then
+    echo "baseline build predates quality_gate; commit a baseline fixture instead" >&2
+    exit 1
+  fi
+  "$BASELINE_BIN_DIR/quality_gate" record \
+    --model-dir "$MODEL_DIR" \
+    --prompts "$prompts" \
+    --out "$fixture"
+fi
 
 set +e
 "$CANDIDATE_BIN_DIR/quality_gate" check \
