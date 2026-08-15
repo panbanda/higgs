@@ -265,6 +265,14 @@ fn model_label(model: &crate::config::ModelConfig) -> String {
 fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
     for model in &config.models {
         let label = model_label(model);
+        if let Err(error) = model.validate_disk_prefix_store() {
+            fail(&format!("model {label} disk prefix store: {error}"), result);
+        } else if model.kv_disk_dir.is_some() {
+            pass(
+                &format!("model {label} disk prefix store is writable"),
+                result,
+            );
+        }
         match model.kv_cache_config().validate() {
             Ok(()) => {}
             Err(err) => {
@@ -602,6 +610,8 @@ mod tests {
                     kv_value_bits: None,
                     kv_norm_correction: true,
                     kv_adaptive_dense_layers: 0,
+                    kv_disk_dir: None,
+                    kv_disk_space_mb: 4096,
                 },
                 ModelConfig {
                     path: "org/model-b".to_owned(),
@@ -615,6 +625,8 @@ mod tests {
                     kv_value_bits: None,
                     kv_norm_correction: true,
                     kv_adaptive_dense_layers: 0,
+                    kv_disk_dir: None,
+                    kv_disk_space_mb: 4096,
                 },
             ],
             ..HiggsConfig::default()
@@ -641,6 +653,8 @@ mod tests {
                     kv_value_bits: None,
                     kv_norm_correction: true,
                     kv_adaptive_dense_layers: 0,
+                    kv_disk_dir: None,
+                    kv_disk_space_mb: 4096,
                 },
                 ModelConfig {
                     path: "org/model-a".to_owned(),
@@ -654,6 +668,8 @@ mod tests {
                     kv_value_bits: None,
                     kv_norm_correction: true,
                     kv_adaptive_dense_layers: 0,
+                    kv_disk_dir: None,
+                    kv_disk_space_mb: 4096,
                 },
             ],
             ..HiggsConfig::default()
@@ -1129,6 +1145,8 @@ mod tests {
                 kv_value_bits: None,
                 kv_norm_correction: true,
                 kv_adaptive_dense_layers: 0,
+                kv_disk_dir: None,
+                kv_disk_space_mb: 4096,
             }],
             ..HiggsConfig::default()
         };
@@ -1159,6 +1177,8 @@ mod tests {
                 kv_value_bits: None,
                 kv_norm_correction: true,
                 kv_adaptive_dense_layers: 0,
+                kv_disk_dir: None,
+                kv_disk_space_mb: 4096,
             }],
             ..HiggsConfig::default()
         };
@@ -1191,6 +1211,8 @@ mod tests {
                 kv_value_bits: None,
                 kv_norm_correction: true,
                 kv_adaptive_dense_layers: 0,
+                kv_disk_dir: None,
+                kv_disk_space_mb: 4096,
             }],
             routes: vec![RouteConfig {
                 name: Some("test".to_owned()),

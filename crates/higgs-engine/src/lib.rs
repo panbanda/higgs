@@ -4,6 +4,7 @@ pub mod batch_engine;
 pub mod cache;
 pub mod chat_template;
 pub mod constrained;
+pub mod disk_prefix_store;
 pub mod engine;
 pub mod error;
 pub mod mlx_tuning;

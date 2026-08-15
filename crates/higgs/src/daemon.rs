@@ -155,6 +155,8 @@ port = 8000
 # name = "llama"
 # mlx_profile = "throughput"
 # batch = false
+# kv_disk_dir = "/var/lib/higgs/prefix-kv" # optional durable prefix cache
+# kv_disk_space_mb = 4096                # LRU budget; minimum 64 MiB
 
 # --- Remote providers ---
 # Forward requests to external APIs via proxy routes.

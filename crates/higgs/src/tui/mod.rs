@@ -653,6 +653,8 @@ mod tests {
                 kv_value_bits: None,
                 kv_norm_correction: true,
                 kv_adaptive_dense_layers: 0,
+                kv_disk_dir: None,
+                kv_disk_space_mb: 4096,
             }],
             ..HiggsConfig::default()
         }

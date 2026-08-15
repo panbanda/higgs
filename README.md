@@ -8,6 +8,8 @@
 
 Run open-weight MLX models locally on Apple Silicon, route requests across local and remote providers, and expose everything through one endpoint.
 
+For a local model, set `kv_disk_dir` in its `[[models]]` entry to retain block-aligned prefix KV state across restarts. `kv_disk_space_mb` controls its on-disk LRU budget (default `4096`, minimum `64`). The disk tier is model, quantization, configuration, tokenizer, and chat-template bound; incompatible entries are ignored.
+
 Higgs is a single static Rust binary that serves local models, proxies to providers like OpenAI, Anthropic, and Ollama, and translates between OpenAI and Anthropic-style APIs so your existing tools and apps do not need a new integration.
 
 **Why care**

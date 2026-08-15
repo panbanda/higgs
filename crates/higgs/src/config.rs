@@ -414,6 +414,12 @@ pub struct ModelConfig {
     /// Seed used by `TurboQuant` setup.
     #[serde(default)]
     pub kv_seed: u64,
+    /// Directory used for durable, disk-backed prefix KV entries.
+    #[serde(default)]
+    pub kv_disk_dir: Option<String>,
+    /// Maximum disk-prefix-store size in MiB.
+    #[serde(default = "default_kv_disk_space_mb")]
+    pub kv_disk_space_mb: u64,
 }
 
 const fn default_norm_correction() -> bool {
@@ -424,7 +430,27 @@ const fn default_kv_bits() -> u8 {
     3
 }
 
+const fn default_kv_disk_space_mb() -> u64 {
+    4096
+}
+
 impl ModelConfig {
+    /// Validate disk-prefix-store settings independently of engine startup.
+    pub fn validate_disk_prefix_store(&self) -> Result<(), String> {
+        let Some(dir) = self.kv_disk_dir.as_deref() else {
+            return Ok(());
+        };
+        if self.kv_disk_space_mb < 64 {
+            return Err("kv_disk_space_mb must be at least 64".to_owned());
+        }
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("kv_disk_dir {dir:?} is not creatable: {e}"))?;
+        let probe = std::path::Path::new(dir).join(".higgs-write-probe");
+        std::fs::write(&probe, [])
+            .map_err(|e| format!("kv_disk_dir {dir:?} is not writable: {e}"))?;
+        std::fs::remove_file(probe).map_err(|e| format!("kv_disk_dir cleanup failed: {e}"))?;
+        Ok(())
+    }
     pub const fn kv_cache_config(&self) -> KvCacheConfig {
         KvCacheConfig {
             mode: self.kv_cache,
@@ -666,6 +692,8 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             kv_norm_correction: !args.kv_no_norm_correction,
             kv_adaptive_dense_layers: args.kv_adaptive_dense_layers.unwrap_or(0),
             kv_seed: args.kv_seed.unwrap_or_default(),
+            kv_disk_dir: None,
+            kv_disk_space_mb: default_kv_disk_space_mb(),
         })
         .collect();
 
@@ -753,6 +781,8 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                     kv_norm_correction: !serve_args.kv_no_norm_correction,
                     kv_adaptive_dense_layers: serve_args.kv_adaptive_dense_layers.unwrap_or(0),
                     kv_seed: serve_args.kv_seed.unwrap_or_default(),
+                    kv_disk_dir: None,
+                    kv_disk_space_mb: default_kv_disk_space_mb(),
                 })
                 .collect();
             let mut existing = figment
@@ -924,6 +954,8 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         kv_norm_correction: true,
         kv_adaptive_dense_layers: 0,
         kv_seed: 0,
+        kv_disk_dir: None,
+        kv_disk_space_mb: default_kv_disk_space_mb(),
     });
     config.auto_router.model = name;
 }
