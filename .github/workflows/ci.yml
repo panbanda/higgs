@@ -18,7 +18,7 @@ env:
 jobs:
   test:
     name: Test
-    runs-on: macos-15 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
+    runs-on: macos-26 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
     permissions:
       contents: read
 
@@ -43,7 +43,7 @@ jobs:
 
   build:
     name: Build
-    runs-on: macos-15 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
+    runs-on: macos-26 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
     permissions:
       contents: read
 
@@ -70,7 +70,7 @@ jobs:
     name: Bench smoke
     # Advisory until model-backed validation has stabilized across macOS runners.
     continue-on-error: true
-    runs-on: macos-15 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
+    runs-on: macos-26 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
     permissions:
       contents: read
 
@@ -91,7 +91,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: macos-15 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
+    runs-on: macos-26 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
     permissions:
       contents: read
 
@@ -120,7 +120,7 @@ jobs:
 
   msrv:
     name: MSRV
-    runs-on: macos-15 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
+    runs-on: macos-26 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
     permissions:
       contents: read
 
@@ -145,7 +145,7 @@ jobs:
 
   coverage:
     name: Coverage
-    runs-on: macos-15 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
+    runs-on: macos-26 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
     permissions:
       contents: read
 
