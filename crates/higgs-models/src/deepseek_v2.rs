@@ -26,6 +26,7 @@ use crate::{
     qwen3_next::{
         QEmbedding, QLinear, QuantizationConfig, SwitchMlpWeights, new_mlp_projections, swiglu,
     },
+    turboquant::KvCacheConfig,
     utils::{AttentionMask, create_attention_mask},
 };
 
@@ -268,7 +269,7 @@ struct DeepSeekV2Attention {
     kv_lora_rank: i32,
     qk_nope_head_dim: i32,
     qk_rope_head_dim: i32,
-    _v_head_dim: i32,
+    v_head_dim: i32,
     scale: f32,
     rope_base: f32,
     yarn_freqs: Option<Array>,
@@ -377,7 +378,7 @@ impl DeepSeekV2Attention {
             kv_lora_rank: args.kv_lora_rank,
             qk_nope_head_dim: args.qk_nope_head_dim,
             qk_rope_head_dim: args.qk_rope_head_dim,
-            _v_head_dim: args.v_head_dim,
+            v_head_dim: args.v_head_dim,
             scale,
             rope_base: args.rope_theta,
             yarn_freqs,
@@ -406,24 +407,24 @@ impl DeepSeekV2Attention {
             ])?;
             let v = weight
                 .index((k_width.., ..))
-                .reshape(&[1, self.num_heads, self._v_head_dim, self.kv_lora_rank])?
+                .reshape(&[1, self.num_heads, self.v_head_dim, self.kv_lora_rank])?
                 .transpose_axes(&[0, 1, 3, 2])?;
             self.absorbed_k = Some(k);
             self.absorbed_v = Some(v);
         }
-        let k = self
+        let cached_k = self
             .absorbed_k
             .as_ref()
             .ok_or_else(|| Exception::custom("absorbed K missing"))?;
-        let v = self
+        let cached_v = self
             .absorbed_v
             .as_ref()
             .ok_or_else(|| Exception::custom("absorbed V missing"))?;
         // Keep this cast here: MLX scalar/rope operations can promote fp16 inputs
         // to fp32, which otherwise changes both cache residency and QLinear input dtype.
-        if k.dtype() != dtype || v.dtype() != dtype {
-            self.absorbed_k = Some(k.as_dtype(dtype)?);
-            self.absorbed_v = Some(v.as_dtype(dtype)?);
+        if cached_k.dtype() != dtype || cached_v.dtype() != dtype {
+            self.absorbed_k = Some(cached_k.as_dtype(dtype)?);
+            self.absorbed_v = Some(cached_v.as_dtype(dtype)?);
         }
         let k = self
             .absorbed_k
@@ -436,7 +437,7 @@ impl DeepSeekV2Attention {
         Ok((k, v))
     }
 
-    #[allow(non_snake_case)]
+    #[allow(non_snake_case, clippy::too_many_lines)]
     fn forward<C: KeyValueCache>(
         &mut self,
         x: &Array,
@@ -896,7 +897,7 @@ impl DeepSeekV2CausalLM {
                     SteppingKeyValueCache::new_mla(
                         self.args.kv_lora_rank,
                         self.args.qk_rope_head_dim,
-                        Default::default(),
+                        KvCacheConfig::default(),
                     )
                 } else {
                     Ok(SteppingKeyValueCache::new())
@@ -927,7 +928,7 @@ impl DeepSeekV2CausalLM {
                         SteppingKeyValueCache::new_mla(
                             self.args.kv_lora_rank,
                             self.args.qk_rope_head_dim,
-                            Default::default(),
+                            KvCacheConfig::default(),
                         )
                     } else {
                         Ok(SteppingKeyValueCache::new())

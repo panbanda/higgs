@@ -27,7 +27,7 @@ fn parse_mla_latent_cache_enabled(raw: Option<&str>) -> bool {
         .unwrap_or(DEFAULT_MLA_LATENT_CACHE_ENABLED)
 }
 
-/// Whether DeepSeek MLA caches should store compressed latent rows.
+/// Whether `DeepSeek` MLA caches should store compressed latent rows.
 pub fn mla_latent_cache_enabled() -> bool {
     *MLA_LATENT_CACHE_ENABLED.get_or_init(|| {
         parse_mla_latent_cache_enabled(std::env::var("HIGGS_MLA_LATENT_CACHE").ok().as_deref())
@@ -458,7 +458,7 @@ impl SteppingKeyValueCache {
         })
     }
 
-    /// Construct an MLA cache that stores compressed latent plus shared RoPE K.
+    /// Construct an MLA cache that stores compressed latent plus shared `RoPE` K.
     pub fn new_mla(
         kv_lora_rank: i32,
         rope_dim: i32,
@@ -877,7 +877,11 @@ impl SteppingKeyValueCache {
             ));
         }
         let prev = self.offset;
-        let capacity = storage.latent.as_ref().map_or(0, |a| a.shape()[2]);
+        let capacity = storage
+            .latent
+            .as_ref()
+            .and_then(|a| a.shape().get(2).copied())
+            .unwrap_or(0);
         if prev + new_tokens > capacity {
             let slots = ((new_tokens + self.step - 1) / self.step) * self.step;
             let grown = ops::zeros_dtype(&[1, 1, slots, width], rows.dtype())?;
@@ -1875,9 +1879,9 @@ mod tests {
 
         cache.trim_by(1);
         let replacement = Array::zeros::<f32>(&[1, 1, 1, 6]).unwrap();
-        let (stored, offset) = cache.update_latent_and_fetch(replacement).unwrap();
-        assert_eq!(stored.shape(), &[1, 1, 3, 6]);
-        assert_eq!(offset, 3);
+        let (rewritten, rewritten_offset) = cache.update_latent_and_fetch(replacement).unwrap();
+        assert_eq!(rewritten.shape(), &[1, 1, 3, 6]);
+        assert_eq!(rewritten_offset, 3);
 
         let checkpoint = cache.deep_clone();
         let update = Array::full::<f32>(&[1, 1, 1, 6], &Array::from_f32(2.0)).unwrap();

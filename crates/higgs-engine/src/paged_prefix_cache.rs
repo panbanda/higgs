@@ -4,13 +4,13 @@ use std::time::Instant;
 
 use std::sync::Arc;
 
-use higgs_models::cache::{slice_axis1, slice_axis2, KeyValueCache, SteppingKeyValueCache};
+use higgs_models::cache::{KeyValueCache, SteppingKeyValueCache, slice_axis1, slice_axis2};
 use higgs_models::qwen3_next::ArraysCache;
 use higgs_models::turboquant::TurboQuantContext;
 use higgs_models::{AnyCache, LayerCache};
+use mlx_rs::Array;
 use mlx_rs::error::Exception;
 use mlx_rs::ops::concatenate_axis;
-use mlx_rs::Array;
 
 /// Default block size in tokens for paged caching.
 pub const DEFAULT_BLOCK_SIZE: usize = 32;
