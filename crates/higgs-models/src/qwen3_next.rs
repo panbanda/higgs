@@ -4410,6 +4410,14 @@ fn gate_quantization_override(config: &serde_json::Value) -> Option<serde_json::
         "language_model.model.layers.0.mlp.gate",
     ] {
         if let Some(gate_q) = quant.get(key) {
+            // `true` means "quantize with the scalar defaults" (see
+            // QuantizationSettings::deserialize) — identical to the key
+            // being absent. Treat it as such rather than injecting it into
+            // `gate_quantization`, whose type requires an object with
+            // group_size/bits and would fail to deserialize a bare bool.
+            if gate_q == &serde_json::Value::Bool(true) {
+                continue;
+            }
             return Some(gate_q.clone());
         }
     }
@@ -5831,6 +5839,58 @@ mod tests {
         let gate_q = args.gate_quantization.unwrap();
         assert_eq!(gate_q.group_size, 64);
         assert_eq!(gate_q.bits, 8);
+    }
+
+    #[test]
+    fn test_load_qwen3_next_args_treats_true_gate_override_as_default() {
+        // Real predicate-map checkpoints list every tensor path explicitly,
+        // including the layer-0 router gate as `true` ("use the scalar
+        // defaults"). That must NOT be injected into `gate_quantization`
+        // (whose type requires a {group_size, bits} object) — it should be
+        // treated exactly like the key being absent.
+        let config = serde_json::json!({
+            "model_type": "qwen3_next",
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 1024,
+            "max_position_embeddings": 4096,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 4,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+            "num_experts": 8,
+            "num_experts_per_tok": 2,
+            "decoder_sparse_step": 1,
+            "shared_expert_intermediate_size": 32,
+            "moe_intermediate_size": 32,
+            "full_attention_interval": 4,
+            "quantization": {
+                "group_size": 64,
+                "bits": 4,
+                "model.layers.0.mlp.gate": true,
+                "model.layers.0.mlp.shared_expert_gate": true,
+                "model.layers.1.mlp.gate": {"group_size": 64, "bits": 8},
+                "model.layers.1.mlp.shared_expert_gate": {"group_size": 64, "bits": 8},
+                "model.embed_tokens": true,
+                "lm_head": false
+            }
+        });
+
+        let args = load_qwen3_next_args_from_value(config).unwrap();
+        assert!(
+            args.gate_quantization.is_none(),
+            "a `true` override at the scanned layer must not populate gate_quantization"
+        );
+
+        // Loads end-to-end with the gate at default (scalar) quantization.
+        let model = Qwen3NextCausalLM::new(args).unwrap();
+        assert_eq!(model.args.num_hidden_layers, 2);
     }
 
     #[test]
