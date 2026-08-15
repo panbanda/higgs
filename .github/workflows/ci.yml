@@ -66,6 +66,29 @@ jobs:
       - name: Build release
         run: cargo build --release
 
+  bench-smoke:
+    name: Bench smoke
+    # Advisory until model-backed validation has stabilized across macOS runners.
+    continue-on-error: true
+    runs-on: macos-15 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          prefix-key: "v1-mlx-air-macos15"
+
+      - name: Test validation PII scrubber
+        run: python3 scripts/validate/test_scrub.py
+
+      - name: Exercise validation runner offline
+        run: scripts/validate/run.sh --self-test
+
   lint:
     name: Lint
     runs-on: macos-15 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
