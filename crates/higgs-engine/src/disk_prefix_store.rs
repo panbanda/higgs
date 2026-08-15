@@ -539,6 +539,12 @@ fn cache_layers(cache: &AnyCache) -> std::io::Result<Vec<DiskLayer<'_>>> {
 }
 
 fn cache_kv_layer(kv: &SteppingKeyValueCache) -> std::io::Result<DiskLayer<'_>> {
+    if kv.is_mla() {
+        tracing::debug!("MLA latent prefixes not yet disk-persistable");
+        return Err(std::io::Error::other(
+            "MLA latent layer cannot be persisted",
+        ));
+    }
     if let Some((_, key_codes, key_norms, key_gammas, value_codes, value_norms)) = kv.turbo_arrays()
     {
         return Ok(DiskLayer::Turbo([
@@ -580,6 +586,10 @@ fn prototype_kv_layer(layer: &Option<SteppingKeyValueCache>) -> std::io::Result<
     prototype_kv(kv)
 }
 fn prototype_kv(kv: &SteppingKeyValueCache) -> std::io::Result<PrototypeLayer> {
+    if kv.is_mla() {
+        tracing::debug!("MLA latent prefixes not yet disk-persistable");
+        return Err(std::io::Error::other("MLA latent layer cannot be restored"));
+    }
     if let Some(context) = kv.turbo_context() {
         return Ok(PrototypeLayer::Turbo(std::sync::Arc::clone(context)));
     }

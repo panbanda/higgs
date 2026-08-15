@@ -680,6 +680,7 @@ impl SteppingKeyValueCache {
             keys: Some(keys),
             values: Some(values),
             turbo: None,
+            mla: None,
             config,
             offset,
             step: 256,
