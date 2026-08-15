@@ -2,23 +2,37 @@
 # Decode throughput smoke suite. Variables are provided by ../run.sh.
 set -euo pipefail
 
+SERVER_PIDS=""
+
+cleanup() {
+    local pid
+    for pid in $SERVER_PIDS; do
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    done
+}
+trap cleanup EXIT
+
 run_side() {
     # Separate declarations: macOS bash 3.2 + set -u rejects a `local` line
     # whose later assignments expand variables assigned earlier in that line.
-    local side="$1" bin_dir="$2" port="$3" pid=""
+    local side="$1" bin_dir="$2" port="$3" pid="" pids
     local log_file="$OUT_DIR/raw/$side-server.log"
     local deadline ready=0 health_status
 
-    cleanup_server() {
-        if [[ -n "$pid" ]]; then
-            kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
+    pids="$(lsof -ti :$port || true)"
+    if [[ -n "$pids" ]]; then
+        kill $pids 2>/dev/null || true
+        sleep 2
+        if [[ -n "$(lsof -ti :$port || true)" ]]; then
+            echo "port $port is still bound after killing existing server" >&2
+            exit 1
         fi
-    }
-    trap cleanup_server RETURN
+    fi
 
     "$bin_dir/higgs" serve --model "$MODEL_DIR" --port "$port" >"$log_file" 2>&1 &
     pid=$!
+    SERVER_PIDS="${SERVER_PIDS:+$SERVER_PIDS }$pid"
 
     deadline=$((SECONDS + 300))
     while ((SECONDS < deadline)); do

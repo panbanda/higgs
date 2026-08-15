@@ -79,6 +79,7 @@ build_ref() {
     local source_dir="$REPO_ROOT"
     local build_dir="$BUILD_CACHE/$sha"
     local shared_target_dir="$CACHE_ROOT/target"
+    local metallib_path
     if [[ "$sha" != "$CANDIDATE_SHA" ]]; then
         source_dir="$WORKTREE_CACHE/$sha"
         if [[ ! -e "$source_dir/.git" ]]; then
@@ -91,10 +92,16 @@ build_ref() {
         mkdir -p "$build_dir/release"
         cp "$shared_target_dir/release/higgs" "$build_dir/release/higgs"
         cp "$shared_target_dir/release/bench_decode" "$build_dir/release/bench_decode"
-        if [[ -f "$shared_target_dir/release/mlx.metallib" ]]; then
-            cp "$shared_target_dir/release/mlx.metallib" "$build_dir/release/mlx.metallib"
-        fi
     fi
+    if [[ -f "$shared_target_dir/release/mlx.metallib" ]]; then
+        cp "$shared_target_dir/release/mlx.metallib" "$build_dir/release/mlx.metallib"
+    fi
+    metallib_path="$(find "$shared_target_dir/release/build" -path "*/mlx-sys-*/out/build/lib/mlx.metallib" -type f -exec ls -t {} + 2>/dev/null | head -n 1 || true)"
+    if [[ -z "$metallib_path" ]]; then
+        echo "missing mlx.metallib in shared target directory: $shared_target_dir" >&2
+        exit 1
+    fi
+    cp "$metallib_path" "$build_dir/release/mlx.metallib"
     printf '%s\n' "$build_dir/release"
 }
 
