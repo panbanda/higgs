@@ -927,6 +927,9 @@ pub fn load_gemma2_model<P: AsRef<Path>>(model_dir: P) -> Result<Gemma2CausalLM,
     );
 
     let quantization = args.quantization.clone();
+    if let Some(settings) = quantization.as_ref() {
+        crate::validate_per_tensor_quantization_support(settings, &[])?;
+    }
     let raw_model = Gemma2CausalLM::new(args)?;
 
     let mut model = if let Some(ref qc) = quantization {

@@ -561,6 +561,9 @@ pub fn load_phi3_model<P: AsRef<Path>>(model_dir: P) -> Result<Phi3CausalLM, Mod
     let args = load_phi3_model_args(model_path)?;
 
     let quantization = args.quantization.clone();
+    if let Some(settings) = quantization.as_ref() {
+        crate::validate_per_tensor_quantization_support(settings, &[])?;
+    }
     let raw_model = Phi3CausalLM::new(args)?;
 
     tracing::info!(

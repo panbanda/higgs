@@ -828,6 +828,9 @@ pub fn load_gemma3_model<P: AsRef<Path>>(model_dir: P) -> Result<Gemma3CausalLM,
     );
 
     let quantization = args.quantization.clone();
+    if let Some(settings) = quantization.as_ref() {
+        crate::validate_per_tensor_quantization_support(settings, &[])?;
+    }
     let raw_model = Gemma3CausalLM::new(args)?;
 
     let mut model = if let Some(ref qc) = quantization {

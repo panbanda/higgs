@@ -17,6 +17,7 @@ use mlx_rs::{
 };
 use serde::Deserialize;
 
+use crate::qwen3_next::{QEmbedding, QLinear};
 use crate::{
     cache::{KeyValueCache, SteppingKeyValueCache},
     error::ModelError,
@@ -451,9 +452,8 @@ struct TransformerModel {
     pub vocab_size: i32,
     pub num_hidden_layers: i32,
 
-    #[quantizable]
     #[param]
-    pub embed_tokens: MaybeQuantized<nn::Embedding>,
+    pub embed_tokens: QEmbedding,
     #[quantizable]
     #[param]
     pub layers: Vec<TransformerBlock>,
@@ -462,7 +462,7 @@ struct TransformerModel {
 }
 
 impl TransformerModel {
-    fn new(args: &ModelArgs) -> Result<Self, Exception> {
+    fn new(args: &ModelArgs, embed_group_size: i32, embed_bits: i32) -> Result<Self, Exception> {
         if !args.vocab_size.is_positive() {
             return Err(Exception::custom("vocab_size must be positive"));
         }
@@ -476,10 +476,7 @@ impl TransformerModel {
         Ok(Self {
             vocab_size: args.vocab_size,
             num_hidden_layers: args.num_hidden_layers,
-            embed_tokens: MaybeQuantized::Original(nn::Embedding::new(
-                args.vocab_size,
-                args.hidden_size,
-            )?),
+            embed_tokens: QEmbedding::new(embed_group_size, embed_bits)?,
             layers: (0..args.num_hidden_layers)
                 .map(|_| TransformerBlock::new(args))
                 .collect::<Result<Vec<_>, _>>()?,
@@ -546,7 +543,6 @@ where
     }
 
     fn training_mode(&mut self, mode: bool) {
-        self.embed_tokens.training_mode(mode);
         for layer in &mut self.layers {
             <TransformerBlock as Module<AttentionInput<'_, C>>>::training_mode(layer, mode);
         }
@@ -563,22 +559,29 @@ pub struct Model {
     #[param]
     model: TransformerModel,
 
-    #[quantizable]
     #[param]
-    lm_head: Option<MaybeQuantized<nn::Linear>>,
+    lm_head: Option<QLinear>,
 }
 
 impl Model {
     pub fn new(args: ModelArgs) -> Result<Self, Exception> {
-        let model = TransformerModel::new(&args)?;
+        let default_quant = args.quantization.as_ref();
+        let embed_quant = default_quant.map_or_else(
+            || crate::quant_config::TensorQuant::Unquantized,
+            |settings| settings.resolve("model.embed_tokens"),
+        );
+        let model = TransformerModel::new(&args, embed_quant.group_size(), embed_quant.bits())?;
+        let lm_head_quant = default_quant.map_or_else(
+            || crate::quant_config::TensorQuant::Unquantized,
+            |settings| settings.resolve("lm_head"),
+        );
         let lm_head = if args.tie_word_embeddings {
             None
         } else {
-            Some(MaybeQuantized::Original(
-                nn::LinearBuilder::new(args.hidden_size, args.vocab_size)
-                    .bias(false)
-                    .build()?,
-            ))
+            Some(QLinear::new(
+                lm_head_quant.group_size(),
+                lm_head_quant.bits(),
+            )?)
         };
 
         Ok(Self {
@@ -869,20 +872,14 @@ impl Model {
         };
         match self.lm_head.as_mut() {
             Some(head) => head.forward(&lm_input),
-            None => match &mut self.model.embed_tokens {
-                MaybeQuantized::Original(embed) => embed.as_linear(&lm_input),
-                MaybeQuantized::Quantized(q_embed) => q_embed.as_linear(&lm_input),
-            },
+            None => self.model.embed_tokens.as_linear(&lm_input),
         }
     }
 
     fn apply_lm_head_all(&mut self, hidden: &Array) -> Result<Array, Exception> {
         match self.lm_head.as_mut() {
             Some(head) => head.forward(hidden),
-            None => match &mut self.model.embed_tokens {
-                MaybeQuantized::Original(embed) => embed.as_linear(hidden),
-                MaybeQuantized::Quantized(q_embed) => q_embed.as_linear(hidden),
-            },
+            None => self.model.embed_tokens.as_linear(hidden),
         }
     }
 }
@@ -941,6 +938,12 @@ pub fn load_vlm_language_model<P: AsRef<Path>>(model_dir: P) -> Result<Model, Mo
     );
 
     let quantization = args.quantization.clone();
+    if let Some(settings) = quantization.as_ref() {
+        crate::validate_per_tensor_quantization_support(
+            settings,
+            &["model.embed_tokens", "lm_head"],
+        )?;
+    }
     let raw_model = Model::new(args)?;
 
     let mut model = if let Some(ref qc) = quantization {
@@ -984,10 +987,16 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<Model, ModelError> {
     );
 
     let quantization = args.quantization.clone();
+    if let Some(settings) = quantization.as_ref() {
+        crate::validate_per_tensor_quantization_support(
+            settings,
+            &["model.embed_tokens", "lm_head"],
+        )?;
+    }
     let raw_model = Model::new(args)?;
 
-    // Pre-quantized models need the MaybeQuantized fields converted to
-    // Quantized variants before loading weights, so that the parameter
+    // Pre-quantized scalar layers need their MaybeQuantized fields converted
+    // to Quantized variants before loading weights, so that the parameter
     // names (inner.weight, scales, biases) match the safetensors keys.
     let mut model = if let Some(ref qc) = quantization {
         tracing::info!(
@@ -1012,6 +1021,7 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<Model, ModelError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_rs::module::ModuleParameters as _;
 
     /// Create a `ModelArgs` with sensible defaults. Only fields that vary
     /// between tests need to be overridden after construction.
@@ -1035,6 +1045,25 @@ mod tests {
             head_dim_override: None,
             quantization: None,
         }
+    }
+
+    #[test]
+    fn keeps_dense_embedding_and_lm_head_outside_global_quantization()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut args = default_model_args();
+        args.quantization = Some(serde_json::from_str(
+            r#"{"group_size":64,"bits":4,"model.embed_tokens":false,"lm_head":false}"#,
+        )?);
+        let model = Model::new(args)?;
+        let quantized = mlx_rs::nn::quantize(model, 64, 4)?;
+        let params = quantized.parameters().flatten();
+
+        assert!(params.contains_key("model.embed_tokens.weight"));
+        assert!(!params.contains_key("model.embed_tokens.inner.weight"));
+        assert!(params.contains_key("lm_head.weight"));
+        assert!(!params.contains_key("lm_head.inner.weight"));
+        assert!(params.contains_key("model.layers.0.self_attn.q_proj.inner.weight"));
+        Ok(())
     }
 
     /// Create a `ModelArgs` with the given core parameters and defaults for

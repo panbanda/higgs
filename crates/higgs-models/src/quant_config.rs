@@ -74,6 +74,11 @@ impl QuantizationSettings {
             })
     }
 
+    /// Explicit per-tensor overrides from the checkpoint config.
+    pub fn overridden_paths(&self) -> impl Iterator<Item = &str> {
+        self.tensors.keys().map(String::as_str)
+    }
+
     /// Resolve a fused tensor group, rejecting mixed storage formats.
     pub fn resolve_uniform<'a, I>(&self, paths: I) -> Result<TensorQuant, String>
     where
@@ -226,6 +231,18 @@ mod tests {
             .err()
             .ok_or_else(|| serde_json::Error::io(std::io::Error::other("expected an error")))?;
         assert!(err.contains("model.layers.0.mlp.experts.1.gate_proj"));
+        Ok(())
+    }
+
+    #[test]
+    fn exposes_only_explicit_tensor_overrides() -> Result<(), serde_json::Error> {
+        let settings: QuantizationSettings =
+            serde_json::from_str(r#"{"group_size": 64, "bits": 4, "model.embed_tokens": false}"#)?;
+
+        assert_eq!(
+            settings.overridden_paths().collect::<Vec<_>>(),
+            ["model.embed_tokens"]
+        );
         Ok(())
     }
 }

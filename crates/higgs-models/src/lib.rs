@@ -1524,6 +1524,26 @@ fn load_checkpoint_quantization_settings(
         .map_err(ModelError::from)
 }
 
+/// Reject per-tensor overrides that a model architecture cannot honor.
+///
+/// Scalar-only model implementations use MLX's global quantization transform,
+/// which cannot represent a dense or differently packed individual tensor.
+/// Failing here keeps an incompatible checkpoint from reaching a Metal kernel
+/// with an opaque dtype error during its first forward pass.
+pub(crate) fn validate_per_tensor_quantization_support(
+    settings: &quant_config::QuantizationSettings,
+    supported_paths: &[&str],
+) -> Result<(), ModelError> {
+    for path in settings.overridden_paths() {
+        if !supported_paths.contains(&path) {
+            return Err(ModelError::ShapeMismatch(format!(
+                "per-tensor quantization for {path} is not supported by this architecture"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Validate the packed inner dimension of a quantized tensor pair.
 ///
 /// MLX stores `weight[..., in_features * bits / 32]` alongside
@@ -1926,6 +1946,17 @@ mod tests {
             remap_quantized_key("model.embed_tokens.weight"),
             Some("model.embed_tokens.inner.weight".to_owned())
         );
+    }
+
+    #[test]
+    fn rejects_unsupported_per_tensor_quantization_override() {
+        let settings: quant_config::QuantizationSettings =
+            serde_json::from_str(r#"{"group_size":64,"bits":4,"model.embed_tokens":false}"#)
+                .unwrap();
+
+        let error = validate_per_tensor_quantization_support(&settings, &[]).unwrap_err();
+        assert!(error.to_string().contains("model.embed_tokens"));
+        assert!(error.to_string().contains("not supported"));
     }
 
     #[test]

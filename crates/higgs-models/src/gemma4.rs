@@ -1587,6 +1587,9 @@ pub fn load_gemma4_model<P: AsRef<Path>>(model_dir: P) -> Result<Gemma4CausalLM,
     );
 
     let quantization = args.quantization.clone();
+    if let Some(settings) = quantization.as_ref() {
+        crate::validate_per_tensor_quantization_support(settings, &[])?;
+    }
     let enable_moe = args.enable_moe_block;
     let raw_model = Gemma4CausalLM::new(args)?;
 

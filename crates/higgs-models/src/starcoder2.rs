@@ -642,6 +642,9 @@ pub fn load_starcoder2_model<P: AsRef<Path>>(
     );
 
     let quantization = args.quantization.clone();
+    if let Some(settings) = quantization.as_ref() {
+        crate::validate_per_tensor_quantization_support(settings, &[])?;
+    }
     let raw_model = Starcoder2CausalLM::new(args)?;
 
     let mut model = if let Some(ref qc) = quantization {
