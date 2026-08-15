@@ -53,9 +53,14 @@ enum Command {
         #[arg(long)]
         fixture: PathBuf,
         #[arg(long, default_value_t = 0.0)]
+        #[arg(
+            long_help = "Maximum absolute logprob delta. At 0.0 (strict/default), each prompt passes only when tokens are exact and the delta is exactly 0.0; use this for same-numerics A/A checks, where MLX greedy replay is deterministic on one machine. Above 0.0, a prompt passes when tokens are exact or the delta is within tolerance."
+        )]
         logprob_tolerance: f32,
         #[arg(long)]
         perturb_logits: Option<f32>,
+        #[arg(long)]
+        allow_model_mismatch: bool,
     },
 }
 
@@ -131,7 +136,14 @@ fn run(args: Args) -> Result<bool> {
             fixture,
             logprob_tolerance,
             perturb_logits,
-        } => check(&model_dir, &fixture, logprob_tolerance, perturb_logits),
+            allow_model_mismatch,
+        } => check(
+            &model_dir,
+            &fixture,
+            logprob_tolerance,
+            perturb_logits,
+            allow_model_mismatch,
+        ),
     }
 }
 
@@ -174,12 +186,13 @@ fn check(
     fixture_path: &Path,
     tolerance: f32,
     perturb: Option<f32>,
+    allow_model_mismatch: bool,
 ) -> Result<bool> {
     if tolerance < 0.0 {
         bail!("--logprob-tolerance must be non-negative");
     }
-    if perturb.is_some_and(|epsilon| !epsilon.is_finite() || epsilon == 0.0) {
-        bail!("--perturb-logits must be finite and non-zero");
+    if perturb.is_some_and(|epsilon| !epsilon.is_finite() || epsilon <= 0.0) {
+        bail!("--perturb-logits must be finite and positive");
     }
     let fixture: Fixture = serde_json::from_slice(
         &std::fs::read(fixture_path).with_context(|| format!("read {}", fixture_path.display()))?,
@@ -191,6 +204,12 @@ fn check(
             fixture.schema_version
         );
     }
+    let model_config_hash = config_hash(model_dir)?;
+    ensure_fixture_matches_model_config(
+        &fixture.config_json_sha256,
+        &model_config_hash,
+        allow_model_mismatch,
+    )?;
     let tokenizer = load_tokenizer(model_dir)?;
     let mut model = load_model(model_dir)?;
     let mut summaries = Vec::with_capacity(fixture.prompts.len());
@@ -201,12 +220,7 @@ fn check(
             record,
             perturb,
         )?;
-        // A non-zero perturbation is an explicit sensitivity probe. With the
-        // default exact tolerance it must report failure even if it does not
-        // cross an argmax boundary, otherwise this probe could falsely bless a
-        // gate that is insensitive to logprob changes.
-        let sensitivity_probe = perturb.is_some() && tolerance == 0.0;
-        let passed = !sensitivity_probe && (token_exact || max_delta <= tolerance);
+        let passed = prompt_passed(token_exact, max_delta, tolerance);
         eprintln!(
             "[check {}/{}] token_exact={} max_abs_logprob_delta={:.8} passed={}",
             index + 1,
@@ -228,7 +242,7 @@ fn check(
         serde_json::to_string(&CheckSummary {
             schema_version: SCHEMA_VERSION,
             model_basename: model_basename(model_dir)?,
-            config_json_sha256: config_hash(model_dir)?,
+            config_json_sha256: model_config_hash,
             logprob_tolerance: tolerance,
             passed,
             prompts: summaries
@@ -296,7 +310,12 @@ fn score(logits: &Array, perturb: Option<f32>) -> Result<Scores> {
         bail!("model returned empty logits");
     }
     if let Some(epsilon) = perturb {
-        values[0] += epsilon;
+        let (argmax_index, _) = values
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .context("model returned empty logits")?;
+        values[argmax_index] -= epsilon;
     }
     let (index, _) = values
         .iter()
@@ -346,4 +365,67 @@ fn config_hash(model_dir: &Path) -> Result<String> {
     let path = model_dir.join("config.json");
     let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn ensure_fixture_matches_model_config(
+    fixture_config_hash: &str,
+    model_config_hash: &str,
+    allow_model_mismatch: bool,
+) -> Result<()> {
+    if fixture_config_hash != model_config_hash && !allow_model_mismatch {
+        bail!(
+            "fixture config_json_sha256 {fixture_config_hash} does not match model config_json_sha256 {model_config_hash}; pass --allow-model-mismatch to override"
+        );
+    }
+    Ok(())
+}
+
+fn prompt_passed(token_exact: bool, max_abs_logprob_delta: f32, tolerance: f32) -> bool {
+    if tolerance == 0.0 {
+        token_exact && max_abs_logprob_delta == 0.0
+    } else {
+        token_exact || max_abs_logprob_delta <= tolerance
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn perturbation_reduces_the_current_argmax_logit() {
+        let logits = Array::from_slice(&[1.0_f32, 1.4, 0.5], &[1, 1, 3]);
+        let unperturbed = score(&logits, None).unwrap();
+
+        let scores = score(&logits, Some(0.5)).unwrap();
+
+        assert_eq!(scores.argmax, 0);
+        assert!((scores.values[1] - 0.9).abs() < f32::EPSILON);
+        assert!((scores.logprob(1).unwrap() - unperturbed.logprob(1).unwrap()).abs() > 0.0);
+    }
+
+    #[test]
+    fn strict_tolerance_requires_exact_tokens_and_logprobs() {
+        assert!(prompt_passed(true, 0.0, 0.0));
+        assert!(!prompt_passed(false, 0.0, 0.0));
+        assert!(!prompt_passed(true, f32::EPSILON, 0.0));
+    }
+
+    #[test]
+    fn non_strict_tolerance_accepts_exact_tokens_or_bounded_logprob_delta() {
+        assert!(prompt_passed(true, 1.0, 0.1));
+        assert!(prompt_passed(false, 0.1, 0.1));
+        assert!(!prompt_passed(false, 0.2, 0.1));
+    }
+
+    #[test]
+    fn config_mismatch_requires_explicit_override() {
+        let error = ensure_fixture_matches_model_config("fixture-hash", "model-hash", false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("fixture-hash"));
+        assert!(error.contains("model-hash"));
+        assert!(ensure_fixture_matches_model_config("fixture-hash", "model-hash", true).is_ok());
+    }
 }

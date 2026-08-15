@@ -11,7 +11,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires model files on disk"]
-    fn record_then_check_is_self_consistent_and_perturbation_fails() {
+    fn record_then_check_is_self_consistent_and_perturbation_is_measured() {
         let Some(model_dir) = std::env::var_os("HIGGS_MODEL_PATH") else {
             eprintln!("Skipping: set HIGGS_MODEL_PATH to a local model directory");
             return;
@@ -68,8 +68,18 @@ mod tests {
                 "--perturb-logits",
                 "0.5",
             ])
-            .status()
+            .output()
             .unwrap();
-        assert!(!perturbed.success());
+        assert_eq!(perturbed.status.code(), Some(1));
+        let perturbed_summary: serde_json::Value =
+            serde_json::from_slice(&perturbed.stdout).unwrap();
+        assert_eq!(perturbed_summary["passed"], false);
+        assert!(
+            perturbed_summary["prompts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|prompt| prompt["max_abs_logprob_delta"].as_f64().unwrap() > 0.0)
+        );
     }
 }
