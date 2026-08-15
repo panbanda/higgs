@@ -312,6 +312,15 @@ committed under validation/ on each branch.
 | P5 exact tool-call replay | #256 (draft) | tool-turn prefix breaks ~0; TTFT improves | mechanism works (replay hits recorded, byte-identical splice, decoy-guarded) but TTFT delta ~0: thinking-token divergence precedes tool calls; 64-token block quantization hides sub-block extensions; typical calls span <= 1 block | NEGATIVE - do not merge |
 | P6 confidence-gated drafts | #258 (draft) | fewer wasted drafts -> throughput | +0.25% to +0.8% (pre-registered floor: +5% on one suite); adaptive depth + batched verify already make wasted drafts cheap | NEGATIVE - do not merge |
 
+**Merge status (2026-08-15):** PRs #251, #252, #253, #254, #257, #259, #260, and this
+document's PR are merged. The three negative-result drafts, #255, #256, and #258, were
+closed unmerged per the go/no-go protocol. During the merge train, pre-merge review (codex
+sol, medium) caught and fixed: quality-gate/frontier suite integration gaps with the merged
+runner, disk-store hardening (payload checksum, weight-bound identity, longest-prefix
+lookup, bounded allocation), an MLA-vs-disk-store interaction (MLA prefixes cleanly rejected
+from disk persistence), and real-checkpoint quantization compatibility (boolean predicate
+maps, router-gate overrides).
+
 Methodology notes carried forward: all A/B comparisons are medians of >= 3 post-warmup runs
 (single-run spreads up to ~8% from desktop background load); token-identity claims are greedy-only;
 two apparent effects during validation turned out to be measurement confounds and were re-run
