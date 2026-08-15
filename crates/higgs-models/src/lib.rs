@@ -123,6 +123,63 @@ impl AnyCache {
         }
     }
 
+    /// Capture a rollback point before an operation that advances this cache.
+    ///
+    /// KV caches are rolled back by trimming their offset, so they deliberately
+    /// return `None` and are never cloned. Restoring a cloned KV cache would
+    /// make the checkpoint share the live cache's underlying MLX buffers; an
+    /// in-place `slice_update` can then donate a buffer still referenced by the
+    /// checkpoint, corrupting it and causing a double-free on drop. Hybrid SSM/
+    /// recurrent state cannot be offset-trimmed, so it requires a full clone.
+    #[must_use]
+    pub fn checkpoint_for_rollback(&self) -> Option<Self> {
+        match self {
+            Self::KV(_) => None,
+            Self::Hybrid(_) => Some(self.deep_clone()),
+        }
+    }
+
+    /// Undo an operation that advanced this cache by `advanced_by` tokens.
+    ///
+    /// A hybrid checkpoint restores recurrent state exactly. KV-only caches use
+    /// `trim_by`, avoiding MLX buffer aliasing while rewinding their offsets.
+    pub fn rollback(&mut self, checkpoint: Option<Self>, advanced_by: usize) {
+        if let Some(base) = checkpoint {
+            *self = base;
+        } else {
+            self.trim_by(advanced_by);
+        }
+    }
+
+    /// References to every array retained by this cache.
+    #[must_use]
+    pub fn eval_targets(&self) -> Vec<&Array> {
+        let mut targets = Vec::new();
+        match self {
+            Self::KV(layers) => {
+                for layer in layers.iter().flatten() {
+                    targets.extend(layer.eval_targets());
+                }
+            }
+            Self::Hybrid(layers) => {
+                for layer in layers.iter().flatten() {
+                    match layer {
+                        LayerCache::KV(kv) => targets.extend(kv.eval_targets()),
+                        LayerCache::Arrays(arrays) => {
+                            if let Some(conv_state) = &arrays.conv_state {
+                                targets.push(conv_state);
+                            }
+                            if let Some(ssm_state) = &arrays.ssm_state {
+                                targets.push(ssm_state);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        targets
+    }
+
     /// An **independent** deep copy for use as a speculative-decode checkpoint.
     /// KV layers are deep-cloned (their in-place `slice_update` buffers must not
     /// be shared — see [`cache::SteppingKeyValueCache::deep_clone`]); GDN/SSM
@@ -2166,5 +2223,16 @@ mod tests {
         } else {
             panic!("expected Hybrid variant");
         }
+    }
+
+    #[test]
+    fn any_cache_checkpoint_uses_trim_for_kv_and_clone_for_hybrid() {
+        let kv = AnyCache::KV(vec![Some(cache::SteppingKeyValueCache::new())]);
+        assert!(kv.checkpoint_for_rollback().is_none());
+
+        let hybrid = AnyCache::Hybrid(vec![Some(LayerCache::KV(
+            cache::SteppingKeyValueCache::new(),
+        ))]);
+        assert!(hybrid.checkpoint_for_rollback().is_some());
     }
 }

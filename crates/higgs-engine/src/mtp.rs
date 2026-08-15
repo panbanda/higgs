@@ -19,33 +19,12 @@ const fn draft_matches_target(draft_token_id: u32, target_id: u32) -> bool {
     draft_token_id == target_id
 }
 
-/// Capture a backbone-cache rollback point before a speculative verify.
-///
-/// KV caches are rolled back by *trimming the offset* (see [`rollback_backbone`]),
-/// so we deliberately return `None` and never clone them. Cloning a KV cache and
-/// later restoring it (`*cache = base`) makes the checkpoint share the live
-/// cache's underlying MLX buffers; the in-place `slice_update` writes during
-/// verify then let MLX donate a buffer that the checkpoint still references,
-/// corrupting it and double-freeing on drop (the `malloc: pointer being freed
-/// was not allocated` abort). Hybrid SSM/recurrent state cannot be offset-
-/// trimmed, so those still need a full clone-restore.
 fn capture_backbone_checkpoint(cache: &AnyCache) -> Option<AnyCache> {
-    match cache {
-        AnyCache::KV(_) => None,
-        AnyCache::Hybrid(_) => Some(cache.deep_clone()),
-    }
+    cache.checkpoint_for_rollback()
 }
 
-/// Roll the backbone cache back after a rejected speculative verify.
-///
-/// `verify_len` is the number of tokens the verify batch advanced the cache by.
-/// KV caches rewind by `trim_by(verify_len)` (no clone, no buffer aliasing);
-/// hybrid caches restore the clone captured by [`capture_backbone_checkpoint`].
 fn rollback_backbone(cache: &mut AnyCache, checkpoint: Option<AnyCache>, verify_len: usize) {
-    match checkpoint {
-        Some(base) => *cache = base,
-        None => cache.trim_by(verify_len),
-    }
+    cache.rollback(checkpoint, verify_len);
 }
 
 /// Aggregate MTP decode counters.
