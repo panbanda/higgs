@@ -192,12 +192,11 @@ impl ChatTemplateRenderer {
     }
 }
 
-/// Replace normalized Qwen-style tool-call regions with the exact bytes the
-/// model previously emitted. The replacement is deliberately narrow: if the
-/// rendered prompt does not contain a complete `<tool_call>…</tool_call>`
-/// region for a requested replay, it is left unchanged. This guarantees that
-/// replay cannot alter semantic prompt content for templates it does not
-/// recognize.
+/// Replace matching normalized Qwen-style tool-call regions with the exact
+/// bytes the model previously emitted. The replacement is deliberately narrow:
+/// a region is replaced only when its parsed function name and arguments match
+/// the stored raw call. This ensures literal wrapper text in user or tool
+/// content remains untouched.
 fn replay_tool_call_text(mut rendered: String, messages: &[ChatMessage]) -> String {
     const OPEN: &str = "<tool_call>";
     const CLOSE: &str = "</tool_call>";
@@ -206,29 +205,68 @@ fn replay_tool_call_text(mut rendered: String, messages: &[ChatMessage]) -> Stri
     for message in messages {
         let call_count = message.tool_calls.as_ref().map_or(0, Vec::len);
         for call_index in 0..call_count {
-            let Some(start_relative) = rendered.get(search_from..).and_then(|s| s.find(OPEN))
-            else {
-                return rendered;
-            };
-            let start = search_from + start_relative;
-            let Some(end_relative) = rendered.get(start..).and_then(|s| s.find(CLOSE)) else {
-                return rendered;
-            };
-            let end = start + end_relative + CLOSE.len();
             let replay_text = message
                 .raw_tool_call_text
                 .as_ref()
                 .and_then(|calls| calls.get(call_index))
                 .and_then(Option::as_deref);
-            if let Some(raw) = replay_text {
-                rendered.replace_range(start..end, raw);
-                search_from = start.saturating_add(raw.len());
-            } else {
-                search_from = end;
+            let Some(raw) = replay_text else {
+                continue;
+            };
+            let Some(raw_identity) = tool_call_identity(raw) else {
+                continue;
+            };
+
+            let mut candidate_from = search_from;
+            while let Some((start, end)) =
+                find_tool_call_region(&rendered, candidate_from, OPEN, CLOSE)
+            {
+                if tool_call_identity(&rendered[start..end]) == Some(raw_identity.clone()) {
+                    rendered.replace_range(start..end, raw);
+                    search_from = start.saturating_add(raw.len());
+                    break;
+                }
+                candidate_from = end;
             }
         }
     }
     rendered
+}
+
+fn find_tool_call_region(
+    rendered: &str,
+    search_from: usize,
+    open: &str,
+    close: &str,
+) -> Option<(usize, usize)> {
+    let start_relative = rendered.get(search_from..)?.find(open)?;
+    let start = search_from + start_relative;
+    let end_relative = rendered.get(start..)?.find(close)?;
+    Some((start, start + end_relative + close.len()))
+}
+
+fn tool_call_identity(wrapper: &str) -> Option<(String, serde_json::Value)> {
+    let json = wrapper
+        .strip_prefix("<tool_call>")?
+        .strip_suffix("</tool_call>")?
+        .trim();
+    let call: serde_json::Value = serde_json::from_str(json).ok()?;
+    let object = call.as_object()?;
+    let function_object = object
+        .get("function")
+        .and_then(serde_json::Value::as_object);
+    let name = object
+        .get("name")
+        .or_else(|| function_object.and_then(|function| function.get("name")))
+        .and_then(serde_json::Value::as_str)?;
+    let argument_value = object
+        .get("arguments")
+        .or_else(|| function_object.and_then(|function| function.get("arguments")))?;
+    let parsed_arguments = match argument_value.as_str() {
+        Some(argument_text) => serde_json::from_str(argument_text).ok()?,
+        None => argument_value.clone(),
+    };
+    Some((name.to_owned(), parsed_arguments))
 }
 
 /// Normalise a tool-call JSON object so Qwen-Hermes-style chat templates
@@ -588,6 +626,35 @@ TOOLS:{{ tools | length }}
             renderer.apply(&messages, None, false).unwrap(),
             "assistant: <tool_call>\n{\"arguments\":{\"city\":\"Denver\"},\"name\":\"weather\"}\n</tool_call>"
         );
+    }
+
+    #[test]
+    fn replay_skips_user_tool_call_text_until_it_finds_the_matching_call() {
+        let template = "{% for message in messages %}{{ message.role }}: {{ message.content }}{% for tool_call in message.tool_calls %}<tool_call>{{ tool_call | tojson }}</tool_call>{% endfor %}\n{% endfor %}";
+        let renderer = ChatTemplateRenderer::new(template).unwrap();
+        let decoy = r#"<tool_call>{"name": "decoy", "arguments": {"value": 1}}</tool_call>"#;
+        let raw =
+            r#"<tool_call>{"name": "weather", "arguments": { "city": "Denver" }}</tool_call>"#;
+        let messages = vec![
+            msg("user", &format!("Please do not run this example: {decoy}")),
+            ChatMessage {
+                role: "assistant".to_owned(),
+                content: String::new(),
+                tool_calls: Some(vec![serde_json::json!({
+                    "name": "weather",
+                    "arguments": {"city": "Denver"}
+                })]),
+                raw_tool_call_text: Some(vec![Some(raw.to_owned())]),
+            },
+        ];
+
+        let result = renderer.apply(&messages, None, false).unwrap();
+
+        assert!(result.contains(decoy));
+        assert!(result.contains(raw));
+        assert!(!result.contains(
+            r#"<tool_call>{"arguments":{"city":"Denver"},"name":"weather"}</tool_call>"#
+        ));
     }
 
     #[test]
