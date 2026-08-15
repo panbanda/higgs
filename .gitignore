@@ -22,4 +22,3 @@ benchmarks/*.txt
 benchmarks/*.safetensors
 benchmarks/*.py
 validation/**/raw/
-validation/**/raw/
