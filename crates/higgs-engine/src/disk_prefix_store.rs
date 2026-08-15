@@ -27,8 +27,9 @@
 //! least recently touched entries until the configured budget is respected.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use half::{bf16, f16};
 use higgs_models::{AnyCache, LayerCache, cache::SteppingKeyValueCache};
@@ -36,8 +37,8 @@ use mlx_rs::{Array, Dtype, complex64};
 use sha2::{Digest, Sha256};
 
 const MAGIC: &[u8; 4] = b"HKV1";
-const VERSION: u32 = 1;
-const CACHE_VERSION: u32 = 2;
+const VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoreIdentity {
@@ -46,6 +47,14 @@ pub struct StoreIdentity {
     pub config_hash: [u8; 32],
     pub tokenizer_hash: [u8; 32],
     pub chat_template_hash: [u8; 32],
+    /// Fast heuristic fingerprint over the model directory's weight files.
+    ///
+    /// This is intentionally NOT a content hash: hashing multi-gigabyte
+    /// safetensors files on every startup would be unacceptably slow. It
+    /// digests each `*.safetensors` file's (name, byte size, mtime seconds)
+    /// tuple instead, which is enough to detect weights swapped in place
+    /// (e.g. a re-quantization or re-download) without reading file bodies.
+    pub weights_hash: [u8; 32],
 }
 
 impl StoreIdentity {
@@ -65,6 +74,7 @@ impl StoreIdentity {
             config_hash: hash_file("config.json"),
             tokenizer_hash,
             chat_template_hash,
+            weights_hash: weights_fingerprint(model_dir),
         }
     }
 
@@ -76,8 +86,44 @@ impl StoreIdentity {
             config_hash: [1; 32],
             tokenizer_hash: [2; 32],
             chat_template_hash: [3; 32],
+            weights_hash: [4; 32],
         }
     }
+}
+
+/// Heuristic weight fingerprint: digests the sorted (name, size, mtime)
+/// tuples of `*.safetensors` files directly inside `model_dir`. See
+/// `StoreIdentity::weights_hash` for why this isn't a content hash.
+fn weights_fingerprint(model_dir: &Path) -> [u8; 32] {
+    let mut entries: Vec<(String, u64, u64)> = fs::read_dir(model_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("safetensors"))
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok()?;
+            let mtime_secs = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            Some((
+                entry.file_name().to_string_lossy().into_owned(),
+                meta.len(),
+                mtime_secs,
+            ))
+        })
+        .collect();
+    entries.sort();
+    let mut hasher = Sha256::new();
+    for (name, len, mtime) in entries {
+        hasher.update(name.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(len.to_le_bytes());
+        hasher.update(mtime.to_le_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.finalize().into()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,7 +174,7 @@ impl DiskPrefixStore {
             .parent()
             .ok_or_else(|| std::io::Error::other("missing store parent"))?;
         fs::create_dir_all(parent)?;
-        let tmp = path.with_extension("tmp");
+        let tmp = unique_tmp_path(&path);
         let mut file = File::create(&tmp)?;
         file.write_all(MAGIC)?;
         write_u32(&mut file, VERSION)?;
@@ -137,6 +183,7 @@ impl DiskPrefixStore {
         file.write_all(&self.identity.config_hash)?;
         file.write_all(&self.identity.tokenizer_hash)?;
         file.write_all(&self.identity.chat_template_hash)?;
+        file.write_all(&self.identity.weights_hash)?;
         write_u32(&mut file, block_size)?;
         write_u32(&mut file, token_count)?;
         write_u32(&mut file, 0)?;
@@ -179,13 +226,41 @@ impl DiskPrefixStore {
         let token_count = u32::try_from(tokens.len() / block_size_usize * block_size_usize)
             .map_err(|_| std::io::Error::other("token count overflow"))?;
         let layers = cache_layers(cache)?;
+
+        // Serialize the layer section into memory first so its checksum can
+        // be recorded in the header before any of it is written to disk.
+        let mut payload = Vec::new();
+        write_u32(
+            &mut payload,
+            u32::try_from(layers.len()).map_err(|_| std::io::Error::other("too many layers"))?,
+        )?;
+        for layer in layers {
+            match layer {
+                DiskLayer::Empty => payload.write_all(&[0])?,
+                DiskLayer::Dense(keys, values) => {
+                    payload.write_all(&[1])?;
+                    write_array(&mut payload, keys)?;
+                    write_array(&mut payload, values)?;
+                }
+                DiskLayer::Turbo(arrays) => {
+                    payload.write_all(&[2])?;
+                    for array in arrays {
+                        write_array(&mut payload, array)?;
+                    }
+                }
+            }
+        }
+        let payload_checksum = sha256(&payload);
+        let payload_len =
+            u64::try_from(payload.len()).map_err(|_| std::io::Error::other("payload too large"))?;
+
         let key = key(tokens, block_size_usize);
         let path = self.path_for(&key);
         let parent = path
             .parent()
             .ok_or_else(|| std::io::Error::other("missing store parent"))?;
         fs::create_dir_all(parent)?;
-        let tmp = path.with_extension("tmp");
+        let tmp = unique_tmp_path(&path);
         let mut file = File::create(&tmp)?;
         write_header(
             &mut file,
@@ -193,27 +268,10 @@ impl DiskPrefixStore {
             &self.identity,
             block_size,
             token_count,
+            &payload_checksum,
+            payload_len,
         )?;
-        write_u32(
-            &mut file,
-            u32::try_from(layers.len()).map_err(|_| std::io::Error::other("too many layers"))?,
-        )?;
-        for layer in layers {
-            match layer {
-                DiskLayer::Empty => file.write_all(&[0])?,
-                DiskLayer::Dense(keys, values) => {
-                    file.write_all(&[1])?;
-                    write_array(&mut file, keys)?;
-                    write_array(&mut file, values)?;
-                }
-                DiskLayer::Turbo(arrays) => {
-                    file.write_all(&[2])?;
-                    for array in arrays {
-                        write_array(&mut file, array)?;
-                    }
-                }
-            }
-        }
+        file.write_all(&payload)?;
         file.sync_all()?;
         drop(file);
         fs::rename(tmp, path)?;
@@ -223,22 +281,40 @@ impl DiskPrefixStore {
     /// Load a compatible cache. `prototype` supplies cache configuration and
     /// TurboQuant contexts, which are model-bound and intentionally never read
     /// from disk.
+    ///
+    /// Selects the longest stored prefix of `tokens` deterministically:
+    /// candidate block-aligned prefix lengths are probed longest-first by
+    /// their content-addressed key, rather than scanning the store in
+    /// filesystem order.
     pub fn load_cache(
         &self,
         tokens: &[u32],
+        block_size: u32,
         prototype: &AnyCache,
     ) -> std::io::Result<Option<(usize, AnyCache)>> {
-        for (path, _) in self.files()? {
-            match self.read_cache(&path, tokens, prototype) {
-                Ok(Some((prefix_len, cache))) => {
-                    let _ = touch(&path);
-                    return Ok(Some((prefix_len, cache)));
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::debug!(path = %path.display(), %error, "disk prefix cache entry ignored")
+        let block_size_usize = usize::try_from(block_size)
+            .map_err(|_| std::io::Error::other("block size overflow"))?;
+        if block_size_usize == 0 {
+            return Ok(None);
+        }
+        let max_len = tokens.len() / block_size_usize * block_size_usize;
+        let mut candidate_len = max_len;
+        while candidate_len >= block_size_usize {
+            let key = key(&tokens[..candidate_len], block_size_usize);
+            let path = self.path_for(&key);
+            if path.exists() {
+                match self.read_cache(&path, tokens, prototype) {
+                    Ok(Some((prefix_len, cache))) => {
+                        let _ = touch(&path);
+                        return Ok(Some((prefix_len, cache)));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::debug!(path = %path.display(), %error, "disk prefix cache entry ignored");
+                    }
                 }
             }
+            candidate_len -= block_size_usize;
         }
         Ok(None)
     }
@@ -250,7 +326,7 @@ impl DiskPrefixStore {
         prototype: &AnyCache,
     ) -> std::io::Result<Option<(usize, AnyCache)>> {
         let mut file = File::open(path)?;
-        let Some((block_size, token_count)) =
+        let Some((block_size, token_count, payload_checksum, payload_len)) =
             read_header(&mut file, CACHE_VERSION, &self.identity)?
         else {
             return Ok(None);
@@ -262,8 +338,21 @@ impl DiskPrefixStore {
         if !Self::matches_request(path, tokens, block_size, token_count) {
             return Ok(None);
         }
+        let payload_len_usize = usize::try_from(payload_len)
+            .map_err(|_| std::io::Error::other("payload length overflow"))?;
+        let mut payload = vec![0_u8; payload_len_usize];
+        file.read_exact(&mut payload)?;
+        if sha256(&payload) != payload_checksum {
+            tracing::debug!(
+                reason = "tensor payload checksum mismatch",
+                "Disk prefix cache entry rejected"
+            );
+            return Ok(None);
+        }
+        // Checksum verified: safe to materialize arrays from `payload` below.
+        let mut cursor = Cursor::new(payload);
         let count = usize::try_from(
-            read_u32(&mut file).ok_or_else(|| std::io::Error::other("missing layer count"))?,
+            read_u32(&mut cursor).ok_or_else(|| std::io::Error::other("missing layer count"))?,
         )
         .map_err(|_| std::io::Error::other("layer count overflow"))?;
         let configs = prototype_layers(prototype)?;
@@ -276,42 +365,15 @@ impl DiskPrefixStore {
             );
             return Ok(None);
         }
-        let mut layers = Vec::with_capacity(count);
-        for config in configs {
-            let mut tag = [0; 1];
-            file.read_exact(&mut tag)?;
-            layers.push(match (tag[0], config) {
-                (0, PrototypeLayer::Empty) => None,
-                (1, PrototypeLayer::Dense(config)) => Some(LayerCache::KV(
-                    SteppingKeyValueCache::from_arrays_with_config(
-                        read_array(&mut file)?,
-                        read_array(&mut file)?,
-                        config,
-                    )
-                    .map_err(mlx_error)?,
-                )),
-                (2, PrototypeLayer::Turbo(context)) => Some(LayerCache::KV(
-                    SteppingKeyValueCache::from_turbo_arrays(
-                        context,
-                        read_array(&mut file)?,
-                        read_array(&mut file)?,
-                        read_array(&mut file)?,
-                        read_array(&mut file)?,
-                        read_array(&mut file)?,
-                        i32::try_from(token_count)
-                            .map_err(|_| std::io::Error::other("token count overflow"))?,
-                    )
-                    .map_err(mlx_error)?,
-                )),
-                _ => {
-                    tracing::debug!(
-                        tag = tag[0],
-                        reason = "cache layer layout mismatch",
-                        "Disk prefix cache entry rejected"
-                    );
-                    return Ok(None);
-                }
-            });
+        let Some(layers) = parse_cache_layers(&mut cursor, configs, token_count)? else {
+            return Ok(None);
+        };
+        if cursor.position() != payload_len {
+            tracing::debug!(
+                reason = "trailing tensor payload data",
+                "Disk prefix cache entry rejected"
+            );
+            return Ok(None);
         }
         if file.read(&mut [0; 1])? != 0 {
             tracing::debug!(
@@ -393,6 +455,7 @@ impl DiskPrefixStore {
             &self.identity.config_hash,
             &self.identity.tokenizer_hash,
             &self.identity.chat_template_hash,
+            &self.identity.weights_hash,
         ] {
             let mut actual = [0; 32];
             file.read_exact(&mut actual).ok()?;
@@ -462,11 +525,11 @@ impl DiskPrefixStore {
             if entry.file_type()?.is_dir() {
                 for child in fs::read_dir(entry.path())? {
                     let child = child?;
-                    if child.path().extension().and_then(|e| e.to_str()) == Some("tmp") {
+                    if is_tmp_file(&child.path()) {
                         fs::remove_file(child.path())?;
                     }
                 }
-            } else if entry.path().extension().and_then(|e| e.to_str()) == Some("tmp") {
+            } else if is_tmp_file(&entry.path()) {
                 fs::remove_file(entry.path())?;
             }
         }
@@ -489,6 +552,10 @@ impl DiskPrefixStore {
             Corruption::Model => bytes[12] ^= 1,
             Corruption::Quant => bytes[25] ^= 1,
             Corruption::Tokenizer => bytes[40] ^= 1,
+            // First byte of `weights_hash`, which follows
+            // magic(4) + version(4) + model_id(4+10) + quant(4+5) +
+            // config_hash(32) + tokenizer_hash(32) + chat_template_hash(32).
+            Corruption::Weights => bytes[127] ^= 1,
         };
         fs::write(path, bytes)
     }
@@ -501,6 +568,7 @@ enum Corruption {
     Quant,
     Tokenizer,
     Magic,
+    Weights,
 }
 
 enum DiskLayer<'a> {
@@ -600,12 +668,62 @@ fn mlx_error(error: mlx_rs::error::Exception) -> std::io::Error {
     std::io::Error::other(error.to_string())
 }
 
+/// Parse the layer section out of a checksum-verified payload cursor.
+/// Returns `Ok(None)` for a recognized-but-mismatched layout (clean miss,
+/// e.g. after a format change), and `Err` for I/O or array decode failures.
+fn parse_cache_layers(
+    cursor: &mut Cursor<Vec<u8>>,
+    configs: Vec<PrototypeLayer>,
+    token_count: usize,
+) -> std::io::Result<Option<Vec<Option<LayerCache>>>> {
+    let mut layers = Vec::with_capacity(configs.len());
+    for config in configs {
+        let mut tag = [0; 1];
+        cursor.read_exact(&mut tag)?;
+        layers.push(match (tag[0], config) {
+            (0, PrototypeLayer::Empty) => None,
+            (1, PrototypeLayer::Dense(config)) => Some(LayerCache::KV(
+                SteppingKeyValueCache::from_arrays_with_config(
+                    read_array(cursor)?,
+                    read_array(cursor)?,
+                    config,
+                )
+                .map_err(mlx_error)?,
+            )),
+            (2, PrototypeLayer::Turbo(context)) => Some(LayerCache::KV(
+                SteppingKeyValueCache::from_turbo_arrays(
+                    context,
+                    read_array(cursor)?,
+                    read_array(cursor)?,
+                    read_array(cursor)?,
+                    read_array(cursor)?,
+                    read_array(cursor)?,
+                    i32::try_from(token_count)
+                        .map_err(|_| std::io::Error::other("token count overflow"))?,
+                )
+                .map_err(mlx_error)?,
+            )),
+            _ => {
+                tracing::debug!(
+                    tag = tag[0],
+                    reason = "cache layer layout mismatch",
+                    "Disk prefix cache entry rejected"
+                );
+                return Ok(None);
+            }
+        });
+    }
+    Ok(Some(layers))
+}
+
 fn write_header<W: Write>(
     w: &mut W,
     version: u32,
     identity: &StoreIdentity,
     block_size: u32,
     token_count: u32,
+    payload_checksum: &[u8; 32],
+    payload_len: u64,
 ) -> std::io::Result<()> {
     w.write_all(MAGIC)?;
     write_u32(w, version)?;
@@ -614,15 +732,19 @@ fn write_header<W: Write>(
     w.write_all(&identity.config_hash)?;
     w.write_all(&identity.tokenizer_hash)?;
     w.write_all(&identity.chat_template_hash)?;
+    w.write_all(&identity.weights_hash)?;
     write_u32(w, block_size)?;
-    write_u32(w, token_count)
+    write_u32(w, token_count)?;
+    w.write_all(payload_checksum)?;
+    write_u64(w, payload_len)
 }
 
+#[allow(clippy::type_complexity)]
 fn read_header<R: Read>(
     r: &mut R,
     version: u32,
     identity: &StoreIdentity,
-) -> std::io::Result<Option<(u32, u32)>> {
+) -> std::io::Result<Option<(u32, u32, [u8; 32], u64)>> {
     let mut magic = [0; 4];
     if r.read_exact(&mut magic).is_err() {
         tracing::debug!(
@@ -669,6 +791,10 @@ fn read_header<R: Read>(
             &identity.chat_template_hash,
             "StoreIdentity chat template hash mismatch",
         ),
+        (
+            &identity.weights_hash,
+            "StoreIdentity weights fingerprint mismatch",
+        ),
     ] {
         let mut actual = [0; 32];
         if r.read_exact(&mut actual).is_err() {
@@ -683,10 +809,24 @@ fn read_header<R: Read>(
             return Ok(None);
         }
     }
-    match (read_u32(r), read_u32(r)) {
-        (Some(block), Some(tokens)) => Ok(Some((block, tokens))),
-        _ => Ok(None),
+    let Some(block) = read_u32(r) else {
+        return Ok(None);
+    };
+    let Some(tokens) = read_u32(r) else {
+        return Ok(None);
+    };
+    let mut payload_checksum = [0; 32];
+    if r.read_exact(&mut payload_checksum).is_err() {
+        tracing::debug!(
+            reason = "truncated payload checksum",
+            "Disk prefix cache entry rejected"
+        );
+        return Ok(None);
     }
+    let Some(payload_len) = read_u64(r) else {
+        return Ok(None);
+    };
+    Ok(Some((block, tokens, payload_checksum, payload_len)))
 }
 
 fn write_array<W: Write>(w: &mut W, array: &Array) -> std::io::Result<()> {
@@ -950,6 +1090,29 @@ fn key(tokens: &[u32], block_size: usize) -> String {
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
+/// Build a temp-file path that is unique per writer, so two processes (or two
+/// writers in the same process) sharing a store directory cannot clobber each
+/// other's in-progress write of the same key.
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("entry");
+    path.with_file_name(format!("{file_name}.tmp.{pid}.{nanos}.{counter}"))
+}
+/// Whether `path` is a temp file left by an in-progress or interrupted write,
+/// covering both the unique per-writer naming (`<name>.tmp.<pid>.<n>.<c>`)
+/// and the plain `*.tmp` suffix.
+fn is_tmp_file(path: &Path) -> bool {
+    path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+        n.rsplit_once('.')
+            .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("tmp"))
+            || n.contains(".tmp.")
+    })
+}
 fn write_u32<W: Write>(w: &mut W, n: u32) -> std::io::Result<()> {
     w.write_all(&n.to_le_bytes())
 }
@@ -1021,7 +1184,7 @@ mod tests {
         )]);
 
         store.store_cache(&tokens, 2, &cache).unwrap();
-        let (_, restored) = store.load_cache(&tokens, &cache).unwrap().unwrap();
+        let (_, restored) = store.load_cache(&tokens, 2, &cache).unwrap().unwrap();
         let AnyCache::KV(layers) = restored else {
             panic!("expected KV cache")
         };
@@ -1054,7 +1217,7 @@ mod tests {
             .unwrap(),
         )]);
         store.store_cache(&tokens, 2, &cache).unwrap();
-        let (_, restored) = store.load_cache(&tokens, &cache).unwrap().unwrap();
+        let (_, restored) = store.load_cache(&tokens, 2, &cache).unwrap().unwrap();
         let AnyCache::KV(layers) = restored else {
             panic!("expected KV cache")
         };
@@ -1087,7 +1250,13 @@ mod tests {
 
         let restarted_store = DiskPrefixStore::new(dir.path(), 1024 * 1024, identity()).unwrap();
         let prototype = AnyCache::KV(vec![Some(SteppingKeyValueCache::new())]);
-        let Some((prefix_len, restored)) = restarted_store.load_cache(&prompt, &prototype).unwrap()
+        let Some((prefix_len, restored)) = restarted_store
+            .load_cache(
+                &prompt,
+                u32::try_from(DEFAULT_BLOCK_SIZE).unwrap(),
+                &prototype,
+            )
+            .unwrap()
         else {
             panic!("restart should restore the block-aligned prefix");
         };
@@ -1114,6 +1283,7 @@ mod tests {
             Corruption::Quant,
             Corruption::Tokenizer,
             Corruption::Magic,
+            Corruption::Weights,
         ] {
             store
                 .store_payload(&tokens, 2, &DensePayload::test_payload())
@@ -1121,6 +1291,71 @@ mod tests {
             store.corrupt_for_test(&tokens, corruption).unwrap();
             assert!(store.load_payload(&tokens).is_none());
         }
+    }
+    #[test]
+    fn flipped_byte_in_tensor_payload_is_a_clean_miss() {
+        let dir = tempdir().unwrap();
+        let store = DiskPrefixStore::new(dir.path(), 1024 * 1024, identity()).unwrap();
+        let tokens = vec![1, 2, 3, 4];
+        let keys = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4, 1]);
+        let values = Array::from_slice(&[5.0_f32, 6.0, 7.0, 8.0], &[1, 1, 4, 1]);
+        let cache = AnyCache::KV(vec![Some(
+            SteppingKeyValueCache::from_arrays(keys, values).unwrap(),
+        )]);
+        store.store_cache(&tokens, 2, &cache).unwrap();
+
+        let path = store
+            .files()
+            .unwrap()
+            .into_iter()
+            .next()
+            .map(|(p, _)| p)
+            .unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        // Flip the last byte: it necessarily falls inside the serialized
+        // tensor payload (the arrays occupy the tail of the file).
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        fs::write(&path, bytes).unwrap();
+
+        assert!(store.load_cache(&tokens, 2, &cache).unwrap().is_none());
+    }
+    #[test]
+    fn longest_stored_prefix_is_selected_deterministically() {
+        let dir = tempdir().unwrap();
+        let store = DiskPrefixStore::new(dir.path(), 1024 * 1024, identity()).unwrap();
+        let block_size = u32::try_from(DEFAULT_BLOCK_SIZE).unwrap();
+        let conversation: Vec<u32> = (0..u32::try_from(4 * DEFAULT_BLOCK_SIZE).unwrap()).collect();
+
+        let short = &conversation[..2 * DEFAULT_BLOCK_SIZE];
+        let long = &conversation[..3 * DEFAULT_BLOCK_SIZE];
+        let short_len = i32::try_from(short.len()).unwrap();
+        let long_len = i32::try_from(long.len()).unwrap();
+        let short_cache = AnyCache::KV(vec![Some(
+            SteppingKeyValueCache::from_arrays(
+                Array::zeros::<f32>(&[1, 1, short_len, 1]).unwrap(),
+                Array::zeros::<f32>(&[1, 1, short_len, 1]).unwrap(),
+            )
+            .unwrap(),
+        )]);
+        let long_cache = AnyCache::KV(vec![Some(
+            SteppingKeyValueCache::from_arrays(
+                Array::zeros::<f32>(&[1, 1, long_len, 1]).unwrap(),
+                Array::zeros::<f32>(&[1, 1, long_len, 1]).unwrap(),
+            )
+            .unwrap(),
+        )]);
+        store.store_cache(short, block_size, &short_cache).unwrap();
+        store.store_cache(long, block_size, &long_cache).unwrap();
+
+        // A request extending the long prefix should restore the long
+        // prefix, not the shorter one, even though both are compatible.
+        let prototype = AnyCache::KV(vec![Some(SteppingKeyValueCache::new())]);
+        let (prefix_len, _) = store
+            .load_cache(&conversation, block_size, &prototype)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prefix_len, 3 * DEFAULT_BLOCK_SIZE);
     }
     #[test]
     fn eviction_removes_least_recently_touched_file() {

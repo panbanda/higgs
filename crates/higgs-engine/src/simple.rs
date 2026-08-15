@@ -589,7 +589,11 @@ impl SimpleEngine {
         if prefix_match.is_none() && !has_images {
             if let Some(store) = &self.disk_prefix_store {
                 match model.make_cache_with_config(self.kv_cache_config) {
-                    Ok(prototype) => match store.load_cache(prompt_tokens, &prototype) {
+                    Ok(prototype) => match store.load_cache(
+                        prompt_tokens,
+                        u32::try_from(DEFAULT_BLOCK_SIZE).unwrap_or(u32::MAX),
+                        &prototype,
+                    ) {
                         Ok(Some((prefix_len, cache))) => {
                             let mut pc = self.prefix_cache.lock().map_err(|e| {
                                 EngineError::Generation(format!("Cache lock poisoned: {e}"))
