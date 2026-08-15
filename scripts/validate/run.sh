@@ -5,7 +5,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 CACHE_ROOT="$HOME/.cache/higgs-validate"
-MODEL_CACHE="$CACHE_ROOT/models"
 BUILD_CACHE="$CACHE_ROOT/builds"
 WORKTREE_CACHE="$CACHE_ROOT/worktrees"
 RUNS="${RUNS:-5}"
@@ -62,24 +61,24 @@ PY
 }
 
 download_model() {
-    local model_path="$1" model_dir="$2" tool
-    if [[ -d "$model_dir" ]] && [[ -n "$(find "$model_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
-        return
-    fi
+    local model_path="$1" tool output snapshot_dir
     # Prefer hf: huggingface-cli is deprecated and newer installs ship a stub
     # that exits with an error telling you to use hf.
     if command -v hf >/dev/null 2>&1; then tool="hf"; elif command -v huggingface-cli >/dev/null 2>&1; then tool="huggingface-cli"; else
         echo "missing model download tool: install hf (huggingface_hub)" >&2
         exit 1
     fi
-    mkdir -p "$model_dir"
-    "$tool" download "$model_path" --local-dir "$model_dir"
+    output="$("$tool" download "$model_path")"
+    snapshot_dir="${output##*$'\n'}"
+    [[ -n "$snapshot_dir" ]] || { echo "model download did not print a snapshot path" >&2; exit 1; }
+    printf '%s\n' "$snapshot_dir"
 }
 
 build_ref() {
     local sha="$1"
     local source_dir="$REPO_ROOT"
     local build_dir="$BUILD_CACHE/$sha"
+    local shared_target_dir="$CACHE_ROOT/target"
     if [[ "$sha" != "$CANDIDATE_SHA" ]]; then
         source_dir="$WORKTREE_CACHE/$sha"
         if [[ ! -e "$source_dir/.git" ]]; then
@@ -88,8 +87,13 @@ build_ref() {
         fi
     fi
     if [[ ! -x "$build_dir/release/higgs" ]] || [[ ! -x "$build_dir/release/bench_decode" ]]; then
-        mkdir -p "$build_dir"
-        (cd "$source_dir" && CARGO_TARGET_DIR="$build_dir" cargo build --release -p higgs -p higgs-bench)
+        (cd "$source_dir" && CARGO_TARGET_DIR="$shared_target_dir" cargo build --release -p higgs -p higgs-bench)
+        mkdir -p "$build_dir/release"
+        cp "$shared_target_dir/release/higgs" "$build_dir/release/higgs"
+        cp "$shared_target_dir/release/bench_decode" "$build_dir/release/bench_decode"
+        if [[ -f "$shared_target_dir/release/mlx.metallib" ]]; then
+            cp "$shared_target_dir/release/mlx.metallib" "$build_dir/release/mlx.metallib"
+        fi
     fi
     printf '%s\n' "$build_dir/release"
 }
@@ -117,11 +121,10 @@ BASELINE_SHA="$(git -C "$REPO_ROOT" rev-parse "$BASELINE_REF")"
 MODEL_OUTPUT="$(detect_model)"
 MODEL_KEY="${MODEL_OUTPUT%%$'\n'*}"
 MODEL_PATH="${MODEL_OUTPUT#*$'\n'}"
-MODEL_DIR="$MODEL_CACHE/$MODEL_KEY"
 CHIP="$(sysctl -n machdep.cpu.brand_string)"
 RAM_GB=$(( $(sysctl -n hw.memsize) / 1024 / 1024 / 1024 ))
 MACOS_VERSION="$(sw_vers -productVersion)"
-download_model "$MODEL_PATH" "$MODEL_DIR"
+MODEL_DIR="$(download_model "$MODEL_PATH")"
 BASELINE_BIN_DIR="$(build_ref "$BASELINE_SHA")"
 CANDIDATE_BIN_DIR="$(build_ref "$CANDIDATE_SHA")"
 OUT_DIR="$REPO_ROOT/validation/$PR_ID"

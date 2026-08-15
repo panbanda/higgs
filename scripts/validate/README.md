@@ -10,8 +10,10 @@ scripts/validate/run.sh --baseline origin/main aa-smoke
 The runner detects the Mac chip, RAM, and macOS version. It chooses a `small`
 model below 32 GB RAM, a `medium` model from 32 through 64 GB, and the first
 manifest model above 64 GB. Models are downloaded resumably into
-`~/.cache/higgs-validate/models/`. Baseline and candidate release builds are
-cached separately under `~/.cache/higgs-validate/builds/<sha>/`.
+the standard Hugging Face hub cache (respecting `HF_HOME` and
+`HF_HUB_CACHE`). Baseline and candidate release binaries are cached under
+`~/.cache/higgs-validate/builds/<sha>/`; their Cargo build output is shared at
+`~/.cache/higgs-validate/target/` so unchanged dependencies can be reused.
 
 `aa-smoke` starts each built server in turn and uses `bench_decode` with five
 measured trials by default. Set `RUNS` to change that count and
