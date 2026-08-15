@@ -1388,6 +1388,7 @@ impl SimpleEngine {
             drafted = stats.drafted(),
             accepted_drafts = stats.accepted_drafts(),
             emitted = stats.emitted(),
+            confidence_stopped = stats.cycles_confidence_stopped(),
             accept_rate = format!("{:.1}%", stats.acceptance_rate_percent()),
             tok_per_s = format!("{:.1}", f64::from(stats.emitted()) / elapsed.as_secs_f64()),
             "MTP decode complete"
@@ -1406,6 +1407,7 @@ impl SimpleEngine {
             drafted = stats.drafted(),
             accepted_drafts = stats.accepted_drafts(),
             emitted = stats.emitted(),
+            confidence_stopped = stats.cycles_confidence_stopped(),
             accept_rate = format!("{:.1}%", stats.acceptance_rate_percent()),
             tok_per_s = format!("{:.1}", f64::from(stats.emitted()) / elapsed.as_secs_f64()),
             "Prompt-lookup decode complete"
@@ -1491,7 +1493,12 @@ impl SimpleEngine {
             } else {
                 crate::mtp::prompt_lookup_cycle(model, cache, tokens, confirmed_token_id, config)?
             };
-            stats.record_cycle(result.drafted, result.tokens.len(), result.accepted_drafts);
+            stats.record_cycle(
+                result.drafted,
+                result.tokens.len(),
+                result.accepted_drafts,
+                false,
+            );
 
             for &tok in &result.tokens {
                 if let Some(close_id) = think_close_token {
@@ -1723,7 +1730,12 @@ impl SimpleEngine {
                 )?
             };
 
-            mtp_stats.record_cycle(result.drafted, result.tokens.len(), result.accepted_drafts);
+            mtp_stats.record_cycle(
+                result.drafted,
+                result.tokens.len(),
+                result.accepted_drafts,
+                result.confidence_stopped,
+            );
             if let Some(depth) = &mut adaptive_depth {
                 depth.observe(result.accepted_drafts, result.drafted);
             }
@@ -1960,7 +1972,12 @@ impl SimpleEngine {
                 )?
             };
 
-            mtp_stats.record_cycle(result.drafted, result.tokens.len(), result.accepted_drafts);
+            mtp_stats.record_cycle(
+                result.drafted,
+                result.tokens.len(),
+                result.accepted_drafts,
+                result.confidence_stopped,
+            );
             if let Some(depth) = &mut adaptive_depth {
                 depth.observe(result.accepted_drafts, result.drafted);
             }

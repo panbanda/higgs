@@ -3,17 +3,25 @@
 //! Uses the model's built-in MTP head to draft tokens, then verifies them by
 //! processing the verifier window through the backbone in one batch and rolling
 //! back to the committed prefix on rejection.
+//! Set `HIGGS_MTP_CONFIDENCE_MIN` to a probability in `[0, 1)` to stop an MTP
+//! draft cycle before appending a low-confidence candidate after its first
+//! draft. The default is `0.10`; set it to `0` to disable confidence gating.
 //!
 //! Expected speedup: ~1.5x on dense models at ~80% acceptance rate.
 
+use std::sync::OnceLock;
+
 use higgs_models::{AnyCache, AnyModel, MtpCache, deep_clone_mtp_cache};
 use mlx_rs::{
-    Array, argmax_axis,
+    Array, Dtype, argmax_axis,
     ops::{self, concatenate_axis, indexing::IndexOp},
     transforms::eval,
 };
 
 use crate::error::EngineError;
+
+const DEFAULT_MTP_CONFIDENCE_MIN: f32 = 0.10;
+static MTP_CONFIDENCE_MIN: OnceLock<f32> = OnceLock::new();
 
 const fn draft_matches_target(draft_token_id: u32, target_id: u32) -> bool {
     draft_token_id == target_id
@@ -61,6 +69,8 @@ pub struct MtpStats {
     accepted_drafts: u32,
     /// Tokens emitted by MTP cycles, including confirmed tokens and accepted drafts.
     emitted: u32,
+    /// Cycles shortened because a draft candidate was below the confidence threshold.
+    cycles_confidence_stopped: u32,
 }
 
 impl MtpStats {
@@ -69,6 +79,7 @@ impl MtpStats {
         drafted_count: usize,
         emitted_count: usize,
         accepted_drafts_count: usize,
+        confidence_stopped: bool,
     ) {
         let drafted = u32::try_from(drafted_count).unwrap_or(u32::MAX);
         let emitted = u32::try_from(emitted_count).unwrap_or(u32::MAX);
@@ -79,6 +90,9 @@ impl MtpStats {
         self.drafted = self.drafted.saturating_add(drafted);
         self.emitted = self.emitted.saturating_add(emitted);
         self.accepted_drafts = self.accepted_drafts.saturating_add(accepted_drafts);
+        self.cycles_confidence_stopped = self
+            .cycles_confidence_stopped
+            .saturating_add(u32::from(confidence_stopped));
     }
 
     pub const fn cycles(&self) -> u32 {
@@ -95,6 +109,10 @@ impl MtpStats {
 
     pub const fn emitted(&self) -> u32 {
         self.emitted
+    }
+
+    pub const fn cycles_confidence_stopped(&self) -> u32 {
+        self.cycles_confidence_stopped
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -161,6 +179,8 @@ pub struct MtpCycleResult {
     pub drafted: usize,
     /// Number of speculative draft tokens accepted this cycle.
     pub accepted_drafts: usize,
+    /// Whether confidence gating shortened this cycle below its adaptive depth cap.
+    pub confidence_stopped: bool,
 }
 
 /// Prompt-lookup speculative decode settings.
@@ -276,6 +296,7 @@ pub fn mtp_prompt_lookup_cycle(
         next_token_id,
         drafted: drafts.len(),
         accepted_drafts,
+        confidence_stopped: false,
     }))
 }
 
@@ -283,6 +304,21 @@ fn greedy_token_id(logits: &Array) -> Result<u32, EngineError> {
     let token_arr = argmax_axis!(&logits.index((.., -1, ..)), -1).map_err(EngineError::Mlx)?;
     eval([&token_arr]).map_err(EngineError::Mlx)?;
     Ok(token_arr.item())
+}
+
+fn greedy_token_and_probability(logits: &Array) -> Result<(u32, f32), EngineError> {
+    let last_logits = logits.index((.., -1, ..));
+    let token_arr = argmax_axis!(&last_logits, -1).map_err(EngineError::Mlx)?;
+    let log_probs = mlx_rs::nn::log_softmax(&last_logits, -1).map_err(EngineError::Mlx)?;
+    let token_log_prob = log_probs
+        .take_along_axis(&token_arr.reshape(&[-1, 1]).map_err(EngineError::Mlx)?, -1)
+        .map_err(EngineError::Mlx)?
+        .as_dtype(Dtype::Float32)
+        .map_err(EngineError::Mlx)?
+        .exp()
+        .map_err(EngineError::Mlx)?;
+    eval([&token_arr, &token_log_prob]).map_err(EngineError::Mlx)?;
+    Ok((token_arr.item(), token_log_prob.item()))
 }
 
 fn greedy_token_ids(logits: &Array) -> Result<Vec<u32>, EngineError> {
@@ -301,6 +337,22 @@ fn parse_enabled_flag(raw: Option<&str>) -> Option<bool> {
 
 fn mtp_mirror_verify_enabled() -> bool {
     parse_enabled_flag(std::env::var("HIGGS_MTP_MIRROR_VERIFY").ok().as_deref()).unwrap_or(false)
+}
+
+fn parse_confidence_min(raw: Option<&str>) -> f32 {
+    raw.and_then(|value| value.trim().parse::<f32>().ok())
+        .filter(|value| *value >= 0.0 && *value < 1.0)
+        .unwrap_or(DEFAULT_MTP_CONFIDENCE_MIN)
+}
+
+fn mtp_confidence_min() -> f32 {
+    *MTP_CONFIDENCE_MIN.get_or_init(|| {
+        parse_confidence_min(std::env::var("HIGGS_MTP_CONFIDENCE_MIN").ok().as_deref())
+    })
+}
+
+const fn should_continue_drafting(probability: f32, threshold: f32, draft_idx: usize) -> bool {
+    draft_idx == 0 || threshold == 0.0 || probability >= threshold
 }
 
 fn accepted_draft_prefix_len(drafts: &[u32], verifier_targets: &[u32]) -> usize {
@@ -653,6 +705,8 @@ pub fn mtp_cycle(
     let mut speculative_hidden = hidden.clone();
     let mut speculative_token = confirmed_token_id;
     let mut drafts = Vec::with_capacity(draft_limit);
+    let confidence_min = mtp_confidence_min();
+    let mut confidence_stopped = false;
 
     for draft_idx in 0..draft_limit {
         let (next_hidden, draft_logits) = model
@@ -662,7 +716,11 @@ pub fn mtp_cycle(
                 &mut speculative_mtp_cache,
             )
             .map_err(EngineError::Mlx)?;
-        let draft_token_id = greedy_token_id(&draft_logits)?;
+        let (draft_token_id, probability) = greedy_token_and_probability(&draft_logits)?;
+        if !should_continue_drafting(probability, confidence_min, draft_idx) {
+            confidence_stopped = true;
+            break;
+        }
         drafts.push(draft_token_id);
         speculative_hidden = next_hidden;
         speculative_token = draft_token_id;
@@ -754,15 +812,44 @@ pub fn mtp_cycle(
         next_token_id,
         drafted: drafts.len(),
         accepted_drafts,
+        confidence_stopped,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AdaptiveDraftDepth, MtpStats, accepted_draft_prefix_len, draft_matches_target,
-        emitted_tokens, prompt_lookup_draft,
+        AdaptiveDraftDepth, DEFAULT_MTP_CONFIDENCE_MIN, MtpStats, accepted_draft_prefix_len,
+        draft_matches_target, emitted_tokens, parse_confidence_min, prompt_lookup_draft,
+        should_continue_drafting,
     };
+
+    #[test]
+    fn confidence_gate_stops_before_a_low_confidence_second_draft() {
+        assert!(should_continue_drafting(0.01, 0.10, 0));
+        assert!(!should_continue_drafting(0.09, 0.10, 1));
+    }
+
+    #[test]
+    fn zero_confidence_threshold_disables_the_gate() {
+        assert!(should_continue_drafting(0.0, 0.0, 1));
+        assert!(should_continue_drafting(0.01, 0.0, 4));
+    }
+
+    #[test]
+    fn confidence_threshold_parse_accepts_only_the_configured_range() {
+        assert!((parse_confidence_min(Some("0.25")) - 0.25).abs() < f32::EPSILON);
+        assert!(parse_confidence_min(Some("0")).abs() < f32::EPSILON);
+        assert!(
+            (parse_confidence_min(Some("1")) - DEFAULT_MTP_CONFIDENCE_MIN).abs() < f32::EPSILON
+        );
+        assert!(
+            (parse_confidence_min(Some("-0.1")) - DEFAULT_MTP_CONFIDENCE_MIN).abs() < f32::EPSILON
+        );
+        assert!(
+            (parse_confidence_min(Some("nope")) - DEFAULT_MTP_CONFIDENCE_MIN).abs() < f32::EPSILON
+        );
+    }
 
     #[test]
     fn draft_match_helper_accepts_identical_tokens() {
@@ -777,13 +864,14 @@ mod tests {
     #[test]
     fn mtp_stats_tracks_explicit_accepted_draft_count() {
         let mut stats = MtpStats::default();
-        stats.record_cycle(3, 2, 2);
-        stats.record_cycle(2, 1, 0);
+        stats.record_cycle(3, 2, 2, true);
+        stats.record_cycle(2, 1, 0, false);
 
         assert_eq!(stats.cycles(), 2);
         assert_eq!(stats.drafted(), 5);
         assert_eq!(stats.emitted(), 3);
         assert_eq!(stats.accepted_drafts(), 2);
+        assert_eq!(stats.cycles_confidence_stopped(), 1);
         assert!((stats.acceptance_rate_percent() - 40.0).abs() < f64::EPSILON);
     }
 
