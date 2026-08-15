@@ -667,27 +667,48 @@ fn deepseek_expert_projection_quantization(
         return Ok((fallback_group_size, fallback_bits));
     };
 
+    let fused_path = fused_expert_projection_path(layer_idx, projection);
+    let fused_override = settings.is_overridden(&fused_path);
+    let per_expert_paths = (0..num_experts)
+        .map(|expert_idx| format!("model.layers.{layer_idx}.mlp.experts.{expert_idx}.{projection}"))
+        .collect::<Vec<_>>();
+    let has_per_expert_override = per_expert_paths
+        .iter()
+        .any(|path| settings.is_overridden(path));
+
     // Prefer an explicit override on the fused tensor path -- this is what
     // a real mlx_lm.convert run actually records in config.json, since
     // routed experts are one physical tensor per layer/projection there.
-    let fused_path = fused_expert_projection_path(layer_idx, projection);
-    let quant = if settings.is_overridden(&fused_path) {
-        settings.resolve(&fused_path)
+    // Fall back to the legacy per-expert-indexed convention (used by this
+    // crate's own fixtures/tests, and by make_recipe.py's --granularity
+    // expert mode in scripts/quantize/ as the more expressive artifact for
+    // a hypothetical unfused checkpoint) when the fused path has no
+    // override of its own. resolve_uniform rejects a mismatched per-expert
+    // override rather than silently picking one, and cleanly falls back to
+    // the scalar default when neither convention has an entry.
+    let quant = if fused_override {
+        let fused_quant = settings.resolve(&fused_path);
+        if has_per_expert_override {
+            // Both conventions carry a genuine (non-default-equal) entry
+            // for this layer/projection -- a checkpoint should never say
+            // two different things about the same physical tensor. Require
+            // every legacy per-expert entry to agree with the fused
+            // setting rather than silently preferring the fused one.
+            let per_expert_quant = settings
+                .resolve_uniform(per_expert_paths.iter().map(String::as_str))
+                .map_err(Exception::custom)?;
+            if per_expert_quant != fused_quant {
+                return Err(Exception::custom(format!(
+                    "conflicting quantization overrides for model.layers.{layer_idx}.mlp.{projection}: \
+                     fused path {fused_path} resolves to {fused_quant:?}, but a legacy per-expert \
+                     override resolves to {per_expert_quant:?}"
+                )));
+            }
+        }
+        fused_quant
     } else {
-        // Fall back to the legacy per-expert-indexed convention (used by
-        // this crate's own fixtures/tests, and by make_recipe.py's
-        // --granularity expert mode in scripts/quantize/ as the more
-        // expressive artifact for a hypothetical unfused checkpoint).
-        // resolve_uniform rejects a mismatched per-expert override rather
-        // than silently picking one, and cleanly falls back to the scalar
-        // default when neither convention has an entry.
-        let paths = (0..num_experts)
-            .map(|expert_idx| {
-                format!("model.layers.{layer_idx}.mlp.experts.{expert_idx}.{projection}")
-            })
-            .collect::<Vec<_>>();
         settings
-            .resolve_uniform(paths.iter().map(String::as_str))
+            .resolve_uniform(per_expert_paths.iter().map(String::as_str))
             .map_err(Exception::custom)?
     };
 
@@ -1538,6 +1559,61 @@ mod tests {
                     .contains("model.layers.1.mlp.switch_mlp.gate_proj"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_model_new_rejects_conflicting_fused_and_per_expert_overrides() {
+        // A checkpoint that says two different things about the same
+        // physical tensor (fused switch_mlp override at 3-bit, legacy
+        // per-expert override at 4-bit for the same layer/projection) must
+        // be rejected loudly rather than silently preferring the fused
+        // path -- naming the layer/projection so the contradiction is
+        // debuggable.
+        let mut args = small_args();
+        args.quantization = Some(
+            serde_json::from_str(
+                r#"{
+                    "group_size": 64,
+                    "bits": 6,
+                    "model.layers.1.mlp.switch_mlp.gate_proj": {"group_size": 64, "bits": 3},
+                    "model.layers.1.mlp.experts.0.gate_proj": {"group_size": 64, "bits": 4},
+                    "model.layers.1.mlp.experts.1.gate_proj": {"group_size": 64, "bits": 4},
+                    "model.layers.1.mlp.experts.2.gate_proj": {"group_size": 64, "bits": 4},
+                    "model.layers.1.mlp.experts.3.gate_proj": {"group_size": 64, "bits": 4}
+                }"#,
+            )
+            .unwrap(),
+        );
+        let err = DeepSeekV2CausalLM::new(args).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("conflicting quantization overrides")
+                && err.to_string().contains("model.layers.1.mlp.gate_proj"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_model_new_accepts_consistent_fused_and_per_expert_overrides() {
+        // Both conventions carrying the *same* setting for a layer/
+        // projection is not a contradiction and must load normally.
+        let mut args = small_args();
+        args.quantization = Some(
+            serde_json::from_str(
+                r#"{
+                    "group_size": 64,
+                    "bits": 6,
+                    "model.layers.1.mlp.switch_mlp.gate_proj": {"group_size": 64, "bits": 3},
+                    "model.layers.1.mlp.experts.0.gate_proj": {"group_size": 64, "bits": 3},
+                    "model.layers.1.mlp.experts.1.gate_proj": {"group_size": 64, "bits": 3},
+                    "model.layers.1.mlp.experts.2.gate_proj": {"group_size": 64, "bits": 3},
+                    "model.layers.1.mlp.experts.3.gate_proj": {"group_size": 64, "bits": 3}
+                }"#,
+            )
+            .unwrap(),
+        );
+        let model = DeepSeekV2CausalLM::new(args).unwrap();
+        assert_eq!(model.args.num_hidden_layers, 2);
     }
 
     #[test]
