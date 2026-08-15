@@ -954,6 +954,12 @@ pub struct DeepSeekV2CausalLM {
     model: DeepSeekV2Inner,
     #[param]
     lm_head: Option<QLinear>,
+    /// MLA decision resolved by the most recent [`Self::make_cache_with_config`]
+    /// call, if any. `forward_hidden`'s lazy empty-cache re-init uses this
+    /// (when present) instead of re-deriving an env-only decision, so it stays
+    /// consistent with the caches `make_cache_with_config` actually built.
+    /// `Cell` because both methods take `&self`/build on immutable borrows.
+    last_resolved_mla: std::cell::Cell<Option<bool>>,
 }
 
 impl DeepSeekV2CausalLM {
@@ -1000,14 +1006,18 @@ impl DeepSeekV2CausalLM {
             args,
             model,
             lm_head,
+            last_resolved_mla: std::cell::Cell::new(None),
         })
     }
 
     /// Build caches using the env-only MLA decision.
     ///
-    /// This is the standalone lazy-init path: it has no `KvCacheConfig` to
-    /// consult, so it only honors `HIGGS_MLA_LATENT_CACHE`. Callers that have
-    /// a `KvCacheConfig` (e.g. the engine's `make_cache_with_config` flow)
+    /// This is the standalone path: it has no `KvCacheConfig` to consult, so
+    /// it only honors `HIGGS_MLA_LATENT_CACHE`, and it does not record a
+    /// resolved decision for `forward_hidden`'s lazy re-init to reuse — so
+    /// that re-init still falls back to the env-only decision unless
+    /// `make_cache_with_config` has run first. Callers that have a
+    /// `KvCacheConfig` (e.g. the engine's `make_cache_with_config` flow)
     /// should use [`Self::make_cache_with_config`] instead, which is
     /// authoritative for engine-managed caches.
     pub fn make_cache(&self) -> Result<Vec<Option<SteppingKeyValueCache>>, Exception> {
@@ -1036,6 +1046,7 @@ impl DeepSeekV2CausalLM {
         kv_cache_config: KvCacheConfig,
     ) -> Result<Vec<Option<SteppingKeyValueCache>>, Exception> {
         let mla_enabled = resolve_mla_latent_cache(kv_cache_config.mla_latent);
+        self.last_resolved_mla.set(Some(mla_enabled));
         (0..self.args.num_hidden_layers)
             .map(|_| {
                 if mla_enabled {
@@ -1059,17 +1070,26 @@ impl DeepSeekV2CausalLM {
         mask: Option<&Array>,
         kv_cache: &mut Vec<Option<SteppingKeyValueCache>>,
     ) -> Result<Array, Exception> {
-        let mut h = self.model.embed_tokens.forward(inputs)?;
-
-        let computed_mask = match mask {
-            Some(m) => Some(AttentionMask::Array(m.clone())),
-            None => create_attention_mask(&h, kv_cache, None)?,
-        };
-
+        // Validate/lazily populate the cache before running any layers, so a
+        // length mismatch or cache-construction error surfaces before doing
+        // (wasted) embedding/attention work. Freshly built caches all start
+        // at offset 0, matching the empty-slice fallback `create_attention_mask`
+        // below would otherwise use, so reordering this ahead of the mask
+        // computation does not change its result.
         if kv_cache.is_empty() {
+            // Prefer the decision the most recent `make_cache_with_config` call
+            // resolved, so a config-driven `mla_latent_cache=true` (with
+            // HIGGS_MLA_LATENT_CACHE unset) doesn't silently regress to dense
+            // caches here. Callers that never went through
+            // `make_cache_with_config` (e.g. tests exercising `forward_hidden`
+            // directly) fall back to the env-only decision.
+            let mla_enabled = self
+                .last_resolved_mla
+                .get()
+                .unwrap_or_else(mla_latent_cache_enabled);
             *kv_cache = (0..self.model.layers.len())
                 .map(|_| {
-                    if mla_latent_cache_enabled() {
+                    if mla_enabled {
                         SteppingKeyValueCache::new_mla(
                             self.args.kv_lora_rank,
                             self.args.qk_rope_head_dim,
@@ -1088,6 +1108,13 @@ impl DeepSeekV2CausalLM {
                 self.model.layers.len()
             )));
         }
+
+        let mut h = self.model.embed_tokens.forward(inputs)?;
+
+        let computed_mask = match mask {
+            Some(m) => Some(AttentionMask::Array(m.clone())),
+            None => create_attention_mask(&h, kv_cache, None)?,
+        };
 
         for (layer, layer_cache) in self.model.layers.iter_mut().zip(kv_cache.iter_mut()) {
             h = layer.forward(&h, computed_mask.as_ref(), layer_cache.as_mut())?;
@@ -1545,6 +1572,45 @@ mod tests {
         let input = Array::from_slice(&[1_i32], &[1, 1]);
         let result = model.forward(&input, None, &mut cache);
         assert!(result.is_err(), "mismatched cache length should error");
+    }
+
+    /// `forward_hidden`'s lazy empty-cache re-init must reuse the MLA
+    /// decision `make_cache_with_config` resolved, not silently fall back to
+    /// the env-only decision (which would build dense caches here since
+    /// `HIGGS_MLA_LATENT_CACHE` is unset).
+    #[test]
+    #[allow(unsafe_code)]
+    fn test_forward_hidden_lazy_init_reuses_resolved_mla_decision() {
+        // SAFETY: test-only env mutation; higgs-models tests run single-threaded
+        // (--test-threads=1) so there is no cross-test interleaving. Ensure the
+        // env override is unset so the config-resolved decision is exercised.
+        unsafe {
+            std::env::remove_var("HIGGS_MLA_LATENT_CACHE");
+        }
+
+        let args = small_args();
+        let mut model = DeepSeekV2CausalLM::new(args).unwrap();
+
+        let kv_cache_config = KvCacheConfig {
+            mla_latent: true,
+            ..Default::default()
+        };
+        let _ = model.make_cache_with_config(kv_cache_config).unwrap();
+
+        // The cache vec is populated before the per-layer forward pass runs,
+        // so we only need the lazy-init side effect here, not a successful
+        // forward pass (mirrors `test_forward_preserves_pre_initialized_cache`).
+        let mut cache: Vec<Option<SteppingKeyValueCache>> = Vec::new();
+        let input = Array::from_slice(&[1_i32, 2, 3], &[1, 3]);
+        let _ = model.forward_hidden(&input, None, &mut cache);
+
+        assert_eq!(cache.len(), 2);
+        for (i, maybe_cache) in cache.iter().enumerate() {
+            let layer_cache = maybe_cache
+                .as_ref()
+                .unwrap_or_else(|| panic!("layer {i} cache should be Some"));
+            assert!(layer_cache.is_mla(), "layer {i} cache should be MLA");
+        }
     }
 
     #[test]

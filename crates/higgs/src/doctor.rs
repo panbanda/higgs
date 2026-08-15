@@ -286,18 +286,25 @@ fn check_prefill_yield_tokens(
     true
 }
 
-/// Warn (not fail) when `mla_latent_cache=true` is set for a model whose
-/// architecture isn't `deepseek_v2`. The flag is a no-op for other
+/// Warn (not fail) when the *resolved* MLA decision is enabled for a model
+/// whose architecture isn't `deepseek_v2`. The flag is a no-op for other
 /// architectures at runtime -- `KvCacheConfig::mla_latent` is only consulted
 /// by `DeepSeekV2::make_cache_with_config` -- so this is advisory, not a
 /// hard failure.
+///
+/// Uses [`higgs_models::cache::resolve_mla_latent_cache`] rather than the raw
+/// `model.mla_latent_cache` field, so this matches runtime behavior: e.g.
+/// `HIGGS_MLA_LATENT_CACHE=1` with `mla_latent_cache` unset in config still
+/// warns (the flag is effectively on), and `HIGGS_MLA_LATENT_CACHE=0` with
+/// `mla_latent_cache=true` in config does not warn (the flag is effectively
+/// off).
 fn check_mla_latent_cache_architecture(
     label: &str,
     model: &crate::config::ModelConfig,
     resolved: &std::path::Path,
     result: &mut DoctorResult,
 ) {
-    if model.mla_latent_cache != Some(true) {
+    if !higgs_models::cache::resolve_mla_latent_cache(model.kv_cache_config().mla_latent) {
         return;
     }
     match model_loader::ModelConfig::from_dir(resolved) {
@@ -341,8 +348,26 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
         if !check_prefill_yield_tokens(&label, model.prefill_yield_tokens, result) {
             continue;
         }
-        match model.kv_cache_config().validate() {
-            Ok(()) => {}
+        let kv_cache_config = model.kv_cache_config();
+        match kv_cache_config.validate() {
+            Ok(()) => {
+                // `validate()` only rejects the MLA/TurboQuant combination
+                // using the *resolved* decision (env-aware), so a
+                // config-declared conflict that HIGGS_MLA_LATENT_CACHE
+                // overrides away passes silently there. Surface that as an
+                // advisory warning rather than staying silent.
+                if model.mla_latent_cache == Some(true)
+                    && kv_cache_config.is_turboquant()
+                    && !higgs_models::cache::resolve_mla_latent_cache(kv_cache_config.mla_latent)
+                {
+                    warn(
+                        &format!(
+                            "model {label} sets mla_latent_cache=true with kv_cache=turboquant, but HIGGS_MLA_LATENT_CACHE overrides MLA off; the conflict is masked at runtime"
+                        ),
+                        result,
+                    );
+                }
+            }
             Err(err) => {
                 fail(
                     &format!("model {label} has invalid KV cache config: {err}"),
@@ -351,7 +376,7 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                 continue;
             }
         }
-        if model.batch && model.kv_cache_config().is_turboquant() {
+        if model.batch && kv_cache_config.is_turboquant() {
             fail(
                 &format!(
                     "model {label} enables unsupported combination: TurboQuant with batch=true"
@@ -1390,62 +1415,177 @@ mod tests {
         .unwrap();
     }
 
+    /// Run `f` with `HIGGS_MLA_LATENT_CACHE` set to `env_value` (or unset,
+    /// for `None`), restoring the prior value afterward. Serialized via
+    /// `crate::test_env_lock()` since this mutates process-global state;
+    /// combined with `--test-threads=1` (the repo's mandated test-runner
+    /// flag for this crate) there is no interleaving risk, but the lock
+    /// keeps the guarantee explicit and independent of that flag.
+    #[allow(unsafe_code)]
+    fn with_mla_env<R>(env_value: Option<&str>, f: impl FnOnce() -> R) -> R {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var("HIGGS_MLA_LATENT_CACHE").ok();
+        match env_value {
+            Some(v) => unsafe { std::env::set_var("HIGGS_MLA_LATENT_CACHE", v) },
+            None => unsafe { std::env::remove_var("HIGGS_MLA_LATENT_CACHE") },
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+
+        match previous.as_deref() {
+            Some(v) => unsafe { std::env::set_var("HIGGS_MLA_LATENT_CACHE", v) },
+            None => unsafe { std::env::remove_var("HIGGS_MLA_LATENT_CACHE") },
+        }
+        result.unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+    }
+
     #[test]
     fn test_mla_latent_cache_turboquant_conflict_fails_in_check_models() {
-        let dir = tempfile::tempdir().unwrap();
-        write_model_config_json(dir.path(), "deepseek_v2");
-        let mut model = model_with_path(dir.path().to_str().unwrap().to_owned());
-        model.kv_cache = higgs_models::turboquant::KvCacheMode::Turboquant;
-        model.mla_latent_cache = Some(true);
-        let config = HiggsConfig {
-            models: vec![model],
-            ..HiggsConfig::default()
-        };
-        let mut result = empty_result();
-        check_models(&config, &mut result);
-        assert_eq!(result.failures, 1);
-        assert_eq!(result.warnings, 0);
+        with_mla_env(None, || {
+            let dir = tempfile::tempdir().unwrap();
+            write_model_config_json(dir.path(), "deepseek_v2");
+            let mut model = model_with_path(dir.path().to_str().unwrap().to_owned());
+            model.kv_cache = higgs_models::turboquant::KvCacheMode::Turboquant;
+            model.mla_latent_cache = Some(true);
+            let config = HiggsConfig {
+                models: vec![model],
+                ..HiggsConfig::default()
+            };
+            let mut result = empty_result();
+            check_models(&config, &mut result);
+            assert_eq!(result.failures, 1);
+            assert_eq!(result.warnings, 0);
+        });
+    }
+
+    #[test]
+    fn test_mla_latent_cache_env_off_masks_turboquant_conflict_as_warning() {
+        with_mla_env(Some("0"), || {
+            let dir = tempfile::tempdir().unwrap();
+            write_model_config_json(dir.path(), "deepseek_v2");
+            let mut model = model_with_path(dir.path().to_str().unwrap().to_owned());
+            model.kv_cache = higgs_models::turboquant::KvCacheMode::Turboquant;
+            model.mla_latent_cache = Some(true);
+            let config = HiggsConfig {
+                models: vec![model],
+                ..HiggsConfig::default()
+            };
+            let mut result = empty_result();
+            check_models(&config, &mut result);
+            assert_eq!(
+                result.failures, 0,
+                "HIGGS_MLA_LATENT_CACHE=0 should resolve the conflict away, not fail"
+            );
+            assert_eq!(
+                result.warnings, 1,
+                "the masked conflict should still surface as a warning"
+            );
+        });
+    }
+
+    #[test]
+    fn test_mla_latent_cache_env_on_triggers_turboquant_conflict() {
+        with_mla_env(Some("1"), || {
+            let dir = tempfile::tempdir().unwrap();
+            write_model_config_json(dir.path(), "deepseek_v2");
+            let mut model = model_with_path(dir.path().to_str().unwrap().to_owned());
+            model.kv_cache = higgs_models::turboquant::KvCacheMode::Turboquant;
+            // mla_latent_cache left unset in config -- the env var alone
+            // must be enough to trigger the conflict.
+            let config = HiggsConfig {
+                models: vec![model],
+                ..HiggsConfig::default()
+            };
+            let mut result = empty_result();
+            check_models(&config, &mut result);
+            assert_eq!(result.failures, 1);
+            assert_eq!(result.warnings, 0);
+        });
     }
 
     #[test]
     fn test_mla_latent_cache_architecture_passes_for_deepseek_v2() {
-        let dir = tempfile::tempdir().unwrap();
-        write_model_config_json(dir.path(), "deepseek_v2");
-        let model = ModelConfig {
-            mla_latent_cache: Some(true),
-            ..model_with_path(dir.path().to_str().unwrap().to_owned())
-        };
-        let mut result = empty_result();
-        check_mla_latent_cache_architecture("test-model", &model, dir.path(), &mut result);
-        assert_eq!(result.passes, 1);
-        assert_eq!(result.warnings, 0);
-        assert_eq!(result.failures, 0);
+        with_mla_env(None, || {
+            let dir = tempfile::tempdir().unwrap();
+            write_model_config_json(dir.path(), "deepseek_v2");
+            let model = ModelConfig {
+                mla_latent_cache: Some(true),
+                ..model_with_path(dir.path().to_str().unwrap().to_owned())
+            };
+            let mut result = empty_result();
+            check_mla_latent_cache_architecture("test-model", &model, dir.path(), &mut result);
+            assert_eq!(result.passes, 1);
+            assert_eq!(result.warnings, 0);
+            assert_eq!(result.failures, 0);
+        });
     }
 
     #[test]
     fn test_mla_latent_cache_architecture_warns_for_non_deepseek() {
-        let dir = tempfile::tempdir().unwrap();
-        write_model_config_json(dir.path(), "qwen2");
-        let model = ModelConfig {
-            mla_latent_cache: Some(true),
-            ..model_with_path(dir.path().to_str().unwrap().to_owned())
-        };
-        let mut result = empty_result();
-        check_mla_latent_cache_architecture("test-model", &model, dir.path(), &mut result);
-        assert_eq!(result.passes, 0);
-        assert_eq!(result.warnings, 1);
-        assert_eq!(result.failures, 0);
+        with_mla_env(None, || {
+            let dir = tempfile::tempdir().unwrap();
+            write_model_config_json(dir.path(), "qwen2");
+            let model = ModelConfig {
+                mla_latent_cache: Some(true),
+                ..model_with_path(dir.path().to_str().unwrap().to_owned())
+            };
+            let mut result = empty_result();
+            check_mla_latent_cache_architecture("test-model", &model, dir.path(), &mut result);
+            assert_eq!(result.passes, 0);
+            assert_eq!(result.warnings, 1);
+            assert_eq!(result.failures, 0);
+        });
+    }
+
+    #[test]
+    fn test_mla_latent_cache_architecture_env_on_warns_for_non_deepseek() {
+        with_mla_env(Some("1"), || {
+            let dir = tempfile::tempdir().unwrap();
+            write_model_config_json(dir.path(), "qwen2");
+            // config leaves mla_latent_cache unset -- the env override alone
+            // must be enough to trigger the architecture warning.
+            let model = model_with_path(dir.path().to_str().unwrap().to_owned());
+            let mut result = empty_result();
+            check_mla_latent_cache_architecture("test-model", &model, dir.path(), &mut result);
+            assert_eq!(result.passes, 0);
+            assert_eq!(result.warnings, 1);
+            assert_eq!(result.failures, 0);
+        });
+    }
+
+    #[test]
+    fn test_mla_latent_cache_architecture_env_off_suppresses_warning() {
+        with_mla_env(Some("0"), || {
+            let dir = tempfile::tempdir().unwrap();
+            write_model_config_json(dir.path(), "qwen2");
+            let model = ModelConfig {
+                mla_latent_cache: Some(true),
+                ..model_with_path(dir.path().to_str().unwrap().to_owned())
+            };
+            let mut result = empty_result();
+            check_mla_latent_cache_architecture("test-model", &model, dir.path(), &mut result);
+            assert_eq!(result.passes, 0);
+            assert_eq!(
+                result.warnings, 0,
+                "env forcing MLA off should suppress the architecture warning"
+            );
+            assert_eq!(result.failures, 0);
+        });
     }
 
     #[test]
     fn test_mla_latent_cache_architecture_noop_when_unset() {
-        let dir = tempfile::tempdir().unwrap();
-        write_model_config_json(dir.path(), "qwen2");
-        let model = model_with_path(dir.path().to_str().unwrap().to_owned());
-        let mut result = empty_result();
-        check_mla_latent_cache_architecture("test-model", &model, dir.path(), &mut result);
-        assert_eq!(result.passes, 0);
-        assert_eq!(result.warnings, 0);
-        assert_eq!(result.failures, 0);
+        with_mla_env(None, || {
+            let dir = tempfile::tempdir().unwrap();
+            write_model_config_json(dir.path(), "qwen2");
+            let model = model_with_path(dir.path().to_str().unwrap().to_owned());
+            let mut result = empty_result();
+            check_mla_latent_cache_architecture("test-model", &model, dir.path(), &mut result);
+            assert_eq!(result.passes, 0);
+            assert_eq!(result.warnings, 0);
+            assert_eq!(result.failures, 0);
+        });
     }
 }

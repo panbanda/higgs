@@ -97,8 +97,18 @@ impl KvCacheConfig {
         matches!(self.mode, KvCacheMode::Turboquant)
     }
 
+    /// Validate this config.
+    ///
+    /// The MLA-latent/`TurboQuant` conflict check evaluates the *resolved*
+    /// MLA decision (see [`crate::cache::resolve_mla_latent_cache`]): if
+    /// `HIGGS_MLA_LATENT_CACHE` is set to a recognized value it overrides
+    /// `self.mla_latent` for this check too, so e.g. `mla_latent=true` with
+    /// the env var forcing it off does not fail validation here (callers
+    /// that want to surface that masking as a warning, like `higgs doctor`,
+    /// should compare `self.mla_latent` against the resolved decision
+    /// themselves).
     pub fn validate(self) -> Result<(), Exception> {
-        if self.mla_latent && self.is_turboquant() {
+        if crate::cache::resolve_mla_latent_cache(self.mla_latent) && self.is_turboquant() {
             return Err(Exception::custom(
                 "MLA latent cache cannot be combined with TurboQuant KV cache",
             ));
@@ -1663,7 +1673,13 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)]
     fn test_mla_latent_rejects_turboquant_combination() {
+        // SAFETY: test-only env mutation; higgs-models tests run single-threaded
+        // (--test-threads=1) so there is no cross-test interleaving.
+        unsafe {
+            std::env::remove_var("HIGGS_MLA_LATENT_CACHE");
+        }
         let conflicting = KvCacheConfig {
             mode: KvCacheMode::Turboquant,
             mla_latent: true,
@@ -1677,13 +1693,62 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)]
     fn test_mla_latent_alone_is_valid() {
+        // SAFETY: see note above.
+        unsafe {
+            std::env::remove_var("HIGGS_MLA_LATENT_CACHE");
+        }
         let config = KvCacheConfig {
             mode: KvCacheMode::Off,
             mla_latent: true,
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn test_mla_latent_env_override_off_masks_turboquant_conflict() {
+        // SAFETY: see note above.
+        unsafe {
+            std::env::set_var("HIGGS_MLA_LATENT_CACHE", "0");
+        }
+        let masked = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            mla_latent: true,
+            ..Default::default()
+        };
+        let result = masked.validate();
+        unsafe {
+            std::env::remove_var("HIGGS_MLA_LATENT_CACHE");
+        }
+        assert!(
+            result.is_ok(),
+            "env forcing MLA off should resolve the conflict away: {result:?}"
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn test_mla_latent_env_override_on_triggers_turboquant_conflict() {
+        // SAFETY: see note above.
+        unsafe {
+            std::env::set_var("HIGGS_MLA_LATENT_CACHE", "1");
+        }
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            mla_latent: false,
+            ..Default::default()
+        };
+        let result = config.validate();
+        unsafe {
+            std::env::remove_var("HIGGS_MLA_LATENT_CACHE");
+        }
+        assert!(
+            result.is_err(),
+            "env forcing MLA on should trigger the conflict even with mla_latent=false in config"
+        );
     }
 
     #[test]
