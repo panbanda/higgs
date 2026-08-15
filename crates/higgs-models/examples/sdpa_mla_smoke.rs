@@ -9,7 +9,14 @@ fn main() {
         let k = normal::<f32>(&[1, 1, s, 576], None, None, None).unwrap();
         let v = normal::<f32>(&[1, 1, s, 512], None, None, None).unwrap();
         let scale = 1.0 / (576.0f32).sqrt();
-        match fast::scaled_dot_product_attention(&q, &k, &v, scale, None::<fast::ScaledDotProductAttentionMask>, None::<&Array>) {
+        match fast::scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            scale,
+            None::<fast::ScaledDotProductAttentionMask>,
+            None::<&Array>,
+        ) {
             Ok(out) => {
                 if let Err(e) = eval([&out]) {
                     println!("S={s}: EVAL FAILED: {e}");
@@ -43,7 +50,14 @@ fn main() {
     let k = normal::<f32>(&[1, 1, t, 576], None, None, None).unwrap();
     let v = normal::<f32>(&[1, 1, t, 512], None, None, None).unwrap();
     let scale = 1.0 / (576.0f32).sqrt();
-    match fast::scaled_dot_product_attention(&q, &k, &v, scale, Some(fast::ScaledDotProductAttentionMask::Causal), None::<&Array>) {
+    match fast::scaled_dot_product_attention(
+        &q,
+        &k,
+        &v,
+        scale,
+        Some(fast::ScaledDotProductAttentionMask::Causal),
+        None::<&Array>,
+    ) {
         Ok(out) => {
             eval([&out]).unwrap();
             println!("prefill T={t} causal: OK shape={:?}", out.shape());
