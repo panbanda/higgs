@@ -837,13 +837,19 @@ struct DeepSeekV2Inner {
 }
 
 impl DeepSeekV2Inner {
-    fn new(args: &DeepSeekV2ModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
+    fn new(
+        args: &DeepSeekV2ModelArgs,
+        ql: i32,
+        qb: i32,
+        embed_ql: i32,
+        embed_qb: i32,
+    ) -> Result<Self, Exception> {
         let layers = (0..args.num_hidden_layers)
             .map(|i| DeepSeekV2DecoderLayer::new(args, i, ql, qb))
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
-            embed_tokens: QEmbedding::new(ql, qb)?,
+            embed_tokens: QEmbedding::new(embed_ql, embed_qb)?,
             layers,
             norm: nn::RmsNormBuilder::new(args.hidden_size)
                 .eps(args.rms_norm_eps)
@@ -880,11 +886,23 @@ impl DeepSeekV2CausalLM {
         let ql = args.quantization.as_ref().map_or(64, |q| q.group_size);
         let qb = args.quantization.as_ref().map_or(4, |q| q.bits);
 
-        let model = DeepSeekV2Inner::new(&args, ql, qb)?;
+        let embed_quant = args
+            .quantization
+            .as_ref()
+            .map(|settings| settings.resolve("model.embed_tokens"));
+        let embed_ql = embed_quant.map_or(ql, crate::quant_config::TensorQuant::group_size);
+        let embed_qb = embed_quant.map_or(qb, crate::quant_config::TensorQuant::bits);
+        let model = DeepSeekV2Inner::new(&args, ql, qb, embed_ql, embed_qb)?;
+        let lm_head_quant = args
+            .quantization
+            .as_ref()
+            .map(|settings| settings.resolve("lm_head"));
+        let lm_head_ql = lm_head_quant.map_or(ql, crate::quant_config::TensorQuant::group_size);
+        let lm_head_qb = lm_head_quant.map_or(qb, crate::quant_config::TensorQuant::bits);
         let lm_head = if args.tie_word_embeddings {
             None
         } else {
-            Some(QLinear::new(ql, qb)?)
+            Some(QLinear::new(lm_head_ql, lm_head_qb)?)
         };
 
         Ok(Self {
@@ -1102,10 +1120,7 @@ mod tests {
             topk_group: Some(1),
             first_k_dense_replace: 1,
             moe_layer_freq: Some(1),
-            quantization: Some(QuantizationConfig {
-                group_size: 64,
-                bits: 4,
-            }),
+            quantization: Some(QuantizationConfig::new(64, 4)),
         }
     }
 

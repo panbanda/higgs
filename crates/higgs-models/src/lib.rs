@@ -10,6 +10,7 @@ pub mod llava_qwen2;
 mod metal_kernel;
 pub mod phi3;
 pub mod progress;
+pub mod quant_config;
 pub mod qwen3_moe;
 pub mod qwen3_next;
 pub mod registry;

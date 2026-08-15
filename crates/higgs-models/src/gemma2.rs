@@ -46,12 +46,7 @@ const fn default_tie_word_embeddings() -> bool {
     true
 }
 
-/// Quantization parameters from config.json.
-#[derive(Debug, Clone, Deserialize)]
-pub struct QuantizationConfig {
-    pub group_size: i32,
-    pub bits: i32,
-}
+pub use crate::quant_config::QuantizationSettings as QuantizationConfig;
 
 /// Gemma 2 model configuration.
 #[derive(Debug, Clone, Deserialize)]

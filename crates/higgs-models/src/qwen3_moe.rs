@@ -635,10 +635,7 @@ mod tests {
             decoder_sparse_step: 1,
             mlp_only_layers: vec![],
             norm_topk_prob: true,
-            quantization: Some(QuantizationConfig {
-                group_size: 64,
-                bits: 4,
-            }),
+            quantization: Some(QuantizationConfig::new(64, 4)),
         }
     }
 

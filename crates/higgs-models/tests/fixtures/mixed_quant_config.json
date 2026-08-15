@@ -1,0 +1,12 @@
+{
+  "quantization": {
+    "group_size": 128,
+    "bits": 4,
+    "model.layers.0.mlp.experts.0.gate_proj": {"group_size": 64, "bits": 2},
+    "lm_head": false
+  },
+  "quantization_config": {
+    "group_size": 32,
+    "bits": 8
+  }
+}

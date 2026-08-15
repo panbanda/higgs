@@ -114,12 +114,7 @@ const fn default_norm_topk_prob() -> bool {
     true
 }
 
-/// Quantization parameters from config.json (top-level defaults).
-#[derive(Debug, Clone, Deserialize)]
-pub struct QuantizationConfig {
-    pub group_size: i32,
-    pub bits: i32,
-}
+pub use crate::quant_config::QuantizationSettings as QuantizationConfig;
 
 /// Configuration for the Qwen3-Next / Qwen3.5 hybrid architecture.
 ///
@@ -279,14 +274,18 @@ impl QLinear {
     }
 
     pub(crate) fn forward(&self, x: &Array) -> Result<Array, Exception> {
-        quantized_forward(
-            x,
-            &self.weight,
-            &self.scales,
-            &self.biases,
-            self.group_size,
-            self.bits,
-        )
+        if self.bits == 0 {
+            dense_linear_no_bias_forward(&self.weight, x)
+        } else {
+            quantized_forward(
+                x,
+                &self.weight,
+                &self.scales,
+                &self.biases,
+                self.group_size,
+                self.bits,
+            )
+        }
     }
 
     /// Decode-only fast path for 4-bit single-token inference.
@@ -372,16 +371,23 @@ impl QEmbedding {
         let shape = indices.shape().to_vec();
         let flat = indices.flatten(None, None)?;
         let w = (*self.weight).take_axis(&flat, 0)?;
-        let s = (*self.scales).take_axis(&flat, 0)?;
-        let b = (*self.biases).take_axis(&flat, 0)?;
-        let out = ops::dequantize(&w, &s, &b, self.group_size, self.bits)?;
+        let out = if self.bits == 0 {
+            w
+        } else {
+            let s = (*self.scales).take_axis(&flat, 0)?;
+            let b = (*self.biases).take_axis(&flat, 0)?;
+            ops::dequantize(&w, &s, &b, self.group_size, self.bits)?
+        };
         let mut ret_shape: Vec<i32> = shape;
         ret_shape.push(-1);
         out.reshape(&ret_shape)
     }
 
     pub(crate) fn as_linear(&self, x: &Array) -> Result<Array, Exception> {
-        if self.bits == 4 && matches!(x.shape(), [1, 1, _]) && self.weight.shape().len() == 2 {
+        if self.bits == 0 {
+            dense_linear_no_bias_forward(&self.weight, x)
+        } else if self.bits == 4 && matches!(x.shape(), [1, 1, _]) && self.weight.shape().len() == 2
+        {
             qgemv_4bit(x, &self.weight, &self.scales, &self.biases, self.group_size)
         } else {
             quantized_forward(
@@ -3374,13 +3380,19 @@ struct Qwen3NextInner {
 }
 
 impl Qwen3NextInner {
-    fn new(args: &Qwen3NextModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
+    fn new(
+        args: &Qwen3NextModelArgs,
+        ql: i32,
+        qb: i32,
+        embed_ql: i32,
+        embed_qb: i32,
+    ) -> Result<Self, Exception> {
         let layers = (0..args.num_hidden_layers)
             .map(|i| DecoderLayer::new(args, i, ql, qb))
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
-            embed_tokens: QEmbedding::new(ql, qb)?,
+            embed_tokens: QEmbedding::new(embed_ql, embed_qb)?,
             layers,
             norm: nn::RmsNormBuilder::new(args.hidden_size)
                 .eps(args.rms_norm_eps)
@@ -3513,11 +3525,23 @@ impl Qwen3NextCausalLM {
         let ql = args.quantization.as_ref().map_or(64, |q| q.group_size);
         let qb = args.quantization.as_ref().map_or(4, |q| q.bits);
 
-        let model = Qwen3NextInner::new(&args, ql, qb)?;
+        let embed_quant = args
+            .quantization
+            .as_ref()
+            .map(|settings| settings.resolve("model.embed_tokens"));
+        let embed_ql = embed_quant.map_or(ql, crate::quant_config::TensorQuant::group_size);
+        let embed_qb = embed_quant.map_or(qb, crate::quant_config::TensorQuant::bits);
+        let model = Qwen3NextInner::new(&args, ql, qb, embed_ql, embed_qb)?;
+        let lm_head_quant = args
+            .quantization
+            .as_ref()
+            .map(|settings| settings.resolve("lm_head"));
+        let lm_head_ql = lm_head_quant.map_or(ql, crate::quant_config::TensorQuant::group_size);
+        let lm_head_qb = lm_head_quant.map_or(qb, crate::quant_config::TensorQuant::bits);
         let lm_head = if args.tie_word_embeddings {
             None
         } else {
-            Some(QLinear::new(ql, qb)?)
+            Some(QLinear::new(lm_head_ql, lm_head_qb)?)
         };
         let mtp = (args.mtp_num_hidden_layers > 0 && !args.use_dense_mtp && !args.use_moe_mtp)
             .then(|| MtpHead::new(&args, ql, qb))
@@ -4616,10 +4640,10 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
 
 /// Parse a `{group_size, bits}` quantization spec from a JSON node.
 fn qwen3_5_quantization_config(value: &serde_json::Value) -> Option<QuantizationConfig> {
-    Some(QuantizationConfig {
-        group_size: i32::try_from(value.get("group_size")?.as_i64()?).ok()?,
-        bits: i32::try_from(value.get("bits")?.as_i64()?).ok()?,
-    })
+    Some(QuantizationConfig::new(
+        i32::try_from(value.get("group_size")?.as_i64()?).ok()?,
+        i32::try_from(value.get("bits")?.as_i64()?).ok()?,
+    ))
 }
 
 /// Scan the per-layer `quantization` map and return layer indices where the GDN
@@ -5291,6 +5315,16 @@ mod tests {
     use crate::cache::KeyValueCache;
 
     #[test]
+    fn qlinear_zero_bits_uses_dense_weight() {
+        let mut linear = QLinear::new(0, 0).unwrap();
+        *linear.weight = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[2, 2]);
+        let input = Array::from_slice(&[2.0_f32, 1.0], &[1, 2]);
+        let output = linear.forward(&input).unwrap();
+        assert_eq!(output.shape(), &[1, 2]);
+        assert_eq!(output.as_slice::<f32>(), &[4.0, 10.0]);
+    }
+
+    #[test]
     fn test_config_deserialization() {
         let json = r#"{
             "model_type": "qwen3_next",
@@ -5738,10 +5772,7 @@ mod tests {
     #[test]
     fn test_causal_lm_with_quantization() {
         let mut args = valid_causal_lm_args();
-        args.quantization = Some(QuantizationConfig {
-            group_size: 32,
-            bits: 8,
-        });
+        args.quantization = Some(QuantizationConfig::new(32, 8));
         let result = Qwen3NextCausalLM::new(args);
         assert!(result.is_ok());
     }
@@ -6257,10 +6288,7 @@ mod tests {
         args.moe_intermediate_size = 64;
         args.shared_expert_intermediate_size = 64;
         args.hidden_size = 64;
-        args.gate_quantization = Some(QuantizationConfig {
-            group_size: 64,
-            bits: 8,
-        });
+        args.gate_quantization = Some(QuantizationConfig::new(64, 8));
 
         let mut block = SparseMoeBlock::new(&args, 64, 4).unwrap();
 

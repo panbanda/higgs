@@ -54,12 +54,7 @@ where
     }
 }
 
-/// Quantization parameters from config.json.
-#[derive(Debug, Clone, Deserialize)]
-pub struct QuantizationConfig {
-    pub group_size: i32,
-    pub bits: i32,
-}
+pub use crate::quant_config::QuantizationSettings as QuantizationConfig;
 
 /// Unified model configuration, deserialized from config.json.
 ///
@@ -1217,10 +1212,7 @@ mod tests {
     fn test_quantization_config_deserialization() {
         let mut args = default_model_args();
         args.model_type = "qwen2".to_owned();
-        args.quantization = Some(QuantizationConfig {
-            group_size: 64,
-            bits: 4,
-        });
+        args.quantization = Some(QuantizationConfig::new(64, 4));
         let qc = args.quantization.unwrap();
         assert_eq!(qc.group_size, 64);
         assert_eq!(qc.bits, 4);

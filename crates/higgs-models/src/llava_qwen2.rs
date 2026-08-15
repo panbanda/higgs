@@ -39,11 +39,7 @@ pub struct LlavaQwen2Config {
     pub quantization: Option<QuantizationConfig>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct QuantizationConfig {
-    pub group_size: i32,
-    pub bits: i32,
-}
+pub use crate::quant_config::QuantizationSettings as QuantizationConfig;
 
 // ---------------------------------------------------------------------------
 // Multimodal Projector (MLP)

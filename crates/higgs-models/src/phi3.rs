@@ -35,12 +35,7 @@ const fn default_rope_theta() -> f32 {
     10000.0
 }
 
-/// Quantization parameters from config.json.
-#[derive(Debug, Clone, Deserialize)]
-pub struct QuantizationConfig {
-    pub group_size: i32,
-    pub bits: i32,
-}
+pub use crate::quant_config::QuantizationSettings as QuantizationConfig;
 
 /// Phi-3 model configuration.
 #[derive(Debug, Clone, Deserialize)]
