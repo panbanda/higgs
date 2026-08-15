@@ -1776,7 +1776,53 @@ pub(crate) fn moe_expert_projection_quantization(
     let quant = settings
         .resolve_uniform(paths.iter().map(String::as_str))
         .map_err(Exception::custom)?;
+    if matches!(quant, crate::quant_config::TensorQuant::Unquantized) {
+        return Err(Exception::custom(format!(
+            "dense (unquantized) expert projections are not supported by the fused MoE path; tensor {}",
+            paths.first().map_or(projection, String::as_str)
+        )));
+    }
     Ok((quant.group_size(), quant.bits()))
+}
+
+/// Every checkpoint tensor path this architecture actually resolves against
+/// a per-tensor quantization override while constructing the model.
+///
+/// Attention projections, `GatedDeltaNet` linear-attention projections, and
+/// dense-layer `mlp.{gate,up,down}_proj` are always built from the scalar
+/// `group_size`/`bits` fallback — an override for one of those paths must be
+/// rejected rather than silently dropped. The MTP sidecar (`mtp.*`,
+/// `dense_mtp.*`, `moe_mtp.*`) is likewise scalar-only.
+pub(crate) fn consumed_quantization_paths(
+    args: &Qwen3NextModelArgs,
+) -> std::collections::HashSet<String> {
+    let mut consumed = std::collections::HashSet::new();
+    consumed.insert("model.embed_tokens".to_owned());
+    consumed.insert("lm_head".to_owned());
+
+    if args.num_experts > 0 {
+        // Every layer's `mlp` block resolves per-expert overrides via
+        // `moe_expert_projection_quantization` (see `FfnBlock::new_moe`).
+        let mut moe_layer_count = args.num_hidden_layers;
+        // The MoE-structured MTP sidecar (Qwen3.6-A3B style) reuses the same
+        // `model.layers.{idx}.mlp.experts.*` path prefix for its own
+        // `SparseMoeBlock` (see `MoeMtpHead::new`), keyed by 0..mtp layer
+        // count rather than the main model's layer indices — cover it too.
+        if args.use_moe_mtp {
+            moe_layer_count = moe_layer_count.max(args.mtp_num_hidden_layers);
+        }
+        for layer_idx in 0..moe_layer_count {
+            for expert_idx in 0..args.num_experts {
+                for projection in ["gate_proj", "up_proj", "down_proj"] {
+                    consumed.insert(format!(
+                        "model.layers.{layer_idx}.mlp.experts.{expert_idx}.{projection}"
+                    ));
+                }
+            }
+        }
+    }
+
+    consumed
 }
 
 impl Qwen3NextMLP {
@@ -3566,6 +3612,12 @@ impl Qwen3NextCausalLM {
             return Err(Exception::custom("linear_conv_kernel_dim must be > 0"));
         }
 
+        if let Some(settings) = args.quantization.as_ref() {
+            settings
+                .assert_all_overrides_consumed(&consumed_quantization_paths(&args))
+                .map_err(Exception::custom)?;
+        }
+
         let ql = args.quantization.as_ref().map_or(64, |q| q.group_size);
         let qb = args.quantization.as_ref().map_or(4, |q| q.bits);
 
@@ -5085,11 +5137,13 @@ fn load_qwen3_next_weights<M: mlx_rs::module::ModuleParametersExt>(
     model_path: &Path,
 ) -> Result<(), crate::error::ModelError> {
     let safetensors_files = crate::collect_safetensors_files(model_path)?;
+    let quantization = crate::load_checkpoint_quantization_settings(model_path)?;
     let mut params = model.parameters_mut().flatten();
 
     for file_path in &safetensors_files {
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
+        crate::validate_quantized_tensor_widths(&loaded, quantization.as_ref())?;
 
         for (key, value) in loaded {
             let key = normalize_sidecar_mtp_key(file_path, key);
@@ -5120,6 +5174,7 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
     model_path: &Path,
 ) -> Result<(), crate::error::ModelError> {
     let safetensors_files = crate::collect_safetensors_files(model_path)?;
+    let quantization = crate::load_checkpoint_quantization_settings(model_path)?;
     let mut params = model.parameters_mut().flatten();
     let mut matched = 0usize;
     let mut unmatched = Vec::new();
@@ -5127,6 +5182,7 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
     for file_path in &safetensors_files {
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
+        crate::validate_quantized_tensor_widths(&loaded, quantization.as_ref())?;
 
         for (key, value) in loaded {
             let key = normalize_sidecar_mtp_key(file_path, key);
@@ -5196,6 +5252,7 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     use std::collections::HashMap;
 
     let safetensors_files = crate::collect_safetensors_files(model_path)?;
+    let quantization = crate::load_checkpoint_quantization_settings(model_path)?;
     let mut params = model.parameters_mut().flatten();
 
     let qkvz_perm = build_qkvz_permutation(gdn_dims)
@@ -5214,6 +5271,7 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     for file_path in &safetensors_files {
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
+        crate::validate_quantized_tensor_widths(&loaded, quantization.as_ref())?;
 
         for (key, value) in loaded {
             let key = normalize_sidecar_mtp_key(file_path, key);
@@ -5575,6 +5633,46 @@ mod tests {
         args.linear_num_value_heads = 0;
         let result = Qwen3NextCausalLM::new(args);
         assert!(result.is_err(), "Should reject linear_num_value_heads == 0");
+    }
+
+    #[test]
+    fn test_causal_lm_rejects_unsupported_per_tensor_override() {
+        // self_attn projections are always built from the scalar
+        // group_size/bits fallback; an override for one must be rejected
+        // rather than silently ignored.
+        let mut args = valid_causal_lm_args();
+        args.quantization = Some(
+            serde_json::from_str(
+                r#"{"group_size": 64, "bits": 4, "model.layers.0.self_attn.q_proj": false}"#,
+            )
+            .unwrap(),
+        );
+        let err = Qwen3NextCausalLM::new(args).unwrap_err();
+        assert!(
+            err.to_string().contains("model.layers.0.self_attn.q_proj"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_causal_lm_accepts_honored_expert_projection_override() {
+        // valid_causal_lm_args() has num_experts=4; resolve_uniform requires
+        // every expert in the fused group to share the override.
+        let mut args = valid_causal_lm_args();
+        args.quantization = Some(
+            serde_json::from_str(
+                r#"{
+                    "group_size": 64,
+                    "bits": 4,
+                    "model.layers.0.mlp.experts.0.gate_proj": {"group_size": 32, "bits": 8},
+                    "model.layers.0.mlp.experts.1.gate_proj": {"group_size": 32, "bits": 8},
+                    "model.layers.0.mlp.experts.2.gate_proj": {"group_size": 32, "bits": 8},
+                    "model.layers.0.mlp.experts.3.gate_proj": {"group_size": 32, "bits": 8}
+                }"#,
+            )
+            .unwrap(),
+        );
+        Qwen3NextCausalLM::new(args).unwrap();
     }
 
     #[test]
@@ -5949,6 +6047,54 @@ mod tests {
         std::fs::write(dir.path().join("config.json"), "{{bad json").unwrap();
         let result = load_model_args(dir.path());
         assert!(result.is_err());
+    }
+
+    /// A malformed `scales` width must fail at load time through the custom
+    /// `load_qwen3_next_weights` shard loop, not surface as an opaque Metal
+    /// kernel error on first forward. This exercises the same
+    /// `validate_quantized_tensor_widths` check that the generic loaders in
+    /// `lib.rs` already run, wired into the qwen3_next-specific loader.
+    #[test]
+    fn test_load_qwen3_next_weights_rejects_malformed_scales_width() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"quantization": {"group_size": 64, "bits": 4}}"#,
+        )
+        .unwrap();
+
+        // weight: [4, 8] packed i.e. bits=4, group_size=64 implies scales
+        // width should be 8*32/4/64 = 1, but we provide width 2.
+        let weight_data = vec![0_u8; 4 * 8 * 4];
+        let scales_data = vec![0_u8; 4 * 2 * 4];
+        let weight_tensor = safetensors::tensor::TensorView::new(
+            safetensors::tensor::Dtype::F32,
+            vec![4, 8],
+            &weight_data,
+        )
+        .unwrap();
+        let scales_tensor = safetensors::tensor::TensorView::new(
+            safetensors::tensor::Dtype::F32,
+            vec![4, 2],
+            &scales_data,
+        )
+        .unwrap();
+        safetensors::serialize_to_file(
+            [
+                ("model.layers.0.self_attn.q_proj.weight", weight_tensor),
+                ("model.layers.0.self_attn.q_proj.scales", scales_tensor),
+            ],
+            None,
+            &dir.path().join("model.safetensors"),
+        )
+        .unwrap();
+
+        let mut model = Qwen3NextCausalLM::new(valid_causal_lm_args()).unwrap();
+        let err = load_qwen3_next_weights(&mut model, dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("model.layers.0.self_attn.q_proj"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

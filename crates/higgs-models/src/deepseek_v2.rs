@@ -662,7 +662,43 @@ fn deepseek_expert_projection_quantization(
     let quant = settings
         .resolve_uniform(paths.iter().map(String::as_str))
         .map_err(Exception::custom)?;
+    if matches!(quant, crate::quant_config::TensorQuant::Unquantized) {
+        return Err(Exception::custom(format!(
+            "dense (unquantized) expert projections are not supported by the fused MoE path; tensor {}",
+            paths.first().map_or(projection, String::as_str)
+        )));
+    }
     Ok((quant.group_size(), quant.bits()))
+}
+
+/// Every checkpoint tensor path this architecture actually resolves against
+/// a per-tensor quantization override while constructing the model.
+///
+/// Attention projections (`q_a_proj`, `q_b_proj`, `kv_a_proj_with_mqa`,
+/// `kv_b_proj`, `o_proj`) and dense-layer `mlp.{gate,up,down}_proj` are
+/// always built from the scalar `group_size`/`bits` fallback — an override
+/// for one of those paths must be rejected rather than silently dropped.
+fn consumed_quantization_paths(args: &DeepSeekV2ModelArgs) -> std::collections::HashSet<String> {
+    let mut consumed = std::collections::HashSet::new();
+    consumed.insert("model.embed_tokens".to_owned());
+    consumed.insert("lm_head".to_owned());
+
+    if let Some(n_routed) = args.n_routed_experts.filter(|n| n.is_positive()) {
+        for layer_idx in 0..args.num_hidden_layers {
+            if !args.is_moe_layer(layer_idx) {
+                continue;
+            }
+            for expert_idx in 0..n_routed {
+                for projection in ["gate_proj", "up_proj", "down_proj"] {
+                    consumed.insert(format!(
+                        "model.layers.{layer_idx}.mlp.experts.{expert_idx}.{projection}"
+                    ));
+                }
+            }
+        }
+    }
+
+    consumed
 }
 
 impl DeepSeekV2MlpBlock {
@@ -928,6 +964,12 @@ impl DeepSeekV2CausalLM {
         }
         if !args.num_attention_heads.is_positive() {
             return Err(Exception::custom("num_attention_heads must be positive"));
+        }
+
+        if let Some(settings) = args.quantization.as_ref() {
+            settings
+                .assert_all_overrides_consumed(&consumed_quantization_paths(&args))
+                .map_err(Exception::custom)?;
         }
 
         let ql = args.quantization.as_ref().map_or(64, |q| q.group_size);
@@ -1361,6 +1403,55 @@ mod tests {
         let model = DeepSeekV2CausalLM::new(args).unwrap();
         assert_eq!(model.args.num_hidden_layers, 2);
         assert!(model.lm_head.is_none(), "tied embeddings => no lm_head");
+    }
+
+    #[test]
+    fn test_model_new_rejects_unsupported_per_tensor_override() {
+        // kv_b_proj is always built from the scalar group_size/bits
+        // fallback (needed for MLA absorption); an override for it must be
+        // rejected rather than silently ignored.
+        let mut args = small_args();
+        args.quantization = Some(
+            serde_json::from_str(
+                r#"{"group_size": 64, "bits": 4, "model.layers.0.self_attn.kv_b_proj": false}"#,
+            )
+            .unwrap(),
+        );
+        let err = DeepSeekV2CausalLM::new(args).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("model.layers.0.self_attn.kv_b_proj"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_model_new_rejects_dense_expert_projection_override() {
+        // A `false` (unquantized) override for a fused expert projection
+        // can't be honored by the gather_qmm MoE path.
+        // Layer 1 is MoE with 4 experts (small_args); all of them must be
+        // overridden to `false` to reach the loud-failure check rather than
+        // the "fused tensor group requires uniform quantization" check.
+        let mut args = small_args();
+        args.quantization = Some(
+            serde_json::from_str(
+                r#"{
+                    "group_size": 64,
+                    "bits": 4,
+                    "model.layers.1.mlp.experts.0.gate_proj": false,
+                    "model.layers.1.mlp.experts.1.gate_proj": false,
+                    "model.layers.1.mlp.experts.2.gate_proj": false,
+                    "model.layers.1.mlp.experts.3.gate_proj": false
+                }"#,
+            )
+            .unwrap(),
+        );
+        let err = DeepSeekV2CausalLM::new(args).unwrap_err();
+        assert!(
+            err.to_string().contains("dense (unquantized) expert")
+                && err.to_string().contains("gate_proj"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

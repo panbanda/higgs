@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Deserializer};
 
@@ -99,6 +99,27 @@ impl QuantizationSettings {
         }
         Ok(first)
     }
+
+    /// Reject a per-tensor override that the caller's architecture never
+    /// read while constructing the model.
+    ///
+    /// Architectures that only partially support per-tensor overrides (e.g.
+    /// `deepseek_v2`, `qwen3_next`) must collect every tensor path they
+    /// actually resolved during construction and pass it here. Any
+    /// override key outside that set would otherwise be silently ignored —
+    /// the weight loads into a default-quantized (or default-dense) module
+    /// instead of the format the checkpoint declares, producing wrong
+    /// numerics instead of a load-time error.
+    pub fn assert_all_overrides_consumed(&self, consumed: &HashSet<String>) -> Result<(), String> {
+        for path in self.overridden_paths() {
+            if !consumed.contains(path) {
+                return Err(format!(
+                    "per-tensor quantization override for {path} is not supported by this architecture"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<'de> Deserialize<'de> for QuantizationSettings {
@@ -173,6 +194,8 @@ impl<'de> Deserialize<'de> for QuantizationSettings {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::{QuantizationSettings, TensorQuant};
 
     #[test]
@@ -243,6 +266,33 @@ mod tests {
             settings.overridden_paths().collect::<Vec<_>>(),
             ["model.embed_tokens"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn assert_all_overrides_consumed_rejects_unhonored_key() -> Result<(), serde_json::Error> {
+        let settings: QuantizationSettings = serde_json::from_str(
+            r#"{"group_size": 64, "bits": 4, "model.layers.0.self_attn.kv_b_proj": false}"#,
+        )?;
+
+        let consumed: HashSet<String> = ["model.embed_tokens".to_owned(), "lm_head".to_owned()]
+            .into_iter()
+            .collect();
+        let err = settings
+            .assert_all_overrides_consumed(&consumed)
+            .err()
+            .ok_or_else(|| serde_json::Error::io(std::io::Error::other("expected an error")))?;
+        assert!(err.contains("model.layers.0.self_attn.kv_b_proj"));
+        Ok(())
+    }
+
+    #[test]
+    fn assert_all_overrides_consumed_accepts_honored_key() -> Result<(), serde_json::Error> {
+        let settings: QuantizationSettings =
+            serde_json::from_str(r#"{"group_size": 64, "bits": 4, "lm_head": false}"#)?;
+
+        let consumed: HashSet<String> = std::iter::once("lm_head".to_owned()).collect();
+        assert!(settings.assert_all_overrides_consumed(&consumed).is_ok());
         Ok(())
     }
 }

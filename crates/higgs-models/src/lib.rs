@@ -1504,7 +1504,7 @@ pub fn load_quantized_safetensors_weights_optional_prefix<M: ModuleParametersExt
     Ok(())
 }
 
-fn load_checkpoint_quantization_settings(
+pub(crate) fn load_checkpoint_quantization_settings(
     model_path: &Path,
 ) -> Result<Option<quant_config::QuantizationSettings>, ModelError> {
     let config_path = model_path.join("config.json");
@@ -1550,7 +1550,7 @@ pub(crate) fn validate_per_tensor_quantization_support(
 /// `scales[..., in_features / group_size]`. Checking the two checkpoint
 /// tensors before assigning them prevents a malformed shard from reaching a
 /// later, less actionable Metal kernel error.
-fn validate_quantized_tensor_widths(
+pub(crate) fn validate_quantized_tensor_widths(
     loaded: &HashMap<String, Array>,
     quantization: Option<&quant_config::QuantizationSettings>,
 ) -> Result<(), ModelError> {
