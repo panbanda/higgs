@@ -18,7 +18,7 @@ clap = { workspace = true }
 futures = { workspace = true }
 higgs-engine = { workspace = true }
 higgs-models = { workspace = true }
-mlx-rs.workspace = true
+mlx-rs = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -37,6 +37,10 @@ tempfile = "3"
 [[bin]]
 name = "bench_decode"
 path = "src/bin/bench_decode.rs"
+
+[[bin]]
+name = "bench_frontier"
+path = "src/bin/bench_frontier.rs"
 
 [[bin]]
 name = "bench_speculative"
