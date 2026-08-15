@@ -398,15 +398,19 @@ impl DeepSeekV2Attention {
                 self.kv_b_proj.group_size,
                 self.kv_b_proj.bits,
             )?;
-            let k_width = self.num_heads * self.qk_nope_head_dim;
-            let k = weight.index((..k_width, ..)).reshape(&[
-                1,
+            // `kv_b_proj` output rows are contiguous within each head:
+            // [head0 K, head0 V, head1 K, head1 V, ...]. Split after reshaping
+            // so K/V rows remain associated with their original head.
+            let per_head_weight = weight.reshape(&[
                 self.num_heads,
-                self.qk_nope_head_dim,
+                self.qk_nope_head_dim + self.v_head_dim,
                 self.kv_lora_rank,
             ])?;
-            let v = weight
-                .index((k_width.., ..))
+            let k = per_head_weight
+                .index((.., ..self.qk_nope_head_dim, ..))
+                .reshape(&[1, self.num_heads, self.qk_nope_head_dim, self.kv_lora_rank])?;
+            let v = per_head_weight
+                .index((.., self.qk_nope_head_dim.., ..))
                 .reshape(&[1, self.num_heads, self.v_head_dim, self.kv_lora_rank])?
                 .transpose_axes(&[0, 1, 3, 2])?;
             self.absorbed_k = Some(k);
@@ -1027,6 +1031,46 @@ pub fn load_deepseek_v2_model<P: AsRef<Path>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_rs::module::Param;
+
+    fn random_qlinear(input_dim: i32, output_dim: i32) -> QLinear {
+        let group_size = 32;
+        let bits = 4;
+        let raw =
+            mlx_rs::random::normal::<f32>(&[output_dim, input_dim], None, None, None).unwrap();
+        let (weight, scales, biases) = ops::quantize(&raw, group_size, bits).unwrap();
+        QLinear {
+            weight: Param::new(weight),
+            scales: Param::new(scales),
+            biases: Param::new(biases),
+            group_size,
+            bits,
+        }
+    }
+
+    fn random_attention() -> DeepSeekV2Attention {
+        let args = small_args();
+        let mut attention = DeepSeekV2Attention::new(&args, 64, 4).unwrap();
+        attention.q_proj = Some(random_qlinear(64, 4 * (16 + 8)));
+        attention.kv_a_proj_with_mqa = random_qlinear(64, 32 + 8);
+        attention.kv_b_proj = random_qlinear(32, 4 * (16 + 16));
+        attention.o_proj = random_qlinear(4 * 16, 64);
+        attention
+    }
+
+    fn assert_attention_outputs_close(dense: &Array, absorbed: &Array, step: &str) {
+        assert_eq!(dense.shape(), absorbed.shape());
+        let max_delta = dense
+            .as_slice::<f32>()
+            .iter()
+            .zip(absorbed.as_slice::<f32>().iter())
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_delta < 1e-2,
+            "{step} absorbed MLA output diverged from dense cache: max_delta={max_delta}"
+        );
+    }
 
     fn v2_lite_args() -> DeepSeekV2ModelArgs {
         DeepSeekV2ModelArgs {
@@ -1097,6 +1141,35 @@ mod tests {
             moe_layer_freq: Some(1),
             quantization: None,
         }
+    }
+
+    #[test]
+    fn absorbed_mla_attention_matches_dense_cache_for_prefill_and_decode() {
+        let mut dense_attention = random_attention();
+        let mut absorbed_attention = dense_attention.clone();
+        let mut dense_cache = SteppingKeyValueCache::new();
+        let mut absorbed_cache =
+            SteppingKeyValueCache::new_mla(32, 8, KvCacheConfig::default()).unwrap();
+
+        let prefill = mlx_rs::random::normal::<f32>(&[1, 6, 64], None, None, None).unwrap();
+        let prefill_mask =
+            create_attention_mask(&prefill, &[Some(SteppingKeyValueCache::new())], None).unwrap();
+        let dense_prefill = dense_attention
+            .forward(&prefill, prefill_mask.as_ref(), Some(&mut dense_cache))
+            .unwrap();
+        let absorbed_prefill = absorbed_attention
+            .forward(&prefill, prefill_mask.as_ref(), Some(&mut absorbed_cache))
+            .unwrap();
+        assert_attention_outputs_close(&dense_prefill, &absorbed_prefill, "prefill");
+
+        let decode = mlx_rs::random::normal::<f32>(&[1, 1, 64], None, None, None).unwrap();
+        let dense_decode = dense_attention
+            .forward(&decode, None, Some(&mut dense_cache))
+            .unwrap();
+        let absorbed_decode = absorbed_attention
+            .forward(&decode, None, Some(&mut absorbed_cache))
+            .unwrap();
+        assert_attention_outputs_close(&dense_decode, &absorbed_decode, "decode");
     }
 
     #[test]
