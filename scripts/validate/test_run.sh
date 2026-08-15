@@ -22,6 +22,8 @@ grep -Fq 'cp "$shared_target_dir/release/mlx.metallib" "$build_dir/release/mlx.m
 grep -Fq 'build_marker="$(mktemp "${TMPDIR:-/tmp}/higgs-validate-build.XXXXXX")"' "$RUNNER"
 grep -Fq '[[ "$shared_target_dir/release/quality_gate" -nt "$build_marker" ]]' "$RUNNER"
 grep -Fq 'cp "$shared_target_dir/release/quality_gate" "$build_dir/release/quality_gate"' "$RUNNER"
+grep -Fq '[[ "$shared_target_dir/release/bench_frontier" -nt "$build_marker" ]]' "$RUNNER"
+grep -Fq 'cp "$shared_target_dir/release/bench_frontier" "$build_dir/release/bench_frontier"' "$RUNNER"
 grep -Fq 'find "$shared_target_dir/release/build" -path "*/mlx-sys-*/out/build/lib/mlx.metallib"' "$RUNNER"
 grep -Fq 'metallib_path="$(find' "$RUNNER"
 grep -Fq 'missing mlx.metallib in shared target directory' "$RUNNER"

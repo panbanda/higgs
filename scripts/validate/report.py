@@ -31,6 +31,41 @@ def stats(values):
     }
 
 
+def render_frontier_section(baseline_path, candidate_path):
+    baseline_rows = json.loads(baseline_path.read_text())["results"]["rows"]
+    candidate_rows = json.loads(candidate_path.read_text())["results"]["rows"]
+
+    def by_frontier(rows):
+        grouped = {}
+        for row in rows:
+            grouped.setdefault(row["frontier"], []).append(row)
+        return grouped
+
+    baseline_by_frontier = by_frontier(baseline_rows)
+    candidate_by_frontier = by_frontier(candidate_rows)
+    frontiers = sorted(set(baseline_by_frontier) & set(candidate_by_frontier))
+
+    section = "## Frontier\n\n"
+    section += (
+        "| Frontier | Baseline decode tok/s | Candidate decode tok/s | Delta | "
+        "Baseline KV B/tok | Candidate KV B/tok |\n"
+        "| ---: | ---: | ---: | ---: | ---: | ---: |\n"
+    )
+    for frontier in frontiers:
+        base_rows = baseline_by_frontier[frontier]
+        cand_rows = candidate_by_frontier[frontier]
+        base_decode = statistics.median(row["probe_decode_tokps"] for row in base_rows)
+        cand_decode = statistics.median(row["probe_decode_tokps"] for row in cand_rows)
+        base_kv = statistics.median(row["kv_bytes_per_token"] for row in base_rows)
+        cand_kv = statistics.median(row["kv_bytes_per_token"] for row in cand_rows)
+        delta = (cand_decode / base_decode - 1.0) * 100.0 if base_decode else 0.0
+        section += (
+            f"| {frontier} | {base_decode:.2f} | {cand_decode:.2f} | {delta:+.2f}% | "
+            f"{base_kv:.2f} | {cand_kv:.2f} |\n"
+        )
+    return section
+
+
 def render_quality_section(quality_path):
     payload = json.loads(quality_path.read_text())
     verdict = "PASS" if payload["passed"] else "FAIL"
@@ -54,12 +89,16 @@ def main():
     baseline_path = raw / "baseline.json"
     candidate_path = raw / "candidate.json"
     quality_path = raw / "quality.json"
+    frontier_baseline_path = raw / "frontier-baseline.json"
+    frontier_candidate_path = raw / "frontier-candidate.json"
     has_decode = baseline_path.exists() and candidate_path.exists()
     has_quality = quality_path.exists()
-    if not has_decode and not has_quality:
+    has_frontier = frontier_baseline_path.exists() and frontier_candidate_path.exists()
+    if not has_decode and not has_quality and not has_frontier:
         raise SystemExit(
             f"no results to report: expected decode results at {baseline_path} and {candidate_path}, "
-            f"or a quality gate result at {quality_path}"
+            f"a quality gate result at {quality_path}, or frontier results at "
+            f"{frontier_baseline_path} and {frontier_candidate_path}"
         )
 
     rows = ["side,run,decode_tokps"]
@@ -91,6 +130,11 @@ def main():
         if has_decode:
             report += "\n"
         report += render_quality_section(quality_path)
+
+    if has_frontier:
+        if has_decode or has_quality:
+            report += "\n"
+        report += render_frontier_section(frontier_baseline_path, frontier_candidate_path)
 
     (args.out_dir / "runs.csv").write_text(scrub("\n".join(rows) + "\n"))
     (args.out_dir / "report.md").write_text(scrub(report))

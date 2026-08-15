@@ -108,6 +108,12 @@ build_ref() {
     if [[ -n "${build_marker:-}" ]] && [[ -f "$shared_target_dir/release/quality_gate" ]] && [[ "$shared_target_dir/release/quality_gate" -nt "$build_marker" ]]; then
         cp "$shared_target_dir/release/quality_gate" "$build_dir/release/quality_gate"
     fi
+    # bench_frontier postdates some baseline SHAs the same way quality_gate
+    # does; guard against both absence and a stale cross-sha binary left in
+    # the shared target dir by the same marker-freshness check.
+    if [[ -n "${build_marker:-}" ]] && [[ -f "$shared_target_dir/release/bench_frontier" ]] && [[ "$shared_target_dir/release/bench_frontier" -nt "$build_marker" ]]; then
+        cp "$shared_target_dir/release/bench_frontier" "$build_dir/release/bench_frontier"
+    fi
     [[ -n "${build_marker:-}" ]] && rm -f "$build_marker"
     metallib_path="$(find "$shared_target_dir/release/build" -path "*/mlx-sys-*/out/build/lib/mlx.metallib" -type f -exec ls -t {} + 2>/dev/null | head -n 1 || true)"
     if [[ -z "$metallib_path" ]]; then
