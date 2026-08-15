@@ -16,15 +16,23 @@ anyhow = "1"
 chrono = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
+higgs-engine = { workspace = true }
+higgs-models = { workspace = true }
+mlx-rs.workspace = true
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sysinfo = "0.38"
+sha2 = "0.10"
 tokio = { workspace = true }
+tokenizers.workspace = true
 toml = "1.0"
 
 [build-dependencies]
 built = { version = "0.8", features = ["git2"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [[bin]]
 name = "bench_decode"
@@ -37,3 +45,7 @@ path = "src/bin/bench_speculative.rs"
 [[bin]]
 name = "bench_summarize"
 path = "src/bin/bench_summarize.rs"
+
+[[bin]]
+name = "quality_gate"
+path = "src/bin/quality_gate.rs"
