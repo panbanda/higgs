@@ -544,6 +544,14 @@ impl SteppingKeyValueCache {
         self.mla.is_some()
     }
 
+    /// MLA latent and shared-RoPE widths, when this is an MLA cache.
+    pub const fn mla_dimensions(&self) -> Option<(i32, i32)> {
+        match &self.mla {
+            Some(storage) => Some((storage.kv_lora_rank, storage.rope_dim)),
+            None => None,
+        }
+    }
+
     /// Simultaneous mutable access to the key and value arrays.
     ///
     /// Re-borrows both optional fields from a single `&mut` split to satisfy

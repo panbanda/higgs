@@ -4,13 +4,13 @@ use std::time::Instant;
 
 use std::sync::Arc;
 
-use higgs_models::cache::{KeyValueCache, SteppingKeyValueCache, slice_axis1, slice_axis2};
+use higgs_models::cache::{slice_axis1, slice_axis2, KeyValueCache, SteppingKeyValueCache};
 use higgs_models::qwen3_next::ArraysCache;
 use higgs_models::turboquant::TurboQuantContext;
 use higgs_models::{AnyCache, LayerCache};
-use mlx_rs::Array;
 use mlx_rs::error::Exception;
 use mlx_rs::ops::concatenate_axis;
+use mlx_rs::Array;
 
 /// Default block size in tokens for paged caching.
 pub const DEFAULT_BLOCK_SIZE: usize = 32;
@@ -59,6 +59,8 @@ enum CachedLayerData {
     Kv(Vec<KvBlock>),
     /// Attention layer: sequence of `TurboQuant` blocks.
     TurboQuantKv(Vec<TqBlock>),
+    /// Attention layer: compressed MLA latent blocks `[1, 1, T, r + rope]`.
+    MlaLatent(Vec<Array>, i32, i32),
     /// GDN/SSM layer: state snapshot at block boundary.
     Gdn(GdnSnapshot),
     /// Layer had no cache data.
@@ -507,7 +509,9 @@ fn slice_into_blocks(
             let Some(kv) = layer_opt.as_ref() else {
                 return Ok(CachedLayerData::Empty);
             };
-            if kv.is_quantized() {
+            if kv.is_mla() {
+                slice_mla_layer(kv, num_blocks, block_size_i32)
+            } else if kv.is_quantized() {
                 if tq_context.is_none() {
                     tq_context = kv.turbo_arrays().map(|(c, ..)| Arc::clone(c));
                 }
@@ -532,6 +536,32 @@ fn slice_into_blocks(
             is_hybrid: false,
         })
     }
+}
+
+/// Slice a single MLA latent layer into blocks along its sequence axis.
+fn slice_mla_layer(
+    kv: &SteppingKeyValueCache,
+    num_blocks: usize,
+    block_size: i32,
+) -> Result<CachedLayerData, Exception> {
+    let Some(latent) = kv.latent_array() else {
+        return Ok(CachedLayerData::Empty);
+    };
+    let mut blocks = Vec::with_capacity(num_blocks);
+    for i in 0..num_blocks {
+        let start = i32::try_from(i)
+            .map_err(|_| Exception::custom("block index overflow"))?
+            .checked_mul(block_size)
+            .ok_or_else(|| Exception::custom("block start overflow"))?;
+        let end = start
+            .checked_add(block_size)
+            .ok_or_else(|| Exception::custom("block end overflow"))?;
+        blocks.push(slice_axis2(latent, start, end)?);
+    }
+    let (kv_lora_rank, rope_dim) = kv
+        .mla_dimensions()
+        .ok_or_else(|| Exception::custom("MLA cache missing dimensions"))?;
+    Ok(CachedLayerData::MlaLatent(blocks, kv_lora_rank, rope_dim))
 }
 
 /// Slice a single `TurboQuant` KV layer into blocks along axis 1.
@@ -633,6 +663,9 @@ fn materialize_kv(layers: &[CachedLayerData]) -> Result<AnyCache, Exception> {
             CachedLayerData::TurboQuantKv(_) => {
                 Err(Exception::custom("TQ layer in non-TQ materialize"))
             }
+            CachedLayerData::MlaLatent(blocks, r, rope) => {
+                gather_mla_blocks(blocks, *r, *rope).map(Some)
+            }
             CachedLayerData::Empty => Ok(Some(SteppingKeyValueCache::new())),
             CachedLayerData::Gdn(_) => Err(Exception::custom("Unexpected GDN layer in KV cache")),
         })
@@ -649,6 +682,9 @@ fn materialize_tq_kv(
         .map(|layer| match layer {
             CachedLayerData::TurboQuantKv(blocks) => gather_tq_blocks(blocks, context).map(Some),
             CachedLayerData::Kv(blocks) => gather_blocks(blocks).map(Some),
+            CachedLayerData::MlaLatent(blocks, r, rope) => {
+                gather_mla_blocks(blocks, *r, *rope).map(Some)
+            }
             CachedLayerData::Empty => Ok(Some(SteppingKeyValueCache::new())),
             CachedLayerData::Gdn(_) => {
                 Err(Exception::custom("Unexpected GDN layer in TQ KV cache"))
@@ -665,6 +701,9 @@ fn materialize_hybrid(layers: &[CachedLayerData]) -> Result<AnyCache, Exception>
             CachedLayerData::Kv(blocks) => gather_blocks(blocks).map(|kv| Some(LayerCache::KV(kv))),
             CachedLayerData::TurboQuantKv(_) => {
                 Err(Exception::custom("TQ layer in non-TQ hybrid materialize"))
+            }
+            CachedLayerData::MlaLatent(blocks, r, rope) => {
+                gather_mla_blocks(blocks, *r, *rope).map(|kv| Some(LayerCache::KV(kv)))
             }
             CachedLayerData::Gdn(snap) => Ok(Some(LayerCache::Arrays(ArraysCache {
                 conv_state: snap.conv_state.clone(),
@@ -689,6 +728,9 @@ fn materialize_tq_hybrid(
                 gather_tq_blocks(blocks, context).map(|kv| Some(LayerCache::KV(kv)))
             }
             CachedLayerData::Kv(blocks) => gather_blocks(blocks).map(|kv| Some(LayerCache::KV(kv))),
+            CachedLayerData::MlaLatent(blocks, r, rope) => {
+                gather_mla_blocks(blocks, *r, *rope).map(|kv| Some(LayerCache::KV(kv)))
+            }
             CachedLayerData::Gdn(snap) => Ok(Some(LayerCache::Arrays(ArraysCache {
                 conv_state: snap.conv_state.clone(),
                 ssm_state: snap.ssm_state.clone(),
@@ -717,6 +759,23 @@ fn gather_blocks(blocks: &[KvBlock]) -> Result<SteppingKeyValueCache, Exception>
     let values = concatenate_axis(&value_arrays, 2)?;
 
     SteppingKeyValueCache::from_arrays(keys, values)
+}
+
+/// Gather MLA latent blocks into a single contiguous cache.
+fn gather_mla_blocks(
+    blocks: &[Array],
+    kv_lora_rank: i32,
+    rope_dim: i32,
+) -> Result<SteppingKeyValueCache, Exception> {
+    let Some(first) = blocks.first() else {
+        return Ok(SteppingKeyValueCache::new());
+    };
+    let latent = if blocks.len() == 1 {
+        first.clone()
+    } else {
+        concatenate_axis(blocks, 2)?
+    };
+    SteppingKeyValueCache::from_latent_array(latent, kv_lora_rank, rope_dim)
 }
 
 /// Gather TQ blocks into a single `SteppingKeyValueCache` with TQ storage.
@@ -1068,5 +1127,30 @@ mod tests {
         assert_eq!(rk.shape(), &[1, 2, 33, 8]);
         assert_eq!(rv.shape(), &[1, 2, 33, 8]);
         assert_eq!(KeyValueCache::offset(&kv), 33);
+    }
+
+    #[test]
+    fn test_mla_cache_store_lookup_and_continue() {
+        let mut prefix_cache = PagedPrefixCache::new(4, 2);
+        let rows = Array::ones::<f32>(&[1, 1, 4, 6]).unwrap();
+        let layer = SteppingKeyValueCache::from_latent_array(rows, 4, 2).unwrap();
+        let cache = AnyCache::KV(vec![Some(layer)]);
+        let tokens = vec![10, 11, 12, 13];
+        prefix_cache.store(&tokens, &cache);
+
+        let matched = prefix_cache
+            .find_longest_prefix(&[10, 11, 12, 13, 14])
+            .unwrap();
+        assert_eq!(matched.prefix_len, 4);
+        let AnyCache::KV(layers) = matched.cache else {
+            panic!("expected KV cache")
+        };
+        let mut restored = layers.into_iter().next().flatten().unwrap();
+        assert!(restored.is_mla());
+        let (history, offset) = restored
+            .update_latent_and_fetch(Array::zeros::<f32>(&[1, 1, 1, 6]).unwrap())
+            .unwrap();
+        assert_eq!(offset, 5);
+        assert_eq!(history.shape(), &[1, 1, 5, 6]);
     }
 }
