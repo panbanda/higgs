@@ -1,0 +1,11 @@
+side,run,decode_tokps
+baseline,1,318.879450
+baseline,2,319.631704
+baseline,3,319.624674
+baseline,4,320.307437
+baseline,5,317.783072
+candidate,1,318.441022
+candidate,2,319.711146
+candidate,3,319.355115
+candidate,4,318.422519
+candidate,5,319.349677
