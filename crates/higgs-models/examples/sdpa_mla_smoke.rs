@@ -1,4 +1,4 @@
-//! Smoke test: MQA SDPA with qk_dim=576, v_dim=512 on Metal (MLA absorbed shapes).
+//! Smoke test: MQA SDPA with `qk_dim=576`, `v_dim=512` on Metal (MLA absorbed shapes).
 #![allow(clippy::unwrap_used, clippy::print_stdout)]
 use mlx_rs::{Array, fast, ops, random::normal, transforms::eval};
 
@@ -25,7 +25,7 @@ fn main() {
                 println!("S={s}: OK shape={:?}", out.shape());
                 // Cross-check against explicit softmax path.
                 let attn = ops::softmax_axis(
-                    &q.matmul(&k.transpose_axes(&[0, 1, 3, 2]).unwrap())
+                    q.matmul(k.transpose_axes(&[0, 1, 3, 2]).unwrap())
                         .unwrap()
                         .multiply(Array::from_f32(scale))
                         .unwrap(),
@@ -34,7 +34,7 @@ fn main() {
                 )
                 .unwrap();
                 let reference = attn.matmul(&v).unwrap();
-                let diff = ops::abs(&out.subtract(&reference).unwrap())
+                let diff = ops::abs(out.subtract(&reference).unwrap())
                     .unwrap()
                     .max(None)
                     .unwrap();
