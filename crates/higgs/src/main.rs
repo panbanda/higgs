@@ -293,6 +293,8 @@ fn load_engines(
                 kv_cache_config,
                 tuning,
                 config.local.raise_wired_limit,
+                model_cfg.kv_disk_dir.as_deref().map(std::path::Path::new),
+                model_cfg.kv_disk_space_mb.saturating_mul(1024 * 1024),
             )?
         };
         let name = model_cfg

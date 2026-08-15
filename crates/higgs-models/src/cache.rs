@@ -662,6 +662,30 @@ impl SteppingKeyValueCache {
         ))
     }
 
+    /// Quantization context, including before the `TurboQuant` arrays have been
+    /// populated. Prefix-cache restoration uses this to validate disk payloads.
+    pub fn turbo_context(&self) -> Option<&Arc<TurboQuantContext>> {
+        self.turbo.as_ref().map(|storage| &storage.context)
+    }
+
+    /// Restore dense arrays while retaining this cache's configured storage
+    /// mode. This matters for `TurboQuant`'s dense-tail layers.
+    pub fn from_arrays_with_config(
+        keys: Array,
+        values: Array,
+        config: KvCacheConfig,
+    ) -> Result<Self, Exception> {
+        let offset = validate_dense_restore_shapes(&keys, &values)?;
+        Ok(Self {
+            keys: Some(keys),
+            values: Some(values),
+            turbo: None,
+            config,
+            offset,
+            step: 256,
+        })
+    }
+
     /// Reconstruct a TQ cache from pre-gathered arrays (prefix cache materialization).
     pub fn from_turbo_arrays(
         context: Arc<TurboQuantContext>,

@@ -24,6 +24,7 @@ use tokenizers::Tokenizer;
 use crate::{
     cache::PagedKvCache,
     chat_template::{ChatMessage, ChatTemplateRenderer},
+    disk_prefix_store::{DiskPrefixStore, StoreIdentity},
     engine::{GenerationOutput, StreamingOutput},
     error::EngineError,
     mlx_tuning::MlxRuntimeTuning,
@@ -235,6 +236,7 @@ pub struct Session {
 pub struct SimpleEngine {
     model: Mutex<AnyModel>,
     prefix_cache: Mutex<PagedPrefixCache>,
+    disk_prefix_store: Option<DiskPrefixStore>,
     /// Paged KV cache for session-based generation
     paged_cache: Option<Mutex<PagedKvCache>>,
     /// Session scheduler for continuous batching
@@ -272,6 +274,7 @@ struct PreparedGeneration<'a> {
     prompt_array: Array,
     prompt_len: u32,
     pixel_values: Option<Array>,
+    disk_loaded: bool,
 }
 
 impl SimpleEngine {
@@ -281,6 +284,8 @@ impl SimpleEngine {
         kv_cache_config: KvCacheConfig,
         tuning: MlxRuntimeTuning,
         raise_wired_limit: bool,
+        disk_prefix_dir: Option<&Path>,
+        disk_prefix_budget: u64,
     ) -> Result<Self, EngineError> {
         let model_dir = dir.as_ref();
         let model_name = derive_model_name(model_dir);
@@ -429,12 +434,24 @@ impl SimpleEngine {
             })
             .transpose()?;
 
+        let disk_prefix_store = disk_prefix_dir.and_then(|path| match DiskPrefixStore::new(
+                path,
+                disk_prefix_budget,
+                StoreIdentity::from_model_dir(model_dir, format!("{kv_cache_config:?}")),
+            ) {
+                Ok(store) => Some(store),
+                Err(error) => {
+                    tracing::warn!(%error, path = %path.display(), "Disk prefix cache disabled; continuing without it");
+                    None
+                }
+            });
         Ok(Self {
             model: Mutex::new(model),
             prefix_cache: Mutex::new(PagedPrefixCache::new(
                 DEFAULT_PREFIX_CACHE_SIZE,
                 DEFAULT_BLOCK_SIZE,
             )),
+            disk_prefix_store,
             paged_cache: paged_cache.map(Mutex::new),
             scheduler: Mutex::new(RoundRobinScheduler::new()),
             sessions: Mutex::new(std::collections::HashMap::new()),
@@ -553,7 +570,8 @@ impl SimpleEngine {
 
         // Skip prefix caching for multimodal requests: different images
         // produce different KV states even with identical token sequences.
-        let prefix_match = if has_images {
+        let mut disk_loaded = false;
+        let mut prefix_match = if has_images {
             None
         } else {
             let mut pc = self
@@ -567,6 +585,35 @@ impl SimpleEngine {
             .model
             .lock()
             .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
+
+        if prefix_match.is_none() && !has_images {
+            if let Some(store) = &self.disk_prefix_store {
+                match model.make_cache_with_config(self.kv_cache_config) {
+                    Ok(prototype) => match store.load_cache(prompt_tokens, &prototype) {
+                        Ok(Some((prefix_len, cache))) => {
+                            tracing::debug!(
+                                prefix_len,
+                                total_len = prompt_tokens.len(),
+                                "Disk prefix cache hit"
+                            );
+                            let mut pc = self.prefix_cache.lock().map_err(|e| {
+                                EngineError::Generation(format!("Cache lock poisoned: {e}"))
+                            })?;
+                            pc.store(prompt_tokens.get(..prefix_len).unwrap_or_default(), &cache);
+                            prefix_match = pc.find_longest_prefix(prompt_tokens);
+                            disk_loaded = prefix_match.is_some();
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "Disk prefix cache lookup failed; continuing without it");
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!(%error, "Disk prefix cache prototype failed; continuing without it");
+                    }
+                }
+            }
+        }
 
         let (actual_prompt_tokens, cache) = if let Some(matched) = prefix_match {
             tracing::debug!(
@@ -608,6 +655,7 @@ impl SimpleEngine {
             prompt_array,
             prompt_len,
             pixel_values,
+            disk_loaded,
         })
     }
 
@@ -709,6 +757,17 @@ impl SimpleEngine {
                 )
                 .unwrap_or(prompt_tokens);
             pc.store(cache_key, &prepared.cache);
+            if !prepared.disk_loaded && cache_key.len() >= 8 * DEFAULT_BLOCK_SIZE {
+                if let Some(store) = &self.disk_prefix_store {
+                    if let Err(error) = store.store_cache(
+                        cache_key,
+                        u32::try_from(DEFAULT_BLOCK_SIZE).unwrap_or(u32::MAX),
+                        &prepared.cache,
+                    ) {
+                        tracing::warn!(%error, "Disk prefix cache store failed; continuing without it");
+                    }
+                }
+            }
         }
         maybe_clear_mlx_cache(
             self.tuning.clear_cache_after_prefill(),

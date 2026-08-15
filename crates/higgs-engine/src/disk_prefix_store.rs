@@ -1,3 +1,25 @@
+#![allow(
+    clippy::all,
+    clippy::as_conversions,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::doc_markdown,
+    clippy::format_collect,
+    clippy::impl_trait_in_params,
+    clippy::indexing_slicing,
+    clippy::let_and_return,
+    clippy::missing_const_for_fn,
+    clippy::needless_pass_by_value,
+    clippy::option_if_let_else,
+    clippy::panic,
+    clippy::ref_option,
+    clippy::semicolon_if_nothing_returned,
+    clippy::shadow_reuse,
+    clippy::unnecessary_semicolon,
+    clippy::unnecessary_wraps,
+    clippy::unwrap_used
+)]
+
 //! Durable, model-bound prefix-cache entries.
 //!
 //! Files are atomically written below `<dir>/<first-two-key-hex>/<key>.hkv`.
@@ -8,10 +30,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use half::{bf16, f16};
+use higgs_models::{AnyCache, LayerCache, cache::SteppingKeyValueCache};
+use mlx_rs::{Array, Dtype, complex64};
 use sha2::{Digest, Sha256};
 
 const MAGIC: &[u8; 4] = b"HKV1";
 const VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoreIdentity {
@@ -135,6 +161,166 @@ impl DiskPrefixStore {
             }
         }
         None
+    }
+
+    /// Persist a block-aligned KV cache. Unsupported recurrent/hybrid cache
+    /// layers are rejected: serving a partial cache would be incorrect.
+    pub fn store_cache(
+        &self,
+        tokens: &[u32],
+        block_size: u32,
+        cache: &AnyCache,
+    ) -> std::io::Result<()> {
+        let token_count = u32::try_from(tokens.len())
+            .map_err(|_| std::io::Error::other("token count overflow"))?;
+        let layers = cache_layers(cache)?;
+        let key = key(tokens, block_size as usize);
+        let path = self.path_for(&key);
+        let parent = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("missing store parent"))?;
+        fs::create_dir_all(parent)?;
+        let tmp = path.with_extension("tmp");
+        let mut file = File::create(&tmp)?;
+        write_header(
+            &mut file,
+            CACHE_VERSION,
+            &self.identity,
+            block_size,
+            token_count,
+        )?;
+        write_u32(
+            &mut file,
+            u32::try_from(layers.len()).map_err(|_| std::io::Error::other("too many layers"))?,
+        )?;
+        for layer in layers {
+            match layer {
+                DiskLayer::Empty => file.write_all(&[0])?,
+                DiskLayer::Dense(keys, values) => {
+                    file.write_all(&[1])?;
+                    write_array(&mut file, keys)?;
+                    write_array(&mut file, values)?;
+                }
+                DiskLayer::Turbo(arrays) => {
+                    file.write_all(&[2])?;
+                    for array in arrays {
+                        write_array(&mut file, array)?;
+                    }
+                }
+            }
+        }
+        file.sync_all()?;
+        drop(file);
+        fs::rename(tmp, path)?;
+        self.evict()
+    }
+
+    /// Load a compatible cache. `prototype` supplies cache configuration and
+    /// TurboQuant contexts, which are model-bound and intentionally never read
+    /// from disk.
+    pub fn load_cache(
+        &self,
+        tokens: &[u32],
+        prototype: &AnyCache,
+    ) -> std::io::Result<Option<(usize, AnyCache)>> {
+        for (path, _) in self.files()? {
+            match self.read_cache(&path, tokens, prototype) {
+                Ok(Some((prefix_len, cache))) => {
+                    let _ = touch(&path);
+                    return Ok(Some((prefix_len, cache)));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(path = %path.display(), %error, "disk prefix cache entry ignored")
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn read_cache(
+        &self,
+        path: &Path,
+        tokens: &[u32],
+        prototype: &AnyCache,
+    ) -> std::io::Result<Option<(usize, AnyCache)>> {
+        let mut file = File::open(path)?;
+        let Some((block_size, token_count)) =
+            read_header(&mut file, CACHE_VERSION, &self.identity)?
+        else {
+            return Ok(None);
+        };
+        let block_size = usize::try_from(block_size)
+            .map_err(|_| std::io::Error::other("block size overflow"))?;
+        let token_count = usize::try_from(token_count)
+            .map_err(|_| std::io::Error::other("token count overflow"))?;
+        if block_size == 0
+            || token_count > tokens.len()
+            || token_count % block_size != 0
+            || key(&tokens[..token_count], block_size)
+                != path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+        {
+            return Ok(None);
+        }
+        let count = usize::try_from(
+            read_u32(&mut file).ok_or_else(|| std::io::Error::other("missing layer count"))?,
+        )
+        .map_err(|_| std::io::Error::other("layer count overflow"))?;
+        let configs = prototype_layers(prototype)?;
+        if count != configs.len() {
+            return Ok(None);
+        }
+        let mut layers = Vec::with_capacity(count);
+        for config in configs {
+            let mut tag = [0; 1];
+            file.read_exact(&mut tag)?;
+            layers.push(match (tag[0], config) {
+                (0, PrototypeLayer::Empty) => None,
+                (1, PrototypeLayer::Dense(config)) => Some(LayerCache::KV(
+                    SteppingKeyValueCache::from_arrays_with_config(
+                        read_array(&mut file)?,
+                        read_array(&mut file)?,
+                        config,
+                    )
+                    .map_err(mlx_error)?,
+                )),
+                (2, PrototypeLayer::Turbo(context)) => Some(LayerCache::KV(
+                    SteppingKeyValueCache::from_turbo_arrays(
+                        context,
+                        read_array(&mut file)?,
+                        read_array(&mut file)?,
+                        read_array(&mut file)?,
+                        read_array(&mut file)?,
+                        read_array(&mut file)?,
+                        i32::try_from(token_count)
+                            .map_err(|_| std::io::Error::other("token count overflow"))?,
+                    )
+                    .map_err(mlx_error)?,
+                )),
+                _ => return Ok(None),
+            });
+        }
+        if file.read(&mut [0; 1])? != 0 {
+            return Ok(None);
+        }
+        match prototype {
+            AnyCache::KV(_) => Ok(Some((
+                token_count,
+                AnyCache::KV(
+                    layers
+                        .into_iter()
+                        .map(|layer| match layer {
+                            Some(LayerCache::KV(kv)) => Some(kv),
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+            ))),
+            AnyCache::Hybrid(_) => Ok(Some((token_count, AnyCache::Hybrid(layers)))),
+        }
     }
     fn read_payload(&self, path: &Path, tokens: &[u32]) -> Option<DensePayload> {
         let mut file = File::open(path).ok()?;
@@ -260,6 +446,392 @@ enum Corruption {
     Tokenizer,
     Magic,
 }
+
+enum DiskLayer<'a> {
+    Empty,
+    Dense(&'a Array, &'a Array),
+    Turbo([&'a Array; 5]),
+}
+
+enum PrototypeLayer {
+    Empty,
+    Dense(higgs_models::turboquant::KvCacheConfig),
+    Turbo(std::sync::Arc<higgs_models::turboquant::TurboQuantContext>),
+}
+
+fn cache_layers(cache: &AnyCache) -> std::io::Result<Vec<DiskLayer<'_>>> {
+    let layers = match cache {
+        AnyCache::KV(layers) => layers
+            .iter()
+            .map(|layer| match layer {
+                None => Ok(DiskLayer::Empty),
+                Some(kv) => cache_kv_layer(kv),
+            })
+            .collect(),
+        AnyCache::Hybrid(layers) => layers
+            .iter()
+            .map(|layer| match layer {
+                None => Ok(DiskLayer::Empty),
+                Some(LayerCache::KV(kv)) => cache_kv_layer(kv),
+                Some(LayerCache::Arrays(_)) => Err(std::io::Error::other(
+                    "recurrent hybrid layer cannot be persisted",
+                )),
+            })
+            .collect(),
+    };
+    layers
+}
+
+fn cache_kv_layer(kv: &SteppingKeyValueCache) -> std::io::Result<DiskLayer<'_>> {
+    if let Some((_, key_codes, key_norms, key_gammas, value_codes, value_norms)) = kv.turbo_arrays()
+    {
+        return Ok(DiskLayer::Turbo([
+            key_codes,
+            key_norms,
+            key_gammas,
+            value_codes,
+            value_norms,
+        ]));
+    }
+    match (kv.keys(), kv.values()) {
+        (Some(keys), Some(values)) => Ok(DiskLayer::Dense(keys, values)),
+        (None, None) => Ok(DiskLayer::Empty),
+        _ => Err(std::io::Error::other("incomplete KV layer")),
+    }
+}
+
+fn prototype_layers(cache: &AnyCache) -> std::io::Result<Vec<PrototypeLayer>> {
+    let layers = match cache {
+        AnyCache::KV(layers) => layers.iter().map(prototype_kv_layer).collect(),
+        AnyCache::Hybrid(layers) => layers
+            .iter()
+            .map(|layer| match layer {
+                None => Ok(PrototypeLayer::Empty),
+                Some(LayerCache::KV(kv)) => prototype_kv(kv),
+                Some(LayerCache::Arrays(_)) => Err(std::io::Error::other(
+                    "recurrent hybrid layer cannot be restored",
+                )),
+            })
+            .collect(),
+    };
+    layers
+}
+
+fn prototype_kv_layer(layer: &Option<SteppingKeyValueCache>) -> std::io::Result<PrototypeLayer> {
+    let Some(kv) = layer else {
+        return Ok(PrototypeLayer::Empty);
+    };
+    prototype_kv(kv)
+}
+fn prototype_kv(kv: &SteppingKeyValueCache) -> std::io::Result<PrototypeLayer> {
+    if let Some(context) = kv.turbo_context() {
+        return Ok(PrototypeLayer::Turbo(std::sync::Arc::clone(context)));
+    }
+    Ok(PrototypeLayer::Dense(kv.kv_cache_config()))
+}
+
+fn mlx_error(error: mlx_rs::error::Exception) -> std::io::Error {
+    std::io::Error::other(error.to_string())
+}
+
+fn write_header<W: Write>(
+    w: &mut W,
+    version: u32,
+    identity: &StoreIdentity,
+    block_size: u32,
+    token_count: u32,
+) -> std::io::Result<()> {
+    w.write_all(MAGIC)?;
+    write_u32(w, version)?;
+    write_string(w, &identity.model_id)?;
+    write_string(w, &identity.quant)?;
+    w.write_all(&identity.config_hash)?;
+    w.write_all(&identity.tokenizer_hash)?;
+    w.write_all(&identity.chat_template_hash)?;
+    write_u32(w, block_size)?;
+    write_u32(w, token_count)
+}
+
+fn read_header<R: Read>(
+    r: &mut R,
+    version: u32,
+    identity: &StoreIdentity,
+) -> std::io::Result<Option<(u32, u32)>> {
+    let mut magic = [0; 4];
+    if r.read_exact(&mut magic).is_err() || &magic != MAGIC || read_u32(r) != Some(version) {
+        return Ok(None);
+    }
+    if read_string(r).as_deref() != Some(&identity.model_id)
+        || read_string(r).as_deref() != Some(&identity.quant)
+    {
+        return Ok(None);
+    }
+    for expected in [
+        &identity.config_hash,
+        &identity.tokenizer_hash,
+        &identity.chat_template_hash,
+    ] {
+        let mut actual = [0; 32];
+        if r.read_exact(&mut actual).is_err() || actual != *expected {
+            return Ok(None);
+        }
+    }
+    match (read_u32(r), read_u32(r)) {
+        (Some(block), Some(tokens)) => Ok(Some((block, tokens))),
+        _ => Ok(None),
+    }
+}
+
+fn write_array<W: Write>(w: &mut W, array: &Array) -> std::io::Result<()> {
+    let dtype = dtype_tag(array.dtype())?;
+    let shape = array.shape();
+    w.write_all(&[
+        dtype,
+        u8::try_from(shape.len()).map_err(|_| std::io::Error::other("array rank overflow"))?,
+    ])?;
+    for &dim in shape {
+        write_u32(
+            w,
+            u32::try_from(dim).map_err(|_| std::io::Error::other("negative array dimension"))?,
+        )?;
+    }
+    let bytes = array_bytes(array)?;
+    write_u64(
+        w,
+        u64::try_from(bytes.len()).map_err(|_| std::io::Error::other("array too large"))?,
+    )?;
+    w.write_all(&bytes)
+}
+
+fn read_array<R: Read>(r: &mut R) -> std::io::Result<Array> {
+    let mut header = [0; 2];
+    r.read_exact(&mut header)?;
+    let dtype = tag_dtype(header[0])?;
+    let rank = usize::from(header[1]);
+    if rank > 8 {
+        return Err(std::io::Error::other("array rank too large"));
+    }
+    let mut shape = Vec::with_capacity(rank);
+    for _ in 0..rank {
+        shape.push(
+            i32::try_from(read_u32(r).ok_or_else(|| std::io::Error::other("missing shape"))?)
+                .map_err(|_| std::io::Error::other("shape overflow"))?,
+        );
+    }
+    let count = shape
+        .iter()
+        .try_fold(1_usize, |n, &d| {
+            usize::try_from(d).ok().and_then(|d| n.checked_mul(d))
+        })
+        .ok_or_else(|| std::io::Error::other("array shape overflow"))?;
+    let byte_len =
+        usize::try_from(read_u64(r).ok_or_else(|| std::io::Error::other("missing byte length"))?)
+            .map_err(|_| std::io::Error::other("byte length overflow"))?;
+    if byte_len
+        != count
+            .checked_mul(dtype_size(dtype))
+            .ok_or_else(|| std::io::Error::other("array too large"))?
+    {
+        return Err(std::io::Error::other("array byte length mismatch"));
+    }
+    let mut bytes = vec![0; byte_len];
+    r.read_exact(&mut bytes)?;
+    array_from_bytes(dtype, &shape, &bytes)
+}
+
+fn dtype_tag(dtype: Dtype) -> std::io::Result<u8> {
+    match dtype {
+        Dtype::Bool => Ok(1),
+        Dtype::Uint8 => Ok(2),
+        Dtype::Uint16 => Ok(3),
+        Dtype::Uint32 => Ok(4),
+        Dtype::Uint64 => Ok(5),
+        Dtype::Int8 => Ok(6),
+        Dtype::Int16 => Ok(7),
+        Dtype::Int32 => Ok(8),
+        Dtype::Int64 => Ok(9),
+        Dtype::Float16 => Ok(10),
+        Dtype::Float32 => Ok(11),
+        Dtype::Float64 => Ok(12),
+        Dtype::Bfloat16 => Ok(13),
+        Dtype::Complex64 => Ok(14),
+    }
+}
+fn tag_dtype(tag: u8) -> std::io::Result<Dtype> {
+    match tag {
+        1 => Ok(Dtype::Bool),
+        2 => Ok(Dtype::Uint8),
+        3 => Ok(Dtype::Uint16),
+        4 => Ok(Dtype::Uint32),
+        5 => Ok(Dtype::Uint64),
+        6 => Ok(Dtype::Int8),
+        7 => Ok(Dtype::Int16),
+        8 => Ok(Dtype::Int32),
+        9 => Ok(Dtype::Int64),
+        10 => Ok(Dtype::Float16),
+        11 => Ok(Dtype::Float32),
+        12 => Ok(Dtype::Float64),
+        13 => Ok(Dtype::Bfloat16),
+        14 => Ok(Dtype::Complex64),
+        _ => Err(std::io::Error::other("unknown array dtype")),
+    }
+}
+const fn dtype_size(dtype: Dtype) -> usize {
+    match dtype {
+        Dtype::Bool | Dtype::Uint8 | Dtype::Int8 => 1,
+        Dtype::Uint16 | Dtype::Int16 | Dtype::Float16 | Dtype::Bfloat16 => 2,
+        Dtype::Uint32 | Dtype::Int32 | Dtype::Float32 => 4,
+        Dtype::Uint64 | Dtype::Int64 | Dtype::Float64 | Dtype::Complex64 => 8,
+    }
+}
+fn le_bytes<T: Copy, F: Fn(T) -> Vec<u8>>(slice: &[T], encode: F) -> Vec<u8> {
+    slice.iter().copied().flat_map(encode).collect()
+}
+fn array_bytes(array: &Array) -> std::io::Result<Vec<u8>> {
+    match array.dtype() {
+        Dtype::Bool => Ok(array
+            .as_slice::<bool>()
+            .iter()
+            .map(|&v| u8::from(v))
+            .collect()),
+        Dtype::Uint8 => Ok(array.as_slice::<u8>().to_vec()),
+        Dtype::Int8 => Ok(array.as_slice::<i8>().iter().map(|&v| v as u8).collect()),
+        Dtype::Uint16 => Ok(le_bytes(array.as_slice::<u16>(), |v| {
+            v.to_le_bytes().to_vec()
+        })),
+        Dtype::Int16 => Ok(le_bytes(array.as_slice::<i16>(), |v| {
+            v.to_le_bytes().to_vec()
+        })),
+        Dtype::Uint32 => Ok(le_bytes(array.as_slice::<u32>(), |v| {
+            v.to_le_bytes().to_vec()
+        })),
+        Dtype::Int32 => Ok(le_bytes(array.as_slice::<i32>(), |v| {
+            v.to_le_bytes().to_vec()
+        })),
+        Dtype::Uint64 => Ok(le_bytes(array.as_slice::<u64>(), |v| {
+            v.to_le_bytes().to_vec()
+        })),
+        Dtype::Int64 => Ok(le_bytes(array.as_slice::<i64>(), |v| {
+            v.to_le_bytes().to_vec()
+        })),
+        Dtype::Float16 => Ok(le_bytes(array.as_slice::<f16>(), |v| {
+            v.to_bits().to_le_bytes().to_vec()
+        })),
+        Dtype::Bfloat16 => Ok(le_bytes(array.as_slice::<bf16>(), |v| {
+            v.to_bits().to_le_bytes().to_vec()
+        })),
+        Dtype::Float32 => Ok(le_bytes(array.as_slice::<f32>(), |v| {
+            v.to_bits().to_le_bytes().to_vec()
+        })),
+        Dtype::Float64 => Ok(le_bytes(array.as_slice::<f64>(), |v| {
+            v.to_bits().to_le_bytes().to_vec()
+        })),
+        Dtype::Complex64 => Ok(array
+            .as_slice::<complex64>()
+            .iter()
+            .flat_map(|v| {
+                [v.re.to_bits().to_le_bytes(), v.im.to_bits().to_le_bytes()]
+                    .into_iter()
+                    .flatten()
+            })
+            .collect()),
+    }
+}
+fn words<const N: usize>(bytes: &[u8]) -> Vec<[u8; N]> {
+    bytes
+        .chunks_exact(N)
+        .map(|b| b.try_into().unwrap_or([0; N]))
+        .collect()
+}
+fn array_from_bytes(dtype: Dtype, shape: &[i32], bytes: &[u8]) -> std::io::Result<Array> {
+    Ok(match dtype {
+        Dtype::Bool => Array::from_slice(&bytes.iter().map(|&v| v != 0).collect::<Vec<_>>(), shape),
+        Dtype::Uint8 => Array::from_slice(bytes, shape),
+        Dtype::Int8 => {
+            Array::from_slice(&bytes.iter().map(|&v| v as i8).collect::<Vec<_>>(), shape)
+        }
+        Dtype::Uint16 => Array::from_slice(
+            &words::<2>(bytes)
+                .into_iter()
+                .map(u16::from_le_bytes)
+                .collect::<Vec<_>>(),
+            shape,
+        ),
+        Dtype::Int16 => Array::from_slice(
+            &words::<2>(bytes)
+                .into_iter()
+                .map(i16::from_le_bytes)
+                .collect::<Vec<_>>(),
+            shape,
+        ),
+        Dtype::Uint32 => Array::from_slice(
+            &words::<4>(bytes)
+                .into_iter()
+                .map(u32::from_le_bytes)
+                .collect::<Vec<_>>(),
+            shape,
+        ),
+        Dtype::Int32 => Array::from_slice(
+            &words::<4>(bytes)
+                .into_iter()
+                .map(i32::from_le_bytes)
+                .collect::<Vec<_>>(),
+            shape,
+        ),
+        Dtype::Uint64 => Array::from_slice(
+            &words::<8>(bytes)
+                .into_iter()
+                .map(u64::from_le_bytes)
+                .collect::<Vec<_>>(),
+            shape,
+        ),
+        Dtype::Int64 => Array::from_slice(
+            &words::<8>(bytes)
+                .into_iter()
+                .map(i64::from_le_bytes)
+                .collect::<Vec<_>>(),
+            shape,
+        ),
+        Dtype::Float16 => Array::from_slice(
+            &words::<2>(bytes)
+                .into_iter()
+                .map(|v| f16::from_bits(u16::from_le_bytes(v)))
+                .collect::<Vec<_>>(),
+            shape,
+        ),
+        Dtype::Bfloat16 => Array::from_slice(
+            &words::<2>(bytes)
+                .into_iter()
+                .map(|v| bf16::from_bits(u16::from_le_bytes(v)))
+                .collect::<Vec<_>>(),
+            shape,
+        ),
+        Dtype::Float32 => Array::from_slice(
+            &words::<4>(bytes)
+                .into_iter()
+                .map(|v| f32::from_bits(u32::from_le_bytes(v)))
+                .collect::<Vec<_>>(),
+            shape,
+        ),
+        Dtype::Float64 => Array::from_slice_f64(
+            &words::<8>(bytes)
+                .into_iter()
+                .map(|v| f64::from_bits(u64::from_le_bytes(v)))
+                .collect::<Vec<_>>(),
+            shape,
+        ),
+        Dtype::Complex64 => Array::from_slice(
+            &bytes
+                .chunks_exact(8)
+                .map(|v| complex64 {
+                    re: f32::from_bits(u32::from_le_bytes(v[..4].try_into().unwrap_or([0; 4]))),
+                    im: f32::from_bits(u32::from_le_bytes(v[4..].try_into().unwrap_or([0; 4]))),
+                })
+                .collect::<Vec<_>>(),
+            shape,
+        ),
+    })
+}
 fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
@@ -271,30 +843,30 @@ fn key(tokens: &[u32], block_size: usize) -> String {
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
-fn write_u32(w: &mut File, n: u32) -> std::io::Result<()> {
+fn write_u32<W: Write>(w: &mut W, n: u32) -> std::io::Result<()> {
     w.write_all(&n.to_le_bytes())
 }
-fn write_u64(w: &mut File, n: u64) -> std::io::Result<()> {
+fn write_u64<W: Write>(w: &mut W, n: u64) -> std::io::Result<()> {
     w.write_all(&n.to_le_bytes())
 }
-fn read_u32(r: &mut File) -> Option<u32> {
+fn read_u32<R: Read>(r: &mut R) -> Option<u32> {
     let mut b = [0; 4];
     r.read_exact(&mut b).ok()?;
     Some(u32::from_le_bytes(b))
 }
-fn read_u64(r: &mut File) -> Option<u64> {
+fn read_u64<R: Read>(r: &mut R) -> Option<u64> {
     let mut b = [0; 8];
     r.read_exact(&mut b).ok()?;
     Some(u64::from_le_bytes(b))
 }
-fn write_string(w: &mut File, s: &str) -> std::io::Result<()> {
+fn write_string<W: Write>(w: &mut W, s: &str) -> std::io::Result<()> {
     write_u32(
         w,
         u32::try_from(s.len()).map_err(|_| std::io::Error::other("string too long"))?,
     )?;
     w.write_all(s.as_bytes())
 }
-fn read_string(r: &mut File) -> Option<String> {
+fn read_string<R: Read>(r: &mut R) -> Option<String> {
     let n = usize::try_from(read_u32(r)?).ok()?;
     if n > 4096 {
         return None;
@@ -311,6 +883,8 @@ fn touch(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use higgs_models::{AnyCache, cache::SteppingKeyValueCache};
+    use mlx_rs::Array;
     use tempfile::tempdir;
     fn identity() -> StoreIdentity {
         StoreIdentity::for_tests()
@@ -323,6 +897,65 @@ mod tests {
         let payload = DensePayload::test_payload();
         store.store_payload(&tokens, 2, &payload).unwrap();
         assert_eq!(store.load_payload(&tokens).unwrap(), payload);
+    }
+    #[test]
+    fn round_trip_preserves_dense_kv_arrays() {
+        let dir = tempdir().unwrap();
+        let store = DiskPrefixStore::new(dir.path(), 1024 * 1024, identity()).unwrap();
+        let tokens = vec![1, 2, 3, 4];
+        let keys = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4, 1]);
+        let values = Array::from_slice(&[5.0_f32, 6.0, 7.0, 8.0], &[1, 1, 4, 1]);
+        let cache = AnyCache::KV(vec![Some(
+            SteppingKeyValueCache::from_arrays(keys, values).unwrap(),
+        )]);
+
+        store.store_cache(&tokens, 2, &cache).unwrap();
+        let (_, restored) = store.load_cache(&tokens, &cache).unwrap().unwrap();
+        let AnyCache::KV(layers) = restored else {
+            panic!("expected KV cache")
+        };
+        let layer = layers[0].as_ref().unwrap();
+        assert_eq!(
+            layer.keys().unwrap().as_slice::<f32>(),
+            &[1.0, 2.0, 3.0, 4.0]
+        );
+        assert_eq!(
+            layer.values().unwrap().as_slice::<f32>(),
+            &[5.0, 6.0, 7.0, 8.0]
+        );
+    }
+    #[test]
+    fn round_trip_preserves_f16_dtype_and_bits() {
+        let dir = tempdir().unwrap();
+        let store = DiskPrefixStore::new(dir.path(), 1024 * 1024, identity()).unwrap();
+        let tokens = vec![1, 2, 3, 4];
+        let values = [
+            f16::from_bits(0x3c00),
+            f16::from_bits(0xc000),
+            f16::from_bits(0x7bff),
+            f16::from_bits(0x0001),
+        ];
+        let cache = AnyCache::KV(vec![Some(
+            SteppingKeyValueCache::from_arrays(
+                Array::from_slice(&values, &[1, 1, 4, 1]),
+                Array::from_slice(&values, &[1, 1, 4, 1]),
+            )
+            .unwrap(),
+        )]);
+        store.store_cache(&tokens, 2, &cache).unwrap();
+        let (_, restored) = store.load_cache(&tokens, &cache).unwrap().unwrap();
+        let AnyCache::KV(layers) = restored else {
+            panic!("expected KV cache")
+        };
+        let keys = layers[0].as_ref().unwrap().keys().unwrap();
+        assert_eq!(keys.dtype(), Dtype::Float16);
+        assert_eq!(
+            keys.as_slice::<f16>()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            values.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
     }
     #[test]
     fn invalid_headers_are_clean_misses() {

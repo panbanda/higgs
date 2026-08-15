@@ -31,9 +31,18 @@ impl Engine {
         kv_cache_config: KvCacheConfig,
         tuning: MlxRuntimeTuning,
         raise_wired_limit: bool,
+        disk_prefix_dir: Option<&Path>,
+        disk_prefix_budget: u64,
     ) -> Result<Self, EngineError> {
-        SimpleEngine::load(dir, kv_cache_config, tuning, raise_wired_limit)
-            .map(|e| Self::Simple(Box::new(e)))
+        SimpleEngine::load(
+            dir,
+            kv_cache_config,
+            tuning,
+            raise_wired_limit,
+            disk_prefix_dir,
+            disk_prefix_budget,
+        )
+        .map(|e| Self::Simple(Box::new(e)))
     }
 
     pub fn load_batch<P: AsRef<Path>>(
