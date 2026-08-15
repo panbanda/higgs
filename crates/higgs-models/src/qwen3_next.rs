@@ -1760,6 +1760,25 @@ pub(crate) fn new_mlp_projections(
     ))
 }
 
+pub(crate) fn moe_expert_projection_quantization(
+    args: &Qwen3NextModelArgs,
+    layer_idx: i32,
+    projection: &str,
+    fallback_group_size: i32,
+    fallback_bits: i32,
+) -> Result<(i32, i32), Exception> {
+    let Some(settings) = args.quantization.as_ref() else {
+        return Ok((fallback_group_size, fallback_bits));
+    };
+    let paths = (0..args.num_experts)
+        .map(|expert_idx| format!("model.layers.{layer_idx}.mlp.experts.{expert_idx}.{projection}"))
+        .collect::<Vec<_>>();
+    let quant = settings
+        .resolve_uniform(paths.iter().map(String::as_str))
+        .map_err(Exception::custom)?;
+    Ok((quant.group_size(), quant.bits()))
+}
+
 impl Qwen3NextMLP {
     fn new(ql: i32, qb: i32) -> Result<Self, Exception> {
         let (gate_proj, down_proj, up_proj) = new_mlp_projections(ql, qb)?;
@@ -2016,7 +2035,7 @@ impl MoeMtpHead {
         mtp_args.gate_quantization = None;
 
         let layers = (0..n)
-            .map(|_| {
+            .map(|layer_idx| {
                 Ok(MoeMtpTransformerLayer {
                     self_attn: Qwen3NextAttention::new(args, ql, qb)?,
                     input_layernorm: nn::RmsNormBuilder::new(args.hidden_size)
@@ -2025,7 +2044,13 @@ impl MoeMtpHead {
                     post_attention_layernorm: nn::RmsNormBuilder::new(args.hidden_size)
                         .eps(args.rms_norm_eps)
                         .build()?,
-                    mlp: SparseMoeBlock::new(&mtp_args, ql, qb)?,
+                    mlp: SparseMoeBlock::new(
+                        &mtp_args,
+                        i32::try_from(layer_idx)
+                            .map_err(|_| Exception::custom("MTP layer index exceeds i32"))?,
+                        ql,
+                        qb,
+                    )?,
                 })
             })
             .collect::<Result<Vec<_>, Exception>>()?;
@@ -2064,11 +2089,18 @@ pub(crate) struct SwitchMlpWeights {
 
 impl SwitchMlpWeights {
     pub(crate) fn new(ql: i32, qb: i32) -> Result<Self, Exception> {
-        let (gate_proj, down_proj, up_proj) = new_mlp_projections(ql, qb)?;
+        Self::new_with_projection_quantization((ql, qb), (ql, qb), (ql, qb))
+    }
+
+    pub(crate) fn new_with_projection_quantization(
+        gate: (i32, i32),
+        up: (i32, i32),
+        down: (i32, i32),
+    ) -> Result<Self, Exception> {
         Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
+            gate_proj: QLinear::new(gate.0, gate.1)?,
+            up_proj: QLinear::new(up.0, up.1)?,
+            down_proj: QLinear::new(down.0, down.1)?,
             fused_gate_up: None,
         })
     }
@@ -2353,7 +2385,7 @@ struct SparseMoeBlock {
 }
 
 impl SparseMoeBlock {
-    fn new(args: &Qwen3NextModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
+    fn new(args: &Qwen3NextModelArgs, layer_idx: i32, ql: i32, qb: i32) -> Result<Self, Exception> {
         if args.num_experts <= 0 {
             return Err(Exception::custom("num_experts must be > 0"));
         }
@@ -2370,9 +2402,16 @@ impl SparseMoeBlock {
             .gate_quantization
             .as_ref()
             .map_or((ql, qb), |gq| (gq.group_size, gq.bits));
+        let expert_gate = moe_expert_projection_quantization(args, layer_idx, "gate_proj", ql, qb)?;
+        let expert_up = moe_expert_projection_quantization(args, layer_idx, "up_proj", ql, qb)?;
+        let expert_down = moe_expert_projection_quantization(args, layer_idx, "down_proj", ql, qb)?;
         Ok(Self {
             gate: QLinear::new(gate_ql, gate_qb)?,
-            switch_mlp: SwitchMlpWeights::new(ql, qb)?,
+            switch_mlp: SwitchMlpWeights::new_with_projection_quantization(
+                expert_gate,
+                expert_up,
+                expert_down,
+            )?,
             shared_expert: Qwen3NextMLP::new(ql, qb)?,
             shared_expert_gate: QLinear::new(gate_ql, gate_qb)?,
             top_k: args.num_experts_per_tok,
@@ -3070,8 +3109,13 @@ struct FfnBlock {
 }
 
 impl FfnBlock {
-    fn new_moe(args: &Qwen3NextModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
-        let moe = SparseMoeBlock::new(args, ql, qb)?;
+    fn new_moe(
+        args: &Qwen3NextModelArgs,
+        layer_idx: i32,
+        ql: i32,
+        qb: i32,
+    ) -> Result<Self, Exception> {
+        let moe = SparseMoeBlock::new(args, layer_idx, ql, qb)?;
         Ok(Self {
             gate: Some(moe.gate),
             switch_mlp: Some(moe.switch_mlp),
@@ -3300,7 +3344,7 @@ impl DecoderLayer {
             .transpose()?;
 
         let ffn = if args.num_experts > 0 {
-            FfnBlock::new_moe(args, ql, qb)?
+            FfnBlock::new_moe(args, layer_idx, ql, qb)?
         } else {
             FfnBlock::new_dense(ql, qb)?
         };
@@ -5421,7 +5465,7 @@ mod tests {
         let mut args = minimal_qwen3_next_args();
         args.num_experts = 4;
         args.num_experts_per_tok = 4; // top_k == num_experts is fine
-        let result = SparseMoeBlock::new(&args, 64, 4);
+        let result = SparseMoeBlock::new(&args, 0, 64, 4);
         assert!(result.is_ok());
     }
 
@@ -5431,7 +5475,7 @@ mod tests {
     ) {
         let mut args = minimal_qwen3_next_args();
         mutate(&mut args);
-        let result = SparseMoeBlock::new(&args, 64, 4);
+        let result = SparseMoeBlock::new(&args, 0, 64, 4);
         assert!(result.is_err(), "Should reject invalid args");
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -5721,7 +5765,7 @@ mod tests {
     #[test]
     fn test_sparse_moe_happy_path_construction() {
         let args = minimal_qwen3_next_args();
-        let result = SparseMoeBlock::new(&args, 64, 4);
+        let result = SparseMoeBlock::new(&args, 0, 64, 4);
         assert!(result.is_ok());
         let block = result.unwrap();
         assert_eq!(block.top_k, args.num_experts_per_tok);
@@ -6290,7 +6334,7 @@ mod tests {
         args.hidden_size = 64;
         args.gate_quantization = Some(QuantizationConfig::new(64, 8));
 
-        let mut block = SparseMoeBlock::new(&args, 64, 4).unwrap();
+        let mut block = SparseMoeBlock::new(&args, 0, 64, 4).unwrap();
 
         // Set router gate weights: [num_experts, hidden_size]
         let gate_w = Array::ones::<f32>(&[4, 64]).unwrap();

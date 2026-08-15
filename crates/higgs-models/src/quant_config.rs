@@ -30,6 +30,12 @@ impl TensorQuant {
 /// Scalar `group_size` and `bits` entries specify the fallback. Any other
 /// key is a checkpoint tensor path and either overrides that fallback or is
 /// `false` when the tensor is stored densely.
+///
+/// Routed `MoE` expert weights are stored as one stacked tensor per projection
+/// and dispatched through a fused gather kernel. Consequently, all experts in
+/// one layer/projection must use the same storage format. Call
+/// [`Self::resolve_uniform`] while building such a group; it rejects a
+/// per-expert mixed setting rather than loading an incompatible checkpoint.
 #[derive(Debug, Clone)]
 pub struct QuantizationSettings {
     /// Kept public for source compatibility while callers migrate to the
@@ -66,6 +72,27 @@ impl QuantizationSettings {
                 group_size: self.group_size,
                 bits: self.bits,
             })
+    }
+
+    /// Resolve a fused tensor group, rejecting mixed storage formats.
+    pub fn resolve_uniform<'a, I>(&self, paths: I) -> Result<TensorQuant, String>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let mut path_iter = paths.into_iter();
+        let Some(first_path) = path_iter.next() else {
+            return Err("cannot resolve an empty quantized tensor group".to_owned());
+        };
+        let first = self.resolve(first_path);
+        for path in path_iter {
+            let actual = self.resolve(path);
+            if actual != first {
+                return Err(format!(
+                    "fused tensor group requires uniform quantization; {path} resolves to {actual:?}, but {first_path} resolves to {first:?}"
+                ));
+            }
+        }
+        Ok(first)
     }
 }
 
@@ -178,5 +205,27 @@ mod tests {
             r#"{"group_size": 64, "bits": 4, "lm_head": true}"#,
         );
         assert!(result.is_err_and(|err| err.to_string().contains("lm_head")));
+    }
+
+    #[test]
+    fn rejects_mixed_quantization_in_a_fused_expert_group() -> Result<(), serde_json::Error> {
+        let settings: QuantizationSettings = serde_json::from_str(
+            r#"{
+                "group_size": 64,
+                "bits": 4,
+                "model.layers.0.mlp.experts.0.gate_proj": {"group_size": 64, "bits": 4},
+                "model.layers.0.mlp.experts.1.gate_proj": false
+            }"#,
+        )?;
+
+        let err = settings
+            .resolve_uniform([
+                "model.layers.0.mlp.experts.0.gate_proj",
+                "model.layers.0.mlp.experts.1.gate_proj",
+            ])
+            .err()
+            .ok_or_else(|| serde_json::Error::io(std::io::Error::other("expected an error")))?;
+        assert!(err.contains("model.layers.0.mlp.experts.1.gate_proj"));
+        Ok(())
     }
 }

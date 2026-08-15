@@ -1329,6 +1329,7 @@ pub fn load_quantized_safetensors_weights<M: ModuleParametersExt>(
     quantized: bool,
 ) -> Result<(), ModelError> {
     let safetensors_files = collect_safetensors_files(model_path)?;
+    let quantization = load_checkpoint_quantization_settings(model_path)?;
 
     let mut params = model.parameters_mut().flatten();
 
@@ -1336,6 +1337,7 @@ pub fn load_quantized_safetensors_weights<M: ModuleParametersExt>(
         tracing::debug!(file = %file_path.display(), "Loading weights");
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+        validate_quantized_tensor_widths(&loaded, quantization.as_ref())?;
 
         for (key, value) in loaded {
             if let Some(param) = params.get_mut(&*key) {
@@ -1376,6 +1378,7 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
 ) -> Result<(), ModelError> {
     const MAX_UNMATCHED_WARNS: usize = 5;
     let safetensors_files = collect_safetensors_files(model_path)?;
+    let quantization = load_checkpoint_quantization_settings(model_path)?;
 
     let mut params = model.parameters_mut().flatten();
 
@@ -1386,6 +1389,7 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
         tracing::debug!(file = %file_path.display(), prefix, "Loading weights with prefix");
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+        validate_quantized_tensor_widths(&loaded, quantization.as_ref())?;
 
         let mut matched = 0usize;
         let mut unmatched = 0usize;
@@ -1454,6 +1458,7 @@ pub fn load_quantized_safetensors_weights_optional_prefix<M: ModuleParametersExt
 ) -> Result<(), ModelError> {
     const MAX_UNMATCHED_WARNS: usize = 5;
     let safetensors_files = collect_safetensors_files(model_path)?;
+    let quantization = load_checkpoint_quantization_settings(model_path)?;
 
     let mut params = model.parameters_mut().flatten();
     let mut total_matched = 0usize;
@@ -1463,6 +1468,7 @@ pub fn load_quantized_safetensors_weights_optional_prefix<M: ModuleParametersExt
     for file_path in &safetensors_files {
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+        validate_quantized_tensor_widths(&loaded, quantization.as_ref())?;
 
         for (key, value) in loaded {
             let stripped = key.strip_prefix(optional_prefix).unwrap_or(&key);
@@ -1495,6 +1501,92 @@ pub fn load_quantized_safetensors_weights_optional_prefix<M: ModuleParametersExt
         .eval()
         .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
 
+    Ok(())
+}
+
+fn load_checkpoint_quantization_settings(
+    model_path: &Path,
+) -> Result<Option<quant_config::QuantizationSettings>, ModelError> {
+    let config_path = model_path.join("config.json");
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    let config: Value = serde_json::from_reader(std::fs::File::open(config_path)?)?;
+    let quantization = config.get("quantization").or_else(|| {
+        config
+            .get("text_config")
+            .and_then(|text| text.get("quantization"))
+    });
+    quantization
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(ModelError::from)
+}
+
+/// Validate the packed inner dimension of a quantized tensor pair.
+///
+/// MLX stores `weight[..., in_features * bits / 32]` alongside
+/// `scales[..., in_features / group_size]`. Checking the two checkpoint
+/// tensors before assigning them prevents a malformed shard from reaching a
+/// later, less actionable Metal kernel error.
+fn validate_quantized_tensor_widths(
+    loaded: &HashMap<String, Array>,
+    quantization: Option<&quant_config::QuantizationSettings>,
+) -> Result<(), ModelError> {
+    let Some(settings) = quantization else {
+        return Ok(());
+    };
+
+    for (weight_key, weight) in loaded {
+        let Some(base) = weight_key.strip_suffix(".weight") else {
+            continue;
+        };
+        let scales_key = format!("{base}.scales");
+        let Some(scales) = loaded.get(&scales_key) else {
+            continue;
+        };
+        let quant = settings.resolve(base);
+        let bits = quant.bits();
+        let group_size = quant.group_size();
+        if bits <= 0 || group_size <= 0 {
+            continue;
+        }
+        let Some(&weight_width) = weight.shape().last() else {
+            continue;
+        };
+        let Some(&scales_width) = scales.shape().last() else {
+            continue;
+        };
+        let expected_scales_width = weight_width
+            .checked_mul(32)
+            .and_then(|width| width.checked_div(bits))
+            .and_then(|width| width.checked_div(group_size))
+            .ok_or_else(|| {
+                ModelError::ShapeMismatch(format!(
+                    "{scales_key}: invalid quantization group_size={group_size}, bits={bits}"
+                ))
+            })?;
+        if scales_width != expected_scales_width {
+            return Err(ModelError::ShapeMismatch(format!(
+                "{scales_key}: scales width expected {expected_scales_width}, actual {scales_width}"
+            )));
+        }
+        let expected_weight_width = scales_width
+            .checked_mul(group_size)
+            .and_then(|width| width.checked_mul(bits))
+            .and_then(|width| width.checked_div(32))
+            .ok_or_else(|| {
+                ModelError::ShapeMismatch(format!(
+                    "{weight_key}: invalid quantization group_size={group_size}, bits={bits}"
+                ))
+            })?;
+        if weight_width != expected_weight_width {
+            return Err(ModelError::ShapeMismatch(format!(
+                "{weight_key}: packed width expected {expected_weight_width}, actual {weight_width}"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1607,6 +1699,153 @@ fn remap_quantized_key(key: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::cache::KeyValueCache;
+    use crate::qwen3_next::QLinear;
+    use mlx_rs::macros::ModuleParameters;
+
+    #[derive(ModuleParameters)]
+    struct TestQuantizedModel {
+        #[param]
+        proj: QLinear,
+    }
+
+    #[derive(ModuleParameters)]
+    struct TestMixedQuantizedModel {
+        #[param]
+        dense: QLinear,
+        #[param]
+        quantized: QLinear,
+    }
+
+    #[test]
+    fn quantized_loader_rejects_wrong_scales_width() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"quantization":{"group_size":64,"bits":4}}"#,
+        )
+        .unwrap();
+
+        let packed_weight = [0_u8; 64 * 8 * 4];
+        let scales_bytes = [0_u8; 64 * 2 * 4];
+        let weight = safetensors::tensor::TensorView::new(
+            safetensors::tensor::Dtype::U32,
+            vec![64, 8],
+            &packed_weight,
+        )
+        .unwrap();
+        let scales_view = safetensors::tensor::TensorView::new(
+            safetensors::tensor::Dtype::F32,
+            vec![64, 2],
+            &scales_bytes,
+        )
+        .unwrap();
+        safetensors::serialize_to_file(
+            [("proj.weight", weight), ("proj.scales", scales_view)],
+            None,
+            &dir.path().join("model.safetensors"),
+        )
+        .unwrap();
+
+        let mut model = TestQuantizedModel {
+            proj: QLinear::new(64, 4).unwrap(),
+        };
+        let err = load_quantized_safetensors_weights(&mut model, dir.path(), true).unwrap_err();
+        assert!(
+            err.to_string().contains("proj.scales"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("expected 1"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("actual 2"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn quantized_loader_supports_mixed_dense_and_quantized_projections() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "quantization": {
+                    "group_size": 64,
+                    "bits": 4,
+                    "dense": false
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let mut dense = vec![0.0_f32; 2 * 64];
+        dense[0] = 1.0;
+        dense[65] = 1.0;
+        let packed_weight = [0_u8; 2 * 8 * 4];
+        let scales = [1.0_f32; 2];
+        let biases = [0.0_f32; 2];
+        let f32_bytes = |values: &[f32]| {
+            values
+                .iter()
+                .flat_map(|value| value.to_ne_bytes())
+                .collect::<Vec<_>>()
+        };
+        let dense_bytes = f32_bytes(&dense);
+        let scales_bytes = f32_bytes(&scales);
+        let biases_bytes = f32_bytes(&biases);
+        let dense_view = safetensors::tensor::TensorView::new(
+            safetensors::tensor::Dtype::F32,
+            vec![2, 64],
+            &dense_bytes,
+        )
+        .unwrap();
+        let weight = safetensors::tensor::TensorView::new(
+            safetensors::tensor::Dtype::U32,
+            vec![2, 8],
+            &packed_weight,
+        )
+        .unwrap();
+        let scales_view = safetensors::tensor::TensorView::new(
+            safetensors::tensor::Dtype::F32,
+            vec![2, 1],
+            &scales_bytes,
+        )
+        .unwrap();
+        let biases_view = safetensors::tensor::TensorView::new(
+            safetensors::tensor::Dtype::F32,
+            vec![2, 1],
+            &biases_bytes,
+        )
+        .unwrap();
+        safetensors::serialize_to_file(
+            [
+                ("dense.weight", dense_view),
+                ("quantized.weight", weight),
+                ("quantized.scales", scales_view),
+                ("quantized.biases", biases_view),
+            ],
+            None,
+            &dir.path().join("model.safetensors"),
+        )
+        .unwrap();
+
+        let mut model = TestMixedQuantizedModel {
+            dense: QLinear::new(0, 0).unwrap(),
+            quantized: QLinear::new(64, 4).unwrap(),
+        };
+        load_quantized_safetensors_weights(&mut model, dir.path(), true).unwrap();
+
+        let mut input_values = vec![0.0_f32; 64];
+        input_values[0] = 2.0;
+        input_values[1] = 3.0;
+        let input = Array::from_slice(&input_values, &[1, 1, 64]);
+        let dense_out = model.dense.forward(&input).unwrap();
+        let quantized_out = model.quantized.forward(&input).unwrap();
+        assert_eq!(dense_out.shape(), &[1, 1, 2]);
+        assert_eq!(quantized_out.shape(), &[1, 1, 2]);
+        assert_eq!(dense_out.as_slice::<f32>(), &[2.0, 3.0]);
+    }
 
     fn params(temp: f32, top_p: f32) -> SamplingParams {
         SamplingParams {

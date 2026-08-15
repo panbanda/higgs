@@ -645,8 +645,33 @@ struct DeepSeekV2MlpBlock {
     is_moe: bool,
 }
 
+fn deepseek_expert_projection_quantization(
+    args: &DeepSeekV2ModelArgs,
+    layer_idx: i32,
+    num_experts: i32,
+    projection: &str,
+    fallback_group_size: i32,
+    fallback_bits: i32,
+) -> Result<(i32, i32), Exception> {
+    let Some(settings) = args.quantization.as_ref() else {
+        return Ok((fallback_group_size, fallback_bits));
+    };
+    let paths = (0..num_experts)
+        .map(|expert_idx| format!("model.layers.{layer_idx}.mlp.experts.{expert_idx}.{projection}"))
+        .collect::<Vec<_>>();
+    let quant = settings
+        .resolve_uniform(paths.iter().map(String::as_str))
+        .map_err(Exception::custom)?;
+    Ok((quant.group_size(), quant.bits()))
+}
+
 impl DeepSeekV2MlpBlock {
-    fn new_moe(args: &DeepSeekV2ModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
+    fn new_moe(
+        args: &DeepSeekV2ModelArgs,
+        layer_idx: i32,
+        ql: i32,
+        qb: i32,
+    ) -> Result<Self, Exception> {
         let n_routed = args
             .n_routed_experts
             .ok_or_else(|| Exception::custom("n_routed_experts required for MoE layer"))?;
@@ -657,6 +682,24 @@ impl DeepSeekV2MlpBlock {
             .is_some()
             .then(|| SharedExperts::new(ql, qb))
             .transpose()?;
+        let expert_gate = deepseek_expert_projection_quantization(
+            args,
+            layer_idx,
+            n_routed,
+            "gate_proj",
+            ql,
+            qb,
+        )?;
+        let expert_up =
+            deepseek_expert_projection_quantization(args, layer_idx, n_routed, "up_proj", ql, qb)?;
+        let expert_down = deepseek_expert_projection_quantization(
+            args,
+            layer_idx,
+            n_routed,
+            "down_proj",
+            ql,
+            qb,
+        )?;
 
         Ok(Self {
             gate: Some(
@@ -664,7 +707,11 @@ impl DeepSeekV2MlpBlock {
                     .bias(false)
                     .build()?,
             ),
-            switch_mlp: Some(SwitchMlpWeights::new(ql, qb)?),
+            switch_mlp: Some(SwitchMlpWeights::new_with_projection_quantization(
+                expert_gate,
+                expert_up,
+                expert_down,
+            )?),
             shared_experts: shared,
             gate_proj: None,
             down_proj: None,
@@ -789,7 +836,7 @@ impl DeepSeekV2DecoderLayer {
         qb: i32,
     ) -> Result<Self, Exception> {
         let mlp = if args.is_moe_layer(layer_idx) {
-            DeepSeekV2MlpBlock::new_moe(args, ql, qb)?
+            DeepSeekV2MlpBlock::new_moe(args, layer_idx, ql, qb)?
         } else {
             DeepSeekV2MlpBlock::new_dense(ql, qb)?
         };
