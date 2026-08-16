@@ -23,7 +23,7 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sysinfo = "0.38"
-sha2 = "0.10"
+sha2 = "0.11"
 tokio = { workspace = true }
 tokenizers.workspace = true
 toml = "1.0"
