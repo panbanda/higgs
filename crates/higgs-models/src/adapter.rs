@@ -1,9 +1,13 @@
 //! Model-family detection and loading adapters.
 //!
-//! Resolution chooses the adapter with the highest score. Equal scores are
-//! resolved by registry order, which is stable and therefore deterministic.
+//! Detection preserves both nested text-backbone and top-level wrapper model
+//! types as resolution candidates. Resolution scores every adapter across all
+//! candidates: special structural matches beat exact matches, exact matches on
+//! any candidate beat tolerant matches on any candidate, and equal scores are
+//! resolved by stable registry order.
 
 use std::{
+    borrow::Cow,
     fmt,
     path::{Path, PathBuf},
     sync::OnceLock,
@@ -75,6 +79,12 @@ pub struct DetectedModel {
 }
 
 impl DetectedModel {
+    /// Candidate model types in diagnostic order: effective/nested first,
+    /// followed by the top-level wrapper type when present.
+    fn model_type_candidates(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.model_type.as_str()).chain(self.wrapper_model_type.as_deref())
+    }
+
     /// The config object consumed by the effective text loader.
     #[must_use]
     pub fn resolved_config(&self) -> &Value {
@@ -317,16 +327,22 @@ static BUILTINS: [&BuiltinAdapter; 13] = [
 
 impl BuiltinAdapter {
     fn is_exact(&self, model_type: &str) -> bool {
+        let text_alias = strip_text_alias(model_type);
         match self.kind {
-            LoadKind::Transformer => matches!(model_type, "qwen2" | "qwen3" | "llama" | "mistral"),
-            LoadKind::Bonsai => model_type == "qwen3",
-            LoadKind::Qwen3Next => model_type == "qwen3_next",
-            LoadKind::Qwen35Dense => model_type == "qwen3_5",
-            LoadKind::Qwen35Moe => model_type == "qwen3_5_moe",
-            LoadKind::Qwen3Moe => model_type == "qwen3_moe",
+            LoadKind::Transformer => {
+                matches!(text_alias.as_ref(), "qwen2" | "qwen3")
+                    || matches!(model_type, "llama" | "mistral")
+            }
+            LoadKind::Bonsai => text_alias == "qwen3",
+            LoadKind::Qwen3Next => text_alias == "qwen3_next",
+            LoadKind::Qwen35Dense => text_alias == "qwen3_5",
+            LoadKind::Qwen35Moe => text_alias == "qwen3_5_moe",
+            LoadKind::Qwen3Moe => text_alias == "qwen3_moe",
             LoadKind::Gemma2 => model_type == "gemma2",
-            LoadKind::Gemma3 => matches!(model_type, "gemma3" | "gemma3_text"),
-            LoadKind::Gemma4 => matches!(model_type, "gemma4" | "gemma4_text" | "gemma4_unified"),
+            LoadKind::Gemma3 => text_alias == "gemma3",
+            LoadKind::Gemma4 => {
+                matches!(text_alias.as_ref(), "gemma4" | "gemma4_unified")
+            }
             LoadKind::Phi3 => model_type == "phi3",
             LoadKind::Starcoder2 => model_type == "starcoder2",
             LoadKind::LlavaQwen2 => model_type == "llava-qwen2",
@@ -334,16 +350,16 @@ impl BuiltinAdapter {
         }
     }
 
-    fn tolerant_match(&self, model: &DetectedModel) -> bool {
+    fn tolerant_match(&self, model_type: &str) -> bool {
         match self.kind {
             LoadKind::Qwen35Dense => {
-                qwen_revision(&model.model_type).is_some_and(|(minor, moe)| minor >= 5 && !moe)
+                qwen_revision(model_type).is_some_and(|(minor, moe)| minor >= 5 && !moe)
             }
             LoadKind::Qwen35Moe => {
-                qwen_revision(&model.model_type).is_some_and(|(minor, moe)| minor >= 5 && moe)
+                qwen_revision(model_type).is_some_and(|(minor, moe)| minor >= 5 && moe)
             }
-            LoadKind::Gemma3 => gemma_revision(&model.model_type).is_some_and(|major| major >= 3),
-            LoadKind::Gemma4 => gemma_revision(&model.model_type).is_some_and(|major| major >= 4),
+            LoadKind::Gemma3 => gemma_revision(model_type).is_some_and(|major| major >= 3),
+            LoadKind::Gemma4 => gemma_revision(model_type).is_some_and(|major| major >= 4),
             LoadKind::Transformer
             | LoadKind::Bonsai
             | LoadKind::Qwen3Next
@@ -356,8 +372,14 @@ impl BuiltinAdapter {
         }
     }
 
+    fn has_exact_candidate(&self, model: &DetectedModel) -> bool {
+        model
+            .model_type_candidates()
+            .any(|model_type| self.is_exact(model_type))
+    }
+
     fn validate_tolerant(&self, model: &DetectedModel) -> Result<(), ModelError> {
-        if self.is_exact(&model.model_type) {
+        if self.has_exact_candidate(model) {
             return Ok(());
         }
         let config = model.resolved_config();
@@ -449,14 +471,17 @@ impl ModelAdapter for BuiltinAdapter {
         if matches!(self.kind, LoadKind::Bonsai) {
             let group_size = u64::try_from(crate::bonsai_q1::GROUP_SIZE).ok()?;
             let quantization = model.raw.get("quantization")?;
-            return (model.model_type == "qwen3"
+            return (self.has_exact_candidate(model)
                 && quantization.get("bits").and_then(Value::as_u64) == Some(1)
                 && quantization.get("group_size").and_then(Value::as_u64) == Some(group_size))
             .then_some(2_000);
         }
-        if self.is_exact(&model.model_type) {
+        if self.has_exact_candidate(model) {
             Some(1_000)
-        } else if self.tolerant_match(model) {
+        } else if model
+            .model_type_candidates()
+            .any(|model_type| self.tolerant_match(model_type))
+        {
             Some(if matches!(self.kind, LoadKind::Gemma4) {
                 120
             } else {
@@ -468,7 +493,7 @@ impl ModelAdapter for BuiltinAdapter {
     }
     fn load(&self, model: &DetectedModel) -> Result<AnyModel, ModelError> {
         self.validate_tolerant(model)?;
-        if !self.is_exact(&model.model_type) {
+        if !self.has_exact_candidate(model) {
             tracing::warn!(model_type = %model.model_type, adapter = self.id, "loading an untested model version through a structurally compatible adapter");
         }
         let dir = &model.dir;
@@ -566,21 +591,14 @@ pub fn detect(dir: &Path) -> Result<DetectedModel, ModelError> {
                 .map(ToOwned::to_owned)
                 .collect()
         });
-    let is_wrapper = architectures
-        .iter()
-        .any(|name| name.ends_with("ForConditionalGeneration"));
     let nested_type = raw
         .get("text_config")
         .and_then(|value| value.get("model_type"))
         .and_then(Value::as_str);
-    let (model_type, wrapper_model_type) = if is_wrapper {
-        nested_type.map_or_else(
-            || (top_model_type.to_owned(), None),
-            |nested| (nested.to_owned(), Some(top_model_type.to_owned())),
-        )
-    } else {
-        (top_model_type.to_owned(), None)
-    };
+    let (model_type, wrapper_model_type) = nested_type.map_or_else(
+        || (top_model_type.to_owned(), None),
+        |nested| (nested.to_owned(), Some(top_model_type.to_owned())),
+    );
     let (family, version) = classify(&model_type);
     Ok(DetectedModel {
         model_type,
@@ -593,8 +611,10 @@ pub fn detect(dir: &Path) -> Result<DetectedModel, ModelError> {
     })
 }
 
-/// Resolve the most-specific adapter, validating structural compatibility for
-/// version-tolerant matches.
+/// Resolve the most-specific adapter across all detected model-type candidates.
+///
+/// Exact matches on either the nested or wrapper candidate take precedence over
+/// every version-tolerant match. Tolerant selections retain structural checks.
 pub fn resolve(model: &DetectedModel) -> Result<&'static dyn ModelAdapter, ModelError> {
     let selected = registry()
         .iter()
@@ -636,7 +656,9 @@ pub fn supported() -> Vec<AdapterInfo> {
 /// Whether resolution selected a structurally gated, not-exactly-known version.
 #[must_use]
 pub fn is_untested_version(adapter: &dyn ModelAdapter, model: &DetectedModel) -> bool {
-    !is_exact_supported_by(adapter.id(), &model.model_type)
+    !model
+        .model_type_candidates()
+        .any(|model_type| is_exact_supported_by(adapter.id(), model_type))
 }
 
 /// Exact-string compatibility used by the legacy registry facade.
@@ -663,7 +685,8 @@ fn unsupported_error(model_type: &str) -> ModelError {
 }
 
 fn qwen_revision(model_type: &str) -> Option<(u32, bool)> {
-    let rest = model_type.strip_prefix("qwen3_")?;
+    let normalized = strip_text_alias(model_type);
+    let rest = normalized.strip_prefix("qwen3_")?;
     let (minor_text, suffix) = rest
         .split_once('_')
         .map_or((rest, None), |(minor, suffix)| (minor, Some(suffix)));
@@ -676,7 +699,8 @@ fn qwen_revision(model_type: &str) -> Option<(u32, bool)> {
 }
 
 fn gemma_revision(model_type: &str) -> Option<u32> {
-    let rest = model_type.strip_prefix("gemma")?;
+    let normalized = strip_text_alias(model_type);
+    let rest = normalized.strip_prefix("gemma")?;
     let (major, suffix) = rest
         .split_once('_')
         .map_or((rest, None), |(major, suffix)| (major, Some(suffix)));
@@ -684,6 +708,17 @@ fn gemma_revision(model_type: &str) -> Option<u32> {
         return None;
     }
     major.parse().ok()
+}
+
+fn strip_text_alias(model_type: &str) -> Cow<'_, str> {
+    model_type.strip_suffix("_text_moe").map_or_else(
+        || {
+            model_type
+                .strip_suffix("_text")
+                .map_or(Cow::Borrowed(model_type), Cow::Borrowed)
+        },
+        |prefix| Cow::Owned(format!("{prefix}_moe")),
+    )
 }
 
 fn classify(model_type: &str) -> (ModelFamily, Option<ModelVersion>) {

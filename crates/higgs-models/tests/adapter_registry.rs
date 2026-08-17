@@ -34,6 +34,14 @@ fn complete_config(model_type: &str) -> serde_json::Value {
     })
 }
 
+fn wrapped_config(top_model_type: &str, nested_model_type: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model_type": top_model_type,
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "text_config": complete_config(nested_model_type)
+    })
+}
+
 #[test]
 fn detects_plain_config() {
     let dir = write_config(&serde_json::json!({
@@ -81,6 +89,71 @@ fn detects_nested_text_config_for_conditional_generation_wrapper() {
     assert_eq!(detected.wrapper_model_type.as_deref(), Some("qwen3_5"));
     assert_eq!(detected.model_type, "qwen3_9");
     assert_eq!(detected.version, Some(ModelVersion { major: 3, minor: 9 }));
+}
+
+#[test]
+fn nested_text_config_is_always_a_resolution_candidate() {
+    let dir = write_config(&serde_json::json!({
+        "model_type": "qwen3_5",
+        "architectures": ["NonstandardWrapperModel"],
+        "text_config": { "model_type": "unknown_text_backbone" }
+    }));
+    let detected = adapter::detect(dir.path()).unwrap();
+
+    assert_eq!(detected.model_type, "unknown_text_backbone");
+    assert_eq!(detected.wrapper_model_type.as_deref(), Some("qwen3_5"));
+    assert_eq!(adapter::resolve(&detected).unwrap().id(), "qwen3.5-dense");
+}
+
+#[test]
+fn qwen38_wrapper_text_alias_resolves_to_dense_adapter() {
+    let dir = write_config(&wrapped_config("qwen3_5", "qwen3_5_text"));
+    let detected = adapter::detect(dir.path()).unwrap();
+    let resolved = adapter::resolve(&detected).unwrap();
+
+    assert_eq!(detected.model_type, "qwen3_5_text");
+    assert_eq!(detected.wrapper_model_type.as_deref(), Some("qwen3_5"));
+    assert_eq!(resolved.id(), "qwen3.5-dense");
+    assert!(!adapter::is_untested_version(resolved, &detected));
+}
+
+#[test]
+fn exact_wrapper_candidate_beats_tolerant_nested_candidate() {
+    let dir = write_config(&wrapped_config("qwen3_5", "qwen3_9_text"));
+    let detected = adapter::detect(dir.path()).unwrap();
+    let resolved = adapter::resolve(&detected).unwrap();
+
+    assert_eq!(resolved.id(), "qwen3.5-dense");
+    assert!(!adapter::is_untested_version(resolved, &detected));
+}
+
+#[test]
+fn future_qwen_wrapper_text_alias_resolves_tolerantly() {
+    let dir = write_config(&wrapped_config("qwen3_9", "qwen3_9_text"));
+    let detected = adapter::detect(dir.path()).unwrap();
+    let resolved = adapter::resolve(&detected).unwrap();
+
+    assert_eq!(resolved.id(), "qwen3.5-dense");
+    assert!(adapter::is_untested_version(resolved, &detected));
+}
+
+#[test]
+fn future_qwen_text_moe_alias_resolves_tolerantly() {
+    let mut config = wrapped_config("qwen3_9_text_moe", "qwen3_9_text_moe");
+    let text_config = config
+        .get_mut("text_config")
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap();
+    text_config.insert("num_experts".into(), 128.into());
+    text_config.insert("num_experts_per_tok".into(), 8.into());
+    text_config.insert("shared_expert_intermediate_size".into(), 1_024.into());
+    text_config.insert("moe_intermediate_size".into(), 768.into());
+    let dir = write_config(&config);
+    let detected = adapter::detect(dir.path()).unwrap();
+    let resolved = adapter::resolve(&detected).unwrap();
+
+    assert_eq!(resolved.id(), "qwen3.5-moe");
+    assert!(adapter::is_untested_version(resolved, &detected));
 }
 
 #[test]
