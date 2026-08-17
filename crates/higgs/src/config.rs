@@ -904,10 +904,6 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
     Ok(())
 }
 
-fn supports_batch_model_type(model_type: &str) -> bool {
-    matches!(model_type, "qwen2" | "qwen3" | "llama" | "mistral")
-}
-
 fn batch_support_for_model_path(model_path: &str) -> Result<Option<bool>, String> {
     match crate::model_resolver::resolve(model_path) {
         Ok(resolved) => resolved_model_supports_batch(&resolved).map(Some),
@@ -929,7 +925,7 @@ fn batch_support_check_can_be_deferred(model_path: &str, err: &str) -> bool {
 pub fn resolved_model_supports_batch(model_dir: &Path) -> Result<bool, String> {
     let inspected = model_loader::ModelConfig::from_dir(model_dir)
         .map_err(|e| format!("failed to inspect {}: {e}", model_dir.display()))?;
-    Ok(supports_batch_model_type(&inspected.model_type))
+    Ok(inspected.capabilities.batch_engine)
 }
 
 /// If `auto_router` is enabled, ensure its model is present in `config.models`

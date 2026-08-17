@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::error::ModelError;
 
 /// Maximum config.json size (10 MiB) — prevents `DoS` from symlinked large files.
-const MAX_CONFIG_SIZE: u64 = 10 * 1024 * 1024;
+const MAX_CONFIG_SIZE: u64 = crate::adapter::MAX_CONFIG_SIZE;
 
 /// Detect the model architecture from config.json's `model_type` field.
 pub fn detect_model_type<P: AsRef<Path>>(model_dir: P) -> Result<String, ModelError> {
@@ -26,27 +26,7 @@ pub fn detect_model_type<P: AsRef<Path>>(model_dir: P) -> Result<String, ModelEr
 
 /// Supported model architectures.
 pub fn is_supported(model_type: &str) -> bool {
-    matches!(
-        model_type,
-        "qwen2"
-            | "qwen3"
-            | "llama"
-            | "mistral"
-            | "qwen3_next"
-            | "qwen3_moe"
-            | "qwen3_5"
-            | "qwen3_5_moe"
-            | "gemma2"
-            | "gemma3"
-            | "gemma3_text"
-            | "gemma4"
-            | "gemma4_text"
-            | "gemma4_unified"
-            | "phi3"
-            | "starcoder2"
-            | "llava-qwen2"
-            | "deepseek_v2"
-    )
+    crate::adapter::is_exact_supported(model_type)
 }
 
 #[allow(clippy::panic, clippy::unwrap_used)]

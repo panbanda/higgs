@@ -912,7 +912,13 @@ pub fn load_gemma2_model_args<P: AsRef<Path>>(model_dir: P) -> Result<Gemma2Mode
 pub fn load_gemma2_model<P: AsRef<Path>>(model_dir: P) -> Result<Gemma2CausalLM, ModelError> {
     let model_path = model_dir.as_ref();
     let args = load_gemma2_model_args(model_path)?;
+    load_gemma2_model_with_args(model_path, args)
+}
 
+pub(crate) fn load_gemma2_model_with_args(
+    model_path: &Path,
+    args: Gemma2ModelArgs,
+) -> Result<Gemma2CausalLM, ModelError> {
     tracing::info!(
         model_type = %args.model_type,
         hidden_size = args.hidden_size,
@@ -945,7 +951,12 @@ pub fn load_gemma2_model<P: AsRef<Path>>(model_dir: P) -> Result<Gemma2CausalLM,
         raw_model
     };
 
-    crate::load_quantized_safetensors_weights(&mut model, model_path, quantization.is_some())?;
+    crate::load_quantized_safetensors_weights_with_settings(
+        &mut model,
+        model_path,
+        quantization.is_some(),
+        quantization.as_ref(),
+    )?;
 
     // Apply RMSNorm +1 convention: add 1.0 to all norm weights
     apply_rmsnorm_plus_one(&mut model)

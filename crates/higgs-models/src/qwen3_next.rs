@@ -4424,7 +4424,7 @@ fn gate_quantization_override(config: &serde_json::Value) -> Option<serde_json::
     None
 }
 
-fn load_qwen3_next_args_from_value(
+pub(crate) fn load_qwen3_next_args_from_value(
     mut config: serde_json::Value,
 ) -> Result<Qwen3NextModelArgs, ModelError> {
     let gate_override = gate_quantization_override(&config);
@@ -4631,7 +4631,14 @@ pub fn load_qwen3_next_model<P: AsRef<Path>>(
     model_dir: P,
 ) -> Result<Qwen3NextCausalLM, ModelError> {
     let model_path = model_dir.as_ref();
-    let mut args = load_model_args(model_path)?;
+    let args = load_model_args(model_path)?;
+    load_qwen3_next_model_with_args(model_path, args)
+}
+
+pub(crate) fn load_qwen3_next_model_with_args(
+    model_path: &Path,
+    mut args: Qwen3NextModelArgs,
+) -> Result<Qwen3NextCausalLM, ModelError> {
     maybe_disable_mtp_without_checkpoint_weights(&mut args, model_path)?;
 
     tracing::info!(
@@ -4645,6 +4652,7 @@ pub fn load_qwen3_next_model<P: AsRef<Path>>(
         "Loading qwen3_next model"
     );
 
+    let quantization = args.quantization.clone();
     let mut model = Qwen3NextCausalLM::new(args)?;
 
     // Backbone keys match model params directly, but the MTP sidecar may need
@@ -4652,7 +4660,7 @@ pub fn load_qwen3_next_model<P: AsRef<Path>>(
     // dense or MoE head (params `dense_mtp.*` / `moe_mtp.*`) while the checkpoint
     // still ships the head under the `mtp.*` namespace. The plain loader can't
     // bridge that, so it would silently leave the draft head uninitialized.
-    load_qwen3_next_weights(&mut model, model_path)?;
+    load_qwen3_next_weights(&mut model, model_path, quantization.as_ref())?;
 
     tracing::info!("Qwen3Next model loaded successfully");
     Ok(model)
@@ -4674,7 +4682,12 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
     let config_path = model_dir.as_ref().join("config.json");
     let file = std::fs::File::open(config_path)?;
     let config: serde_json::Value = serde_json::from_reader(file)?;
+    load_qwen3_5_text_config_args_from_value(&config)
+}
 
+pub(crate) fn load_qwen3_5_text_config_args_from_value(
+    config: &serde_json::Value,
+) -> Result<Qwen3NextModelArgs, ModelError> {
     let text_config = config
         .get("text_config")
         .ok_or_else(|| ModelError::UnsupportedModel("missing text_config in config.json".into()))?;
@@ -4730,7 +4743,7 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
     // in Unsloth dynamic quants), construct the model with separate GDN
     // projection fields so the direct weight loader can match them. Otherwise,
     // construct with fused fields (weights are rearranged at load time).
-    let mixed_ba_layers = qwen3_5_mixed_ba_quantization_layers(&config, text_config);
+    let mixed_ba_layers = qwen3_5_mixed_ba_quantization_layers(config, text_config);
     let config_requests_separate = map
         .get("use_separate_gdn_projections")
         .and_then(serde_json::Value::as_bool)
@@ -4750,7 +4763,7 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
     }
 
     // Detect per-layer gate quantization override from top-level quantization config
-    if let Some(gate_q) = gate_quantization_override(&config) {
+    if let Some(gate_q) = gate_quantization_override(config) {
         map.insert("gate_quantization".to_owned(), gate_q);
     }
 
@@ -4827,7 +4840,14 @@ fn qwen3_5_mixed_ba_quantization_layers(
 /// `decoder_sparse_step=1` or attempt `MoE` gate fusion.
 pub fn load_qwen3_5_model<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3NextCausalLM, ModelError> {
     let model_path = model_dir.as_ref();
-    let mut args = load_qwen3_5_moe_text_config_args(model_path)?;
+    let args = load_qwen3_5_moe_text_config_args(model_path)?;
+    load_qwen3_5_model_with_args(model_path, args)
+}
+
+pub(crate) fn load_qwen3_5_model_with_args(
+    model_path: &Path,
+    mut args: Qwen3NextModelArgs,
+) -> Result<Qwen3NextCausalLM, ModelError> {
     maybe_disable_mtp_without_checkpoint_weights(&mut args, model_path)?;
 
     tracing::info!(
@@ -4861,7 +4881,14 @@ pub fn load_qwen3_5_moe_model<P: AsRef<Path>>(
     model_dir: P,
 ) -> Result<Qwen3NextCausalLM, ModelError> {
     let model_path = model_dir.as_ref();
-    let mut args = load_qwen3_5_moe_text_config_args(model_path)?;
+    let args = load_qwen3_5_moe_text_config_args(model_path)?;
+    load_qwen3_5_moe_model_with_args(model_path, args)
+}
+
+pub(crate) fn load_qwen3_5_moe_model_with_args(
+    model_path: &Path,
+    mut args: Qwen3NextModelArgs,
+) -> Result<Qwen3NextCausalLM, ModelError> {
     maybe_disable_mtp_without_checkpoint_weights(&mut args, model_path)?;
 
     tracing::info!(
@@ -4905,18 +4932,24 @@ fn load_qwen3_5_model_with_gdn_fallback(
     mut args: Qwen3NextModelArgs,
     gdn_dims: &GdnDims,
 ) -> Result<Qwen3NextCausalLM, ModelError> {
+    let quantization = args.quantization.clone();
     let force_separate =
         args.use_separate_gdn_projections || std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok();
     if force_separate {
         args.use_separate_gdn_projections = true;
         let mut model = Qwen3NextCausalLM::new(args)?;
-        load_qwen3_5_moe_weights_direct(&mut model, model_path)?;
+        load_qwen3_5_moe_weights_direct(&mut model, model_path, quantization.as_ref())?;
         tracing::info!("Using SEPARATE GDN projections (4 dispatches per layer)");
         return Ok(model);
     }
 
     let mut fused_model = Qwen3NextCausalLM::new(args.clone())?;
-    match load_qwen3_5_moe_weights_fused(&mut fused_model, model_path, gdn_dims) {
+    match load_qwen3_5_moe_weights_fused(
+        &mut fused_model,
+        model_path,
+        gdn_dims,
+        quantization.as_ref(),
+    ) {
         Ok(()) => {
             tracing::info!("Using FUSED GDN projections (2 dispatches per layer)");
             Ok(fused_model)
@@ -4928,7 +4961,11 @@ fn load_qwen3_5_model_with_gdn_fallback(
             );
             args.use_separate_gdn_projections = true;
             let mut separate_model = Qwen3NextCausalLM::new(args)?;
-            load_qwen3_5_moe_weights_direct(&mut separate_model, model_path)?;
+            load_qwen3_5_moe_weights_direct(
+                &mut separate_model,
+                model_path,
+                quantization.as_ref(),
+            )?;
             tracing::info!(
                 "Using SEPARATE GDN projections (4 dispatches per layer, mixed-bit fallback)"
             );
@@ -5158,15 +5195,15 @@ fn qwen35_loaded_value(
 fn load_qwen3_next_weights<M: mlx_rs::module::ModuleParametersExt>(
     model: &mut M,
     model_path: &Path,
+    quantization: Option<&QuantizationConfig>,
 ) -> Result<(), crate::error::ModelError> {
     let safetensors_files = crate::collect_safetensors_files(model_path)?;
-    let quantization = crate::load_checkpoint_quantization_settings(model_path)?;
     let mut params = model.parameters_mut().flatten();
 
     for file_path in &safetensors_files {
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
-        crate::validate_quantized_tensor_widths(&loaded, quantization.as_ref())?;
+        crate::validate_quantized_tensor_widths(&loaded, quantization)?;
 
         for (key, value) in loaded {
             let key = normalize_sidecar_mtp_key(file_path, key);
@@ -5195,9 +5232,9 @@ fn load_qwen3_next_weights<M: mlx_rs::module::ModuleParametersExt>(
 fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
     model: &mut M,
     model_path: &Path,
+    quantization: Option<&QuantizationConfig>,
 ) -> Result<(), crate::error::ModelError> {
     let safetensors_files = crate::collect_safetensors_files(model_path)?;
-    let quantization = crate::load_checkpoint_quantization_settings(model_path)?;
     let mut params = model.parameters_mut().flatten();
     let mut matched = 0usize;
     let mut unmatched = Vec::new();
@@ -5205,7 +5242,7 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
     for file_path in &safetensors_files {
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
-        crate::validate_quantized_tensor_widths(&loaded, quantization.as_ref())?;
+        crate::validate_quantized_tensor_widths(&loaded, quantization)?;
 
         for (key, value) in loaded {
             let key = normalize_sidecar_mtp_key(file_path, key);
@@ -5271,11 +5308,11 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     model: &mut M,
     model_path: &Path,
     gdn_dims: &GdnDims,
+    quantization: Option<&QuantizationConfig>,
 ) -> Result<(), crate::error::ModelError> {
     use std::collections::HashMap;
 
     let safetensors_files = crate::collect_safetensors_files(model_path)?;
-    let quantization = crate::load_checkpoint_quantization_settings(model_path)?;
     let mut params = model.parameters_mut().flatten();
 
     let qkvz_perm = build_qkvz_permutation(gdn_dims)
@@ -5294,7 +5331,7 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     for file_path in &safetensors_files {
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
-        crate::validate_quantized_tensor_widths(&loaded, quantization.as_ref())?;
+        crate::validate_quantized_tensor_widths(&loaded, quantization)?;
 
         for (key, value) in loaded {
             let key = normalize_sidecar_mtp_key(file_path, key);
@@ -6235,7 +6272,9 @@ mod tests {
         .unwrap();
 
         let mut model = Qwen3NextCausalLM::new(valid_causal_lm_args()).unwrap();
-        let err = load_qwen3_next_weights(&mut model, dir.path()).unwrap_err();
+        let quantization: QuantizationConfig =
+            serde_json::from_str(r#"{"group_size": 64, "bits": 4}"#).unwrap();
+        let err = load_qwen3_next_weights(&mut model, dir.path(), Some(&quantization)).unwrap_err();
         assert!(
             err.to_string().contains("model.layers.0.self_attn.q_proj"),
             "unexpected error: {err}"

@@ -266,8 +266,23 @@ fn merge_embeddings(
 pub fn load_llava_qwen2_model(model_dir: &Path) -> Result<LlavaQwen2Model, ModelError> {
     let config_path = model_dir.join("config.json");
     let config_str = std::fs::read_to_string(&config_path)?;
-    let config: LlavaQwen2Config = serde_json::from_str(&config_str)?;
+    let raw: serde_json::Value = serde_json::from_str(&config_str)?;
+    load_llava_qwen2_model_from_value(model_dir, &raw)
+}
 
+pub(crate) fn load_llava_qwen2_model_from_value(
+    model_dir: &Path,
+    raw: &serde_json::Value,
+) -> Result<LlavaQwen2Model, ModelError> {
+    let config: LlavaQwen2Config = serde_json::from_value(raw.clone())?;
+    load_llava_qwen2_model_with_config(model_dir, &config, raw)
+}
+
+fn load_llava_qwen2_model_with_config(
+    model_dir: &Path,
+    config: &LlavaQwen2Config,
+    raw: &serde_json::Value,
+) -> Result<LlavaQwen2Model, ModelError> {
     tracing::info!(
         image_size = config.vision_config.image_size,
         vision_layers = config.vision_config.num_hidden_layers,
@@ -285,7 +300,8 @@ pub fn load_llava_qwen2_model(model_dir: &Path) -> Result<LlavaQwen2Model, Model
     let mut mm_projector = MmProjector::new(config.mm_hidden_size, config.hidden_size)?;
 
     // Build language model (reads text_config, strips language_model. prefix)
-    let language_model = transformer::load_vlm_language_model(model_dir)?;
+    let language_args = transformer::text_model_args_from_value(raw)?;
+    let language_model = transformer::load_vlm_language_model_with_args(model_dir, language_args)?;
 
     // Load all safetensor weights for vision and projector
     let weights = load_safetensor_weights(model_dir)?;

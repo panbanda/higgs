@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use higgs_models::{
-    AnyModel, error::ModelError, load_tokenizer as shared_load_tokenizer, registry, transformer,
+    AnyModel,
+    adapter::{self, Capabilities, ModelFamily, ModelVersion},
+    load_tokenizer as shared_load_tokenizer,
 };
 
 use crate::error::EngineError;
@@ -11,138 +13,36 @@ use crate::error::EngineError;
 pub struct ModelConfig {
     pub model_dir: PathBuf,
     pub model_type: String,
+    pub adapter_id: &'static str,
+    pub family: ModelFamily,
+    pub version: Option<ModelVersion>,
+    pub capabilities: Capabilities,
 }
 
 impl ModelConfig {
     /// Detect model type and create a config from a model directory.
     pub fn from_dir<P: AsRef<Path>>(dir: P) -> Result<Self, EngineError> {
         let model_dir = dir.as_ref().to_path_buf();
-        let model_type = registry::detect_model_type(&model_dir)?;
-
-        if !registry::is_supported(&model_type) {
-            return Err(EngineError::Model(
-                higgs_models::error::ModelError::UnsupportedModel(model_type),
-            ));
-        }
+        let detected = adapter::detect(&model_dir)?;
+        let resolved = adapter::resolve(&detected)?;
+        let info = resolved.describe();
 
         Ok(Self {
             model_dir,
-            model_type,
+            model_type: detected.model_type,
+            adapter_id: info.id,
+            family: detected.family,
+            version: detected.version,
+            capabilities: info.capabilities,
         })
     }
 }
 
 /// Load a model from a directory, auto-detecting the architecture.
 pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError> {
-    let config = ModelConfig::from_dir(&model_dir)?;
-
-    match config.model_type.as_str() {
-        "qwen2" | "qwen3" | "llama" | "mistral" => {
-            // Packed 1.25-bpw Bonsai-Q1 checkpoints declare model_type="qwen3"
-            // but the weights are quantized to bits=1. Route them to the
-            // dedicated packed engine, whose bits=1 matvec/dequant run through
-            // runtime JIT Metal kernels (higgs-models::metal_kernel) — so it
-            // runs on stock oxideai/mlx-rs with no forked bits=1 MLX kernel.
-            if is_bonsai_q1(&config.model_dir)? {
-                let gpu = higgs_models::bonsai_q1::load_bonsai_q1(&config.model_dir)
-                    .map_err(EngineError::Model)?;
-                return Ok(AnyModel::BonsaiQ1(gpu));
-            }
-            let model = transformer::load_model(&config.model_dir).map_err(EngineError::Model)?;
-            Ok(AnyModel::Transformer(model))
-        }
-        "qwen3_next" => {
-            let model = higgs_models::qwen3_next::load_qwen3_next_model(&config.model_dir)
-                .map_err(EngineError::Model)?;
-            Ok(AnyModel::Qwen3Next(model))
-        }
-        "qwen3_5" => {
-            let model = higgs_models::qwen3_next::load_qwen3_5_model(&config.model_dir)
-                .map_err(EngineError::Model)?;
-            Ok(AnyModel::Qwen3Next(model))
-        }
-        "qwen3_5_moe" => {
-            let model = higgs_models::qwen3_next::load_qwen3_5_moe_model(&config.model_dir)
-                .map_err(EngineError::Model)?;
-            Ok(AnyModel::Qwen3Next(model))
-        }
-        "qwen3_moe" => {
-            let model = higgs_models::qwen3_moe::load_qwen3_moe_model(&config.model_dir)
-                .map_err(EngineError::Model)?;
-            Ok(AnyModel::Qwen3Moe(model))
-        }
-        "gemma2" => {
-            let model = higgs_models::gemma2::load_gemma2_model(&config.model_dir)
-                .map_err(EngineError::Model)?;
-            Ok(AnyModel::Gemma2(model))
-        }
-        "gemma3" | "gemma3_text" => {
-            let model = higgs_models::gemma3::load_gemma3_model(&config.model_dir)
-                .map_err(EngineError::Model)?;
-            Ok(AnyModel::Gemma3(model))
-        }
-        "gemma4" | "gemma4_text" | "gemma4_unified" => {
-            let model = higgs_models::gemma4::load_gemma4_model(&config.model_dir)
-                .map_err(EngineError::Model)?;
-            Ok(AnyModel::Gemma4(model))
-        }
-        "phi3" => {
-            let model = higgs_models::phi3::load_phi3_model(&config.model_dir)
-                .map_err(EngineError::Model)?;
-            Ok(AnyModel::Phi3(model))
-        }
-        "starcoder2" => {
-            let model = higgs_models::starcoder2::load_starcoder2_model(&config.model_dir)
-                .map_err(EngineError::Model)?;
-            Ok(AnyModel::Starcoder2(model))
-        }
-        "llava-qwen2" => {
-            let model = higgs_models::llava_qwen2::load_llava_qwen2_model(&config.model_dir)
-                .map_err(EngineError::Model)?;
-            Ok(AnyModel::LlavaQwen2(model))
-        }
-        "deepseek_v2" => {
-            let model = higgs_models::deepseek_v2::load_deepseek_v2_model(&config.model_dir)
-                .map_err(EngineError::Model)?;
-            Ok(AnyModel::DeepSeekV2(model))
-        }
-        other => Err(EngineError::Model(
-            higgs_models::error::ModelError::UnsupportedModel(other.to_owned()),
-        )),
-    }
-}
-
-/// Peek into `config.json` to detect packed 1-bit Bonsai-Q1 checkpoints.
-///
-/// Returns `true` for Qwen3-shaped `quantization.bits == 1` checkpoints using
-/// the expected group size. Returns `false` for any other model type or
-/// quantization config. A missing / malformed `config.json` propagates as an
-/// IO / JSON error — we never mask it.
-fn is_bonsai_q1(dir: &Path) -> Result<bool, EngineError> {
-    let cfg_path = dir.join("config.json");
-    let txt = std::fs::read_to_string(&cfg_path).map_err(|e| {
-        EngineError::Model(higgs_models::error::ModelError::Io(std::io::Error::new(
-            e.kind(),
-            format!("{}: {e}", cfg_path.display()),
-        )))
-    })?;
-    let cfg: serde_json::Value = serde_json::from_str(&txt)
-        .map_err(|e| EngineError::Model(higgs_models::error::ModelError::Json(e)))?;
-    let bonsai_group_size = u64::try_from(higgs_models::bonsai_q1::GROUP_SIZE)
-        .map_err(|e| EngineError::Model(ModelError::ShapeMismatch(e.to_string())))?;
-    Ok(
-        cfg.get("model_type").and_then(serde_json::Value::as_str) == Some("qwen3")
-            && cfg
-                .get("quantization")
-                .and_then(|q| q.get("bits"))
-                .and_then(serde_json::Value::as_u64)
-                == Some(1)
-            && cfg
-                .get("quantization")
-                .and_then(|q| q.get("group_size"))
-                .and_then(serde_json::Value::as_u64)
-                == Some(bonsai_group_size),
-    )
+    let detected = adapter::detect(model_dir.as_ref()).map_err(EngineError::Model)?;
+    let resolved = adapter::resolve(&detected).map_err(EngineError::Model)?;
+    resolved.load(&detected).map_err(EngineError::Model)
 }
 
 /// Load a tokenizer from a model directory.
@@ -307,44 +207,6 @@ mod tests {
             err,
             EngineError::Model(ModelError::UnsupportedModel(_))
         ));
-    }
-
-    #[test]
-    fn is_bonsai_q1_requires_qwen3_model_type_and_group_size() {
-        let (qwen3_dir, _qwen3_result) = config_from_raw(
-            r#"{
-                "model_type": "qwen3",
-                "quantization": {"bits": 1, "group_size": 128}
-            }"#,
-        );
-        assert!(is_bonsai_q1(qwen3_dir.path()).unwrap());
-
-        let (llama_dir, _llama_result) = config_from_raw(
-            r#"{
-                "model_type": "llama",
-                "quantization": {"bits": 1, "group_size": 128}
-            }"#,
-        );
-        assert!(!is_bonsai_q1(llama_dir.path()).unwrap());
-
-        let (wrong_group_dir, _wrong_group_result) = config_from_raw(
-            r#"{
-                "model_type": "qwen3",
-                "quantization": {"bits": 1, "group_size": 64}
-            }"#,
-        );
-        assert!(!is_bonsai_q1(wrong_group_dir.path()).unwrap());
-
-        let (q4_dir, _q4_result) = config_from_raw(
-            r#"{
-                "model_type": "qwen3",
-                "quantization": {"bits": 4, "group_size": 128}
-            }"#,
-        );
-        assert!(
-            !is_bonsai_q1(q4_dir.path()).unwrap(),
-            "regular Q4 Qwen3 must not be misclassified as Bonsai-Q1"
-        );
     }
 
     #[test]

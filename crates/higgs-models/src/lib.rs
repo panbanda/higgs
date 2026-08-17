@@ -1,3 +1,4 @@
+pub mod adapter;
 pub mod bonsai_q1;
 pub mod cache;
 pub mod deepseek_v2;
@@ -1328,8 +1329,22 @@ pub fn load_quantized_safetensors_weights<M: ModuleParametersExt>(
     model_path: &Path,
     quantized: bool,
 ) -> Result<(), ModelError> {
-    let safetensors_files = collect_safetensors_files(model_path)?;
     let quantization = load_checkpoint_quantization_settings(model_path)?;
+    load_quantized_safetensors_weights_with_settings(
+        model,
+        model_path,
+        quantized,
+        quantization.as_ref(),
+    )
+}
+
+pub(crate) fn load_quantized_safetensors_weights_with_settings<M: ModuleParametersExt>(
+    model: &mut M,
+    model_path: &Path,
+    quantized: bool,
+    quantization: Option<&quant_config::QuantizationSettings>,
+) -> Result<(), ModelError> {
+    let safetensors_files = collect_safetensors_files(model_path)?;
 
     let mut params = model.parameters_mut().flatten();
 
@@ -1337,7 +1352,7 @@ pub fn load_quantized_safetensors_weights<M: ModuleParametersExt>(
         tracing::debug!(file = %file_path.display(), "Loading weights");
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
-        validate_quantized_tensor_widths(&loaded, quantization.as_ref())?;
+        validate_quantized_tensor_widths(&loaded, quantization)?;
 
         for (key, value) in loaded {
             if let Some(param) = params.get_mut(&*key) {
@@ -1376,9 +1391,27 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
     quantized: bool,
     prefix: &str,
 ) -> Result<(), ModelError> {
+    let quantization = load_checkpoint_quantization_settings(model_path)?;
+    load_quantized_safetensors_weights_with_prefix_and_settings(
+        model,
+        model_path,
+        quantized,
+        prefix,
+        quantization.as_ref(),
+    )
+}
+
+pub(crate) fn load_quantized_safetensors_weights_with_prefix_and_settings<
+    M: ModuleParametersExt,
+>(
+    model: &mut M,
+    model_path: &Path,
+    quantized: bool,
+    prefix: &str,
+    quantization: Option<&quant_config::QuantizationSettings>,
+) -> Result<(), ModelError> {
     const MAX_UNMATCHED_WARNS: usize = 5;
     let safetensors_files = collect_safetensors_files(model_path)?;
-    let quantization = load_checkpoint_quantization_settings(model_path)?;
 
     let mut params = model.parameters_mut().flatten();
 
@@ -1389,7 +1422,7 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
         tracing::debug!(file = %file_path.display(), prefix, "Loading weights with prefix");
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
-        validate_quantized_tensor_widths(&loaded, quantization.as_ref())?;
+        validate_quantized_tensor_widths(&loaded, quantization)?;
 
         let mut matched = 0usize;
         let mut unmatched = 0usize;
@@ -1456,9 +1489,27 @@ pub fn load_quantized_safetensors_weights_optional_prefix<M: ModuleParametersExt
     quantized: bool,
     optional_prefix: &str,
 ) -> Result<(), ModelError> {
+    let quantization = load_checkpoint_quantization_settings(model_path)?;
+    load_quantized_safetensors_weights_optional_prefix_with_settings(
+        model,
+        model_path,
+        quantized,
+        optional_prefix,
+        quantization.as_ref(),
+    )
+}
+
+pub(crate) fn load_quantized_safetensors_weights_optional_prefix_with_settings<
+    M: ModuleParametersExt,
+>(
+    model: &mut M,
+    model_path: &Path,
+    quantized: bool,
+    optional_prefix: &str,
+    quantization: Option<&quant_config::QuantizationSettings>,
+) -> Result<(), ModelError> {
     const MAX_UNMATCHED_WARNS: usize = 5;
     let safetensors_files = collect_safetensors_files(model_path)?;
-    let quantization = load_checkpoint_quantization_settings(model_path)?;
 
     let mut params = model.parameters_mut().flatten();
     let mut total_matched = 0usize;
@@ -1468,7 +1519,7 @@ pub fn load_quantized_safetensors_weights_optional_prefix<M: ModuleParametersExt
     for file_path in &safetensors_files {
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
-        validate_quantized_tensor_widths(&loaded, quantization.as_ref())?;
+        validate_quantized_tensor_widths(&loaded, quantization)?;
 
         for (key, value) in loaded {
             let stripped = key.strip_prefix(optional_prefix).unwrap_or(&key);

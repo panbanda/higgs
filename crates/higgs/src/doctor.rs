@@ -286,11 +286,9 @@ fn check_prefill_yield_tokens(
     true
 }
 
-/// Warn (not fail) when the *resolved* MLA decision is enabled for a model
-/// whose architecture isn't `deepseek_v2`. The flag is a no-op for other
-/// architectures at runtime -- `KvCacheConfig::mla_latent` is only consulted
-/// by `DeepSeekV2::make_cache_with_config` -- so this is advisory, not a
-/// hard failure.
+/// Warn (not fail) when the *resolved* MLA decision is enabled for an adapter
+/// that does not advertise MLA latent-cache support. The flag is a no-op for
+/// those adapters at runtime, so this is advisory rather than a hard failure.
 ///
 /// Uses [`higgs_models::cache::resolve_mla_latent_cache`] rather than the raw
 /// `model.mla_latent_cache` field, so this matches runtime behavior: e.g.
@@ -298,6 +296,7 @@ fn check_prefill_yield_tokens(
 /// warns (the flag is effectively on), and `HIGGS_MLA_LATENT_CACHE=0` with
 /// `mla_latent_cache=true` in config does not warn (the flag is effectively
 /// off).
+#[cfg(test)]
 fn check_mla_latent_cache_architecture(
     label: &str,
     model: &crate::config::ModelConfig,
@@ -308,21 +307,7 @@ fn check_mla_latent_cache_architecture(
         return;
     }
     match model_loader::ModelConfig::from_dir(resolved) {
-        Ok(inspected) if inspected.model_type == "deepseek_v2" => {
-            pass(
-                &format!("model {label} mla_latent_cache=true (deepseek_v2)"),
-                result,
-            );
-        }
-        Ok(inspected) => {
-            warn(
-                &format!(
-                    "model {label} enables mla_latent_cache=true but architecture '{}' is not deepseek_v2; the flag is a no-op at runtime",
-                    inspected.model_type
-                ),
-                result,
-            );
-        }
+        Ok(inspected) => check_mla_latent_cache_adapter(label, &inspected, result),
         Err(err) => {
             warn(
                 &format!(
@@ -334,6 +319,31 @@ fn check_mla_latent_cache_architecture(
     }
 }
 
+fn check_mla_latent_cache_adapter(
+    label: &str,
+    inspected: &model_loader::ModelConfig,
+    result: &mut DoctorResult,
+) {
+    if inspected.capabilities.mla_latent_cache {
+        pass(
+            &format!(
+                "model {label} mla_latent_cache=true (adapter {})",
+                inspected.adapter_id
+            ),
+            result,
+        );
+    } else {
+        warn(
+            &format!(
+                "model {label} enables mla_latent_cache=true but adapter '{}' does not support MLA latent cache; the flag is a no-op at runtime",
+                inspected.adapter_id
+            ),
+            result,
+        );
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
     for model in &config.models {
         let label = model_label(model);
@@ -387,28 +397,32 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
         }
         match model_resolver::resolve(&model.path) {
             Ok(resolved) => {
+                let inspected = match model_loader::ModelConfig::from_dir(&resolved) {
+                    Ok(inspected) => inspected,
+                    Err(err) => {
+                        fail(
+                            &format!("model {label} architecture validation failed: {err}"),
+                            result,
+                        );
+                        continue;
+                    }
+                };
                 if model.batch {
-                    match crate::config::resolved_model_supports_batch(&resolved) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            fail(
-                                &format!(
-                                    "model {label} enables unsupported batch=true; only transformer models (llama, mistral, qwen2, qwen3) support true batched decode"
-                                ),
-                                result,
-                            );
-                            continue;
-                        }
-                        Err(err) => {
-                            fail(
-                                &format!("model {label} batch validation failed: {err}"),
-                                result,
-                            );
-                            continue;
-                        }
+                    if !inspected.capabilities.batch_engine {
+                        fail(
+                            &format!(
+                                "model {label} enables unsupported batch=true; adapter '{}' does not support true batched decode",
+                                inspected.adapter_id
+                            ),
+                            result,
+                        );
+                        continue;
                     }
                 }
-                check_mla_latent_cache_architecture(&label, model, &resolved, result);
+                if higgs_models::cache::resolve_mla_latent_cache(model.kv_cache_config().mla_latent)
+                {
+                    check_mla_latent_cache_adapter(&label, &inspected, result);
+                }
                 let requested_profile = model.requested_mlx_profile(&config.local);
                 let profile_msg = if model.batch {
                     "batch=true; batched decode supported".to_owned()
@@ -425,7 +439,16 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                         )
                     }
                 };
-                pass(&format!("model {label} resolvable ({profile_msg})"), result);
+                let version = inspected
+                    .version
+                    .map_or_else(|| "unknown".to_owned(), |version| version.to_string());
+                pass(
+                    &format!(
+                        "model {label} resolvable (adapter={}, family={}, version={version}; {profile_msg})",
+                        inspected.adapter_id, inspected.family
+                    ),
+                    result,
+                );
             }
             Err(err) => fail(&format!("model {label} not found: {err}"), result),
         }

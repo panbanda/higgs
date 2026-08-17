@@ -587,7 +587,13 @@ pub fn load_model_args<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3MoeModelArgs
 pub fn load_qwen3_moe_model<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3MoeCausalLM, ModelError> {
     let model_path = model_dir.as_ref();
     let args = load_model_args(model_path)?;
+    load_qwen3_moe_model_with_args(model_path, args)
+}
 
+pub(crate) fn load_qwen3_moe_model_with_args(
+    model_path: &Path,
+    args: Qwen3MoeModelArgs,
+) -> Result<Qwen3MoeCausalLM, ModelError> {
     tracing::info!(
         model_type = %args.model_type,
         hidden_size = args.hidden_size,
@@ -608,9 +614,15 @@ pub fn load_qwen3_moe_model<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3MoeCaus
         crate::validate_per_tensor_quantization_support(settings, &[])?;
     }
 
+    let quantization = args.quantization.clone();
     let mut model = Qwen3MoeCausalLM::new(args)?;
 
-    crate::load_safetensors_weights(&mut model, model_path)?;
+    crate::load_quantized_safetensors_weights_with_settings(
+        &mut model,
+        model_path,
+        false,
+        quantization.as_ref(),
+    )?;
 
     tracing::info!("Qwen3MoE model loaded successfully");
     Ok(model)

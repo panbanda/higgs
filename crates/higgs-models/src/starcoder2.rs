@@ -627,7 +627,13 @@ pub fn load_starcoder2_model<P: AsRef<Path>>(
 ) -> Result<Starcoder2CausalLM, ModelError> {
     let model_path = model_dir.as_ref();
     let args = load_starcoder2_model_args(model_path)?;
+    load_starcoder2_model_with_args(model_path, args)
+}
 
+pub(crate) fn load_starcoder2_model_with_args(
+    model_path: &Path,
+    args: Starcoder2ModelArgs,
+) -> Result<Starcoder2CausalLM, ModelError> {
     tracing::info!(
         model_type = %args.model_type,
         hidden_size = args.hidden_size,
@@ -660,7 +666,12 @@ pub fn load_starcoder2_model<P: AsRef<Path>>(
         raw_model
     };
 
-    crate::load_quantized_safetensors_weights(&mut model, model_path, quantization.is_some())?;
+    crate::load_quantized_safetensors_weights_with_settings(
+        &mut model,
+        model_path,
+        quantization.is_some(),
+        quantization.as_ref(),
+    )?;
 
     tracing::info!("Starcoder2 model loaded successfully");
     Ok(model)

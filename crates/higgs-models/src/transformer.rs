@@ -893,12 +893,21 @@ pub fn load_model_args<P: AsRef<Path>>(model_dir: P) -> Result<ModelArgs, ModelE
     Ok(serde_json::from_reader(file)?)
 }
 
+pub(crate) fn model_args_from_value(config: &serde_json::Value) -> Result<ModelArgs, ModelError> {
+    Ok(serde_json::from_value(config.clone())?)
+}
+
 /// Load model args from the `text_config` section of config.json (used by VLMs).
 pub fn load_text_config_args<P: AsRef<Path>>(model_dir: P) -> Result<ModelArgs, ModelError> {
     let config_path = model_dir.as_ref().join("config.json");
     let file = std::fs::File::open(config_path)?;
     let config: serde_json::Value = serde_json::from_reader(file)?;
+    text_model_args_from_value(&config)
+}
 
+pub(crate) fn text_model_args_from_value(
+    config: &serde_json::Value,
+) -> Result<ModelArgs, ModelError> {
     let text_config = config
         .get("text_config")
         .ok_or_else(|| ModelError::UnsupportedModel("missing text_config in config.json".into()))?;
@@ -919,7 +928,7 @@ pub fn load_text_config_args<P: AsRef<Path>>(model_dir: P) -> Result<ModelArgs, 
         }
     }
 
-    Ok(serde_json::from_value(text_obj)?)
+    model_args_from_value(&text_obj)
 }
 
 /// Load a language model for a VLM.
@@ -929,7 +938,13 @@ pub fn load_text_config_args<P: AsRef<Path>>(model_dir: P) -> Result<ModelArgs, 
 pub fn load_vlm_language_model<P: AsRef<Path>>(model_dir: P) -> Result<Model, ModelError> {
     let model_path = model_dir.as_ref();
     let args = load_text_config_args(model_path)?;
+    load_vlm_language_model_with_args(model_path, args)
+}
 
+pub(crate) fn load_vlm_language_model_with_args(
+    model_path: &Path,
+    args: ModelArgs,
+) -> Result<Model, ModelError> {
     tracing::info!(
         model_type = %args.model_type,
         hidden_size = args.hidden_size,
@@ -959,11 +974,12 @@ pub fn load_vlm_language_model<P: AsRef<Path>>(model_dir: P) -> Result<Model, Mo
         raw_model
     };
 
-    crate::load_quantized_safetensors_weights_with_prefix(
+    crate::load_quantized_safetensors_weights_with_prefix_and_settings(
         &mut model,
         model_path,
         quantization.is_some(),
         "language_model.",
+        quantization.as_ref(),
     )?;
 
     tracing::info!("VLM language model loaded successfully");
@@ -973,8 +989,14 @@ pub fn load_vlm_language_model<P: AsRef<Path>>(model_dir: P) -> Result<Model, Mo
 /// Load a model from a directory containing safetensors + config.json.
 pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<Model, ModelError> {
     let model_path = model_dir.as_ref();
-
     let args = load_model_args(model_path)?;
+    load_model_with_args(model_path, args)
+}
+
+pub(crate) fn load_model_with_args(
+    model_path: &Path,
+    args: ModelArgs,
+) -> Result<Model, ModelError> {
     tracing::info!(
         model_type = %args.model_type,
         hidden_size = args.hidden_size,
@@ -1011,7 +1033,12 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<Model, ModelError> {
         raw_model
     };
 
-    crate::load_quantized_safetensors_weights(&mut model, model_path, quantization.is_some())?;
+    crate::load_quantized_safetensors_weights_with_settings(
+        &mut model,
+        model_path,
+        quantization.is_some(),
+        quantization.as_ref(),
+    )?;
 
     tracing::info!("Model loaded successfully");
     Ok(model)

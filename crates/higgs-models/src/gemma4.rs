@@ -1542,9 +1542,15 @@ struct Gemma4TopLevel {
 /// Supports both flat and `text_config`-wrapped HF config formats.
 pub fn load_gemma4_model_args<P: AsRef<Path>>(model_dir: P) -> Result<Gemma4ModelArgs, ModelError> {
     let config_path = model_dir.as_ref().join("config.json");
-    let text = std::fs::read_to_string(config_path)?;
-    let raw: serde_json::Value = serde_json::from_str(&text)?;
-    let top: Gemma4TopLevel = serde_json::from_str(&text)?;
+    let file = std::fs::File::open(config_path)?;
+    let raw: serde_json::Value = serde_json::from_reader(file)?;
+    gemma4_model_args_from_value(raw)
+}
+
+pub(crate) fn gemma4_model_args_from_value(
+    raw: serde_json::Value,
+) -> Result<Gemma4ModelArgs, ModelError> {
+    let top: Gemma4TopLevel = serde_json::from_value(raw.clone())?;
 
     let mut args: Gemma4ModelArgs = if let Some(inner) = top.text_config {
         let mut a: Gemma4ModelArgs = serde_json::from_value(inner)?;
@@ -1574,7 +1580,13 @@ pub fn load_gemma4_model_args<P: AsRef<Path>>(model_dir: P) -> Result<Gemma4Mode
 pub fn load_gemma4_model<P: AsRef<Path>>(model_dir: P) -> Result<Gemma4CausalLM, ModelError> {
     let model_path = model_dir.as_ref();
     let args = load_gemma4_model_args(model_path)?;
+    load_gemma4_model_with_args(model_path, args)
+}
 
+pub(crate) fn load_gemma4_model_with_args(
+    model_path: &Path,
+    args: Gemma4ModelArgs,
+) -> Result<Gemma4CausalLM, ModelError> {
     tracing::info!(
         model_type = %args.model_type,
         hidden_size = args.hidden_size,
@@ -1609,11 +1621,12 @@ pub fn load_gemma4_model<P: AsRef<Path>>(model_dir: P) -> Result<Gemma4CausalLM,
     // `gemma4` (multimodal wrapper) checkpoints nest the text model under
     // `language_model.`; `gemma4_text` checkpoints start at `model.`. Strip the
     // prefix when present so both load, and skip the vision/audio tower weights.
-    crate::load_quantized_safetensors_weights_optional_prefix(
+    crate::load_quantized_safetensors_weights_optional_prefix_with_settings(
         &mut model,
         model_path,
         quantization.is_some(),
         "language_model.",
+        quantization.as_ref(),
     )?;
 
     if enable_moe {

@@ -559,7 +559,13 @@ pub fn load_phi3_model_args<P: AsRef<Path>>(model_dir: P) -> Result<Phi3ModelArg
 pub fn load_phi3_model<P: AsRef<Path>>(model_dir: P) -> Result<Phi3CausalLM, ModelError> {
     let model_path = model_dir.as_ref();
     let args = load_phi3_model_args(model_path)?;
+    load_phi3_model_with_args(model_path, args)
+}
 
+pub(crate) fn load_phi3_model_with_args(
+    model_path: &Path,
+    args: Phi3ModelArgs,
+) -> Result<Phi3CausalLM, ModelError> {
     let quantization = args.quantization.clone();
     if let Some(settings) = quantization.as_ref() {
         crate::validate_per_tensor_quantization_support(settings, &[])?;
@@ -590,7 +596,12 @@ pub fn load_phi3_model<P: AsRef<Path>>(model_dir: P) -> Result<Phi3CausalLM, Mod
         raw_model
     };
 
-    crate::load_quantized_safetensors_weights(&mut model, model_path, quantization.is_some())?;
+    crate::load_quantized_safetensors_weights_with_settings(
+        &mut model,
+        model_path,
+        quantization.is_some(),
+        quantization.as_ref(),
+    )?;
 
     tracing::info!("Phi-3 model loaded successfully");
     Ok(model)

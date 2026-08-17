@@ -65,6 +65,15 @@ pub fn load_bonsai_q1<P: AsRef<Path>>(model_dir: P) -> Result<BonsaiQ1Gpu, Model
     engine.to_gpu().map_err(ModelError::Mlx)
 }
 
+pub(crate) fn load_bonsai_q1_with_config(
+    model_dir: &Path,
+    config: &serde_json::Value,
+) -> Result<BonsaiQ1Gpu, ModelError> {
+    let engine =
+        BonsaiQ1Engine::load_with_config(model_dir, config).map_err(ModelError::ShapeMismatch)?;
+    engine.to_gpu().map_err(ModelError::Mlx)
+}
+
 pub const GROUP_SIZE: usize = 128;
 const GROUP_SIZE_I32: i32 = GROUP_SIZE as i32;
 
@@ -192,12 +201,14 @@ impl BonsaiQ1Engine {
     #[allow(clippy::too_many_lines)]
     pub fn load<P: AsRef<Path>>(model_dir: P) -> Result<Self, String> {
         let dir = model_dir.as_ref();
-
         let cfg_txt = std::fs::read_to_string(dir.join("config.json"))
             .map_err(|e| format!("config.json: {e}"))?;
         let cfg: serde_json::Value =
             serde_json::from_str(&cfg_txt).map_err(|e| format!("config.json parse: {e}"))?;
+        Self::load_with_config(dir, &cfg)
+    }
 
+    fn load_with_config(dir: &Path, cfg: &serde_json::Value) -> Result<Self, String> {
         let u64_of = |k: &str| -> Result<u64, String> {
             cfg[k]
                 .as_u64()
