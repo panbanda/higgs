@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.7.0](https://github.com/panbanda/higgs/compare/higgs-v1.6.1...higgs-v1.7.0) (2026-08-18)
+
+
+### Features
+
+* **config:** first-class config surface for the MLA latent KV cache ([#263](https://github.com/panbanda/higgs/issues/263)) ([cdb3c4e](https://github.com/panbanda/higgs/commit/cdb3c4e74677be2471a89ca6c4d826c2b095d662))
+* **engine:** chunked prefill yield quantum for the batch serving loop (PR8 / ds4 P9) ([#259](https://github.com/panbanda/higgs/issues/259)) ([247147e](https://github.com/panbanda/higgs/commit/247147eacfa04ad97af6d1b5aca974594e8da736))
+* **engine:** disk-backed KV prefix store for restart-resume (PR6 / ds4 P4) ([#257](https://github.com/panbanda/higgs/issues/257)) ([0435d11](https://github.com/panbanda/higgs/commit/0435d112ff8abf3de65ed554a95e3e3a9b69d690))
+
+
+### Bug Fixes
+
+* **higgs:** validate config writes, and make metrics see failed requests ([#272](https://github.com/panbanda/higgs/issues/272)) ([cfe0ab0](https://github.com/panbanda/higgs/commit/cfe0ab033705a2f819c1eb4d59b78db6c6d2f6f7))
+
 ## [1.6.1](https://github.com/panbanda/higgs/compare/higgs-v1.6.0...higgs-v1.6.1) (2026-08-11)
 
 

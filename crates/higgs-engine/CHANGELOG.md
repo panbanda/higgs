@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.7.0](https://github.com/panbanda/higgs/compare/higgs-engine-v1.6.1...higgs-engine-v1.7.0) (2026-08-18)
+
+
+### Features
+
+* **bench:** context-frontier benchmark with shared cache rollback helper (PR2 / ds4 P8) ([#253](https://github.com/panbanda/higgs/issues/253)) ([4510835](https://github.com/panbanda/higgs/commit/451083523816e33cf636d796e240c6bb21a0a62d))
+* **engine:** chunked prefill yield quantum for the batch serving loop (PR8 / ds4 P9) ([#259](https://github.com/panbanda/higgs/issues/259)) ([247147e](https://github.com/panbanda/higgs/commit/247147eacfa04ad97af6d1b5aca974594e8da736))
+* **engine:** disk-backed KV prefix store for restart-resume (PR6 / ds4 P4) ([#257](https://github.com/panbanda/higgs/issues/257)) ([0435d11](https://github.com/panbanda/higgs/commit/0435d112ff8abf3de65ed554a95e3e3a9b69d690))
+* **models:** MLA latent KV cache with weight absorption for DeepSeek-V2 (PR3 / ds4 P1) ([#254](https://github.com/panbanda/higgs/issues/254)) ([482d2ec](https://github.com/panbanda/higgs/commit/482d2eceab6d616f9e6e79c37d6af06624c42410))
+
+
+### Bug Fixes
+
+* **deps:** migrate to sha2 0.11 ([#273](https://github.com/panbanda/higgs/issues/273)) ([eb817f9](https://github.com/panbanda/higgs/commit/eb817f97f6f5fd27c6f6d1f1b99c358fe53c6724))
+
 ## [1.6.1](https://github.com/panbanda/higgs/compare/higgs-engine-v1.6.0...higgs-engine-v1.6.1) (2026-08-11)
 
 

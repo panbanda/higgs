@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.7.0](https://github.com/panbanda/higgs/compare/higgs-models-v1.6.1...higgs-models-v1.7.0) (2026-08-18)
+
+
+### Features
+
+* **bench:** context-frontier benchmark with shared cache rollback helper (PR2 / ds4 P8) ([#253](https://github.com/panbanda/higgs/issues/253)) ([4510835](https://github.com/panbanda/higgs/commit/451083523816e33cf636d796e240c6bb21a0a62d))
+* **config:** first-class config surface for the MLA latent KV cache ([#263](https://github.com/panbanda/higgs/issues/263)) ([cdb3c4e](https://github.com/panbanda/higgs/commit/cdb3c4e74677be2471a89ca6c4d826c2b095d662))
+* **engine:** disk-backed KV prefix store for restart-resume (PR6 / ds4 P4) ([#257](https://github.com/panbanda/higgs/issues/257)) ([0435d11](https://github.com/panbanda/higgs/commit/0435d112ff8abf3de65ed554a95e3e3a9b69d690))
+* **models:** MLA latent KV cache with weight absorption for DeepSeek-V2 (PR3 / ds4 P1) ([#254](https://github.com/panbanda/higgs/issues/254)) ([482d2ec](https://github.com/panbanda/higgs/commit/482d2eceab6d616f9e6e79c37d6af06624c42410))
+* **models:** per-tensor quantization settings with dense-mode loading (PR9 / ds4 P2 loader half) ([#260](https://github.com/panbanda/higgs/issues/260)) ([92277ca](https://github.com/panbanda/higgs/commit/92277cae5c4595d0148b826739633dc0f4619cfc))
+* **quantize:** MoE calibration tooling + loader fixes; asymmetric-quality claim negative ([#264](https://github.com/panbanda/higgs/issues/264)) ([9c40cce](https://github.com/panbanda/higgs/commit/9c40cce8094567ab5923281257a62542af9778e5))
+
 ## [1.6.1](https://github.com/panbanda/higgs/compare/higgs-models-v1.6.0...higgs-models-v1.6.1) (2026-08-11)
 
 
