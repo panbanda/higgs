@@ -11,11 +11,17 @@ use crate::error::EngineError;
 /// Configuration for loading a model from a directory.
 #[derive(Debug)]
 pub struct ModelConfig {
+    /// Local checkpoint directory used for model and tokenizer loading.
     pub model_dir: PathBuf,
+    /// Effective model type, using nested `text_config.model_type` for wrappers.
     pub model_type: String,
+    /// Stable identifier of the adapter selected for this checkpoint.
     pub adapter_id: &'static str,
+    /// Broad family detected from the effective model type.
     pub family: ModelFamily,
+    /// Numeric version parsed from `model_type`, or `None` when no numeric version parses.
     pub version: Option<ModelVersion>,
+    /// Capabilities of the resolved adapter implementation, not claims copied from the checkpoint.
     pub capabilities: Capabilities,
 }
 

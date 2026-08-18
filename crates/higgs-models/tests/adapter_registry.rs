@@ -96,13 +96,31 @@ fn nested_text_config_is_always_a_resolution_candidate() {
     let dir = write_config(&serde_json::json!({
         "model_type": "qwen3_5",
         "architectures": ["NonstandardWrapperModel"],
-        "text_config": { "model_type": "unknown_text_backbone" }
+        "text_config": complete_config("unknown_text_backbone")
     }));
     let detected = adapter::detect(dir.path()).unwrap();
 
     assert_eq!(detected.model_type, "unknown_text_backbone");
     assert_eq!(detected.wrapper_model_type.as_deref(), Some("qwen3_5"));
     assert_eq!(adapter::resolve(&detected).unwrap().id(), "qwen3.5-dense");
+}
+
+#[test]
+fn exact_wrapper_fallback_validates_unknown_nested_config() {
+    let mut text_config = complete_config("unknown_text_backbone");
+    text_config.as_object_mut().unwrap().remove("hidden_size");
+    let dir = write_config(&serde_json::json!({
+        "model_type": "qwen3_5",
+        "architectures": ["NonstandardWrapperModel"],
+        "text_config": text_config
+    }));
+    let detected = adapter::detect(dir.path()).unwrap();
+    let error = match adapter::resolve(&detected) {
+        Err(error) => error,
+        Ok(adapter) => panic!("unexpected adapter: {}", adapter.id()),
+    };
+
+    assert!(error.to_string().contains("hidden_size"));
 }
 
 #[test]

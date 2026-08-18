@@ -14,10 +14,12 @@ version string would hard-fail with no path forward short of editing two files.
 
 ### Behavioral equivalence vs main — PASS
 Qwen3.8-27B-4bit, identical greedy request (temp 0, max_tokens 600):
+
 | Build | content | reasoning chars | usage |
 | --- | --- | ---: | --- |
 | main f599e95 | '391' | 137 | prompt 67 / completion 52 |
 | adapter branch | '391' | 137 | prompt 67 / completion 52 |
+
 Byte-identical. Codex also verified Qwen3-1.7B-4bit (transformer path) and
 DeepSeek-Coder-V2-Lite-4bit (deepseek_v2 path) generate normally.
 

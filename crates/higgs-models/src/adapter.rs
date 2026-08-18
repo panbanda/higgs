@@ -23,14 +23,23 @@ pub const MAX_CONFIG_SIZE: u64 = 10 * 1024 * 1024;
 /// A broad model family, independent of checkpoint naming revisions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ModelFamily {
+    /// Alibaba's Qwen language-model family.
     Qwen,
+    /// Google's Gemma language-model family.
     Gemma,
+    /// Meta's Llama language-model family.
     Llama,
+    /// Mistral AI's language-model family.
     Mistral,
+    /// Microsoft's Phi language-model family.
     Phi,
+    /// The `StarCoder` language-model family.
     Starcoder,
+    /// The `DeepSeek` language-model family.
     DeepSeek,
+    /// The `LLaVA` vision-language family with a supported text backbone.
     Llava,
+    /// A detected family for which Higgs has no built-in family variant.
     Other(String),
 }
 
@@ -53,7 +62,9 @@ impl fmt::Display for ModelFamily {
 /// Numeric family version parsed from a checkpoint's effective model type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ModelVersion {
+    /// Major version parsed from `model_type`.
     pub major: u32,
+    /// Minor version parsed from `model_type`, or zero when only a major version is present.
     pub minor: u32,
 }
 
@@ -66,15 +77,19 @@ impl fmt::Display for ModelVersion {
 /// A config parsed once for adapter resolution and loading.
 #[derive(Debug, Clone)]
 pub struct DetectedModel {
-    /// Effective text model type.
+    /// Effective model type from the config consumed by the selected text loader.
     pub model_type: String,
     /// Top-level wrapper model type when `text_config` was selected.
     pub wrapper_model_type: Option<String>,
+    /// Top-level architecture names declared by the checkpoint.
     pub architectures: Vec<String>,
+    /// Broad family classified from the effective `model_type`.
     pub family: ModelFamily,
+    /// Numeric version parsed from the effective `model_type`, when present.
     pub version: Option<ModelVersion>,
     /// Original, unmodified top-level configuration.
     pub raw: Value,
+    /// Checkpoint directory containing the detected `config.json` and weights.
     pub dir: PathBuf,
 }
 
@@ -100,29 +115,57 @@ impl DetectedModel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Capabilities {
+    /// Whether the adapter implements vision or other image inputs.
     pub vision: bool,
+    /// Whether the adapter can load and use multi-token-prediction layers.
     pub mtp: bool,
+    /// Whether the adapter implements mixture-of-experts layers.
     pub moe: bool,
+    /// Whether the adapter can store the compressed MLA latent state in the KV cache.
+    ///
+    /// When false, requesting MLA latent caching is a no-op and diagnostics warn
+    /// that the resolved adapter does not implement it.
     pub mla_latent_cache: bool,
+    /// Whether the adapter supports the true batched-decode engine used by `batch=true`.
+    ///
+    /// This is distinct from serving concurrent requests through the normal,
+    /// non-batched engine.
     pub batch_engine: bool,
 }
 
 /// Human-facing adapter metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdapterInfo {
+    /// Stable identifier used in logs, diagnostics, and configuration inspection.
     pub id: &'static str,
+    /// Broad model family implemented by the adapter.
     pub family: ModelFamily,
+    /// Human-readable version range the adapter accepts.
     pub version_range: String,
+    /// Features implemented by this adapter's current loader.
     pub capabilities: Capabilities,
+    /// Short human-readable description of the implementation and its limits.
     pub notes: &'static str,
 }
 
 /// Uniform model-family routing and loading interface.
 pub trait ModelAdapter: Send + Sync {
+    /// Return the adapter's stable identifier.
     fn id(&self) -> &'static str;
+    /// Return the broad model family implemented by this adapter.
     fn family(&self) -> ModelFamily;
+    /// Return metadata describing the adapter's supported range and capabilities.
     fn describe(&self) -> AdapterInfo;
+    /// Score this adapter for a detected checkpoint.
+    ///
+    /// Higher scores are preferred; equal scores preserve registry order.
+    /// Returning `None` means the adapter cannot handle the checkpoint.
     fn match_score(&self, model: &DetectedModel) -> Option<u32>;
+    /// Construct a model from the already-detected configuration and checkpoint directory.
+    ///
+    /// Implementations must consume `DetectedModel::raw` or `resolved_config()`
+    /// rather than reopening `config.json`, and return a descriptive error when
+    /// the config or weights are incompatible.
     fn load(&self, model: &DetectedModel) -> Result<AnyModel, ModelError>;
 }
 
@@ -293,22 +336,6 @@ static DEEPSEEK_V2: BuiltinAdapter = BuiltinAdapter {
     kind: LoadKind::DeepSeekV2,
 };
 
-static ADAPTERS: [&'static dyn ModelAdapter; 13] = [
-    &BONSAI_Q1,
-    &QWEN35_MOE,
-    &QWEN35_DENSE,
-    &QWEN3_NEXT,
-    &QWEN3_MOE,
-    &GEMMA4,
-    &GEMMA3,
-    &GEMMA2,
-    &PHI3,
-    &STARCODER2,
-    &LLAVA_QWEN2,
-    &DEEPSEEK_V2,
-    &TRANSFORMER_DENSE,
-];
-
 static BUILTINS: [&BuiltinAdapter; 13] = [
     &BONSAI_Q1,
     &QWEN35_MOE,
@@ -378,8 +405,12 @@ impl BuiltinAdapter {
             .any(|model_type| self.is_exact(model_type))
     }
 
+    fn has_exact_resolved_config(&self, model: &DetectedModel) -> bool {
+        self.is_exact(&model.model_type)
+    }
+
     fn validate_tolerant(&self, model: &DetectedModel) -> Result<(), ModelError> {
-        if self.has_exact_candidate(model) {
+        if self.has_exact_resolved_config(model) {
             return Ok(());
         }
         let config = model.resolved_config();
@@ -559,11 +590,17 @@ fn qwen35_args(model: &DetectedModel) -> Result<crate::qwen3_next::Qwen3NextMode
     }
 }
 
+fn as_model_adapter(adapter: &'static BuiltinAdapter) -> &'static dyn ModelAdapter {
+    adapter
+}
+
 /// The process-wide ordered adapter registry.
 #[must_use]
 pub fn registry() -> &'static [&'static dyn ModelAdapter] {
-    static REGISTRY: OnceLock<&'static [&'static dyn ModelAdapter]> = OnceLock::new();
-    REGISTRY.get_or_init(|| &ADAPTERS)
+    static REGISTRY: OnceLock<Vec<&'static dyn ModelAdapter>> = OnceLock::new();
+    REGISTRY
+        .get_or_init(|| BUILTINS.iter().copied().map(as_model_adapter).collect())
+        .as_slice()
 }
 
 /// Parse and classify a checkpoint's `config.json` once.
@@ -616,7 +653,7 @@ pub fn detect(dir: &Path) -> Result<DetectedModel, ModelError> {
 /// Exact matches on either the nested or wrapper candidate take precedence over
 /// every version-tolerant match. Tolerant selections retain structural checks.
 pub fn resolve(model: &DetectedModel) -> Result<&'static dyn ModelAdapter, ModelError> {
-    let selected = registry()
+    let selected = BUILTINS
         .iter()
         .enumerate()
         .filter_map(|(index, adapter)| {
@@ -631,16 +668,7 @@ pub fn resolve(model: &DetectedModel) -> Result<&'static dyn ModelAdapter, Model
     };
     // Keep validation in resolve so callers that only inspect a checkpoint
     // still receive structural errors before attempting to load weights.
-    let Some(concrete) = BUILTINS
-        .iter()
-        .find(|candidate| candidate.id == adapter.id())
-    else {
-        return Err(ModelError::UnsupportedModel(format!(
-            "internal adapter registry mismatch for '{}'",
-            adapter.id()
-        )));
-    };
-    concrete.validate_tolerant(model)?;
+    adapter.validate_tolerant(model)?;
     Ok(adapter)
 }
 

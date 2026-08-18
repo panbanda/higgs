@@ -407,20 +407,17 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                         continue;
                     }
                 };
-                if model.batch {
-                    if !inspected.capabilities.batch_engine {
-                        fail(
-                            &format!(
-                                "model {label} enables unsupported batch=true; adapter '{}' does not support true batched decode",
-                                inspected.adapter_id
-                            ),
-                            result,
-                        );
-                        continue;
-                    }
+                if model.batch && !inspected.capabilities.batch_engine {
+                    fail(
+                        &format!(
+                            "model {label} enables unsupported batch=true; adapter '{}' does not support true batched decode",
+                            inspected.adapter_id
+                        ),
+                        result,
+                    );
+                    continue;
                 }
-                if higgs_models::cache::resolve_mla_latent_cache(model.kv_cache_config().mla_latent)
-                {
+                if higgs_models::cache::resolve_mla_latent_cache(kv_cache_config.mla_latent) {
                     check_mla_latent_cache_adapter(&label, &inspected, result);
                 }
                 let requested_profile = model.requested_mlx_profile(&config.local);
