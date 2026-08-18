@@ -1099,10 +1099,16 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 fn key(tokens: &[u32], block_size: usize) -> String {
     let n = tokens.len() / block_size * block_size;
     let bytes: Vec<u8> = tokens[..n].iter().flat_map(|t| t.to_le_bytes()).collect();
-    hex(&sha256(&bytes))
+    hex_lower(&sha256(&bytes))
 }
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+fn hex_lower(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for &byte in bytes {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 /// Build a temp-file path that is unique per writer, so two processes (or two
 /// writers in the same process) sharing a store directory cannot clobber each
@@ -1176,6 +1182,13 @@ mod tests {
     use tempfile::tempdir;
     fn identity() -> StoreIdentity {
         StoreIdentity::for_tests()
+    }
+    #[test]
+    fn sha256_digest_bytes_and_lowercase_hex_are_stable() {
+        assert_eq!(
+            hex_lower(&sha256(b"higgs")),
+            "a93f7a91f88ee389a5147b54b22968c2521a59e41b1bf98ff0d22d7b5a704a42"
+        );
     }
     #[test]
     fn round_trip_preserves_dense_payload() {

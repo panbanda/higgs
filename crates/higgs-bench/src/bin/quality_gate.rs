@@ -364,7 +364,16 @@ fn model_basename(model_dir: &Path) -> Result<String> {
 fn config_hash(model_dir: &Path) -> Result<String> {
     let path = model_dir.join("config.json");
     let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    Ok(hex_lower(&Sha256::digest(bytes)))
+}
+fn hex_lower(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for &byte in bytes {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 fn ensure_fixture_matches_model_config(
@@ -391,6 +400,14 @@ fn prompt_passed(token_exact: bool, max_abs_logprob_delta: f32, tolerance: f32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sha256_lowercase_hex_is_stable() {
+        assert_eq!(
+            hex_lower(&Sha256::digest(b"higgs")),
+            "a93f7a91f88ee389a5147b54b22968c2521a59e41b1bf98ff0d22d7b5a704a42"
+        );
+    }
 
     #[test]
     fn perturbation_reduces_the_current_argmax_logit() {
