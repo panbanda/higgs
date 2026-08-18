@@ -46,6 +46,15 @@ context = 32768
 tags = ["large", "moe"]
 
 [[models]]
+key = "qwen3.8-27B-4bit"
+label = "Qwen3.8-27B-4bit (Dense)"
+path = "mlx-community/Qwen3.8-27B-4bit"
+quantization = "4bit"
+approx_size_gb = 15.5
+context = 32768
+tags = ["large", "dense"]
+
+[[models]]
 key = "qwen3.6-27B-mtp-8bit"
 label = "Qwen3.6-27B MTP 8-bit"
 path = "trevon/Qwen3.6-27B-mtp"

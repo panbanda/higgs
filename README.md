@@ -99,7 +99,7 @@ curl http://localhost:8000/v1/chat/completions \
 ### Run open-weight models locally on Apple Silicon
 
 - Serve MLX models from Hugging Face IDs or local paths.
-- Support current model families including Qwen 3.6, Qwen 3.x, Llama, Mistral, Gemma 2, Phi-3, Starcoder2, DeepSeek-V2, and LLaVA-Qwen2.
+- Support current model families including Qwen 3.8, Qwen 3.x, Llama, Mistral, Gemma 2, Phi-3, Starcoder2, DeepSeek-V2, and LLaVA-Qwen2. Qwen 3.5+ checkpoints (3.5, 3.6, and 3.8; dense and MoE) use the Qwen 3.5 adapters, including `*ForConditionalGeneration` wrappers whose text-model config lives in `text_config`. Unknown newer versions in a supported family use the nearest structurally compatible adapter and log an untested-version warning; unknown families are rejected with the supported family/version list.
 - Expose local serving through OpenAI and Anthropic-compatible endpoints.
 
 ### Use one endpoint for local and remote models

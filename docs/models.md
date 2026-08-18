@@ -10,8 +10,8 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 | Mistral | `mistral` | Mistral 7B |
 | Qwen2 | `qwen2` | Qwen2 and Qwen2.5 |
 | Qwen3 | `qwen3` | Qwen3 |
-| Qwen3.5 (dense) | `qwen3_5` | Qwen3.5 dense MLX checkpoints |
-| Qwen3.5 / Qwen3.6 MoE | `qwen3_5_moe` | Qwen3.5-35B-A3B, Qwen3.6-35B-A3B |
+| Qwen3.5+ (dense) | `qwen3_5`, `qwen3_5_text` | Qwen3.5 dense checkpoints; Qwen3.8-27B |
+| Qwen3.5+ (MoE) | `qwen3_5_moe`, `qwen3_5_text_moe` | Qwen3.5-35B-A3B, Qwen3.6-35B-A3B |
 | Qwen3-Next | `qwen3_next` | Qwen3-Coder hybrid checkpoints |
 | Qwen3-MoE | `qwen3_moe` | Qwen3-30B-A3B |
 | Gemma 2 | `gemma2` | Gemma 2 2B, 9B, and 27B |
@@ -56,11 +56,15 @@ Other supported architectures still serve normally in simple mode, but Higgs now
 | Qwen3.5 dense | `mlx-community/Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit` |
 | Qwen3.5 MoE | `NexVeridian/Qwen3.5-35B-A3B-3bit` |
 | Qwen3.6 MoE | `mlx-community/Qwen3.6-35B-A3B-4bit` |
+| Qwen3.8 dense | `mlx-community/Qwen3.8-27B-4bit` |
 | DeepSeek-V2 | `mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx` |
 
-## Qwen 3.6 Notes
+## Qwen 3.5+ Adapter and Version Notes
 
-- `Qwen3.6` support currently uses the `qwen3_5_moe` loader path.
+- Qwen 3.5, 3.6, and 3.8 dense and MoE checkpoints use the Qwen 3.5 adapters. This includes `*ForConditionalGeneration` wrapper configs: Higgs detects the top-level wrapper and consumes the nested `text_config` used by the text loader.
+- `_text` aliases such as `qwen3_5_text` and `qwen3_5_text_moe` resolve to the corresponding dense or MoE adapter.
+- Unknown newer versions within a supported family can use the nearest adapter only after the resolved config passes structural validation. Higgs logs an untested-version warning when it takes this tolerant path. A missing or invalid required field is rejected by name; an unknown family is rejected with the supported family/version list.
+- `mlx-community/Qwen3.8-27B-4bit` (27B dense, 4-bit) is verified working through its top-level `qwen3_5` wrapper and nested `qwen3_5_text` config.
 - The cached-model smoke matrix covered `mlx-community/Qwen3.6-35B-A3B-4bit` plus `mlx-community/Llama-3.2-1B-Instruct-4bit`, `mlx-community/Qwen2.5-3B-Instruct-4bit`, `mlx-community/Qwen3-1.7B-4bit`, and `mlx-community/Qwen3-Coder-Next-4bit`.
 - OpenAI-style chat requests use non-thinking mode by default for `Qwen3.6` unless the request explicitly opts into reasoning.
 
