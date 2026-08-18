@@ -36,6 +36,7 @@ pub async fn completions(
 ) -> Result<axum::response::Response, ServerError> {
     let req: CompletionRequest = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("Invalid request body: {e}")))?;
+    request_metrics.set_requested_model(&req.model);
 
     if req.prompt.is_empty() {
         return Err(ServerError::BadRequest(
@@ -78,8 +79,8 @@ pub async fn completions(
                         id: 0,
                         timestamp: Instant::now(),
                         wallclock: chrono::Utc::now(),
-                        model: model_name,
-                        provider: "higgs".to_owned(),
+                        model: Some(model_name),
+                        provider: Some("higgs".to_owned()),
                         routing_method: routing_method.into(),
                         status: 200,
                         duration: start.elapsed(),
@@ -130,8 +131,8 @@ pub async fn completions(
                     id: 0,
                     timestamp: Instant::now(),
                     wallclock: chrono::Utc::now(),
-                    model: metrics_model,
-                    provider: provider_name,
+                    model: Some(metrics_model),
+                    provider: Some(provider_name),
                     routing_method: routing_method.into(),
                     status,
                     duration: start.elapsed(),
@@ -257,8 +258,8 @@ fn completions_stream(
             id: 0,
             timestamp: Instant::now(),
             wallclock: chrono::Utc::now(),
-            model: model_name,
-            provider: "higgs".to_owned(),
+            model: Some(model_name),
+            provider: Some("higgs".to_owned()),
             routing_method: routing_method.into(),
             status: 200,
             duration: std::time::Duration::ZERO,

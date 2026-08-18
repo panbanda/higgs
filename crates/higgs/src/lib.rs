@@ -49,6 +49,9 @@ use crate::state::SharedState;
 
 type SharedRateLimiter = Arc<RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>>;
 
+// Observability/control-plane routes must never perturb API traffic metrics.
+const INFRASTRUCTURE_PATHS: &[&str] = &["/health", "/metrics"];
+
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -131,9 +134,7 @@ async fn record_http_response(
     let wallclock = chrono::Utc::now();
     let response = next.run(request).await;
 
-    // The metrics endpoint reports the store but does not observe itself;
-    // otherwise consecutive snapshots would each perturb the next snapshot.
-    if path != "/metrics"
+    if !INFRASTRUCTURE_PATHS.contains(&path.as_str())
         && !context.was_recorded()
         && let Some(store) = metrics
     {
@@ -142,8 +143,10 @@ async fn record_http_response(
             id: 0,
             timestamp: Instant::now(),
             wallclock,
-            model: path,
-            provider: "higgs".to_owned(),
+            // A parsed client model may be useful for unknown-model errors. A
+            // route path is never a model; unparseable requests stay anonymous.
+            model: context.requested_model(),
+            provider: None,
             routing_method: RoutingMethod::Higgs,
             status: status.as_u16(),
             duration: start.elapsed(),

@@ -31,8 +31,8 @@ pub fn draw(frame: &mut Frame, area: Rect, metrics: &Arc<MetricsStore>, scroll: 
                 .replace('\n', " ");
             Row::new(vec![
                 Cell::from(format_time_ago(now.duration_since(r.timestamp))),
-                Cell::from(r.model.as_str()),
-                Cell::from(r.provider.as_str()),
+                Cell::from(r.model.as_deref().unwrap_or("-")),
+                Cell::from(r.provider.as_deref().unwrap_or("-")),
                 Cell::from(r.status.to_string()).style(Style::default().fg(Color::Red)),
                 Cell::from(error_preview),
             ])
@@ -78,8 +78,8 @@ mod tests {
             id: 0,
             timestamp: Instant::now(),
             wallclock: Utc::now(),
-            model: "claude-opus-4-6".to_owned(),
-            provider: "anthropic".to_owned(),
+            model: Some("claude-opus-4-6".to_owned()),
+            provider: Some("anthropic".to_owned()),
             routing_method: RoutingMethod::Default,
             status: 200,
             duration: Duration::from_millis(500),

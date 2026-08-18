@@ -37,6 +37,7 @@ pub async fn chat_completions(
 ) -> Result<axum::response::Response, ServerError> {
     let mut req: ChatCompletionRequest = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("Invalid request body: {e}")))?;
+    request_metrics.set_requested_model(&req.model);
 
     if req.messages.is_empty() {
         return Err(ServerError::BadRequest(
@@ -86,8 +87,8 @@ pub async fn chat_completions(
                         id: 0,
                         timestamp: Instant::now(),
                         wallclock: chrono::Utc::now(),
-                        model: response.model.clone(),
-                        provider: "higgs".to_owned(),
+                        model: Some(response.model.clone()),
+                        provider: Some("higgs".to_owned()),
                         routing_method: routing_method.into(),
                         status: 200,
                         duration: start.elapsed(),
@@ -135,8 +136,8 @@ pub async fn chat_completions(
                             id: 0,
                             timestamp: Instant::now(),
                             wallclock: chrono::Utc::now(),
-                            model: metrics_model.clone(),
-                            provider: provider_name.clone(),
+                            model: Some(metrics_model.clone()),
+                            provider: Some(provider_name.clone()),
                             routing_method: routing_method.into(),
                             status: result.as_ref().map_or(502, |resp| resp.status().as_u16()),
                             duration: start.elapsed(),
@@ -178,8 +179,8 @@ pub async fn chat_completions(
                                 id: 0,
                                 timestamp: Instant::now(),
                                 wallclock: chrono::Utc::now(),
-                                model: metrics_model.clone(),
-                                provider: provider_name.clone(),
+                                model: Some(metrics_model.clone()),
+                                provider: Some(provider_name.clone()),
                                 routing_method: routing_method.into(),
                                 status: upstream_status,
                                 duration: start.elapsed(),
@@ -220,8 +221,8 @@ pub async fn chat_completions(
                                 id: 0,
                                 timestamp: Instant::now(),
                                 wallclock: chrono::Utc::now(),
-                                model: metrics_model.clone(),
-                                provider: provider_name.clone(),
+                                model: Some(metrics_model.clone()),
+                                provider: Some(provider_name.clone()),
                                 routing_method: routing_method.into(),
                                 status: upstream_status,
                                 duration: start.elapsed(),
@@ -512,8 +513,8 @@ fn chat_completions_stream(
             id: 0,
             timestamp: Instant::now(),
             wallclock: chrono::Utc::now(),
-            model: model.clone(),
-            provider: "higgs".to_owned(),
+            model: Some(model.clone()),
+            provider: Some("higgs".to_owned()),
             routing_method: routing_method.into(),
             status: 200,
             duration: Duration::ZERO,

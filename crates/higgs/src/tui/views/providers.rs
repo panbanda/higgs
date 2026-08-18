@@ -55,7 +55,11 @@ pub fn draw(
             let count = u64::try_from(records.len()).unwrap_or(0);
             let input: u64 = records.iter().map(|r| r.input_tokens).sum();
             let output: u64 = records.iter().map(|r| r.output_tokens).sum();
-            let durations: Vec<_> = records.iter().map(|r| r.duration).collect();
+            let durations: Vec<_> = records
+                .iter()
+                .filter(|r| !r.is_error())
+                .map(|r| r.duration)
+                .collect();
             let p50 = MetricsStore::duration_percentile(&durations, 50);
             let p95 = MetricsStore::duration_percentile(&durations, 95);
             let errors: u64 =
@@ -116,8 +120,8 @@ mod tests {
             id: 0,
             timestamp: Instant::now(),
             wallclock: Utc::now(),
-            model: "claude-opus-4-6".to_owned(),
-            provider: "anthropic".to_owned(),
+            model: Some("claude-opus-4-6".to_owned()),
+            provider: Some("anthropic".to_owned()),
             routing_method: RoutingMethod::Default,
             status: 200,
             duration: Duration::from_millis(500),

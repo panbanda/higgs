@@ -11,16 +11,40 @@ use crate::metrics_log::MetricsLogger;
 ///
 /// Handlers mark this after writing their richer record. The outer layer then
 /// records only responses that did not reach such a handler path.
+#[derive(Default)]
+struct RequestMetricsState {
+    recorded: AtomicBool,
+    requested_model: Mutex<Option<String>>,
+}
+
 #[derive(Clone, Default)]
-pub struct RequestMetricsContext(Arc<AtomicBool>);
+pub struct RequestMetricsContext(Arc<RequestMetricsState>);
 
 impl RequestMetricsContext {
     pub fn mark_recorded(&self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.0.recorded.store(true, Ordering::Relaxed);
     }
 
     pub fn was_recorded(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.0.recorded.load(Ordering::Relaxed)
+    }
+
+    /// Preserve a client-supplied model for failures that happen before route
+    /// resolution. Requests without a parseable model remain unattributed.
+    pub fn set_requested_model(&self, model: &str) {
+        *self
+            .0
+            .requested_model
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(model.to_owned());
+    }
+
+    pub fn requested_model(&self) -> Option<String> {
+        self.0
+            .requested_model
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -59,8 +83,8 @@ pub struct RequestRecord {
     pub id: u64,
     pub timestamp: Instant,
     pub wallclock: DateTime<Utc>,
-    pub model: String,
-    pub provider: String,
+    pub model: Option<String>,
+    pub provider: Option<String>,
     pub routing_method: RoutingMethod,
     pub status: u16,
     pub duration: Duration,
@@ -230,12 +254,14 @@ impl MetricsStore {
 
     pub fn group_by<F, K>(records: &[RequestRecord], key_fn: F) -> HashMap<K, Vec<&RequestRecord>>
     where
-        F: Fn(&RequestRecord) -> K,
+        F: Fn(&RequestRecord) -> Option<K>,
         K: Eq + std::hash::Hash,
     {
         let mut groups: HashMap<K, Vec<&RequestRecord>> = HashMap::new();
         for record in records {
-            groups.entry(key_fn(record)).or_default().push(record);
+            if let Some(key) = key_fn(record) {
+                groups.entry(key).or_default().push(record);
+            }
         }
         groups
     }
@@ -319,8 +345,8 @@ mod tests {
             id: 0,
             timestamp: Instant::now(),
             wallclock: Utc::now(),
-            model: "claude-opus-4-6".to_owned(),
-            provider: "anthropic".to_owned(),
+            model: Some("claude-opus-4-6".to_owned()),
+            provider: Some("anthropic".to_owned()),
             routing_method: RoutingMethod::Default,
             status: 200,
             duration: Duration::from_millis(500),
@@ -342,7 +368,7 @@ mod tests {
         store.record(sample_record());
         let snap = store.snapshot();
         assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].model, "claude-opus-4-6");
+        assert_eq!(snap[0].model.as_deref(), Some("claude-opus-4-6"));
     }
 
     #[test]
@@ -383,7 +409,7 @@ mod tests {
             store.record(sample_record());
         }
         let mut sonnet = sample_record();
-        sonnet.model = "claude-sonnet-4-5-20250929".to_owned();
+        sonnet.model = Some("claude-sonnet-4-5-20250929".to_owned());
         store.record(sonnet);
 
         let snap = store.snapshot();

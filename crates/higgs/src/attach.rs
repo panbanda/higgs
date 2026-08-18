@@ -14,8 +14,8 @@ use crate::metrics_log::rotated_path;
 #[derive(Debug, Deserialize)]
 struct LogEntry {
     timestamp: DateTime<Utc>,
-    model: String,
-    provider: String,
+    model: Option<String>,
+    provider: Option<String>,
     routing_method: Option<String>,
     status: u16,
     duration_ms: u64,
@@ -177,8 +177,8 @@ mod tests {
         let ts = recent_timestamp();
         let line = make_entry(&ts, "claude-opus-4-6", None);
         let record = parse_log_entry(&line).expect("should parse");
-        assert_eq!(record.model, "claude-opus-4-6");
-        assert_eq!(record.provider, "anthropic");
+        assert_eq!(record.model.as_deref(), Some("claude-opus-4-6"));
+        assert_eq!(record.provider.as_deref(), Some("anthropic"));
         assert_eq!(record.status, 200);
         assert_eq!(record.duration.as_millis(), 100);
         assert_eq!(record.input_tokens, 50);
@@ -281,9 +281,9 @@ mod tests {
 
         let snap = store.snapshot();
         assert_eq!(snap.len(), 3);
-        assert_eq!(snap[0].model, "oldest");
-        assert_eq!(snap[1].model, "middle");
-        assert_eq!(snap[2].model, "newest");
+        assert_eq!(snap[0].model.as_deref(), Some("oldest"));
+        assert_eq!(snap[1].model.as_deref(), Some("middle"));
+        assert_eq!(snap[2].model.as_deref(), Some("newest"));
     }
 
     #[test]
@@ -311,7 +311,7 @@ mod tests {
 
         let snap = store.snapshot();
         assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].model, "new-model");
+        assert_eq!(snap[0].model.as_deref(), Some("new-model"));
     }
 
     #[test]

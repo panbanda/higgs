@@ -300,9 +300,9 @@ async fn metrics_recorded_for_proxy() {
 
     let records = metrics.snapshot();
     assert_eq!(records.len(), 1, "expected exactly one metrics record");
-    assert_eq!(records[0].provider, "mock");
+    assert_eq!(records[0].provider.as_deref(), Some("mock"));
     assert_eq!(records[0].status, 200);
-    assert_eq!(records[0].model, "gpt-4");
+    assert_eq!(records[0].model.as_deref(), Some("gpt-4"));
 }
 
 #[tokio::test]
@@ -340,6 +340,24 @@ async fn metrics_record_success_and_all_http_failures_once() {
     ));
     let state = build_selective_test_state(&mock_server.uri(), Arc::clone(&metrics));
     let app = build_app(state);
+
+    for _ in 0..20 {
+        let health_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health_response.status(), 200);
+    }
+    assert!(
+        metrics.snapshot().is_empty(),
+        "infrastructure health polls must not create metrics records"
+    );
 
     let good = serde_json::json!({
         "model": "known-model",
@@ -424,6 +442,30 @@ async fn metrics_record_success_and_all_http_failures_once() {
     assert_eq!(snapshot["status_counts"]["200"], 1);
     assert_eq!(snapshot["status_counts"]["400"], 1);
     assert_eq!(snapshot["status_counts"]["404"], 2);
+    let models = snapshot["models"].as_array().unwrap();
+    let model_names: Vec<&str> = models
+        .iter()
+        .map(|model| model["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(model_names, vec!["known-model", "nonexistent-model"]);
+    assert!(model_names.iter().all(|name| !name.starts_with('/')));
+    let unknown_model = models
+        .iter()
+        .find(|model| model["name"] == "nonexistent-model")
+        .unwrap();
+    assert_eq!(unknown_model["errors"], 1);
+    assert_eq!(unknown_model["input_tokens"], 0);
+    assert_eq!(unknown_model["output_tokens"], 0);
+    assert_eq!(unknown_model["p50_ms"], 0);
+    assert_eq!(unknown_model["p95_ms"], 0);
+    let provider_names: Vec<&str> = snapshot["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|provider| provider["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(provider_names, vec!["mock"]);
+    assert!(provider_names.iter().all(|name| !name.starts_with('/')));
 
     let records = metrics.snapshot();
     assert_eq!(records.len(), 4);
@@ -464,6 +506,35 @@ async fn metrics_record_success_and_all_http_failures_once() {
     assert_eq!(statuses.iter().filter(|&&status| status == 200).count(), 1);
     assert_eq!(statuses.iter().filter(|&&status| status == 400).count(), 1);
     assert_eq!(statuses.iter().filter(|&&status| status == 404).count(), 2);
+    assert!(entries.iter().all(|entry| {
+        entry["model"]
+            .as_str()
+            .is_none_or(|model| !model.starts_with('/'))
+            && entry["provider"]
+                .as_str()
+                .is_none_or(|provider| !provider.starts_with('/'))
+    }));
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry["model"] == "nonexistent-model")
+            .count(),
+        1
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry["model"].is_null())
+            .count(),
+        2
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry["provider"].is_null())
+            .count(),
+        3
+    );
 }
 
 // ---------------------------------------------------------------------------

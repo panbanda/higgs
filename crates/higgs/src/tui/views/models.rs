@@ -56,7 +56,11 @@ pub fn model_table(
             let count = u64::try_from(records.len()).unwrap_or(0);
             let input: u64 = records.iter().map(|r| r.input_tokens).sum();
             let output: u64 = records.iter().map(|r| r.output_tokens).sum();
-            let durations: Vec<_> = records.iter().map(|r| r.duration).collect();
+            let durations: Vec<_> = records
+                .iter()
+                .filter(|r| !r.is_error())
+                .map(|r| r.duration)
+                .collect();
             let p50 = MetricsStore::duration_percentile(&durations, 50);
             let p95 = MetricsStore::duration_percentile(&durations, 95);
             let errors: u64 =
@@ -158,8 +162,8 @@ mod tests {
             id: 0,
             timestamp: Instant::now(),
             wallclock: Utc::now(),
-            model: "claude-opus-4-6".to_owned(),
-            provider: "anthropic".to_owned(),
+            model: Some("claude-opus-4-6".to_owned()),
+            provider: Some("anthropic".to_owned()),
             routing_method: RoutingMethod::Default,
             status: 200,
             duration: Duration::from_millis(500),
@@ -211,7 +215,7 @@ mod tests {
             records.push(sample_record());
         }
         let mut other = sample_record();
-        other.model = "gpt-4".to_owned();
+        other.model = Some("gpt-4".to_owned());
         records.push(other);
         let (_, total) = model_table(&records, " Test ".to_owned(), 0, None);
         assert_eq!(total, 2);
@@ -223,5 +227,33 @@ mod tests {
         let configured = vec!["claude-opus-4-6".to_owned(), "unused-model".to_owned()];
         let (_, total) = model_table(&records, " Test ".to_owned(), 0, Some(&configured));
         assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn model_table_excludes_error_latency_from_percentiles() {
+        let mut error = sample_record();
+        error.status = 404;
+        error.duration = Duration::from_millis(500);
+        error.input_tokens = 0;
+        error.output_tokens = 0;
+        let backend = ratatui::backend::TestBackend::new(120, 8);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let (table, _) = model_table(&[error], " Test ".to_owned(), 0, None);
+                frame.render_widget(table, frame.area());
+            })
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(
+            !content.contains("500ms"),
+            "error latency leaked into model percentiles"
+        );
     }
 }
