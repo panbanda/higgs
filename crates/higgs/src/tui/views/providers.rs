@@ -59,7 +59,7 @@ pub fn draw(
             let p50 = MetricsStore::duration_percentile(&durations, 50);
             let p95 = MetricsStore::duration_percentile(&durations, 95);
             let errors: u64 =
-                u64::try_from(records.iter().filter(|r| r.status >= 400).count()).unwrap_or(0);
+                u64::try_from(records.iter().filter(|r| r.is_error()).count()).unwrap_or(0);
             let error_style = if errors > 0 {
                 Style::default().fg(Color::Red)
             } else {

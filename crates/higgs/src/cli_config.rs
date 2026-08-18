@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::ErrorKind;
 use std::path::Path;
 
 use crate::config;
@@ -18,16 +17,40 @@ fn format_toml_value(value: &toml_edit::Value) -> String {
 }
 
 fn parse_toml_value(raw: &str) -> toml_edit::Item {
-    if raw == "true" {
-        toml_edit::value(true)
-    } else if raw == "false" {
-        toml_edit::value(false)
-    } else if let Ok(n) = raw.parse::<i64>() {
-        toml_edit::value(n)
-    } else if let Ok(f) = raw.parse::<f64>() {
-        toml_edit::value(f)
-    } else {
-        toml_edit::value(raw)
+    raw.parse::<toml_edit::Value>()
+        .map_or_else(|_| toml_edit::value(raw), toml_edit::Item::Value)
+}
+
+const TOP_LEVEL_SECTIONS: &str =
+    "server, local, models, provider, routes, default, auto_router, logging, retention";
+
+fn is_settable_key(segments: &[&str]) -> bool {
+    match segments {
+        ["server", field] => matches!(
+            *field,
+            "host"
+                | "port"
+                | "max_tokens"
+                | "api_key"
+                | "rate_limit"
+                | "timeout"
+                | "max_body_size"
+                | "cors_origins"
+        ),
+        ["local", field] => matches!(*field, "mlx_profile" | "raise_wired_limit"),
+        ["provider", name, field] if !name.is_empty() => matches!(
+            *field,
+            "url" | "format" | "api_key" | "strip_auth" | "stub_count_tokens"
+        ),
+        ["default", "provider"] => true,
+        ["auto_router", field] => {
+            matches!(*field, "enabled" | "force" | "model" | "timeout_ms")
+        }
+        ["logging", "metrics", field] => {
+            matches!(*field, "enabled" | "path" | "max_size_mb" | "max_files")
+        }
+        ["retention", field] => matches!(*field, "enabled" | "minutes"),
+        _ => false,
     }
 }
 
@@ -38,8 +61,13 @@ pub fn config_set(config_path: &Path, key: &str, value: &str) {
         eprintln!("invalid key: {key}");
         std::process::exit(1);
     }
+    if !is_settable_key(&segments) {
+        eprintln!(
+            "unknown configuration key '{key}'; settable top-level sections: {TOP_LEVEL_SECTIONS}; arrays such as models and routes must be edited as TOML"
+        );
+        std::process::exit(1);
+    }
 
-    let original_exists = config_path.exists();
     let original = fs::read_to_string(config_path).unwrap_or_default();
     let mut doc: toml_edit::DocumentMut = original.parse().unwrap_or_else(|e| {
         eprintln!("failed to parse {}: {e}", config_path.display());
@@ -65,6 +93,10 @@ pub fn config_set(config_path: &Path, key: &str, value: &str) {
     current[leaf] = parse_toml_value(value);
 
     let rendered = doc.to_string();
+    if let Err(err) = config::validate_config_contents(&rendered, config_path) {
+        eprintln!("invalid value '{value}' for configuration key '{key}': {err}");
+        std::process::exit(1);
+    }
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent).unwrap_or_else(|e| {
             eprintln!("failed to create {}: {e}", parent.display());
@@ -75,34 +107,6 @@ pub fn config_set(config_path: &Path, key: &str, value: &str) {
         eprintln!("failed to write {}: {e}", config_path.display());
         std::process::exit(1);
     });
-    if let Err(err) = config::load_config_file(config_path, None) {
-        if !bootstrap_config_allowed(&doc) {
-            let _ = restore_original_config(config_path, &original, original_exists);
-            eprintln!("refusing to keep invalid config after setting {key}: {err}");
-            std::process::exit(1);
-        }
-    }
-}
-
-fn bootstrap_config_allowed(doc: &toml_edit::DocumentMut) -> bool {
-    let root = doc.as_table();
-    !root.contains_key("models") && !root.contains_key("provider")
-}
-
-fn restore_original_config(
-    config_path: &Path,
-    original: &str,
-    original_exists: bool,
-) -> std::io::Result<()> {
-    if original_exists {
-        fs::write(config_path, original)
-    } else {
-        match fs::remove_file(config_path) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err),
-        }
-    }
 }
 
 pub fn config_lookup(content: &str, key: &str) -> Result<String, String> {
@@ -185,12 +189,6 @@ mod tests {
     }
 
     #[test]
-    fn set_bool_value() {
-        let doc = set_and_parse("", "flag", "true");
-        assert_eq!(doc["flag"].as_bool(), Some(true));
-    }
-
-    #[test]
     fn set_integer_value() {
         let doc = set_and_parse("", "server.port", "3100");
         assert_eq!(doc["server"]["port"].as_integer(), Some(3100));
@@ -221,45 +219,5 @@ mod tests {
         let toml = "[server]\nport = 3100\n";
         let err = config_lookup(toml, "server").unwrap_err();
         assert!(err.contains("table, not a value"));
-    }
-
-    #[test]
-    fn bootstrap_config_allowed_only_for_empty_models_and_providers() {
-        let bootstrap: toml_edit::DocumentMut = "[server]\nport = 8000\n".parse().unwrap();
-        assert!(bootstrap_config_allowed(&bootstrap));
-
-        let with_provider: toml_edit::DocumentMut =
-            "[provider.openai]\nurl = \"http://localhost\"\n"
-                .parse()
-                .unwrap();
-        assert!(!bootstrap_config_allowed(&with_provider));
-
-        let with_models: toml_edit::DocumentMut =
-            "[[models]]\npath = \"mlx-community/Llama-3.2-1B-Instruct-4bit\"\n"
-                .parse()
-                .unwrap();
-        assert!(!bootstrap_config_allowed(&with_models));
-    }
-
-    #[test]
-    fn restore_original_config_rewrites_existing_file() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
-        fs::write(&path, "invalid = [\n").unwrap();
-
-        restore_original_config(&path, "original = true\n", true).unwrap();
-
-        assert_eq!(fs::read_to_string(&path).unwrap(), "original = true\n");
-    }
-
-    #[test]
-    fn restore_original_config_removes_new_file_when_original_missing() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
-        fs::write(&path, "invalid = [\n").unwrap();
-
-        restore_original_config(&path, "", false).unwrap();
-
-        assert!(!path.exists());
     }
 }

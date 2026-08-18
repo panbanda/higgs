@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use axum::{
     Json,
-    extract::State,
+    extract::{Extension, State},
     http::HeaderMap,
     response::{
         IntoResponse, Sse,
@@ -18,7 +18,7 @@ use crate::{
     anthropic_adapter::{anthropic_messages_to_engine, openai_finish_to_anthropic_stop},
     config::ApiFormat,
     error::ServerError,
-    metrics::MetricsStore,
+    metrics::{MetricsStore, RequestMetricsContext},
     router::ResolvedRoute,
     state::{Engine, SharedState},
     types::anthropic::{
@@ -33,6 +33,7 @@ use higgs_models::SamplingParams;
 #[allow(clippy::too_many_lines)]
 pub async fn create_message(
     State(state): State<SharedState>,
+    Extension(request_metrics): Extension<RequestMetricsContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<axum::response::Response, ServerError> {
@@ -70,6 +71,9 @@ pub async fn create_message(
                 let stream =
                     create_message_stream(req, engine, state.metrics.clone(), routing_method)?;
                 let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+                if state.metrics.is_some() {
+                    request_metrics.mark_recorded();
+                }
                 Ok(sse.into_response())
             } else {
                 let response = create_message_non_streaming(req, engine).await?;
@@ -87,6 +91,7 @@ pub async fn create_message(
                         output_tokens: u64::from(response.usage.output_tokens),
                         error_body: None,
                     });
+                    request_metrics.mark_recorded();
                 }
                 Ok(Json(response).into_response())
             }
@@ -200,6 +205,9 @@ pub async fn create_message(
             };
             if let Some(ref metrics) = state.metrics {
                 let status = result.as_ref().map_or(502, |resp| resp.status().as_u16());
+                if !(200..300).contains(&status) {
+                    usage = (0, 0);
+                }
                 metrics.record(crate::metrics::RequestRecord {
                     id: 0,
                     timestamp: Instant::now(),
@@ -213,6 +221,7 @@ pub async fn create_message(
                     output_tokens: usage.1,
                     error_body: None,
                 });
+                request_metrics.mark_recorded();
             }
             result
         }

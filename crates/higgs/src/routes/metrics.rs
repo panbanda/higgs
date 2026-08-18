@@ -48,7 +48,7 @@ fn build_metrics_response(metrics: &MetricsStore) -> MetricsResponse {
     let snapshot = metrics.snapshot();
     let input_tokens: u64 = snapshot.iter().map(|r| r.input_tokens).sum();
     let output_tokens: u64 = snapshot.iter().map(|r| r.output_tokens).sum();
-    let errors = u64::try_from(snapshot.iter().filter(|r| r.status >= 400).count()).unwrap_or(0);
+    let errors = u64::try_from(snapshot.iter().filter(|r| r.is_error()).count()).unwrap_or(0);
     let num_buckets = usize::try_from(metrics.window_minutes().max(1)).unwrap_or(1);
 
     MetricsResponse {
@@ -76,7 +76,7 @@ fn build_groups(groups: HashMap<String, Vec<&crate::metrics::RequestRecord>>) ->
             let output_tokens: u64 = records.iter().map(|r| r.output_tokens).sum();
             let durations: Vec<_> = records.iter().map(|r| r.duration).collect();
             let errors =
-                u64::try_from(records.iter().filter(|r| r.status >= 400).count()).unwrap_or(0);
+                u64::try_from(records.iter().filter(|r| r.is_error()).count()).unwrap_or(0);
 
             MetricsGroup {
                 name,

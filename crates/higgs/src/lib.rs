@@ -25,6 +25,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use axum::{
     Router,
@@ -43,6 +44,7 @@ use tower_http::{
     validate_request::ValidateRequestHeaderLayer,
 };
 
+use crate::metrics::{MetricsStore, RequestMetricsContext, RequestRecord, RoutingMethod};
 use crate::state::SharedState;
 
 type SharedRateLimiter = Arc<RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>>;
@@ -109,7 +111,50 @@ pub fn build_router(
         router = router.layer(cors);
     }
 
+    let metrics = state.metrics.clone();
+    router = router.layer(middleware::from_fn(move |req, next| {
+        record_http_response(metrics.clone(), req, next)
+    }));
+
     router.with_state(state)
+}
+
+async fn record_http_response(
+    metrics: Option<Arc<MetricsStore>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let context = RequestMetricsContext::default();
+    request.extensions_mut().insert(context.clone());
+    let path = request.uri().path().to_owned();
+    let start = Instant::now();
+    let wallclock = chrono::Utc::now();
+    let response = next.run(request).await;
+
+    // The metrics endpoint reports the store but does not observe itself;
+    // otherwise consecutive snapshots would each perturb the next snapshot.
+    if path != "/metrics"
+        && !context.was_recorded()
+        && let Some(store) = metrics
+    {
+        let status = response.status();
+        store.record(RequestRecord {
+            id: 0,
+            timestamp: Instant::now(),
+            wallclock,
+            model: path,
+            provider: "higgs".to_owned(),
+            routing_method: RoutingMethod::Higgs,
+            status: status.as_u16(),
+            duration: start.elapsed(),
+            input_tokens: 0,
+            output_tokens: 0,
+            error_body: (!status.is_success())
+                .then(|| status.canonical_reason().unwrap_or("HTTP error").to_owned()),
+        });
+    }
+
+    response
 }
 
 /// Build a CORS layer from the configured origin allow-list.

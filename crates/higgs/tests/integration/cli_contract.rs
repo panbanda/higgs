@@ -52,6 +52,123 @@ path = "{}"
     )
 }
 
+fn bootstrap_config(port: u16) -> String {
+    format!(
+        r#"[server]
+host = "127.0.0.1"
+port = {port}
+
+[default]
+provider = "higgs"
+"#
+    )
+}
+
+#[test]
+fn config_set_rejects_wrong_type_without_changing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = bootstrap_config(8000);
+    write_config(dir.path(), &original);
+
+    let output = Command::new(higgs_bin())
+        .args(["config", "set", "server.port", "not_a_number"])
+        .env("HIGGS_CONFIG_DIR", dir.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("config.toml")).unwrap(),
+        original
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("server.port"), "stderr was: {stderr}");
+    assert!(stderr.contains("not_a_number"), "stderr was: {stderr}");
+    assert!(stderr.contains("u16"), "stderr was: {stderr}");
+}
+
+#[test]
+fn config_set_rejects_unknown_key_without_changing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = bootstrap_config(8000);
+    write_config(dir.path(), &original);
+
+    let output = Command::new(higgs_bin())
+        .args(["config", "set", "nonsense.key", "1"])
+        .env("HIGGS_CONFIG_DIR", dir.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("config.toml")).unwrap(),
+        original
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown configuration key 'nonsense.key'"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn config_set_then_get_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    write_config(dir.path(), &bootstrap_config(8000));
+
+    let set = Command::new(higgs_bin())
+        .args(["config", "set", "server.port", "18985"])
+        .env("HIGGS_CONFIG_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        set.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+
+    let get = Command::new(higgs_bin())
+        .args(["config", "get", "server.port"])
+        .env("HIGGS_CONFIG_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(get.status.success());
+    assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), "18985");
+}
+
+#[test]
+fn config_set_dynamic_provider_key_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    write_config(dir.path(), &bootstrap_config(8000));
+
+    let set = Command::new(higgs_bin())
+        .args([
+            "config",
+            "set",
+            "provider.example.url",
+            "http://127.0.0.1:9000",
+        ])
+        .env("HIGGS_CONFIG_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        set.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+
+    let get = Command::new(higgs_bin())
+        .args(["config", "get", "provider.example.url"])
+        .env("HIGGS_CONFIG_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(get.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&get.stdout).trim(),
+        "http://127.0.0.1:9000"
+    );
+}
+
 #[test]
 fn start_rejects_legacy_serve_flags() {
     let output = Command::new(higgs_bin())

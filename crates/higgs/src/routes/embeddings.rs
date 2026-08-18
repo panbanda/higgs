@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use axum::{
     Json,
-    extract::State,
+    extract::{Extension, State},
     http::HeaderMap,
     response::{IntoResponse, Response},
 };
@@ -11,7 +11,7 @@ use bytes::Bytes;
 use crate::{
     config::ApiFormat,
     error::ServerError,
-    metrics::RequestRecord,
+    metrics::{RequestMetricsContext, RequestRecord},
     router::ResolvedRoute,
     state::SharedState,
     types::openai::{
@@ -22,6 +22,7 @@ use crate::{
 #[allow(clippy::too_many_lines)]
 pub async fn embeddings(
     State(state): State<SharedState>,
+    Extension(request_metrics): Extension<RequestMetricsContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ServerError> {
@@ -97,6 +98,7 @@ pub async fn embeddings(
                     output_tokens: 0,
                     error_body: None,
                 });
+                request_metrics.mark_recorded();
             }
 
             Ok(Json(EmbeddingResponse {
@@ -157,6 +159,7 @@ pub async fn embeddings(
                     output_tokens: 0,
                     error_body: None,
                 });
+                request_metrics.mark_recorded();
             }
             response
         }

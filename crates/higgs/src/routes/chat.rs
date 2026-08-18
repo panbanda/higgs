@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use axum::{
     Json,
-    extract::State,
+    extract::{Extension, State},
     http::HeaderMap,
     response::{
         IntoResponse, Sse,
@@ -17,7 +17,7 @@ use tokio_stream::Stream;
 use crate::{
     config::ApiFormat,
     error::ServerError,
-    metrics::{MetricsStore, RequestRecord},
+    metrics::{MetricsStore, RequestMetricsContext, RequestRecord},
     router::ResolvedRoute,
     state::{Engine, SharedState},
     types::openai::{
@@ -31,6 +31,7 @@ use higgs_models::SamplingParams;
 #[allow(clippy::too_many_lines)]
 pub async fn chat_completions(
     State(state): State<SharedState>,
+    Extension(request_metrics): Extension<RequestMetricsContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<axum::response::Response, ServerError> {
@@ -72,6 +73,9 @@ pub async fn chat_completions(
                     routing_method,
                 )?;
                 let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+                if state.metrics.is_some() {
+                    request_metrics.mark_recorded();
+                }
                 Ok(sse.into_response())
             } else {
                 let start = Instant::now();
@@ -91,6 +95,7 @@ pub async fn chat_completions(
                         output_tokens: u64::from(response.usage.completion_tokens),
                         error_body: None,
                     });
+                    request_metrics.mark_recorded();
                 }
                 Ok(Json(response).into_response())
             }
@@ -139,6 +144,7 @@ pub async fn chat_completions(
                             output_tokens: 0,
                             error_body: None,
                         });
+                        request_metrics.mark_recorded();
                     }
                     result
                 }
@@ -181,6 +187,7 @@ pub async fn chat_completions(
                                 output_tokens: 0,
                                 error_body: None,
                             });
+                            request_metrics.mark_recorded();
                         }
                         if upstream_status >= 400 {
                             let status_code = axum::http::StatusCode::from_u16(upstream_status)
@@ -203,7 +210,11 @@ pub async fn chat_completions(
                         let resp_bytes = upstream.bytes().await.map_err(|e| {
                             ServerError::ProxyError(format!("Failed to read response: {e}"))
                         })?;
-                        let usage = crate::proxy::extract_usage(&resp_bytes);
+                        let usage = if (200..300).contains(&upstream_status) {
+                            crate::proxy::extract_usage(&resp_bytes)
+                        } else {
+                            (0, 0)
+                        };
                         if let Some(ref metrics) = state.metrics {
                             metrics.record(RequestRecord {
                                 id: 0,
@@ -218,6 +229,7 @@ pub async fn chat_completions(
                                 output_tokens: usage.1,
                                 error_body: None,
                             });
+                            request_metrics.mark_recorded();
                         }
                         let status_code = axum::http::StatusCode::from_u16(upstream_status)
                             .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);

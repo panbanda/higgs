@@ -10,7 +10,7 @@ pub fn draw(frame: &mut Frame, area: Rect, metrics: &Arc<MetricsStore>, scroll: 
     let snap = metrics.snapshot();
 
     let now = std::time::Instant::now();
-    let mut errors: Vec<_> = snap.iter().filter(|r| r.status >= 400).collect();
+    let mut errors: Vec<_> = snap.iter().filter(|r| r.is_error()).collect();
     errors.sort_by_key(|record| std::cmp::Reverse(record.timestamp));
 
     let header = Row::new(vec!["Age", "Model", "Provider", "Status", "Error"])

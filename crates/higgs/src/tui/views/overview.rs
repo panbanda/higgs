@@ -269,7 +269,7 @@ fn draw_live_log(
         .skip(scroll)
         .take(50)
         .map(|r| {
-            let status_style = if r.status >= 400 {
+            let status_style = if r.is_error() {
                 Style::default().fg(Color::Red)
             } else {
                 Style::default().fg(Color::Green)

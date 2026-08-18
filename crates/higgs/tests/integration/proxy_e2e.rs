@@ -25,8 +25,9 @@ use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use higgs::config::ApiFormat;
+use higgs::config::{ApiFormat, MetricsLogConfig};
 use higgs::metrics::MetricsStore;
+use higgs::metrics_log::MetricsLogger;
 use higgs::router::Router;
 use higgs::state::AppState;
 
@@ -91,6 +92,35 @@ fn openai_chat_request_body() -> serde_json::Value {
 
 fn build_app(state: Arc<AppState>) -> axum::Router {
     higgs::build_router(state, 300.0, None, 0, 10 * 1024 * 1024, None)
+}
+
+fn build_selective_test_state(mock_url: &str, metrics: Arc<MetricsStore>) -> Arc<AppState> {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let config_toml = format!(
+        r#"
+        [provider.mock]
+        url = "{mock_url}"
+        format = "anthropic"
+
+        [[routes]]
+        pattern = "^known-model$"
+        provider = "mock"
+
+        [default]
+        provider = "higgs"
+    "#
+    );
+    std::fs::write(&config_path, &config_toml).unwrap();
+    let config = higgs::config::load_config_file(&config_path, None).unwrap();
+    let router = Router::from_config(&config, HashMap::new()).unwrap();
+
+    Arc::new(AppState {
+        router,
+        config,
+        http_client: reqwest::Client::new(),
+        metrics: Some(metrics),
+    })
 }
 
 fn post_json(uri: &str, body: &serde_json::Value) -> Request<Body> {
@@ -273,6 +303,167 @@ async fn metrics_recorded_for_proxy() {
     assert_eq!(records[0].provider, "mock");
     assert_eq!(records[0].status, 200);
     assert_eq!(records[0].model, "gpt-4");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn metrics_record_success_and_all_http_failures_once() {
+    let mock_server = MockServer::start().await;
+    let anthropic_response = serde_json::json!({
+        "id": "msg_test123",
+        "type": "message",
+        "role": "assistant",
+        "model": "known-model",
+        "content": [{"type": "text", "text": "Hello!"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 12, "output_tokens": 8}
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&anthropic_response))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let log_dir = tempfile::tempdir().unwrap();
+    let log_path = log_dir.path().join("metrics.jsonl");
+    let logger = MetricsLogger::new(&MetricsLogConfig {
+        enabled: true,
+        path: log_path.to_string_lossy().into_owned(),
+        max_size_mb: 1,
+        max_files: 1,
+    })
+    .unwrap();
+    let metrics = Arc::new(MetricsStore::with_logger(
+        Duration::from_secs(METRICS_WINDOW_SECS),
+        logger,
+    ));
+    let state = build_selective_test_state(&mock_server.uri(), Arc::clone(&metrics));
+    let app = build_app(state);
+
+    let good = serde_json::json!({
+        "model": "known-model",
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+    let good_response = app
+        .clone()
+        .oneshot(post_json("/v1/chat/completions", &good))
+        .await
+        .unwrap();
+    assert_eq!(good_response.status(), 200);
+
+    let unknown = serde_json::json!({
+        "model": "nonexistent-model",
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+    let unknown_response = app
+        .clone()
+        .oneshot(post_json("/v1/chat/completions", &unknown))
+        .await
+        .unwrap();
+    assert_eq!(unknown_response.status(), 404);
+    let unknown_body = unknown_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&unknown_body).unwrap();
+    assert_eq!(
+        json["error"]["message"],
+        "model 'nonexistent-model' not found among loaded local models"
+    );
+
+    let malformed_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from("{"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(malformed_response.status(), 400);
+
+    let fallback_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/unknown-route")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fallback_response.status(), 404);
+
+    let metrics_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(metrics_response.status(), 200);
+    let metrics_body = metrics_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let snapshot: serde_json::Value = serde_json::from_slice(&metrics_body).unwrap();
+    assert_eq!(snapshot["totals"]["requests"], 4);
+    assert_eq!(snapshot["totals"]["errors"], 3);
+    assert_eq!(snapshot["totals"]["input_tokens"], 12);
+    assert_eq!(snapshot["totals"]["output_tokens"], 8);
+    assert_eq!(snapshot["status_counts"]["200"], 1);
+    assert_eq!(snapshot["status_counts"]["400"], 1);
+    assert_eq!(snapshot["status_counts"]["404"], 2);
+
+    let records = metrics.snapshot();
+    assert_eq!(records.len(), 4);
+    assert_eq!(MetricsStore::status_counts(&records).get(&200), Some(&1));
+    assert_eq!(MetricsStore::status_counts(&records).get(&400), Some(&1));
+    assert_eq!(MetricsStore::status_counts(&records).get(&404), Some(&2));
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.input_tokens)
+            .sum::<u64>(),
+        12
+    );
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.output_tokens)
+            .sum::<u64>(),
+        8
+    );
+    assert!(
+        records
+            .iter()
+            .filter(|record| record.status >= 400)
+            .all(|record| { record.input_tokens == 0 && record.output_tokens == 0 })
+    );
+
+    let logged = std::fs::read_to_string(log_path).unwrap();
+    let entries: Vec<serde_json::Value> = logged
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(entries.len(), 4);
+    let statuses: Vec<u64> = entries
+        .iter()
+        .map(|entry| entry["status"].as_u64().unwrap())
+        .collect();
+    assert_eq!(statuses.iter().filter(|&&status| status == 200).count(), 1);
+    assert_eq!(statuses.iter().filter(|&&status| status == 400).count(), 1);
+    assert_eq!(statuses.iter().filter(|&&status| status == 404).count(), 2);
 }
 
 // ---------------------------------------------------------------------------

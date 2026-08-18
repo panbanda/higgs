@@ -755,10 +755,33 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
 
 /// Load a `HiggsConfig` from a TOML file, with env and CLI overlays (config mode).
 pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsConfig, String> {
-    let mut figment = Figment::new()
+    let figment = Figment::new()
         .merge(Toml::file(path))
         .merge(Env::prefixed("HIGGS_").split("__"));
 
+    let mut config = extract_config(figment, &path.display().to_string(), args)?;
+    validate_config(&config, false)?;
+    ensure_auto_router_model(&mut config);
+    Ok(config)
+}
+
+/// Deserialize TOML using the same typed extraction path as normal config loading.
+///
+/// This intentionally omits semantic startup validation so users can edit the
+/// commented bootstrap config one field at a time, while still rejecting any
+/// document that cannot deserialize into [`HiggsConfig`].
+pub fn validate_config_contents(contents: &str, source: &Path) -> Result<(), String> {
+    // Validate the document itself without environment overlays: an env value
+    // must not mask an invalid on-disk value that would fail on the next run.
+    let figment = Figment::new().merge(Toml::string(contents));
+    extract_config(figment, &source.display().to_string(), None).map(|_| ())
+}
+
+fn extract_config(
+    mut figment: Figment,
+    source: &str,
+    args: Option<&ServeArgs>,
+) -> Result<HiggsConfig, String> {
     // Overlay CLI args on server section
     if let Some(serve_args) = args {
         if let Some(ref host) = serve_args.host {
@@ -807,7 +830,7 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                 .collect();
             let mut existing = figment
                 .extract_inner::<Option<Vec<ModelConfig>>>("models")
-                .map_err(|e| format!("failed to parse models from {}: {e}", path.display()))?
+                .map_err(|e| format!("failed to parse models from {source}: {e}"))?
                 .unwrap_or_default();
             existing.extend(extra);
             figment = figment.merge(Serialized::default("models", &existing));
@@ -816,14 +839,12 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
 
     let mut config: HiggsConfig = figment
         .extract()
-        .map_err(|e| format!("failed to load config from {}: {e}", path.display()))?;
+        .map_err(|e| format!("failed to load config from {source}: {e}"))?;
     apply_requested_mlx_profile(
         &mut config,
         args.and_then(|serve_args| serve_args.mlx_profile),
     )?;
 
-    validate_config(&config, false)?;
-    ensure_auto_router_model(&mut config);
     Ok(config)
 }
 

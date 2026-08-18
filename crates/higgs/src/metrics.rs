@@ -1,11 +1,28 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
 use crate::metrics_log::MetricsLogger;
+
+/// Per-request coordination between token-aware handlers and the HTTP metrics layer.
+///
+/// Handlers mark this after writing their richer record. The outer layer then
+/// records only responses that did not reach such a handler path.
+#[derive(Clone, Default)]
+pub struct RequestMetricsContext(Arc<AtomicBool>);
+
+impl RequestMetricsContext {
+    pub fn mark_recorded(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    pub fn was_recorded(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutingMethod {
@@ -50,6 +67,12 @@ pub struct RequestRecord {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub error_body: Option<String>,
+}
+
+impl RequestRecord {
+    pub const fn is_error(&self) -> bool {
+        self.status < 200 || self.status >= 300
+    }
 }
 
 pub struct MetricsStore {

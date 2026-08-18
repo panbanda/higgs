@@ -54,11 +54,9 @@ impl IntoResponse for ServerError {
                 "invalid_request_error",
                 msg.clone(),
             ),
-            Self::ModelNotFound(model) => (
-                StatusCode::NOT_FOUND,
-                "model_not_found",
-                format!("Model '{model}' is not loaded"),
-            ),
+            Self::ModelNotFound(message) => {
+                (StatusCode::NOT_FOUND, "model_not_found", message.clone())
+            }
             Self::InternalError(msg) => {
                 tracing::error!(error = %msg, "Internal error");
                 (

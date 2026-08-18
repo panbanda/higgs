@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use axum::{
     Json,
-    extract::State,
+    extract::{Extension, State},
     http::HeaderMap,
     response::{
         IntoResponse, Sse,
@@ -17,7 +17,7 @@ use tokio_stream::Stream;
 use crate::{
     config::ApiFormat,
     error::ServerError,
-    metrics::{MetricsStore, RequestRecord},
+    metrics::{MetricsStore, RequestMetricsContext, RequestRecord},
     router::ResolvedRoute,
     state::{Engine, SharedState},
     types::openai::{
@@ -30,6 +30,7 @@ use higgs_models::SamplingParams;
 #[allow(clippy::too_many_lines)]
 pub async fn completions(
     State(state): State<SharedState>,
+    Extension(request_metrics): Extension<RequestMetricsContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<axum::response::Response, ServerError> {
@@ -65,6 +66,9 @@ pub async fn completions(
                     routing_method,
                 )?;
                 let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+                if state.metrics.is_some() {
+                    request_metrics.mark_recorded();
+                }
                 Ok(sse.into_response())
             } else {
                 let start = Instant::now();
@@ -83,6 +87,7 @@ pub async fn completions(
                         output_tokens: u64::from(response.usage.completion_tokens),
                         error_body: None,
                     });
+                    request_metrics.mark_recorded();
                 }
                 Ok(Json(response).into_response())
             }
@@ -134,6 +139,7 @@ pub async fn completions(
                     output_tokens: 0,
                     error_body: None,
                 });
+                request_metrics.mark_recorded();
             }
             response
         }
