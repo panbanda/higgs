@@ -1,13 +1,14 @@
 pub mod adapter;
 pub mod bonsai_q1;
 pub mod cache;
+/// Internal: runtime JIT Metal kernels (Bonsai-Q1 bits=1 matvec/dequant).
+mod crossrow_qmv;
 pub mod deepseek_v2;
 pub mod error;
 pub mod gemma2;
 pub mod gemma3;
 pub mod gemma4;
 pub mod llava_qwen2;
-/// Internal: runtime JIT Metal kernels (Bonsai-Q1 bits=1 matvec/dequant).
 mod metal_kernel;
 pub mod phi3;
 pub mod progress;

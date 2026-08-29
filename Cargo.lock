@@ -2471,7 +2471,7 @@ dependencies = [
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=f4aa309c79b6be35255ca7d34157dfc10d9ed4c9#f4aa309c79b6be35255ca7d34157dfc10d9ed4c9"
+source = "git+https://github.com/dusterbloom/mlx-rs.git?branch=mlx-0.31#b46423d2447d3db354c134a0ef25ff55dfdfe8b6"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -2483,7 +2483,7 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=f4aa309c79b6be35255ca7d34157dfc10d9ed4c9#f4aa309c79b6be35255ca7d34157dfc10d9ed4c9"
+source = "git+https://github.com/dusterbloom/mlx-rs.git?branch=mlx-0.31#b46423d2447d3db354c134a0ef25ff55dfdfe8b6"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -2494,7 +2494,7 @@ dependencies = [
 [[package]]
 name = "mlx-rs"
 version = "0.25.3"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=f4aa309c79b6be35255ca7d34157dfc10d9ed4c9#f4aa309c79b6be35255ca7d34157dfc10d9ed4c9"
+source = "git+https://github.com/dusterbloom/mlx-rs.git?branch=mlx-0.31#b46423d2447d3db354c134a0ef25ff55dfdfe8b6"
 dependencies = [
  "dyn-clone",
  "half",
@@ -2517,7 +2517,7 @@ dependencies = [
 [[package]]
 name = "mlx-sys"
 version = "0.2.0"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=f4aa309c79b6be35255ca7d34157dfc10d9ed4c9#f4aa309c79b6be35255ca7d34157dfc10d9ed4c9"
+source = "git+https://github.com/dusterbloom/mlx-rs.git?branch=mlx-0.31#b46423d2447d3db354c134a0ef25ff55dfdfe8b6"
 dependencies = [
  "bindgen",
  "cc",
