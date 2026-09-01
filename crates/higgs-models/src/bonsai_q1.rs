@@ -1219,8 +1219,10 @@ fn load_packed(
     }
 
     let w_packed: Vec<u32> = w_bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect();
     let scales = bytes_to_f16_vec(s_bytes);
     let biases = bytes_to_f16_vec(b_bytes);
@@ -1240,8 +1242,10 @@ fn load_f16(tensors: &SafeTensors<'_>, name: &str) -> Result<Vec<f16>, String> {
 }
 
 fn bytes_to_f16_vec(b: &[u8]) -> Vec<f16> {
-    b.chunks_exact(2)
-        .map(|c| f16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+    b.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| f16::from_bits(u16::from_le_bytes(*c)))
         .collect()
 }
 
