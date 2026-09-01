@@ -302,7 +302,7 @@ where
                             let neg_inf = self.cached_neg_inf.as_ref().ok_or_else(|| {
                                 Exception::custom("cached_neg_inf not initialized")
                             })?;
-                            scores = ops::r#where(&window_mask, &scores, neg_inf)?;
+                            scores = ops::select(&window_mask, &scores, neg_inf)?;
                         }
                     }
 
@@ -319,7 +319,7 @@ where
                             .cached_neg_inf
                             .as_ref()
                             .ok_or_else(|| Exception::custom("cached_neg_inf not initialized"))?;
-                        scores = ops::r#where(m, &scores, neg_inf)?;
+                        scores = ops::select(m, &scores, neg_inf)?;
                     }
 
                     let weights = ops::softmax_axis(&scores, -1, None)?;
@@ -417,7 +417,7 @@ where
                     .cached_neg_inf
                     .as_ref()
                     .ok_or_else(|| Exception::custom("cached_neg_inf not initialized"))?;
-                scores = ops::r#where(&window_mask, &scores, neg_inf)?;
+                scores = ops::select(&window_mask, &scores, neg_inf)?;
             }
         }
 
@@ -434,7 +434,7 @@ where
                 .cached_neg_inf
                 .as_ref()
                 .ok_or_else(|| Exception::custom("cached_neg_inf not initialized"))?;
-            scores = ops::r#where(m, &scores, neg_inf)?;
+            scores = ops::select(m, &scores, neg_inf)?;
         }
 
         let weights = ops::softmax_axis(&scores, -1, None)?;
@@ -476,8 +476,8 @@ fn create_sliding_window_mask(L: i32, S: i32, window: i32) -> Result<Array, Exce
     // The causal mask already handles j <= (offset + i).
     // The remaining constraint: j >= (offset + i) - window + 1
 
-    let query_positions = mlx_rs::arange!(start = offset, stop = offset + L)?;
-    let key_positions = mlx_rs::arange!(stop = S)?;
+    let query_positions = mlx_rs::ops::arange::<_, f32>(offset, offset + L, None)?;
+    let key_positions = mlx_rs::ops::arange::<_, f32>(None, S, None)?;
 
     // lower_bound[i] = query_pos[i] - window + 1
     let lower_bounds = query_positions.subtract(array!(window - 1))?;

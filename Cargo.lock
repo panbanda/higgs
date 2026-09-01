@@ -2471,7 +2471,7 @@ dependencies = [
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=f4aa309c79b6be35255ca7d34157dfc10d9ed4c9#f4aa309c79b6be35255ca7d34157dfc10d9ed4c9"
+source = "git+https://github.com/oxideai/mlx-rs.git?rev=cd70e2d07362d62d58dbd3b3c970f350e90675d5#cd70e2d07362d62d58dbd3b3c970f350e90675d5"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -2483,7 +2483,7 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=f4aa309c79b6be35255ca7d34157dfc10d9ed4c9#f4aa309c79b6be35255ca7d34157dfc10d9ed4c9"
+source = "git+https://github.com/oxideai/mlx-rs.git?rev=cd70e2d07362d62d58dbd3b3c970f350e90675d5#cd70e2d07362d62d58dbd3b3c970f350e90675d5"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -2494,7 +2494,7 @@ dependencies = [
 [[package]]
 name = "mlx-rs"
 version = "0.25.3"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=f4aa309c79b6be35255ca7d34157dfc10d9ed4c9#f4aa309c79b6be35255ca7d34157dfc10d9ed4c9"
+source = "git+https://github.com/oxideai/mlx-rs.git?rev=cd70e2d07362d62d58dbd3b3c970f350e90675d5#cd70e2d07362d62d58dbd3b3c970f350e90675d5"
 dependencies = [
  "dyn-clone",
  "half",
@@ -2510,14 +2510,14 @@ dependencies = [
  "parking_lot",
  "paste",
  "smallvec",
- "strum 0.27.2",
+ "strum",
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "mlx-sys"
 version = "0.2.0"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=f4aa309c79b6be35255ca7d34157dfc10d9ed4c9#f4aa309c79b6be35255ca7d34157dfc10d9ed4c9"
+source = "git+https://github.com/oxideai/mlx-rs.git?rev=cd70e2d07362d62d58dbd3b3c970f350e90675d5#cd70e2d07362d62d58dbd3b3c970f350e90675d5"
 dependencies = [
  "bindgen",
  "cc",
@@ -3282,7 +3282,7 @@ dependencies = [
  "lru",
  "palette",
  "serde",
- "strum 0.28.0",
+ "strum",
  "thiserror 2.0.20",
  "unicode-segmentation",
  "unicode-truncate",
@@ -3346,7 +3346,7 @@ dependencies = [
  "line-clipping",
  "ratatui-core",
  "serde",
- "strum 0.28.0",
+ "strum",
  "time",
  "unicode-segmentation",
  "unicode-width",
@@ -3920,32 +3920,11 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "strum"
-version = "0.27.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
-dependencies = [
- "strum_macros 0.27.2",
-]
-
-[[package]]
-name = "strum"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
 dependencies = [
- "strum_macros 0.28.0",
-]
-
-[[package]]
-name = "strum_macros"
-version = "0.27.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7695ce3845ea4b33927c055a39dc438a45b059f7c1b3d91d38d10355fb8cbca7"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
+ "strum_macros",
 ]
 
 [[package]]
@@ -4061,7 +4040,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
  "windows-sys 0.59.0",

@@ -1718,7 +1718,7 @@ fn split_fused_gate_up(
     }
     let m = two_m / 2;
 
-    let parts = fused.split(2, 1).map_err(ModelError::Mlx)?;
+    let parts = fused.split_equal(2, 1).map_err(ModelError::Mlx)?;
     let [gate, up] = <[Array; 2]>::try_from(parts).map_err(|_| {
         ModelError::ShapeMismatch("gate_up_proj split did not yield 2 parts".to_owned())
     })?;

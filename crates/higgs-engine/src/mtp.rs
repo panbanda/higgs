@@ -8,8 +8,8 @@
 
 use higgs_models::{AnyCache, AnyModel, MtpCache, deep_clone_mtp_cache};
 use mlx_rs::{
-    Array, argmax_axis,
-    ops::{self, concatenate_axis, indexing::IndexOp},
+    Array,
+    ops::{self, concatenate, indexing::IndexOp},
     transforms::eval,
 };
 
@@ -259,13 +259,14 @@ pub fn mtp_prompt_lookup_cycle(
 }
 
 fn greedy_token_id(logits: &Array) -> Result<u32, EngineError> {
-    let token_arr = argmax_axis!(&logits.index((.., -1, ..)), -1).map_err(EngineError::Mlx)?;
+    let token_arr = ops::indexing::argmax_axis(logits.index((.., -1, ..)), -1, None)
+        .map_err(EngineError::Mlx)?;
     eval([&token_arr]).map_err(EngineError::Mlx)?;
-    Ok(token_arr.item())
+    Ok(token_arr.item_cast())
 }
 
 fn greedy_token_ids(logits: &Array) -> Result<Vec<u32>, EngineError> {
-    let token_arr = argmax_axis!(logits, -1).map_err(EngineError::Mlx)?;
+    let token_arr = ops::indexing::argmax_axis(logits, -1, None).map_err(EngineError::Mlx)?;
     eval([&token_arr]).map_err(EngineError::Mlx)?;
     Ok(token_arr.as_slice::<u32>().to_vec())
 }
@@ -501,7 +502,7 @@ fn shifted_hidden_rows(
     }
 
     let tail = hidden_rows(hidden, 0, count - 1)?;
-    concatenate_axis(&[initial_hidden, &tail], 1).map_err(EngineError::Mlx)
+    concatenate(&[initial_hidden, &tail], 1).map_err(EngineError::Mlx)
 }
 
 /// Prime an MTP cache from a backbone hidden sequence.

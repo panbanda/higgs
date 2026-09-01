@@ -193,7 +193,7 @@ mod tests {
                 .unwrap()
                 .max(None)
                 .unwrap()
-                .item::<f32>();
+                .item_cast::<f32>();
             assert!(
                 diff < 1e-5,
                 "offset={offset} no-freqs: max_diff={diff} >= 1e-5"
@@ -213,7 +213,7 @@ mod tests {
                 .unwrap()
                 .max(None)
                 .unwrap()
-                .item::<f32>();
+                .item_cast::<f32>();
             assert!(
                 diff < 1e-5,
                 "offset={offset} with-freqs: max_diff={diff} >= 1e-5"

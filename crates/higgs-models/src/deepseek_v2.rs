@@ -528,9 +528,8 @@ impl DeepSeekV2Attention {
             let scale = self.scale;
             let (absorbed_k, absorbed_v) = self.absorbed_weights(q_nope.dtype())?;
             let q_latent = q_nope.matmul(absorbed_k)?;
-            let queries = ops::concatenate_axis(&[&q_latent, &q_pe], -1)?;
-            let rows =
-                ops::concatenate_axis(&[&latent.reshape(&[B, 1, L, kv_lora_rank])?, &k_pe], -1)?;
+            let queries = ops::concatenate(&[&q_latent, &q_pe], -1)?;
+            let rows = ops::concatenate(&[&latent.reshape(&[B, 1, L, kv_lora_rank])?, &k_pe], -1)?;
             let (history, _) = cache
                 .ok_or_else(|| Exception::custom("MLA latent path requires a cache"))?
                 .update_latent_and_fetch(rows)?;
@@ -564,8 +563,8 @@ impl DeepSeekV2Attention {
             ops::broadcast_to(&k_pe, &[B, self.num_heads, L, self.qk_rope_head_dim])?;
 
         // Combine nope + pe components
-        let keys_combined = ops::concatenate_axis(&[&k_nope, &k_pe_expanded], -1)?;
-        let queries = ops::concatenate_axis(&[&q_nope, &q_pe], -1)?;
+        let keys_combined = ops::concatenate(&[&k_nope, &k_pe_expanded], -1)?;
+        let queries = ops::concatenate(&[&q_nope, &q_pe], -1)?;
 
         // Update cache
         let (keys, values) = if let Some(kv_cache) = cache {

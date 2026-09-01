@@ -183,7 +183,7 @@ impl LlavaQwen2Model {
         let sentinel = Array::from_slice(&[IMAGE_TOKEN_INDEX], &[1]);
         let is_sentinel = input_ids.eq(&sentinel)?;
         let zero = Array::from_slice(&[0_i32], &[1]);
-        let safe_ids = mlx_rs::ops::r#where(&is_sentinel, &zero, input_ids)?;
+        let safe_ids = mlx_rs::ops::select(&is_sentinel, &zero, input_ids)?;
         let text_embeddings = self.language_model.embed_tokens(&safe_ids)?;
         let combined = merge_embeddings(input_ids, &text_embeddings, &image_features)?;
         self.language_model
@@ -255,7 +255,7 @@ fn merge_embeddings(
     }
 
     let seg_refs: Vec<&Array> = segments.iter().collect();
-    mlx_rs::ops::concatenate_axis(&seg_refs, 1)
+    mlx_rs::ops::concatenate(&seg_refs, 1)
 }
 
 // ---------------------------------------------------------------------------

@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::OnceLock;
 
-use mlx_rs::{Array, Dtype, Stream, argmin_axis, error::Exception, ops};
+use mlx_rs::{Array, Dtype, Stream, error::Exception, ops};
 #[cfg(test)]
 use rand::Rng;
 use rand::{RngExt, SeedableRng};
@@ -429,7 +429,7 @@ impl TurboQuantContext {
         let distances = ops::abs(&ops::subtract(&rotated_expanded, &centroids)?)?;
 
         // indices: [H, T, D] as u32
-        let indices = argmin_axis!(&distances, -1)?;
+        let indices = ops::indexing::argmin_axis(&distances, -1, None)?;
 
         // Norm correction on CPU batch path
         raw_norms.eval()?;
@@ -513,7 +513,7 @@ impl TurboQuantContext {
         let key_centroids = self.key_centroids_array()?;
         let rotated_expanded = rotated.expand_dims(-1)?; // [H, T, D, 1]
         let distances = ops::abs(&ops::subtract(&rotated_expanded, &key_centroids)?)?;
-        let mse_indices = argmin_axis!(&distances, -1)?; // [H, T, D]
+        let mse_indices = ops::indexing::argmin_axis(&distances, -1, None)?; // [H, T, D]
 
         // Norm correction for keys
         let norms = if self.config.norm_correction {
@@ -585,7 +585,7 @@ impl TurboQuantContext {
         let distances = ops::abs(&ops::subtract(&rotated.expand_dims(-1)?, &centroids)?)?;
 
         // indices: [H, T, D] u32
-        let indices = argmin_axis!(&distances, -1)?;
+        let indices = ops::indexing::argmin_axis(&distances, -1, None)?;
 
         // Norm correction on GPU: gather centroids → L2 → divide norms
         let corrected_norms = if self.config.norm_correction {
@@ -636,7 +636,7 @@ impl TurboQuantContext {
         // MSE quantize: find nearest centroid in rotated space
         let key_centroids = self.key_centroids_array()?;
         let distances = ops::abs(&ops::subtract(&rotated.expand_dims(-1)?, &key_centroids)?)?;
-        let mse_indices = argmin_axis!(&distances, -1)?;
+        let mse_indices = ops::indexing::argmin_axis(&distances, -1, None)?;
 
         // Norm correction for keys: use rotated_approx L2
         let corrected_norms = if self.config.norm_correction {
@@ -743,7 +743,7 @@ pub(crate) fn decode_scores(
     }
     ensure_ffi_error_handler();
 
-    let stream = Stream::task_local_or_default();
+    let stream = Stream::thread_local_or_default();
     let kernel = SCORE_KERNEL.get_or_init(|| CachedMetalKernel(create_scores_kernel()));
     let config = configure_scores_kernel(
         num_heads,
@@ -821,7 +821,7 @@ pub(crate) fn decode_weighted_values(
     }
     ensure_ffi_error_handler();
 
-    let stream = Stream::task_local_or_default();
+    let stream = Stream::thread_local_or_default();
     let kernel = VALUE_KERNEL.get_or_init(|| CachedMetalKernel(create_values_kernel()));
     let config = configure_values_kernel(
         num_heads,
@@ -1468,7 +1468,7 @@ pub(crate) fn pack_indices_gpu(
 ) -> Result<Array, Exception> {
     ensure_ffi_error_handler();
 
-    let stream = Stream::task_local_or_default();
+    let stream = Stream::thread_local_or_default();
     let kernel = PACK_KERNEL.get_or_init(|| CachedMetalKernel(create_pack_kernel()));
     let config = configure_pack_kernel(n, head_dim, bits, code_words);
 

@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use mlx_rs::{Array, Dtype, Stream, error::Exception, ops, ops::concatenate_axis};
+use mlx_rs::{Array, Dtype, Stream, error::Exception, ops, ops::concatenate};
 
 use crate::turboquant::{
     KvCacheConfig, KvCacheMode, QuantizedKey, QuantizedValue, TurboQuantContext,
@@ -129,24 +129,35 @@ impl TurboQuantKvView {
         let value_code_bytes = usize_from_i32(self.context.value_code_bytes, "value_code_bytes")?;
         let value_code_words = usize_from_i32(self.context.value_code_words, "value_code_words")?;
 
+        // These are `slice_axis` sub-ranges of larger pre-allocated capacity
+        // buffers (see `TurboQuantStorage::view`), so they are routinely
+        // non-contiguous whenever `seq_len < capacity` — the common case
+        // mid-decode. `as_slice` requires contiguous row-major storage, so
+        // force a materialized contiguous copy before eval+as_slice.
+        let key_codes_arr = self.key_codes.contiguous()?;
+        let key_norms_arr = self.key_norms.contiguous()?;
+        let key_gammas_arr = self.key_gammas.contiguous()?;
+        let value_codes_arr = self.value_codes.contiguous()?;
+        let value_norms_arr = self.value_norms.contiguous()?;
+
         // Eval all view arrays — they may be lazy GPU results from the pack kernel.
-        self.key_codes.eval()?;
-        self.key_norms.eval()?;
-        self.key_gammas.eval()?;
-        self.value_codes.eval()?;
-        self.value_norms.eval()?;
+        key_codes_arr.eval()?;
+        key_norms_arr.eval()?;
+        key_gammas_arr.eval()?;
+        value_codes_arr.eval()?;
+        value_norms_arr.eval()?;
 
         // Code arrays are u32 words — reinterpret as bytes for CPU dequant
-        let key_codes_u32 = self.key_codes.as_slice::<u32>();
+        let key_codes_u32 = key_codes_arr.as_slice::<u32>();
         let key_codes_u8: Vec<u8> = key_codes_u32.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let key_norms = self.key_norms.as_slice::<f32>();
-        let key_gammas = self.key_gammas.as_slice::<f32>();
-        let value_codes_u32 = self.value_codes.as_slice::<u32>();
+        let key_norms = key_norms_arr.as_slice::<f32>();
+        let key_gammas = key_gammas_arr.as_slice::<f32>();
+        let value_codes_u32 = value_codes_arr.as_slice::<u32>();
         let value_codes_u8: Vec<u8> = value_codes_u32
             .iter()
             .flat_map(|w| w.to_le_bytes())
             .collect();
-        let value_norms = self.value_norms.as_slice::<f32>();
+        let value_norms = value_norms_arr.as_slice::<f32>();
 
         // Each row occupies key_code_words * 4 bytes in the reinterpreted buffer
         let key_row_bytes = checked_mul(key_code_words, 4, "key row bytes")?;
@@ -379,8 +390,8 @@ impl KeyValueCache for ConcatKeyValueCache {
     fn update_and_view(&mut self, keys: Array, values: Array) -> Result<KvCacheView, Exception> {
         if let (Some(existing_keys), Some(existing_values)) = (self.keys.take(), self.values.take())
         {
-            self.keys = Some(concatenate_axis(&[existing_keys, keys], -2)?);
-            self.values = Some(concatenate_axis(&[existing_values, values], -2)?);
+            self.keys = Some(concatenate(&[existing_keys, keys], -2)?);
+            self.values = Some(concatenate(&[existing_values, values], -2)?);
         } else {
             self.keys = Some(keys);
             self.values = Some(values);
@@ -614,6 +625,13 @@ impl SteppingKeyValueCache {
         (self.keys.as_mut(), self.values.as_mut())
     }
 
+    /// Simultaneous mutable access to the key and value slots themselves
+    /// (as opposed to [`Self::key_value_arrays_mut`], which unwraps them),
+    /// for `Updatable::state_projection`.
+    pub const fn key_value_slots_mut(&mut self) -> (&mut Option<Array>, &mut Option<Array>) {
+        (&mut self.keys, &mut self.values)
+    }
+
     /// Create a pre-filled cache from existing K/V arrays.
     ///
     /// Sets `offset = keys.shape()[2]` so the next `update_dense` triggers a
@@ -798,8 +816,8 @@ impl SteppingKeyValueCache {
                     } else {
                         (old_k.clone(), old_v.clone())
                     };
-                    let cat_k = concatenate_axis(&[trimmed_k, new_k], 2)?;
-                    let cat_v = concatenate_axis(&[trimmed_v, new_v], 2)?;
+                    let cat_k = concatenate(&[trimmed_k, new_k], 2)?;
+                    let cat_v = concatenate(&[trimmed_v, new_v], 2)?;
                     (cat_k, cat_v)
                 }
                 _ => (new_k, new_v),
@@ -943,7 +961,7 @@ impl SteppingKeyValueCache {
             let slots = ((new_tokens + self.step - 1) / self.step) * self.step;
             let grown = ops::zeros_dtype(&[1, 1, slots, width], rows.dtype())?;
             storage.latent = Some(match storage.latent.take() {
-                Some(old) => concatenate_axis(&[slice_axis2(&old, 0, prev)?, grown], 2)?,
+                Some(old) => concatenate(&[slice_axis2(&old, 0, prev)?, grown], 2)?,
                 None => grown,
             });
         }
@@ -1350,7 +1368,7 @@ fn slice_update_axis2(
             ends.len(),
             strides.as_ptr(),
             strides.len(),
-            Stream::task_local_or_default().as_ptr(),
+            Stream::thread_local_or_default().as_ptr(),
         );
         if status != 0 {
             mlx_sys::mlx_array_free(result);
@@ -1386,7 +1404,7 @@ fn slice_axis(arr: &Array, axis: usize, start: i32, end: i32) -> Result<Array, E
             ends.len(),
             strides.as_ptr(),
             strides.len(),
-            Stream::task_local_or_default().as_ptr(),
+            Stream::thread_local_or_default().as_ptr(),
         );
         if status != 0 {
             mlx_sys::mlx_array_free(result);
@@ -1429,7 +1447,7 @@ fn slice_update_axis(
             ends.len(),
             strides.as_ptr(),
             strides.len(),
-            Stream::task_local_or_default().as_ptr(),
+            Stream::thread_local_or_default().as_ptr(),
         );
         if status != 0 {
             mlx_sys::mlx_array_free(result);
@@ -1723,7 +1741,11 @@ mod tests {
 
     #[test]
     fn test_as_slice_after_transpose_order() {
-        // Verify whether as_slice returns logical (transposed) or storage order
+        // mlx-rs `as_slice` now refuses non-contiguous (e.g. transposed) views
+        // outright (`AsSliceError::NotContiguous`) instead of silently handing
+        // back storage-order data. Confirm that guard fires, then confirm the
+        // actual fix TurboQuantStorage::append relies on: flatten+reshape to
+        // force contiguous layout before calling as_slice.
         let data: Vec<f32> = (0..24)
             .map(|i| f32::from(i8::try_from(i).unwrap()))
             .collect();
@@ -1731,22 +1753,10 @@ mod tests {
         let transposed = arr.transpose_axes(&[0, 2, 1, 3]).unwrap(); // [B=1, H=2, L=3, D=4]
         assert_eq!(transposed.shape(), &[1, 2, 3, 4]);
         transposed.eval().unwrap();
-        let slice = transposed.as_slice::<f32>();
-
-        // If LOGICAL order (transpose respected): slice[4..8] = [8,9,10,11] (h=0, t=1)
-        // If STORAGE order (transpose ignored): slice[4..8] = [4,5,6,7] (original layout)
-        let slice_4 = *slice.get(4).unwrap();
-        let is_logical = (slice_4 - 8.0).abs() < f32::EPSILON;
-        let is_storage = (slice_4 - 4.0).abs() < f32::EPSILON;
-        // This test documents the actual behavior — whichever assertion passes
-        // tells us whether TurboQuantStorage::append is correct.
-        assert!(
-            is_logical || is_storage,
-            "unexpected as_slice order: slice[4] = {slice_4}"
+        assert_eq!(
+            transposed.try_as_slice::<f32>().unwrap_err(),
+            mlx_rs::error::AsSliceError::NotContiguous
         );
-        // as_slice returns storage order (confirmed), so we must flatten+reshape
-        // to make arrays contiguous before calling as_slice.
-        assert!(is_storage, "expected storage order from as_slice");
 
         // Verify the fix: flatten+reshape forces contiguous layout
         let fixed = transposed
@@ -1798,6 +1808,19 @@ mod tests {
         assert_eq!(turbo.value_codes.shape(), &[2, 3, 1]);
         // Dense storage cleared after bulk quantize
         assert!(cache.keys.is_none());
+
+        // Regression: `TurboQuantStorage` pre-allocates capacity in `step`-sized
+        // chunks (256 by default), so `turbo.seq_len` (3) is well below the
+        // storage's actual capacity (256). `TurboQuantKvView::view` builds each
+        // field via `slice_axis`, which — unlike the deferred-quantize path
+        // above — produces a genuinely non-contiguous array whenever
+        // `seq_len < capacity`. `materialize_dense` must force those arrays
+        // contiguous before calling `as_slice`, or this panics with
+        // `AsSliceError::NotContiguous` (mlx-rs >= 0.26 no longer silently
+        // returns storage-order data for non-contiguous views).
+        let (dense_keys, dense_values) = decode_view.into_dense().unwrap();
+        assert_eq!(dense_keys.shape(), &[1, 2, 3, 8]);
+        assert_eq!(dense_values.shape(), &[1, 2, 3, 8]);
     }
 
     #[test]
