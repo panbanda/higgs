@@ -7986,7 +7986,7 @@ mod tests {
         });
 
         candidates.into_iter().find(|path| {
-            Array::load_safetensors(path).ok().is_some_and(|loaded| {
+            Array::load_safetensors(path).is_ok_and(|loaded| {
                 loaded.keys().any(|key| {
                     key.contains("switch_mlp")
                         && key.contains("gate_proj")
