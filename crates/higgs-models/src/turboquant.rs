@@ -1951,8 +1951,10 @@ mod tests {
             }
             // Reinterpret CPU bytes as u32 words for comparison
             let cpu_words: Vec<u32> = cpu_packed
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
                 .collect();
 
             // GPU pack (outputs u32 words)
@@ -2003,8 +2005,10 @@ mod tests {
             // Reinterpret CPU bytes as u32 words for comparison
             let cpu_words: Vec<u32> = cpu_result
                 .packed_codes
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
                 .collect();
             let gpu_codes_data = gpu_codes.as_slice::<u32>();
             assert_eq!(
@@ -2051,8 +2055,10 @@ mod tests {
             // Reinterpret CPU bytes as u32 words for comparison
             let cpu_code_words: Vec<u32> = cpu_result
                 .packed_codes
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
                 .collect();
             assert_eq!(
                 gpu_codes.as_slice::<u32>(),
