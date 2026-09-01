@@ -1510,7 +1510,7 @@ impl SimpleEngine {
         let logits = model
             .forward_all_logits(&first_input, None, cache)
             .map_err(EngineError::Mlx)?;
-        let next_arr = mlx_rs::ops::indexing::argmax_axis(&logits.index((.., -1, ..)), -1, None)
+        let next_arr = mlx_rs::ops::indexing::argmax_axis(logits.index((.., -1, ..)), -1, None)
             .map_err(EngineError::Mlx)?;
         eval([&next_arr]).map_err(EngineError::Mlx)?;
 
@@ -1709,7 +1709,7 @@ impl SimpleEngine {
         let (hidden, logits) = model
             .forward_with_hidden(&first_input, None, cache)
             .map_err(EngineError::Mlx)?;
-        let next_arr = mlx_rs::ops::indexing::argmax_axis(&logits.index((.., -1, ..)), -1, None)
+        let next_arr = mlx_rs::ops::indexing::argmax_axis(logits.index((.., -1, ..)), -1, None)
             .map_err(EngineError::Mlx)?;
         let h = hidden.index((.., -1.., ..));
         if let Some(previous_hidden) = prefill_hidden
@@ -1948,7 +1948,7 @@ impl SimpleEngine {
         let (hidden, logits) = model
             .forward_with_hidden(&first_input, None, cache)
             .map_err(EngineError::Mlx)?;
-        let next_arr = mlx_rs::ops::indexing::argmax_axis(&logits.index((.., -1, ..)), -1, None)
+        let next_arr = mlx_rs::ops::indexing::argmax_axis(logits.index((.., -1, ..)), -1, None)
             .map_err(EngineError::Mlx)?;
         let h = hidden.index((.., -1.., ..));
         if let Some(previous_hidden) = prefill_hidden

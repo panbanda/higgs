@@ -259,7 +259,7 @@ pub fn mtp_prompt_lookup_cycle(
 }
 
 fn greedy_token_id(logits: &Array) -> Result<u32, EngineError> {
-    let token_arr = ops::indexing::argmax_axis(&logits.index((.., -1, ..)), -1, None)
+    let token_arr = ops::indexing::argmax_axis(logits.index((.., -1, ..)), -1, None)
         .map_err(EngineError::Mlx)?;
     eval([&token_arr]).map_err(EngineError::Mlx)?;
     Ok(token_arr.item_cast())
