@@ -129,24 +129,35 @@ impl TurboQuantKvView {
         let value_code_bytes = usize_from_i32(self.context.value_code_bytes, "value_code_bytes")?;
         let value_code_words = usize_from_i32(self.context.value_code_words, "value_code_words")?;
 
+        // These are `slice_axis` sub-ranges of larger pre-allocated capacity
+        // buffers (see `TurboQuantStorage::view`), so they are routinely
+        // non-contiguous whenever `seq_len < capacity` — the common case
+        // mid-decode. `as_slice` requires contiguous row-major storage, so
+        // force a materialized contiguous copy before eval+as_slice.
+        let key_codes_arr = self.key_codes.contiguous()?;
+        let key_norms_arr = self.key_norms.contiguous()?;
+        let key_gammas_arr = self.key_gammas.contiguous()?;
+        let value_codes_arr = self.value_codes.contiguous()?;
+        let value_norms_arr = self.value_norms.contiguous()?;
+
         // Eval all view arrays — they may be lazy GPU results from the pack kernel.
-        self.key_codes.eval()?;
-        self.key_norms.eval()?;
-        self.key_gammas.eval()?;
-        self.value_codes.eval()?;
-        self.value_norms.eval()?;
+        key_codes_arr.eval()?;
+        key_norms_arr.eval()?;
+        key_gammas_arr.eval()?;
+        value_codes_arr.eval()?;
+        value_norms_arr.eval()?;
 
         // Code arrays are u32 words — reinterpret as bytes for CPU dequant
-        let key_codes_u32 = self.key_codes.as_slice::<u32>();
+        let key_codes_u32 = key_codes_arr.as_slice::<u32>();
         let key_codes_u8: Vec<u8> = key_codes_u32.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let key_norms = self.key_norms.as_slice::<f32>();
-        let key_gammas = self.key_gammas.as_slice::<f32>();
-        let value_codes_u32 = self.value_codes.as_slice::<u32>();
+        let key_norms = key_norms_arr.as_slice::<f32>();
+        let key_gammas = key_gammas_arr.as_slice::<f32>();
+        let value_codes_u32 = value_codes_arr.as_slice::<u32>();
         let value_codes_u8: Vec<u8> = value_codes_u32
             .iter()
             .flat_map(|w| w.to_le_bytes())
             .collect();
-        let value_norms = self.value_norms.as_slice::<f32>();
+        let value_norms = value_norms_arr.as_slice::<f32>();
 
         // Each row occupies key_code_words * 4 bytes in the reinterpreted buffer
         let key_row_bytes = checked_mul(key_code_words, 4, "key row bytes")?;
@@ -1797,6 +1808,19 @@ mod tests {
         assert_eq!(turbo.value_codes.shape(), &[2, 3, 1]);
         // Dense storage cleared after bulk quantize
         assert!(cache.keys.is_none());
+
+        // Regression: `TurboQuantStorage` pre-allocates capacity in `step`-sized
+        // chunks (256 by default), so `turbo.seq_len` (3) is well below the
+        // storage's actual capacity (256). `TurboQuantKvView::view` builds each
+        // field via `slice_axis`, which — unlike the deferred-quantize path
+        // above — produces a genuinely non-contiguous array whenever
+        // `seq_len < capacity`. `materialize_dense` must force those arrays
+        // contiguous before calling `as_slice`, or this panics with
+        // `AsSliceError::NotContiguous` (mlx-rs >= 0.26 no longer silently
+        // returns storage-order data for non-contiguous views).
+        let (dense_keys, dense_values) = decode_view.into_dense().unwrap();
+        assert_eq!(dense_keys.shape(), &[1, 2, 3, 8]);
+        assert_eq!(dense_values.shape(), &[1, 2, 3, 8]);
     }
 
     #[test]
