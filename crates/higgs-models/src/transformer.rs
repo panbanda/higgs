@@ -827,8 +827,8 @@ impl Model {
                         ops::zeros_dtype(&[1, n_kv_heads, pad_len, head_dim], full_k.dtype())?;
                     let pad_v =
                         ops::zeros_dtype(&[1, n_kv_heads, pad_len, head_dim], full_v.dtype())?;
-                    all_keys.push(ops::concatenate_axis(&[&full_k, &pad_k], 2)?);
-                    all_values.push(ops::concatenate_axis(&[&full_v, &pad_v], 2)?);
+                    all_keys.push(ops::concatenate(&[&full_k, &pad_k], 2)?);
+                    all_values.push(ops::concatenate(&[&full_v, &pad_v], 2)?);
                 } else {
                     all_keys.push(full_k);
                     all_values.push(full_v);
@@ -837,9 +837,9 @@ impl Model {
             }
 
             // --- Batched: stack + SDPA + output proj + MLP ---
-            let stacked_q = ops::concatenate_axis(&all_queries.iter().collect::<Vec<_>>(), 0)?;
-            let stacked_k = ops::concatenate_axis(&all_keys.iter().collect::<Vec<_>>(), 0)?;
-            let stacked_v = ops::concatenate_axis(&all_values.iter().collect::<Vec<_>>(), 0)?;
+            let stacked_q = ops::concatenate(&all_queries.iter().collect::<Vec<_>>(), 0)?;
+            let stacked_k = ops::concatenate(&all_keys.iter().collect::<Vec<_>>(), 0)?;
+            let stacked_v = ops::concatenate(&all_values.iter().collect::<Vec<_>>(), 0)?;
 
             let mask = create_batched_decode_mask(&kv_lengths, max_kv_len)?;
 

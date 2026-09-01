@@ -10,12 +10,12 @@
 use std::path::Path;
 
 use mlx_rs::{
-    Array, arange, array,
+    Array, array,
     builder::Builder,
     error::Exception,
     macros::{ModuleParameters, Quantizable},
     module::Module,
-    nn,
+    nn, ops,
     ops::indexing::IndexOp,
     quantization::MaybeQuantized,
 };
@@ -117,8 +117,9 @@ fn create_sliding_causal_mask(
 ) -> Result<Array, Exception> {
     let offset = kv_len - query_len;
 
-    let q_pos = arange!(start = offset, stop = offset + query_len)?.reshape(&[query_len, 1])?;
-    let k_pos = arange!(stop = kv_len)?.reshape(&[1, kv_len])?;
+    let q_pos =
+        ops::arange::<_, f32>(offset, offset + query_len, None)?.reshape(&[query_len, 1])?;
+    let k_pos = ops::arange::<_, f32>(None, kv_len, None)?.reshape(&[1, kv_len])?;
 
     // diff[q, k] = q_abs - k; visible when 0 <= diff < window
     let diff = q_pos.subtract(&k_pos)?;

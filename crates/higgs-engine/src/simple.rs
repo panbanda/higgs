@@ -17,7 +17,7 @@ use mlx_rs::{
     Array, Dtype, Stream,
     ops::indexing::{IndexOp, NewAxis},
     transforms::{async_eval, eval},
-    with_new_default_stream,
+    with_stream,
 };
 use tokenizers::Tokenizer;
 
@@ -885,7 +885,7 @@ impl SimpleEngine {
             return Err(EngineError::Generation("Input is empty".to_owned()));
         }
 
-        with_new_default_stream(Stream::new(), || {
+        with_stream(&Stream::new(), || {
             let input = Array::from(token_ids).index(NewAxis);
             let mut model = self
                 .model
@@ -1067,7 +1067,7 @@ impl SimpleEngine {
 
         // Set a task-local default stream so every MLX operation reuses it
         // instead of creating a new Stream (5 FFI calls) per operation.
-        with_new_default_stream(Stream::new(), || {
+        with_stream(&Stream::new(), || {
             self.generate_inner(
                 prompt_tokens,
                 max_tokens,
@@ -1122,7 +1122,7 @@ impl SimpleEngine {
         )?;
 
         // Capture T1 (already eval'd inside run_prefill).
-        let first_token_id: u32 = current_token.item();
+        let first_token_id: u32 = current_token.item_cast();
         // Advance the constraint past the first sampled token before decode.
         if let Some(ref mut cg) = constraint {
             cg.advance(first_token_id);
@@ -1258,7 +1258,7 @@ impl SimpleEngine {
             // before building the next step, so the mask is always applied at the
             // correct FSM state.
             let constrained_token_id: Option<u32> = constraint.is_some().then(|| {
-                let id: u32 = next_token.item();
+                let id: u32 = next_token.item_cast();
                 if let Some(ref mut cg) = constraint {
                     cg.advance(id);
                 }
@@ -1289,7 +1289,7 @@ impl SimpleEngine {
             let t2 = std::time::Instant::now();
 
             // In the unconstrained pipeline, extract the token here (after building following).
-            let mut token_id: u32 = constrained_token_id.unwrap_or_else(|| next_token.item());
+            let mut token_id: u32 = constrained_token_id.unwrap_or_else(|| next_token.item_cast());
 
             // Thinking budget: force </think> after N tokens if model hasn't closed it.
             // NOTE: when the budget fires, token_id is overwritten but the KV cache
@@ -1510,11 +1510,11 @@ impl SimpleEngine {
         let logits = model
             .forward_all_logits(&first_input, None, cache)
             .map_err(EngineError::Mlx)?;
-        let next_arr =
-            mlx_rs::argmax_axis!(&logits.index((.., -1, ..)), -1).map_err(EngineError::Mlx)?;
+        let next_arr = mlx_rs::ops::indexing::argmax_axis(&logits.index((.., -1, ..)), -1, None)
+            .map_err(EngineError::Mlx)?;
         eval([&next_arr]).map_err(EngineError::Mlx)?;
 
-        let mut confirmed_token_id: u32 = next_arr.item();
+        let mut confirmed_token_id: u32 = next_arr.item_cast();
         let base_config = prompt_lookup_config();
         let mut stats = crate::mtp::MtpStats::default();
         let t_start = std::time::Instant::now();
@@ -1709,8 +1709,8 @@ impl SimpleEngine {
         let (hidden, logits) = model
             .forward_with_hidden(&first_input, None, cache)
             .map_err(EngineError::Mlx)?;
-        let next_arr =
-            mlx_rs::argmax_axis!(&logits.index((.., -1, ..)), -1).map_err(EngineError::Mlx)?;
+        let next_arr = mlx_rs::ops::indexing::argmax_axis(&logits.index((.., -1, ..)), -1, None)
+            .map_err(EngineError::Mlx)?;
         let h = hidden.index((.., -1.., ..));
         if let Some(previous_hidden) = prefill_hidden
             .filter(|_| !actual_prompt_tokens.is_empty())
@@ -1722,7 +1722,7 @@ impl SimpleEngine {
         eval([&next_arr, &h]).map_err(EngineError::Mlx)?;
 
         let mut current_hidden = h;
-        let mut confirmed_token_id: u32 = next_arr.item();
+        let mut confirmed_token_id: u32 = next_arr.item_cast();
         let mut mtp_stats = crate::mtp::MtpStats::default();
         let mut adaptive_depth = mtp_adaptive_draft_enabled()
             .then(|| adaptive_draft_depth_for_cap(self.tuning.mtp_draft_n_max()));
@@ -1948,8 +1948,8 @@ impl SimpleEngine {
         let (hidden, logits) = model
             .forward_with_hidden(&first_input, None, cache)
             .map_err(EngineError::Mlx)?;
-        let next_arr =
-            mlx_rs::argmax_axis!(&logits.index((.., -1, ..)), -1).map_err(EngineError::Mlx)?;
+        let next_arr = mlx_rs::ops::indexing::argmax_axis(&logits.index((.., -1, ..)), -1, None)
+            .map_err(EngineError::Mlx)?;
         let h = hidden.index((.., -1.., ..));
         if let Some(previous_hidden) = prefill_hidden
             .filter(|_| !actual_prompt_tokens.is_empty())
@@ -1961,7 +1961,7 @@ impl SimpleEngine {
         eval([&next_arr, &h]).map_err(EngineError::Mlx)?;
 
         let mut current_hidden = h;
-        let mut confirmed_token_id: u32 = next_arr.item();
+        let mut confirmed_token_id: u32 = next_arr.item_cast();
         let mut mtp_stats = crate::mtp::MtpStats::default();
         let mut adaptive_depth = mtp_adaptive_draft_enabled()
             .then(|| adaptive_draft_depth_for_cap(self.tuning.mtp_draft_n_max()));
@@ -2256,7 +2256,7 @@ impl SimpleEngine {
             return Ok(());
         }
 
-        with_new_default_stream(Stream::new(), || {
+        with_stream(&Stream::new(), || {
             self.generate_streaming_inner(
                 prompt_tokens,
                 max_tokens,
@@ -2356,7 +2356,7 @@ impl SimpleEngine {
         drop(prefill_sink);
 
         let mut all_tokens: Vec<u32> = Vec::new();
-        let first_token_id: u32 = current_token.item();
+        let first_token_id: u32 = current_token.item_cast();
         // Advance the constraint past the first sampled token before decode.
         if let Some(ref mut cg) = constraint {
             cg.advance(first_token_id);
@@ -2482,7 +2482,7 @@ impl SimpleEngine {
             // before decode_step, so the mask is always applied at the correct
             // FSM state (mirrors the non-streaming pattern in generate_inner).
             let constrained_token_id: Option<u32> = constraint.is_some().then(|| {
-                let id: u32 = next_token.item();
+                let id: u32 = next_token.item_cast();
                 if let Some(ref mut cg) = constraint {
                     cg.advance(id);
                 }
@@ -2510,7 +2510,7 @@ impl SimpleEngine {
                 }
             }
 
-            let mut token_id: u32 = constrained_token_id.unwrap_or_else(|| next_token.item());
+            let mut token_id: u32 = constrained_token_id.unwrap_or_else(|| next_token.item_cast());
 
             // Thinking budget: force </think> after N tokens if model hasn't closed it.
             // NOTE: same KV-cache discontinuity caveat as the non-streaming path.

@@ -17,7 +17,7 @@ use mlx_rs::{
     Array, Stream,
     ops::indexing::{IndexOp, NewAxis},
     transforms::{async_eval, eval},
-    with_new_default_stream,
+    with_stream,
 };
 use tokenizers::Tokenizer;
 
@@ -538,7 +538,7 @@ fn worker_loop(
             && active.iter().all(|ar| ar.constraint.is_none());
 
         if use_batched {
-            if let Err(e) = with_new_default_stream(Stream::new(), || {
+            if let Err(e) = with_stream(&Stream::new(), || {
                 run_batched_decode_round(
                     &mut model,
                     &mut active,
@@ -562,7 +562,7 @@ fn worker_loop(
                 }
             }
         } else {
-            with_new_default_stream(Stream::new(), || {
+            with_stream(&Stream::new(), || {
                 run_pipelined_decode_round(
                     &mut model,
                     &mut active,
@@ -663,7 +663,7 @@ fn run_batched_decode_round(
         .map(|ar| ar.current_token.index((.., NewAxis)))
         .collect();
     let token_refs: Vec<&Array> = token_arrays.iter().collect();
-    let batched_input = mlx_rs::ops::concatenate_axis(&token_refs, 0).map_err(EngineError::Mlx)?;
+    let batched_input = mlx_rs::ops::concatenate(&token_refs, 0).map_err(EngineError::Mlx)?;
 
     // Collect mutable cache references
     let mut cache_refs: Vec<&mut higgs_models::AnyCache> =
@@ -787,7 +787,7 @@ fn advance_prefill(
         .min(prefill.tokens.len());
     let is_complete = end == prefill.tokens.len();
 
-    with_new_default_stream(Stream::new(), || {
+    with_stream(&Stream::new(), || {
         let tokens = prefill
             .tokens
             .get(start..end)
@@ -894,7 +894,7 @@ fn complete_prefill(
             "batch_post_prefill",
         );
 
-        let first_token_id: u32 = current_token.item();
+        let first_token_id: u32 = current_token.item_cast();
         let first_token_logprob = first_logprob_data
             .as_ref()
             .map(|lp| lp.materialize(first_token_id));
@@ -1039,7 +1039,7 @@ fn materialize_decode_step(
     tokenizer: &Tokenizer,
     eos_token_ids: &[u32],
 ) -> bool {
-    let token_id: u32 = result.next_token.item();
+    let token_id: u32 = result.next_token.item_cast();
 
     // Advance constrained generator
     if let Some(ref mut cg) = ar.constraint {

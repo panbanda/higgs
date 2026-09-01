@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use mlx_rs::module::ModuleParametersExt;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::transforms::eval;
-use mlx_rs::{Array, argmax_axis, array, categorical, error::Exception};
+use mlx_rs::{Array, array, error::Exception, ops, random};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -959,7 +959,7 @@ pub fn apply_penalties(
             let pos_arr = Array::from_slice(&pos_factors, &[vocab_size_i32]).reshape(&shape)?;
             let neg_arr = Array::from_slice(&neg_factors, &[vocab_size_i32]).reshape(&shape)?;
             let is_positive = result.gt(Array::from_f32(0.0))?;
-            let factor = mlx_rs::ops::r#where(&is_positive, &pos_arr, &neg_arr)?;
+            let factor = mlx_rs::ops::select(&is_positive, &pos_arr, &neg_arr)?;
             result = result.multiply(factor)?;
         }
     }
@@ -1005,7 +1005,7 @@ pub fn apply_penalties(
 /// `logits` via [`apply_penalties`] before calling this function.
 pub fn sample(logits: &Array, params: &SamplingParams) -> Result<Array, Exception> {
     if params.temperature == 0.0 {
-        return argmax_axis!(logits, -1);
+        return ops::indexing::argmax_axis(logits, -1, None);
     }
 
     let scaled = logits.multiply(array!(1.0 / params.temperature))?;
@@ -1013,7 +1013,7 @@ pub fn sample(logits: &Array, params: &SamplingParams) -> Result<Array, Exceptio
     if params.needs_filtering() {
         sample_filtered(&scaled, params)
     } else {
-        categorical!(scaled)
+        random::categorical(scaled, None, None, None)
     }
 }
 
@@ -1062,9 +1062,7 @@ fn sample_filtered_topk(
     k: usize,
     params: &SamplingParams,
 ) -> Result<Array, Exception> {
-    use mlx_rs::ops::{
-        argpartition_axis, argsort_axis, concatenate_axis, indexing::IndexOp, maximum,
-    };
+    use mlx_rs::ops::{argpartition_axis, argsort_axis, concatenate, indexing::IndexOp, maximum};
 
     let k_i32 = i32::try_from(k).map_err(|_| Exception::custom("k overflow for i32"))?;
 
@@ -1090,9 +1088,9 @@ fn sample_filtered_topk(
     let ones = Array::ones::<f32>(&[1])?;
     let zeros = Array::zeros::<f32>(&[k_i32 - 1])?;
     let first_token_mask = if probs.ndim() > 1 {
-        concatenate_axis(&[&ones, &zeros], 0)?.reshape(&[1, -1])?
+        concatenate(&[&ones, &zeros], 0)?.reshape(&[1, -1])?
     } else {
-        concatenate_axis(&[&ones, &zeros], 0)?
+        concatenate(&[&ones, &zeros], 0)?
     };
     let top_p_mask = maximum(&cumsum_mask, &first_token_mask)?;
 
@@ -1111,7 +1109,7 @@ fn sample_filtered_topk(
     let normalized = filtered.divide(sum)?;
 
     let log_probs = normalized.log()?;
-    let sampled = categorical!(log_probs)?;
+    let sampled = random::categorical(log_probs, None, None, None)?;
 
     // Map sampled position in [0, k) back to the original vocab index.
     topk_indices
@@ -1129,7 +1127,7 @@ fn sample_filtered_full(
     effective_k: usize,
     params: &SamplingParams,
 ) -> Result<Array, Exception> {
-    use mlx_rs::ops::{argsort_axis, concatenate_axis, maximum};
+    use mlx_rs::ops::{argsort_axis, concatenate, maximum};
 
     // Sort descending: negate, ascending argsort
     let neg_probs = probs.negative()?;
@@ -1153,9 +1151,9 @@ fn sample_filtered_full(
     let ones = Array::ones::<f32>(&[1])?;
     let zeros = Array::zeros::<f32>(&[n_vocab_i32 - 1])?;
     let first_token_mask = if probs.ndim() > 1 {
-        concatenate_axis(&[&ones, &zeros], 0)?.reshape(&[1, -1])?
+        concatenate(&[&ones, &zeros], 0)?.reshape(&[1, -1])?
     } else {
-        concatenate_axis(&[&ones, &zeros], 0)?
+        concatenate(&[&ones, &zeros], 0)?
     };
     let top_p_mask = maximum(&cumsum_mask, &first_token_mask)?;
 
@@ -1173,7 +1171,7 @@ fn sample_filtered_full(
     let normalized = filtered.divide(sum)?;
 
     let log_probs = normalized.log()?;
-    let sampled = categorical!(log_probs)?;
+    let sampled = random::categorical(log_probs, None, None, None)?;
     sorted_indices
         .take_along_axis(&sampled.reshape(&[-1, 1])?, -1)?
         .squeeze_axes(&[-1])
@@ -1266,7 +1264,7 @@ impl LogprobArrays {
 
     /// Extract concrete values after eval.
     pub fn materialize(&self, token_id: u32) -> TokenLogprobInfo {
-        let logprob: f32 = self.token_logprob.item();
+        let logprob: f32 = self.token_logprob.item_cast();
 
         let top_logprobs = match (&self.top_indices, &self.top_values) {
             (Some(indices), Some(values)) => {
@@ -1942,7 +1940,7 @@ mod tests {
     #[test]
     fn test_sample_greedy() {
         let token = assert_sample_shape(&[0.1_f32, 0.9, 0.0], &[1, 3], 0.0, 1.0, &[1]);
-        let val: u32 = token.item();
+        let val: u32 = token.item_cast();
         assert_eq!(val, 1);
     }
 
@@ -2033,14 +2031,14 @@ mod tests {
     #[test]
     fn sample_single_element_logits() {
         let token = assert_sample_shape(&[5.0_f32], &[1, 1], 0.0, 1.0, &[1]);
-        let val: u32 = token.item();
+        let val: u32 = token.item_cast();
         assert_eq!(val, 0, "Single-element logits must return index 0");
     }
 
     #[test]
     fn sample_uniform_logits_greedy() {
         let token = assert_sample_shape(&[1.0_f32, 1.0, 1.0, 1.0], &[1, 4], 0.0, 1.0, &[1]);
-        let val: u32 = token.item();
+        let val: u32 = token.item_cast();
         assert_eq!(val, 0, "Tied logits should return first index via argmax");
     }
 
@@ -2365,7 +2363,7 @@ mod tests {
             ..SamplingParams::default()
         };
         let token = sample(&logits, &p).unwrap();
-        let val: u32 = token.item();
+        let val: u32 = token.item_cast();
         assert_eq!(val, 3);
     }
 
@@ -2394,7 +2392,7 @@ mod tests {
             ..SamplingParams::default()
         };
         let token = sample(&logits, &p).unwrap();
-        let val: u32 = token.item();
+        let val: u32 = token.item_cast();
         assert_eq!(val, 0);
     }
 

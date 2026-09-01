@@ -724,7 +724,7 @@ impl BonsaiQ1Gpu {
 
         for (layer, layer_cache) in self.layers.iter().zip(cache.iter_mut()) {
             let t0 = Instant::now();
-            let normed = fast::rms_norm(&h, &layer.input_norm, rms_eps)?;
+            let normed = fast::rms_norm(&h, Some(&layer.input_norm), rms_eps)?;
             normed.eval()?;
             times.add("input_norm", t0.elapsed().as_nanos());
 
@@ -751,8 +751,8 @@ impl BonsaiQ1Gpu {
                 .transpose_axes(&[0, 2, 1, 3])?;
 
             let t0 = Instant::now();
-            let q = fast::rms_norm(&q, &layer.q_norm, rms_eps)?;
-            let k = fast::rms_norm(&k, &layer.k_norm, rms_eps)?;
+            let q = fast::rms_norm(&q, Some(&layer.q_norm), rms_eps)?;
+            let k = fast::rms_norm(&k, Some(&layer.k_norm), rms_eps)?;
             q.eval()?;
             k.eval()?;
             times.add("qk_norm", t0.elapsed().as_nanos());
@@ -808,7 +808,7 @@ impl BonsaiQ1Gpu {
             times.add("residual", t0.elapsed().as_nanos());
 
             let t0 = Instant::now();
-            let normed_post = fast::rms_norm(&h_post_attn, &layer.post_attn_norm, rms_eps)?;
+            let normed_post = fast::rms_norm(&h_post_attn, Some(&layer.post_attn_norm), rms_eps)?;
             normed_post.eval()?;
             times.add("post_attn_norm", t0.elapsed().as_nanos());
 
@@ -836,7 +836,7 @@ impl BonsaiQ1Gpu {
         }
 
         let t0 = Instant::now();
-        let out = fast::rms_norm(&h, &self.final_norm, rms_eps)?;
+        let out = fast::rms_norm(&h, Some(&self.final_norm), rms_eps)?;
         out.eval()?;
         times.add("final_norm", t0.elapsed().as_nanos());
         Ok(out)
@@ -891,7 +891,7 @@ pub fn forward_trunk_free(
     let rms_eps = gpu.config.rms_norm_eps;
 
     for (layer, layer_cache) in gpu.layers.iter().zip(cache.iter_mut()) {
-        let normed = fast::rms_norm(&h, &layer.input_norm, rms_eps)?;
+        let normed = fast::rms_norm(&h, Some(&layer.input_norm), rms_eps)?;
 
         let q = layer.q_proj.forward(&normed)?;
         let k = layer.k_proj.forward(&normed)?;
@@ -907,8 +907,8 @@ pub fn forward_trunk_free(
             .reshape(&[B, T, kv_heads, -1])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        let q = fast::rms_norm(&q, &layer.q_norm, rms_eps)?;
-        let k = fast::rms_norm(&k, &layer.k_norm, rms_eps)?;
+        let q = fast::rms_norm(&q, Some(&layer.q_norm), rms_eps)?;
+        let k = fast::rms_norm(&k, Some(&layer.k_norm), rms_eps)?;
 
         let offset = layer_cache.as_ref().map_or(0, KeyValueCache::offset);
         let q = gpu.apply_rope(&q, offset)?;
@@ -940,7 +940,7 @@ pub fn forward_trunk_free(
         let attn_out = layer.o_proj.forward(&attn_out)?;
         let h_post_attn = h.add(&attn_out)?;
 
-        let normed_post = fast::rms_norm(&h_post_attn, &layer.post_attn_norm, rms_eps)?;
+        let normed_post = fast::rms_norm(&h_post_attn, Some(&layer.post_attn_norm), rms_eps)?;
         let gate = layer.gate_proj.forward(&normed_post)?;
         let up = layer.up_proj.forward(&normed_post)?;
         let mlp_hidden = mlx_rs::nn::silu(&gate)?.multiply(&up)?;
@@ -949,15 +949,15 @@ pub fn forward_trunk_free(
         h = h_post_attn.add(&mlp_out)?;
     }
 
-    fast::rms_norm(&h, &gpu.final_norm, rms_eps)
+    fast::rms_norm(&h, Some(&gpu.final_norm), rms_eps)
 }
 
 /// Owned state wrapper for [`compile_with_state`]-driven decoding.
 ///
 /// `compile_with_state` takes the state by `&mut U` where `U: Updatable`.
 /// Wrapping the model **and** the per-layer KV cache in one owned struct
-/// lets us hand-roll a single `Updatable` impl whose positional iteration
-/// order covers both — safer than fighting lifetimes on `(&mut gpu, cache)`
+/// lets us hand-roll a single `Updatable` impl whose keyed projection
+/// covers both — safer than fighting lifetimes on `(&mut gpu, cache)`
 /// tuples. See session-25 recap for the design rationale.
 ///
 /// Expected construction: after prefill, move `gpu` and the filled cache
@@ -968,143 +968,77 @@ pub struct BonsaiQ1DecodeState {
     pub cache: Vec<Option<SteppingKeyValueCache>>,
 }
 
-/// Number of updatable `Array`s per decoder layer:
-/// - `input_norm` + 3×(w,s,b) qkv + `q_norm` + `k_norm` + 3×(w,s,b) o_proj
-///   ... wait: 1 + 3×3 + 2 + 3 + 1 + 3×3 = 1+9+2+3+1+9 = **25**.
-/// Corresponds to the array push order in [`BonsaiQ1DecodeState::updatable_states`].
-const PER_LAYER_UPDATABLE: usize = 25;
-
 impl mlx_rs::utils::Updatable for BonsaiQ1DecodeState {
-    fn updatable_states_len(&self) -> usize {
-        let mut n = 3 // embed (w, scales, biases)
-            + self.gpu.layers.len() * PER_LAYER_UPDATABLE
-            + 1; // final_norm
-        if self.gpu.lm_head.is_some() {
-            n += 3;
+    fn state_projection(
+        &mut self,
+    ) -> Result<mlx_rs::utils::StateProjection<'_>, mlx_rs::error::StateProjectionError> {
+        let mut projection = mlx_rs::utils::StateProjection::new();
+        projection.required("embed.w", &mut self.gpu.embed.w)?;
+        projection.required("embed.scales", &mut self.gpu.embed.scales)?;
+        projection.required("embed.biases", &mut self.gpu.embed.biases)?;
+        for (i, layer) in self.gpu.layers.iter_mut().enumerate() {
+            projection.required(format!("layer{i}.input_norm"), &mut layer.input_norm)?;
+            projection.required(format!("layer{i}.q_proj.w"), &mut layer.q_proj.w)?;
+            projection.required(format!("layer{i}.q_proj.scales"), &mut layer.q_proj.scales)?;
+            projection.required(format!("layer{i}.q_proj.biases"), &mut layer.q_proj.biases)?;
+            projection.required(format!("layer{i}.k_proj.w"), &mut layer.k_proj.w)?;
+            projection.required(format!("layer{i}.k_proj.scales"), &mut layer.k_proj.scales)?;
+            projection.required(format!("layer{i}.k_proj.biases"), &mut layer.k_proj.biases)?;
+            projection.required(format!("layer{i}.v_proj.w"), &mut layer.v_proj.w)?;
+            projection.required(format!("layer{i}.v_proj.scales"), &mut layer.v_proj.scales)?;
+            projection.required(format!("layer{i}.v_proj.biases"), &mut layer.v_proj.biases)?;
+            projection.required(format!("layer{i}.q_norm"), &mut layer.q_norm)?;
+            projection.required(format!("layer{i}.k_norm"), &mut layer.k_norm)?;
+            projection.required(format!("layer{i}.o_proj.w"), &mut layer.o_proj.w)?;
+            projection.required(format!("layer{i}.o_proj.scales"), &mut layer.o_proj.scales)?;
+            projection.required(format!("layer{i}.o_proj.biases"), &mut layer.o_proj.biases)?;
+            projection.required(
+                format!("layer{i}.post_attn_norm"),
+                &mut layer.post_attn_norm,
+            )?;
+            projection.required(format!("layer{i}.gate_proj.w"), &mut layer.gate_proj.w)?;
+            projection.required(
+                format!("layer{i}.gate_proj.scales"),
+                &mut layer.gate_proj.scales,
+            )?;
+            projection.required(
+                format!("layer{i}.gate_proj.biases"),
+                &mut layer.gate_proj.biases,
+            )?;
+            projection.required(format!("layer{i}.up_proj.w"), &mut layer.up_proj.w)?;
+            projection.required(
+                format!("layer{i}.up_proj.scales"),
+                &mut layer.up_proj.scales,
+            )?;
+            projection.required(
+                format!("layer{i}.up_proj.biases"),
+                &mut layer.up_proj.biases,
+            )?;
+            projection.required(format!("layer{i}.down_proj.w"), &mut layer.down_proj.w)?;
+            projection.required(
+                format!("layer{i}.down_proj.scales"),
+                &mut layer.down_proj.scales,
+            )?;
+            projection.required(
+                format!("layer{i}.down_proj.biases"),
+                &mut layer.down_proj.biases,
+            )?;
         }
-        if self.gpu.yarn_freqs.is_some() {
-            n += 1;
-        }
-        for slot in &self.cache {
-            if let Some(c) = slot {
-                if c.keys().is_some() {
-                    n += 1;
-                }
-                if c.values().is_some() {
-                    n += 1;
-                }
-            }
-        }
-        n
-    }
-
-    fn updatable_states(&self) -> impl IntoIterator<Item = &Array> {
-        let mut v: Vec<&Array> = Vec::with_capacity(self.updatable_states_len());
-        v.push(&self.gpu.embed.w);
-        v.push(&self.gpu.embed.scales);
-        v.push(&self.gpu.embed.biases);
-        for layer in &self.gpu.layers {
-            v.push(&layer.input_norm);
-            v.push(&layer.q_proj.w);
-            v.push(&layer.q_proj.scales);
-            v.push(&layer.q_proj.biases);
-            v.push(&layer.k_proj.w);
-            v.push(&layer.k_proj.scales);
-            v.push(&layer.k_proj.biases);
-            v.push(&layer.v_proj.w);
-            v.push(&layer.v_proj.scales);
-            v.push(&layer.v_proj.biases);
-            v.push(&layer.q_norm);
-            v.push(&layer.k_norm);
-            v.push(&layer.o_proj.w);
-            v.push(&layer.o_proj.scales);
-            v.push(&layer.o_proj.biases);
-            v.push(&layer.post_attn_norm);
-            v.push(&layer.gate_proj.w);
-            v.push(&layer.gate_proj.scales);
-            v.push(&layer.gate_proj.biases);
-            v.push(&layer.up_proj.w);
-            v.push(&layer.up_proj.scales);
-            v.push(&layer.up_proj.biases);
-            v.push(&layer.down_proj.w);
-            v.push(&layer.down_proj.scales);
-            v.push(&layer.down_proj.biases);
-        }
-        v.push(&self.gpu.final_norm);
-        if let Some(lm) = self.gpu.lm_head.as_ref() {
-            v.push(&lm.w);
-            v.push(&lm.scales);
-            v.push(&lm.biases);
-        }
-        if let Some(y) = self.gpu.yarn_freqs.as_ref() {
-            v.push(y);
-        }
-        for slot in &self.cache {
-            if let Some(c) = slot {
-                if let Some(k) = c.keys() {
-                    v.push(k);
-                }
-                if let Some(val) = c.values() {
-                    v.push(val);
-                }
-            }
-        }
-        v
-    }
-
-    fn updatable_states_mut(&mut self) -> impl IntoIterator<Item = &mut Array> {
-        let mut v: Vec<&mut Array> = Vec::with_capacity(self.updatable_states_len());
-        v.push(&mut self.gpu.embed.w);
-        v.push(&mut self.gpu.embed.scales);
-        v.push(&mut self.gpu.embed.biases);
-        for layer in &mut self.gpu.layers {
-            v.push(&mut layer.input_norm);
-            v.push(&mut layer.q_proj.w);
-            v.push(&mut layer.q_proj.scales);
-            v.push(&mut layer.q_proj.biases);
-            v.push(&mut layer.k_proj.w);
-            v.push(&mut layer.k_proj.scales);
-            v.push(&mut layer.k_proj.biases);
-            v.push(&mut layer.v_proj.w);
-            v.push(&mut layer.v_proj.scales);
-            v.push(&mut layer.v_proj.biases);
-            v.push(&mut layer.q_norm);
-            v.push(&mut layer.k_norm);
-            v.push(&mut layer.o_proj.w);
-            v.push(&mut layer.o_proj.scales);
-            v.push(&mut layer.o_proj.biases);
-            v.push(&mut layer.post_attn_norm);
-            v.push(&mut layer.gate_proj.w);
-            v.push(&mut layer.gate_proj.scales);
-            v.push(&mut layer.gate_proj.biases);
-            v.push(&mut layer.up_proj.w);
-            v.push(&mut layer.up_proj.scales);
-            v.push(&mut layer.up_proj.biases);
-            v.push(&mut layer.down_proj.w);
-            v.push(&mut layer.down_proj.scales);
-            v.push(&mut layer.down_proj.biases);
-        }
-        v.push(&mut self.gpu.final_norm);
+        projection.required("final_norm", &mut self.gpu.final_norm)?;
         if let Some(lm) = self.gpu.lm_head.as_mut() {
-            v.push(&mut lm.w);
-            v.push(&mut lm.scales);
-            v.push(&mut lm.biases);
+            projection.required("lm_head.w", &mut lm.w)?;
+            projection.required("lm_head.scales", &mut lm.scales)?;
+            projection.required("lm_head.biases", &mut lm.biases)?;
         }
-        if let Some(y) = self.gpu.yarn_freqs.as_mut() {
-            v.push(y);
-        }
-        for slot in &mut self.cache {
+        projection.optional("yarn_freqs", &mut self.gpu.yarn_freqs)?;
+        for (i, slot) in self.cache.iter_mut().enumerate() {
             if let Some(c) = slot {
-                let (k_opt, v_opt) = c.key_value_arrays_mut();
-                if let Some(k) = k_opt {
-                    v.push(k);
-                }
-                if let Some(val) = v_opt {
-                    v.push(val);
-                }
+                let (keys, values) = c.key_value_slots_mut();
+                projection.optional(format!("cache{i}.keys"), keys)?;
+                projection.optional(format!("cache{i}.values"), values)?;
             }
         }
-        v
+        Ok(projection)
     }
 }
 

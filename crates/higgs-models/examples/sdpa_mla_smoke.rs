@@ -39,7 +39,7 @@ fn main() {
                     .max(None)
                     .unwrap();
                 eval([&diff]).unwrap();
-                println!("S={s}: max|sdpa-explicit|={}", diff.item::<f32>());
+                println!("S={s}: max|sdpa-explicit|={}", diff.item_cast::<f32>());
             }
             Err(e) => println!("S={s}: SDPA REJECTED: {e}"),
         }

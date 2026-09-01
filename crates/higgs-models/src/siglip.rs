@@ -6,7 +6,7 @@
 //! pre-norm, self-attention, MLP with GELU activation).
 
 use mlx_rs::{
-    Array, arange,
+    Array,
     builder::Builder,
     error::Exception,
     module::{Module, Param},
@@ -232,7 +232,7 @@ impl SigLipVisionModel {
         let embeddings = patch_embeds.reshape(&[b, h * w, c])?;
 
         // Add position embeddings
-        let position_ids = arange!(stop = self.num_patches)?;
+        let position_ids = ops::arange::<_, f32>(None, self.num_patches, None)?;
         let pos_embeds = self.position_embedding.forward(&position_ids)?;
         let mut hidden_states = embeddings.add(&pos_embeds)?;
 
@@ -255,7 +255,7 @@ impl SigLipVisionModel {
         };
         let embeddings = patch_embeds.reshape(&[b, h * w, c])?;
 
-        let position_ids = arange!(stop = self.num_patches)?;
+        let position_ids = ops::arange::<_, f32>(None, self.num_patches, None)?;
         let pos_embeds = self.position_embedding.forward(&position_ids)?;
         let mut hidden_states = embeddings.add(&pos_embeds)?;
 

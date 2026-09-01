@@ -1717,7 +1717,7 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "mlx-rs",
- "mlx-sys 0.2.0 (git+https://github.com/oxideai/mlx-rs.git?rev=f4aa309c79b6be35255ca7d34157dfc10d9ed4c9)",
+ "mlx-sys",
  "outlines-core",
  "serde",
  "serde_json",
@@ -1737,7 +1737,7 @@ dependencies = [
  "half",
  "image",
  "mlx-rs",
- "mlx-sys 0.2.0 (git+https://github.com/oxideai/mlx-rs.git?rev=f4aa309c79b6be35255ca7d34157dfc10d9ed4c9)",
+ "mlx-sys",
  "rand 0.10.2",
  "safetensors",
  "serde",
@@ -2503,7 +2503,7 @@ dependencies = [
  "mach-sys",
  "mlx-internal-macros",
  "mlx-macros",
- "mlx-sys 0.2.0 (git+https://github.com/oxideai/mlx-rs.git?rev=cd70e2d07362d62d58dbd3b3c970f350e90675d5)",
+ "mlx-sys",
  "num-complex",
  "num-traits",
  "num_enum",
@@ -2518,16 +2518,6 @@ dependencies = [
 name = "mlx-sys"
 version = "0.2.0"
 source = "git+https://github.com/oxideai/mlx-rs.git?rev=cd70e2d07362d62d58dbd3b3c970f350e90675d5#cd70e2d07362d62d58dbd3b3c970f350e90675d5"
-dependencies = [
- "bindgen",
- "cc",
- "cmake",
-]
-
-[[package]]
-name = "mlx-sys"
-version = "0.2.0"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=f4aa309c79b6be35255ca7d34157dfc10d9ed4c9#f4aa309c79b6be35255ca7d34157dfc10d9ed4c9"
 dependencies = [
  "bindgen",
  "cc",
@@ -4050,7 +4040,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
  "windows-sys 0.52.0",

@@ -10,7 +10,7 @@ use higgs_models::turboquant::TurboQuantContext;
 use higgs_models::{AnyCache, LayerCache};
 use mlx_rs::Array;
 use mlx_rs::error::Exception;
-use mlx_rs::ops::concatenate_axis;
+use mlx_rs::ops::concatenate;
 
 /// Default block size in tokens for paged caching.
 pub const DEFAULT_BLOCK_SIZE: usize = 32;
@@ -119,7 +119,7 @@ pub struct PagedPrefixMatch {
 /// layer per entry), this cache stores block-sized array slices. MLX arrays use
 /// internal ref-counting, so blocks from shared prefixes only store data once.
 /// On lookup, blocks are gathered into a contiguous cache via
-/// `concatenate_axis` (one-time cost per request).
+/// `concatenate` (one-time cost per request).
 pub struct PagedPrefixCache {
     root: RadixNode,
     num_cached: usize,
@@ -755,8 +755,8 @@ fn gather_blocks(blocks: &[KvBlock]) -> Result<SteppingKeyValueCache, Exception>
 
     let key_arrays: Vec<Array> = blocks.iter().map(|b| b.keys.clone()).collect();
     let value_arrays: Vec<Array> = blocks.iter().map(|b| b.values.clone()).collect();
-    let keys = concatenate_axis(&key_arrays, 2)?;
-    let values = concatenate_axis(&value_arrays, 2)?;
+    let keys = concatenate(&key_arrays, 2)?;
+    let values = concatenate(&value_arrays, 2)?;
 
     SteppingKeyValueCache::from_arrays(keys, values)
 }
@@ -773,7 +773,7 @@ fn gather_mla_blocks(
     let latent = if blocks.len() == 1 {
         first.clone()
     } else {
-        concatenate_axis(blocks, 2)?
+        concatenate(blocks, 2)?
     };
     SteppingKeyValueCache::from_latent_array(latent, kv_lora_rank, rope_dim)
 }
@@ -795,7 +795,7 @@ fn gather_tq_blocks(
                 .into_iter()
                 .next()
                 .ok_or_else(|| Exception::custom("empty TQ block array")),
-            _ => concatenate_axis(&arrays, 1),
+            _ => concatenate(&arrays, 1),
         }
     };
 

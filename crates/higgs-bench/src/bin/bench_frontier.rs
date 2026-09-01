@@ -29,7 +29,7 @@ use higgs_engine::{
     tokenizers,
 };
 use higgs_models::{AnyCache, turboquant::KvCacheConfig};
-use mlx_rs::{Array, argmax_axis, transforms::eval};
+use mlx_rs::{Array, ops, transforms::eval};
 use serde::Serialize;
 
 const DEFAULT_FRONTIERS: &str = "2048,4096,8192,16384";
@@ -245,9 +245,9 @@ fn decode_probe(
 ) -> Result<f64> {
     let mut elapsed = 0.0;
     for step in 0..probe_tokens {
-        let token = argmax_axis!(&logits, -1).context("argmax greedy token")?;
+        let token = ops::indexing::argmax_axis(&logits, -1, None).context("argmax greedy token")?;
         eval([&token]).context("evaluate greedy token")?;
-        let input = token_array(&[token.item::<u32>()])?;
+        let input = token_array(&[token.item_cast::<u32>()])?;
         let started = Instant::now();
         logits = model
             .forward_last_token(&input, None, cache)

@@ -1,5 +1,5 @@
 use mlx_rs::{
-    Array, arange, array,
+    Array, array,
     error::Exception,
     fast::ScaledDotProductAttentionMask,
     nn, ops,
@@ -106,8 +106,8 @@ fn is_single_token_decode(queries: &Array, head_dim: i32) -> bool {
 pub(crate) fn create_causal_mask(N: i32, raw_offset: Option<i32>) -> Result<Array, Exception> {
     let offset = raw_offset.unwrap_or(0);
 
-    let row_indices = arange!(stop = offset + N)?;
-    let col_indices = arange!(start = offset, stop = offset + N)?;
+    let row_indices = ops::arange::<_, f32>(None, offset + N, None)?;
+    let col_indices = ops::arange::<_, f32>(offset, offset + N, None)?;
     let col_expanded = col_indices.index((.., NewAxis));
     let row_expanded = row_indices.index(NewAxis);
 
@@ -165,9 +165,9 @@ pub(crate) fn create_windowed_causal_mask(
 ) -> Result<Array, Exception> {
     let kv_len = offset + N;
 
-    let key_positions = arange!(stop = kv_len)?;
+    let key_positions = ops::arange::<_, f32>(None, kv_len, None)?;
     // query_i = offset + i for i in 0..N
-    let query_positions = arange!(start = offset, stop = kv_len)?;
+    let query_positions = ops::arange::<_, f32>(offset, kv_len, None)?;
 
     // Broadcast shapes: query [N, 1] vs key [1, kv_len]
     let query_expanded = query_positions.reshape(&[N, 1])?;
@@ -194,7 +194,7 @@ pub(crate) fn create_batched_decode_mask(
     let n = i32::try_from(kv_lengths.len())
         .map_err(|_| Exception::custom("too many requests for batched mask"))?;
     let lengths = Array::from_slice(kv_lengths, &[n]).reshape(&[n, 1])?;
-    let positions = arange!(stop = max_kv_len)?.reshape(&[1, max_kv_len])?;
+    let positions = ops::arange::<_, f32>(None, max_kv_len, None)?.reshape(&[1, max_kv_len])?;
     let mask = lengths.gt(positions)?;
     // 4D so it broadcasts correctly with SDPA's [N, n_heads, 1, max_kv_len]
     mask.reshape(&[n, 1, 1, max_kv_len])
@@ -259,7 +259,7 @@ mod tests {
         // N=1, no offset: single token, should be [1, 1] with value true
         let mask = create_causal_mask(1, None).unwrap();
         assert_eq!(mask.shape(), &[1, 1]);
-        let val: bool = mask.item();
+        let val: bool = mask.item_cast();
         assert!(val);
     }
 
@@ -362,8 +362,8 @@ mod tests {
         let result = scaled_dot_product_attention(queries, keys, values, scale, None).unwrap();
         assert_eq!(result.shape(), &[1, 1, 1, 2]);
         // With single KV pair, softmax(score) = [1.0], so output = values
-        let v0: f32 = result.index((.., .., .., 0..1)).item();
-        let v1: f32 = result.index((.., .., .., 1..2)).item();
+        let v0: f32 = result.index((.., .., .., 0..1)).item_cast();
+        let v1: f32 = result.index((.., .., .., 1..2)).item_cast();
         assert!((v0 - 3.0).abs() < 1e-4);
         assert!((v1 - 7.0).abs() < 1e-4);
     }
