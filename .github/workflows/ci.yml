@@ -10,6 +10,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Default-deny; each job grants only what it needs.
+permissions: {}
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
