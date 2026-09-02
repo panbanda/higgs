@@ -199,12 +199,9 @@ a:focus-visible {
 .rail-brand-mark {
   width: 30px;
   height: 30px;
+  border-radius: 8px;
+  background: #0a0b1e;
   flex-shrink: 0;
-  border-radius: 6px;
-  background: var(--accent);
-  display: flex;
-  align-items: center;
-  justify-content: center;
 }
 
 .rail-brand-text {

@@ -41,13 +41,6 @@ const SECTIONS: Array<{ id: Section; label: string }> = [
 
 const GITHUB_URL = "https://github.com/panbanda/higgs";
 
-function BrandMark() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#1a1408" strokeWidth={2.4} strokeLinecap="round">
-      <path d="M4 14 L9 6 L13 16 L17 9 L20 14" />
-    </svg>
-  );
-}
 
 function NavIcon({ section }: { section: Section }) {
   return (
@@ -121,9 +114,7 @@ export default function App() {
     <div className="app">
       <nav className="rail" data-tauri-drag-region>
         <div className="rail-brand" data-tauri-drag-region>
-          <div className="rail-brand-mark">
-            <BrandMark />
-          </div>
+          <img className="rail-brand-mark" src="/brand.png" alt="" width={30} height={30} />
           <div className="rail-brand-text">
             <span className="rail-brand-name">Higgs</span>
             <span className="label" style={{ fontSize: 11 }}>
