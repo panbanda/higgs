@@ -67,13 +67,15 @@ fn config_scoped(path: &str) -> Result<PathBuf, String> {
 /// Pure logic behind [`log_scoped`], parameterized on the config directory
 /// and home directory so tests can exercise it without touching either of
 /// the real ones.
-fn log_scoped_in(dir: &Path, home: Option<&Path>, path: &str) -> Result<PathBuf, String> {
+fn log_scoped_in(dir: &Path, path: &str) -> Result<PathBuf, String> {
     if let Ok(scoped) = config_scoped_in(dir, path) {
         return Ok(scoped);
     }
     let candidate = expand_home(path);
-    let under_home = home.is_some_and(|home| is_contained_strict(home, &candidate));
-    if candidate.extension().is_some_and(|ext| ext == "jsonl") && under_home {
+    if configured_metrics_logs(dir)
+        .iter()
+        .any(|allowed| is_same_or_rotation(allowed, &candidate))
+    {
         return Ok(candidate);
     }
     Err(format!(
@@ -82,11 +84,58 @@ fn log_scoped_in(dir: &Path, home: Option<&Path>, path: &str) -> Result<PathBuf,
     ))
 }
 
-/// Like [`config_scoped`] but also accepts a `.jsonl` file anywhere under the
-/// home directory, since `logging.metrics.path` may point outside the config
-/// directory.
+/// Metrics log paths declared as `logging.metrics.path` by the config files
+/// in `dir`. Only these (and their rotations) may be read outside `dir`.
+fn configured_metrics_logs(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("config") && name.ends_with(".toml")
+        })
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .filter_map(|raw| toml::from_str::<toml::Value>(&raw).ok())
+        .filter_map(|value| {
+            value
+                .get("logging")?
+                .get("metrics")?
+                .get("path")?
+                .as_str()
+                .map(expand_home)
+        })
+        .collect()
+}
+
+/// True when `candidate` is `allowed` itself or one of its numbered
+/// rotations (`metrics.jsonl.1`, `metrics.jsonl.2`, ...).
+fn is_same_or_rotation(allowed: &Path, candidate: &Path) -> bool {
+    if candidate == allowed {
+        return true;
+    }
+    let (Some(parent), Some(name)) = (candidate.parent(), candidate.file_name()) else {
+        return false;
+    };
+    let Some(allowed_name) = allowed.file_name() else {
+        return false;
+    };
+    let name = name.to_string_lossy();
+    let allowed_name = allowed_name.to_string_lossy();
+    parent == allowed.parent().unwrap_or(Path::new(""))
+        && name
+            .strip_prefix(&*allowed_name)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Like [`config_scoped`] but also accepts the metrics log declared by a
+/// config file in the config directory (and its rotations), since
+/// `logging.metrics.path` may point outside the config directory.
 fn log_scoped(path: &str) -> Result<PathBuf, String> {
-    log_scoped_in(&config_dir(), home_dir().as_deref(), path)
+    log_scoped_in(&config_dir(), path)
 }
 
 #[derive(Debug, Serialize)]
@@ -865,8 +914,8 @@ mod tests {
         assert!(config_scoped_in(&dir.path, "../../etc/passwd").is_err());
         assert!(config_scoped_in(&dir.path, "/etc/passwd").is_err());
         let inside = dir.path.join("logs/metrics.jsonl");
-        assert!(log_scoped_in(&dir.path, Some(&dir.path), &inside.to_string_lossy()).is_ok());
-        assert!(log_scoped_in(&dir.path, Some(&dir.path), "/etc/passwd").is_err());
+        assert!(log_scoped_in(&dir.path, &inside.to_string_lossy()).is_ok());
+        assert!(log_scoped_in(&dir.path, "/etc/passwd").is_err());
     }
 
     #[cfg(unix)]
@@ -885,6 +934,36 @@ mod tests {
         let dir = TempDir::new("config-dir-from");
         let overridden = config_dir_from(Some(dir.path.to_str().expect("utf8 path")));
         assert_eq!(overridden, dir.path);
+    }
+
+    #[test]
+    fn metrics_log_outside_config_dir_needs_a_declaring_config() {
+        let guard = TempDir::new("log-scope");
+        let dir = guard.path.as_path();
+        let elsewhere = TempDir::new("log-elsewhere");
+        let external = elsewhere.path.join("metrics.jsonl");
+        std::fs::create_dir_all(external.parent().expect("parent")).expect("mkdir");
+        std::fs::write(dir.join("config.toml"), "").expect("write");
+        let external_str = external.to_string_lossy().into_owned();
+        // The config directory itself is always allowed.
+        assert!(log_scoped_in(dir, "logs/metrics.jsonl").is_ok());
+        // An undeclared path outside it is not, even under a home-like tree.
+        assert!(log_scoped_in(dir, &external_str).is_err());
+        std::fs::write(
+            dir.join("config.desk.toml"),
+            format!("[logging.metrics]\npath = \"{external_str}\"\n"),
+        )
+        .expect("write");
+        assert!(log_scoped_in(dir, &external_str).is_ok());
+        assert!(log_scoped_in(dir, &format!("{external_str}.3")).is_ok());
+        assert!(log_scoped_in(dir, &format!("{external_str}.bak")).is_err());
+        assert!(
+            log_scoped_in(
+                dir,
+                &format!("{}/other.jsonl", external.parent().expect("p").display())
+            )
+            .is_err()
+        );
     }
 
     #[test]
