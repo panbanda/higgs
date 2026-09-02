@@ -1,0 +1,408 @@
+/* Models, Requests, Providers & Routing, Config and Settings views.
+   Panel primitives (.panel .meta .label .key .rule .seg .btn .swap) and form
+   primitives (.field .form-row .notice .tabs .tab pre.log) live in
+   ../styles.css. styles.css does not define a grid row primitive, so .vrow
+   and its per-table column classes are defined here. */
+
+.vrow {
+  display: grid;
+  align-items: center;
+  min-height: 40px;
+  padding: 0 16px;
+  border-top: 1px solid var(--border);
+  font-size: 14px;
+}
+
+.vrow:hover {
+  background: var(--bg-muted);
+}
+
+.vrow.clickable {
+  cursor: pointer;
+}
+
+.vrow.head {
+  min-height: 28px;
+  cursor: default;
+  border-top: 0;
+}
+
+.vrow.head:hover {
+  background: transparent;
+}
+
+.vrow.selected {
+  background: var(--bg-muted);
+}
+
+.models-grid {
+  grid-template-columns: 1.6fr 110px 90px 100px 90px 90px 90px 150px;
+}
+
+.models-remote-grid {
+  grid-template-columns: 1fr 160px;
+}
+
+.requests-grid {
+  grid-template-columns: 90px 1.3fr 1fr 72px 90px 90px 90px 80px 110px;
+}
+
+.providers-grid {
+  grid-template-columns: 1fr 1.4fr 90px 90px 100px 90px 90px 90px;
+}
+
+.routes-grid {
+  grid-template-columns: 1.2fr 100px 1fr 1fr 1.4fr;
+}
+
+.hub-grid {
+  grid-template-columns: minmax(0, 1.6fr) 80px 100px 70px 80px 150px;
+  column-gap: 16px;
+}
+
+.view-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 16px;
+}
+
+.view-head h1 {
+  margin: 0;
+}
+
+.swatch {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 1px;
+  flex-shrink: 0;
+}
+
+.state-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.row-name {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.row-name .path {
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.row-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.section-label {
+  margin: 22px 0 8px;
+}
+
+/* Requests view */
+.requests-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0 0 12px;
+}
+
+.requests-search {
+  height: 36px;
+  width: 260px;
+  padding: 0 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-size: 13px;
+  box-sizing: border-box;
+}
+
+.requests-summary {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin: 0 0 10px;
+}
+
+.requests-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: 16px;
+  align-items: start;
+}
+
+.detail-panel {
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.detail-dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 8px 12px;
+  font-size: 13px;
+}
+
+.detail-dl dd {
+  margin: 0;
+  text-align: right;
+  word-break: break-word;
+}
+
+.detail-empty {
+  color: var(--text-muted);
+  font-size: 13px;
+  padding: 12px 0;
+}
+
+.detail-error {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+/* Providers & Routing view */
+.routing-note {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin: 8px 0 0;
+}
+
+/* Config view */
+.config-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0 0 16px;
+}
+
+.config-path {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.config-new-profile {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.config-layout {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.config-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.config-nav-btn {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  height: 36px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  font: 600 13px inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.config-nav-btn:hover {
+  background: var(--bg-muted);
+  color: var(--text);
+}
+
+.config-nav-btn.on {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--text);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.config-nav-save {
+  margin-top: 8px;
+}
+
+.config-panels {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+.config-actions-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 16px;
+  flex-wrap: wrap;
+}
+
+.config-section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+
+.config-list-item {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.config-list-item-header {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.config-list-item-header .field {
+  margin-bottom: 0;
+}
+
+.config-list-empty {
+  color: var(--text-muted);
+  font-size: 13px;
+  padding: 4px 0;
+}
+
+.config-key-input {
+  width: 140px;
+  flex-shrink: 0;
+}
+
+.config-disclosure summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 12px;
+  margin: 2px 0 8px;
+}
+
+.config-raw-textarea {
+  width: 100%;
+  min-height: 460px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+  resize: vertical;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+}
+
+.config-doctor-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.config-doctor-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 12px;
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.config-doctor-line {
+  display: grid;
+  grid-template-columns: 48px 1fr;
+  gap: 10px;
+  align-items: baseline;
+}
+
+/* Hub view */
+.hub-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.hub-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.hub-progress-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.hub-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+}
+
+/* Settings view */
+.settings-readonly-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 0;
+  font-size: 13px;
+  border-top: 1px solid var(--border);
+}
+
+.settings-readonly-row:first-child {
+  border-top: 0;
+}
+
+.settings-readonly-label {
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.settings-readonly-value {
+  font-family: var(--mono);
+  font-size: 12px;
+  text-align: right;
+  word-break: break-all;
+}

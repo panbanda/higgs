@@ -17,7 +17,7 @@ use tokio_stream::Stream;
 use crate::{
     config::ApiFormat,
     error::ServerError,
-    metrics::{MetricsStore, RequestMetricsContext, RequestRecord},
+    metrics::{MetricsStore, RequestMetricsContext, RequestRecord, RequestTiming},
     router::ResolvedRoute,
     state::{Engine, SharedState},
     types::openai::{
@@ -34,6 +34,9 @@ pub async fn completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<axum::response::Response, ServerError> {
+    // Captured before parsing and prompt preparation so TTFT measures
+    // the client-observed wait, not only generation.
+    let received_at = Instant::now();
     let req: CompletionRequest = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("Invalid request body: {e}")))?;
     request_metrics.set_requested_model(&req.model);
@@ -65,6 +68,7 @@ pub async fn completions(
                     model_name,
                     metrics,
                     routing_method,
+                    received_at,
                 )?;
                 let sse = Sse::new(stream).keep_alive(KeepAlive::default());
                 if state.metrics.is_some() {
@@ -87,6 +91,7 @@ pub async fn completions(
                         input_tokens: u64::from(response.usage.prompt_tokens),
                         output_tokens: u64::from(response.usage.completion_tokens),
                         error_body: None,
+                        timing: crate::metrics::RequestTiming::default(),
                     });
                     request_metrics.mark_recorded();
                 }
@@ -139,6 +144,7 @@ pub async fn completions(
                     input_tokens: 0,
                     output_tokens: 0,
                     error_body: None,
+                    timing: crate::metrics::RequestTiming::default(),
                 });
                 request_metrics.mark_recorded();
             }
@@ -215,6 +221,7 @@ fn completions_stream(
     model_name: String,
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,
+    received_at: Instant,
 ) -> Result<impl Stream<Item = Result<Event, Infallible>>, ServerError> {
     let max_tokens = req.max_tokens.unwrap_or(state.config.server.max_tokens);
     let sampling = build_sampling_params(&req);
@@ -252,7 +259,7 @@ fn completions_stream(
         }
     });
 
-    let start = Instant::now();
+    let start = received_at;
     let pending_id = metrics.as_ref().map(|m| {
         m.record_pending(RequestRecord {
             id: 0,
@@ -266,13 +273,18 @@ fn completions_stream(
             input_tokens: input_token_count,
             output_tokens: 0,
             error_body: None,
+            timing: crate::metrics::RequestTiming::default(),
         })
     });
 
     let stream = async_stream::stream! {
         let mut writer = crate::sse::CompletionChunkWriter::new(&request_id, created, &model);
         let mut output_tokens: u64 = 0;
+        let mut timing = RequestTiming::default();
         while let Some(output) = rx.recv().await {
+            if timing.ttft_ms.is_none() {
+                timing.ttft_ms = Some(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
+            }
             output_tokens = u64::from(output.completion_tokens);
             let choice = CompletionChunkChoice {
                 index: 0,
@@ -287,7 +299,7 @@ fn completions_stream(
 
         if let Some(ref m) = metrics {
             if let Some(id) = pending_id {
-                m.finalize_stream(id, output_tokens, start.elapsed());
+                m.finalize_stream(id, output_tokens, start.elapsed(), timing);
             }
         }
 

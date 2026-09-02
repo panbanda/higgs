@@ -91,11 +91,38 @@ pub struct RequestRecord {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub error_body: Option<String>,
+    pub timing: RequestTiming,
+}
+
+/// Generation timing only local streaming requests can observe. Remote and
+/// non-streaming requests leave every field `None`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestTiming {
+    /// Time from request start to the first generated token.
+    pub ttft_ms: Option<u64>,
+    /// Prompt tokens served from the prefix cache instead of being prefilled.
+    pub cached_tokens: Option<u64>,
 }
 
 impl RequestRecord {
     pub const fn is_error(&self) -> bool {
         self.status < 200 || self.status >= 300
+    }
+
+    /// Time spent decoding after the first token, when TTFT is known.
+    pub fn decode_duration(&self) -> Option<Duration> {
+        let ttft = Duration::from_millis(self.timing.ttft_ms?);
+        Some(self.duration.saturating_sub(ttft))
+    }
+
+    /// Output tokens per second of decode time. `None` when TTFT is unknown,
+    /// decode time is zero, or nothing was generated.
+    pub fn tokens_per_second(&self) -> Option<f64> {
+        let decode = self.decode_duration()?;
+        if decode.is_zero() || self.output_tokens == 0 {
+            return None;
+        }
+        Some(u32::try_from(self.output_tokens).map_or(f64::MAX, f64::from) / decode.as_secs_f64())
     }
 }
 
@@ -170,7 +197,13 @@ impl MetricsStore {
     }
 
     /// Update `output_tokens` and duration for a previously recorded entry by ID.
-    pub fn finalize_stream(&self, id: u64, output_tokens: u64, duration: Duration) {
+    pub fn finalize_stream(
+        &self,
+        id: u64,
+        output_tokens: u64,
+        duration: Duration,
+        timing: RequestTiming,
+    ) {
         let completed = {
             let mut records = self.records.write().unwrap_or_else(PoisonError::into_inner);
             let index = self.id_index.read().unwrap_or_else(PoisonError::into_inner);
@@ -178,6 +211,7 @@ impl MetricsStore {
                 if let Some(record) = records.get_mut(idx) {
                     record.output_tokens = output_tokens;
                     record.duration = duration;
+                    record.timing = timing;
                     Some(record.clone())
                 } else {
                     None
@@ -242,6 +276,8 @@ impl MetricsStore {
             "input_tokens": record.input_tokens,
             "output_tokens": record.output_tokens,
             "error": &record.error_body,
+            "ttft_ms": record.timing.ttft_ms,
+            "cached_tokens": record.timing.cached_tokens,
         });
         if let Ok(line) = serde_json::to_string(&entry) {
             if let Ok(mut l) = logger.lock() {
@@ -334,6 +370,33 @@ impl MetricsStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tokens_per_second_needs_ttft_and_output() {
+        let mut record = RequestRecord {
+            id: 0,
+            timestamp: Instant::now(),
+            wallclock: Utc::now(),
+            model: None,
+            provider: None,
+            routing_method: RoutingMethod::Higgs,
+            status: 200,
+            duration: Duration::from_secs(3),
+            input_tokens: 0,
+            output_tokens: 40,
+            error_body: None,
+            timing: RequestTiming::default(),
+        };
+        assert!(record.tokens_per_second().is_none());
+        record.timing.ttft_ms = Some(1000);
+        assert_eq!(record.decode_duration(), Some(Duration::from_secs(2)));
+        assert!((record.tokens_per_second().unwrap() - 20.0).abs() < f64::EPSILON);
+        record.timing.ttft_ms = Some(5000);
+        assert!(
+            record.tokens_per_second().is_none(),
+            "ttft past duration saturates to zero decode"
+        );
+    }
     use std::sync::Arc;
 
     const ONE_MINUTE_SECS: u64 = 60;
@@ -353,6 +416,7 @@ mod tests {
             input_tokens: 100,
             output_tokens: 200,
             error_body: None,
+            timing: crate::metrics::RequestTiming::default(),
         }
     }
 
@@ -480,7 +544,7 @@ mod tests {
         rec.duration = Duration::ZERO;
         let id = store.record_pending(rec);
 
-        store.finalize_stream(id, 500, Duration::from_secs(3));
+        store.finalize_stream(id, 500, Duration::from_secs(3), RequestTiming::default());
 
         let snap = store.snapshot();
         let record = snap.iter().find(|r| r.id == id).expect("record not found");
@@ -492,7 +556,12 @@ mod tests {
     fn finalize_stream_ignores_unknown_id() {
         let store = MetricsStore::new(Duration::from_secs(ONE_MINUTE_SECS));
         store.record(sample_record());
-        store.finalize_stream(999_999, 100, Duration::from_secs(1));
+        store.finalize_stream(
+            999_999,
+            100,
+            Duration::from_secs(1),
+            RequestTiming::default(),
+        );
         assert_eq!(store.snapshot().len(), 1);
     }
 
@@ -509,7 +578,7 @@ mod tests {
 
         store.evict_expired();
 
-        store.finalize_stream(id, 999, Duration::from_secs(5));
+        store.finalize_stream(id, 999, Duration::from_secs(5), RequestTiming::default());
         let snap = store.snapshot();
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].output_tokens, 999);
@@ -553,7 +622,7 @@ mod tests {
         let content = std::fs::read_to_string(dir.path().join("metrics.jsonl")).unwrap();
         assert!(content.is_empty(), "record_pending should not log");
 
-        store.finalize_stream(id, 500, Duration::from_secs(3));
+        store.finalize_stream(id, 500, Duration::from_secs(3), RequestTiming::default());
 
         let log_content = std::fs::read_to_string(dir.path().join("metrics.jsonl")).unwrap();
         let entry: serde_json::Value = serde_json::from_str(log_content.trim()).unwrap();
@@ -628,7 +697,12 @@ mod tests {
                 let mut rec = sample_record();
                 rec.output_tokens = 0;
                 let id = writer_store.record_pending(rec);
-                writer_store.finalize_stream(id, i + 1, Duration::from_millis(i + 1));
+                writer_store.finalize_stream(
+                    id,
+                    i + 1,
+                    Duration::from_millis(i + 1),
+                    RequestTiming::default(),
+                );
             }
         });
 

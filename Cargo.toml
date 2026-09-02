@@ -1,5 +1,7 @@
 [workspace]
 members = ["crates/*"]
+# The desktop app is its own workspace so a plain `cargo build` stays Tauri-free.
+exclude = ["apps/desktop/src-tauri"]
 resolver = "2"
 
 [workspace.package]

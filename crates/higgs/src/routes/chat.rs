@@ -17,7 +17,7 @@ use tokio_stream::Stream;
 use crate::{
     config::ApiFormat,
     error::ServerError,
-    metrics::{MetricsStore, RequestMetricsContext, RequestRecord},
+    metrics::{MetricsStore, RequestMetricsContext, RequestRecord, RequestTiming},
     router::ResolvedRoute,
     state::{Engine, SharedState},
     types::openai::{
@@ -35,6 +35,9 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<axum::response::Response, ServerError> {
+    // Captured before parsing and prompt preparation so TTFT measures
+    // the client-observed wait, not only generation.
+    let received_at = Instant::now();
     let mut req: ChatCompletionRequest = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("Invalid request body: {e}")))?;
     request_metrics.set_requested_model(&req.model);
@@ -72,6 +75,7 @@ pub async fn chat_completions(
                     engine,
                     state.metrics.clone(),
                     routing_method,
+                    received_at,
                 )?;
                 let sse = Sse::new(stream).keep_alive(KeepAlive::default());
                 if state.metrics.is_some() {
@@ -95,6 +99,7 @@ pub async fn chat_completions(
                         input_tokens: u64::from(response.usage.prompt_tokens),
                         output_tokens: u64::from(response.usage.completion_tokens),
                         error_body: None,
+                        timing: crate::metrics::RequestTiming::default(),
                     });
                     request_metrics.mark_recorded();
                 }
@@ -144,6 +149,7 @@ pub async fn chat_completions(
                             input_tokens: 0,
                             output_tokens: 0,
                             error_body: None,
+                            timing: crate::metrics::RequestTiming::default(),
                         });
                         request_metrics.mark_recorded();
                     }
@@ -187,6 +193,7 @@ pub async fn chat_completions(
                                 input_tokens: 0,
                                 output_tokens: 0,
                                 error_body: None,
+                                timing: crate::metrics::RequestTiming::default(),
                             });
                             request_metrics.mark_recorded();
                         }
@@ -229,6 +236,7 @@ pub async fn chat_completions(
                                 input_tokens: usage.0,
                                 output_tokens: usage.1,
                                 error_body: None,
+                                timing: crate::metrics::RequestTiming::default(),
                             });
                             request_metrics.mark_recorded();
                         }
@@ -432,6 +440,7 @@ fn chat_completions_stream(
     engine: Arc<Engine>,
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,
+    received_at: Instant,
 ) -> Result<impl Stream<Item = Result<Event, Infallible>>, ServerError> {
     let stream_includes_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
     // Built here (before the `async_stream::stream!` block, which captures by
@@ -507,7 +516,7 @@ fn chat_completions_stream(
     let model = req.model;
     let prompt_token_count = u32::try_from(prompt_tokens.len()).unwrap_or(0);
 
-    let start = Instant::now();
+    let start = received_at;
     let metrics_id = metrics.as_ref().map(|m| {
         m.record_pending(RequestRecord {
             id: 0,
@@ -521,6 +530,7 @@ fn chat_completions_stream(
             input_tokens: u64::from(prompt_token_count),
             output_tokens: 0,
             error_body: None,
+            timing: crate::metrics::RequestTiming::default(),
         })
     });
     let tokenizer = engine.tokenizer().clone();
@@ -536,7 +546,9 @@ fn chat_completions_stream(
             top_logprobs,
             &tx,
             thinking_enabled_stream,
-            return_progress,
+            // Always requested so the metrics record sees prefix-cache hits;
+            // progress chunks are only forwarded when the client opted in.
+            true,
             constraint,
             pixel_values,
         );
@@ -598,18 +610,23 @@ fn chat_completions_stream(
         let mut output_token_count: u32 = 0;
         let mut pending_finish_reason: Option<String> = None;
         let mut pending_finish_logprobs: Option<ChoiceLogprobs> = None;
+        let mut timing = RequestTiming::default();
 
         while let Some(output) = rx.recv().await {
             // Prefill-progress events carry no tokens: forward as
             // `prompt_progress` chunks when the client opted in, and keep
             // them away from the delta/tool trackers either way.
             if let Some(p) = output.prefill_progress {
+                timing.cached_tokens = Some(u64::from(p.cached));
                 if return_progress {
                     let time_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
                     let json = writer.write_prompt_progress(p.total, p.cached, p.processed, time_ms);
                     yield Ok(Event::default().data(json));
                 }
                 continue;
+            }
+            if timing.ttft_ms.is_none() {
+                timing.ttft_ms = Some(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
             }
             output_token_count = output.completion_tokens;
             let chunk_logprobs = output
@@ -751,7 +768,7 @@ fn chat_completions_stream(
 
         if let Some(ref m) = metrics {
             if let Some(id) = metrics_id {
-                m.finalize_stream(id, u64::from(output_token_count), start.elapsed());
+                m.finalize_stream(id, u64::from(output_token_count), start.elapsed(), timing);
             }
         }
 

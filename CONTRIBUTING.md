@@ -47,3 +47,12 @@ When adding or changing config fields:
 - Prefer clear user-visible examples over internal-only wording.
 - Keep the README focused on value, quick start, and proof.
 - Move long reference material into dedicated docs instead of expanding the landing page.
+
+## Release validation
+
+- Run `scripts/release_smoke_cached_models.sh` to validate the cached MLX models already
+  present on the machine without downloading anything.
+- Set `HIGGS_SMOKE_INCLUDE_OPTIONAL_MODELS=1` to include optional large or private cached
+  models such as `mlx-community/Qwen3.6-35B-A3B-4bit`.
+- The harness covers single-model serve, streaming and non-streaming requests, multi-model
+  startup, routing precedence, daemon start/attach/stop, and the batch-support guardrails.

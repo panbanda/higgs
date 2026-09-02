@@ -66,6 +66,63 @@ jobs:
       - name: Build release
         run: cargo build --release
 
+  desktop:
+    name: Desktop app
+    runs-on: macos-15 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: apps/desktop/src-tauri
+          prefix-key: "v1-desktop"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4
+        with:
+          version: 10
+
+      - name: Install Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck and build frontend
+        working-directory: apps/desktop
+        run: pnpm typecheck && pnpm build
+
+      - name: Assert the dev-only local bridge is not bundled
+        working-directory: apps/desktop
+        run: |
+          if grep -rq "__local" dist/assets; then
+            echo "dev local bridge leaked into the production bundle" >&2
+            exit 1
+          fi
+
+      - name: Lint and test Tauri backend
+        working-directory: apps/desktop/src-tauri
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets
+          cargo test
+
   bench-smoke:
     name: Bench smoke
     # Advisory until model-backed validation has stabilized across macOS runners.

@@ -1,0 +1,645 @@
+.chat-page {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+}
+
+/* Left conversation strip */
+.chat-sidebar {
+  width: 220px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  background: var(--bg-rail);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transition:
+    width 0.15s ease,
+    padding 0.15s ease;
+}
+
+.chat-sidebar.collapsed {
+  width: 0;
+  border-right: none;
+}
+
+.chat-sidebar-header {
+  padding: 12px;
+}
+
+.chat-conversation-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.chat-conversation-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.chat-conversation-item:hover {
+  background: var(--bg-panel);
+}
+
+.chat-conversation-item.active {
+  background: var(--bg-fresh);
+  color: var(--text-accent);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.chat-conversation-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.chat-conversation-item .icon-btn {
+  flex-shrink: 0;
+  opacity: 0;
+}
+
+.chat-conversation-item:hover .icon-btn {
+  opacity: 1;
+}
+
+.chat-sidebar-presets {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 8px;
+  border-top: 1px solid var(--border);
+}
+
+.chat-sidebar-preset {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  font-size: 13px;
+}
+
+/* Middle: messages + composer */
+.chat-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.chat-topbar {
+  height: 56px;
+  min-height: 56px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+
+.chat-model-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 12px;
+  border-radius: 6px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  font-weight: 700;
+  min-width: 0;
+  flex-shrink: 0;
+}
+
+.chat-model-badge select {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  font-weight: 700;
+  color: var(--text);
+  max-width: 220px;
+}
+
+.chat-model-detail {
+  font-weight: 500;
+}
+
+/* Fills remaining header width so it (not the header) absorbs shrinkage; the
+   chips inside truncate before this row is ever allowed to wrap. */
+.chat-top-chips {
+  display: flex;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.preset-save-form {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.preset-save-form input {
+  width: 160px;
+}
+
+.chat-page .messages {
+  flex: 1;
+  min-height: 0;
+  padding: 24px 0 16px;
+}
+
+.chat-composer-area {
+  padding: 0 24px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.chat-composer-area .composer {
+  margin: 0 auto;
+  max-width: 760px;
+  width: 100%;
+}
+
+.param-chips {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 500 11px var(--mono);
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: var(--bg-panel);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  cursor: pointer;
+}
+
+.chip:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+.params-panel {
+  margin: 8px 16px 0;
+}
+
+.params-panel .field {
+  margin-bottom: 8px;
+}
+
+.params-panel textarea {
+  width: 100%;
+  resize: vertical;
+}
+
+.params-panel input,
+.params-panel select {
+  width: 100%;
+}
+
+/* Right: request inspector */
+.inspector {
+  width: 480px;
+  flex-shrink: 0;
+  border-left: 1px solid var(--border);
+  background: var(--bg-rail);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.inspector-header {
+  min-height: 56px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.inspector-header > span:first-child {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text);
+  font-weight: 700;
+}
+
+.inspector-header-spacer {
+  flex: 1;
+}
+
+.inspector-collapse-btn {
+  width: 36px;
+  height: 36px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Collapsed inspector: a slim strip with just a reopen chevron. */
+.inspector-strip {
+  width: 36px;
+  flex-shrink: 0;
+  border-left: 1px solid var(--border);
+  background: var(--bg-rail);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-top: 10px;
+}
+
+.inspector .tabs {
+  padding: 0 8px;
+  margin-bottom: 0;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.inspector .tab {
+  flex-shrink: 0;
+  padding: 0 12px;
+}
+
+.inspector-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+  user-select: text;
+}
+
+.inspector-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.inspector-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.inspector-json {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 480px;
+  overflow: auto;
+  margin: 0;
+}
+
+/* Trace tab: stat row + waterfall. This is its own grid (not the shared
+   .stat-row, whose repeat(auto-fit, minmax(140px, 1fr)) wraps a 4th tile to
+   a second row well before the inspector's 480px width is used up). */
+.trace-stat-row {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.trace-stat {
+  padding: 8px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.trace-stat .meta {
+  font-size: 10px;
+}
+
+.trace-stat .mono {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.throughput-stat {
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.waterfall {
+  padding: 10px 12px 12px;
+  display: flex;
+  flex-direction: column;
+}
+
+.waterfall-axis {
+  display: grid;
+  grid-template-columns: 176px 1fr 92px;
+  gap: 10px;
+  align-items: end;
+  padding-bottom: 6px;
+}
+
+.span-dur-head {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.waterfall-ticks {
+  position: relative;
+  height: 14px;
+  border-bottom: 1px solid var(--border-strong);
+}
+
+.waterfall-ticks span {
+  position: absolute;
+  bottom: 0;
+  transform: translateX(-50%);
+  font-size: 10px;
+  color: var(--text-muted);
+  line-height: 1;
+  padding-bottom: 4px;
+}
+
+.span-row {
+  display: grid;
+  grid-template-columns: 176px 1fr 92px;
+  align-items: center;
+  gap: 10px;
+  min-height: 30px;
+  border-top: 1px solid var(--border);
+  cursor: pointer;
+}
+
+.span-row:hover {
+  background: var(--bg-panel);
+}
+
+.span-row.on {
+  background: var(--bg-fresh);
+}
+
+.span-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  min-width: 0;
+}
+
+.span-label-text {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.span-swatch {
+  width: 6px;
+  height: 6px;
+  border-radius: 1px;
+  flex-shrink: 0;
+}
+
+.span-track {
+  position: relative;
+  height: 18px;
+}
+
+.span-bar {
+  position: absolute;
+  top: 3px;
+  height: 12px;
+  min-width: 2px;
+  border-radius: 2px;
+}
+
+.span-stall {
+  position: absolute;
+  top: 0;
+  width: 2px;
+  height: 18px;
+  background: var(--bad);
+}
+
+.span-dur {
+  font-size: 11px;
+  text-align: right;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* Selected-span detail expands in place, directly under its row, instead of
+   a fixed panel at the bottom of the waterfall (which got clipped in short
+   inspector windows). */
+.span-detail {
+  padding: 8px 12px 10px calc(176px + 10px);
+  border-top: 1px solid var(--border);
+  background: var(--bg-fresh);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.span-detail-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.span-detail-title {
+  font-weight: 700;
+  font-size: 12.5px;
+}
+
+.span-detail-text {
+  font-size: 12.5px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+/* Throughput tab */
+.throughput-chart {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.throughput-chart-footer {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.stall-label {
+  color: var(--bad);
+}
+
+/* Tokens tab + Response tab share this row layout */
+.token-rows {
+  display: flex;
+  flex-direction: column;
+  padding: 4px 12px;
+}
+
+.token-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.token-row:first-child {
+  border-top: none;
+}
+
+.chunk-row {
+  display: grid;
+  grid-template-columns: 64px 84px 1fr;
+  gap: 10px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.chunk-row:first-child {
+  border-top: none;
+}
+
+.chunk-row:hover {
+  background: var(--bg-panel);
+}
+
+.chunk-kind {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.chunk-preview {
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.assembled-message {
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+}
+
+.assembled-message .meta {
+  margin-bottom: 6px;
+}
+
+/* Messages: thinking toggle, tool rows, composer height per the instrument-panel spec */
+.chat-page .thinking-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 40px;
+  padding: 0 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  color: var(--text);
+  font: 600 13px var(--sans);
+  width: 100%;
+}
+
+.chat-page .thinking-toggle .chevron {
+  margin-left: auto;
+}
+
+.chat-page .thinking {
+  border-left: none;
+  padding-left: 0;
+}
+
+.chat-page .thinking-body {
+  border-left: 2px solid var(--thinking);
+  padding-left: 10px;
+}
+
+.chat-page .toolcall {
+  border-radius: 6px;
+}
+
+.chat-page .toolcall-header {
+  min-height: 40px;
+  display: grid;
+  grid-template-columns: 20px 1fr auto auto auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.toolcall-args {
+  color: var(--text-muted);
+  margin-left: 2px;
+}
+
+.toolcall-status {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.toolcall-status.ok {
+  color: var(--ok);
+}
+
+.toolcall-status.bad {
+  color: var(--bad);
+}
+
+.chat-composer-area .composer textarea {
+  min-height: 44px;
+}
+
+.chat-composer-area .composer .btn {
+  height: 44px;
+  padding: 0 20px;
+  font-size: 14px;
+}

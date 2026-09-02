@@ -5,6 +5,7 @@
 - `crates/higgs/` -- main binary crate (config, router, doctor, daemon, CLI)
 - `crates/higgs-engine/` -- inference engine
 - `crates/higgs-models/` -- model architectures
+- `apps/desktop/` -- Tauri desktop chat client (separate cargo workspace under `src-tauri/`, excluded from the root workspace)
 
 ## Development Rules
 
