@@ -86,6 +86,22 @@ async function isContained(root: string, candidate: string): Promise<boolean> {
 }
 
 /**
+ * Like `isContained` but also rejects `candidate` itself being a symlink.
+ * Mirrors `is_contained_strict` in src-tauri/src/paths.rs: use this for
+ * config and log paths, which a caller only ever reads or writes as a plain
+ * file; keep the lenient `isContained` for the hub cache, which
+ * intentionally symlinks snapshot files to blobs.
+ */
+async function isContainedStrict(root: string, candidate: string): Promise<boolean> {
+  if (!(await isContained(root, candidate))) return false;
+  try {
+    return !(await fs.lstat(candidate)).isSymbolicLink();
+  } catch {
+    return true;
+  }
+}
+
+/**
  * `logging.metrics.path` from every config file in the config dir, resolved
  * to an absolute path. Used to allow `read_metrics_log` to read a metrics
  * log configured outside the config dir (still constrained to the user's
@@ -127,7 +143,7 @@ async function assertAllowedPath(command: string, args: Record<string, unknown>)
   const pathCommands = new Set(["read_config", "write_config_raw", "write_config_structured", "read_text_tail", "read_metrics_log"]);
   if (command === "daemon_status") {
     const profile = args.profile;
-    if (profile != null && (typeof profile !== "string" || !/^[A-Za-z0-9_-]+$/.test(profile))) {
+    if (profile != null && (typeof profile !== "string" || !isProfileName(profile))) {
       throw new ForbiddenError("invalid profile name");
     }
     return;
@@ -137,8 +153,8 @@ async function assertAllowedPath(command: string, args: Record<string, unknown>)
   if (typeof raw !== "string" || !raw) throw new ForbiddenError("path required");
   const resolved = path.resolve(expandHome(raw));
   const dir = configDir();
-  if (await isContained(dir, resolved)) return;
-  if (command === "read_metrics_log" && (await isContained(os.homedir(), resolved))) {
+  if (await isContainedStrict(dir, resolved)) return;
+  if (command === "read_metrics_log" && (await isContainedStrict(os.homedir(), resolved))) {
     const allowed = await configuredMetricsLogPaths();
     if (allowed.has(resolved)) return;
   }
@@ -201,7 +217,7 @@ async function assertValidSelectorArgs(rest: string[]): Promise<void> {
       const configPath = rest[i + 1];
       if (configPath === undefined) throw new Error("--config requires a value");
       const resolved = path.resolve(expandHome(configPath));
-      if (!(await isContained(configDir(), resolved))) {
+      if (!(await isContainedStrict(configDir(), resolved))) {
         throw new Error(`path ${resolved} is outside the Higgs config directory`);
       }
       i += 2;
@@ -549,6 +565,16 @@ async function hubRunDownload(repo: string, token: unknown, job: HubJob): Promis
   }
 }
 
+// Secrets, mirroring src-tauri/src/secrets.rs's name restriction. Kept in an
+// in-memory Map for the Vite dev process rather than the real macOS
+// Keychain, since browser dev mode has no keychain to talk to.
+const ALLOWED_SECRET_NAMES = new Set(["api_key", "hf_token"]);
+const secrets = new Map<string, string>();
+
+function assertAllowedSecretName(name: string): void {
+  if (!ALLOWED_SECRET_NAMES.has(name)) throw new ForbiddenError(`unknown secret name: ${name}`);
+}
+
 const handlers: Record<string, Handler> = {
   async list_profiles() {
     const dir = configDir();
@@ -787,6 +813,23 @@ const handlers: Record<string, Handler> = {
     const repoDir = path.join(root, hubRepoDirName(repoId));
     await assertWithinDir(repoDir, root);
     await fs.rm(repoDir, { recursive: true, force: true });
+    return null;
+  },
+  async secret_set({ name, value }) {
+    const key = String(name);
+    assertAllowedSecretName(key);
+    secrets.set(key, String(value));
+    return null;
+  },
+  async secret_get({ name }) {
+    const key = String(name);
+    assertAllowedSecretName(key);
+    return secrets.get(key) ?? null;
+  },
+  async secret_delete({ name }) {
+    const key = String(name);
+    assertAllowedSecretName(key);
+    secrets.delete(key);
     return null;
   },
 };

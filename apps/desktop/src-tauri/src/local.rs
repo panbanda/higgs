@@ -8,7 +8,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager as _};
 
-use crate::paths::is_contained;
+use crate::paths::is_contained_strict;
 
 /// Pure computation behind [`config_dir`], parameterized on the
 /// `HIGGS_CONFIG_DIR` value so tests can exercise it without touching the
@@ -49,7 +49,7 @@ fn config_scoped_in(dir: &Path, path: &str) -> Result<PathBuf, String> {
     } else {
         dir.join(candidate)
     };
-    if !is_contained(dir, &absolute) {
+    if !is_contained_strict(dir, &absolute) {
         return Err(format!(
             "path {} is outside the Higgs config directory",
             absolute.display()
@@ -72,7 +72,7 @@ fn log_scoped_in(dir: &Path, home: Option<&Path>, path: &str) -> Result<PathBuf,
         return Ok(scoped);
     }
     let candidate = expand_home(path);
-    let under_home = home.is_some_and(|home| is_contained(home, &candidate));
+    let under_home = home.is_some_and(|home| is_contained_strict(home, &candidate));
     if candidate.extension().is_some_and(|ext| ext == "jsonl") && under_home {
         return Ok(candidate);
     }

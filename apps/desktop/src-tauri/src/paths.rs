@@ -67,6 +67,18 @@ pub fn is_contained(root: &Path, candidate: &Path) -> bool {
     std::fs::canonicalize(&nearest).is_ok_and(|resolved| resolved.starts_with(&canonical_root))
 }
 
+/// Like [`is_contained`] but also rejects `candidate` itself being a
+/// symlink. Use this for paths a caller only ever reads or writes as a plain
+/// file, such as the config and log paths in [`crate::local`]; keep the
+/// lenient [`is_contained`] for the hub cache, which intentionally symlinks
+/// snapshot files to blobs.
+pub fn is_contained_strict(root: &Path, candidate: &Path) -> bool {
+    if !is_contained(root, candidate) {
+        return false;
+    }
+    !std::fs::symlink_metadata(candidate).is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +136,32 @@ mod tests {
         assert!(!is_contained(&root, &candidate));
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_rejects_a_leaf_symlink_escaping_the_root() {
+        let root = temp_dir("strict-leaf-symlink-root");
+        let outside = temp_dir("strict-leaf-symlink-outside");
+        let target = outside.join("secret.txt");
+        std::fs::write(&target, "data").expect("write outside file");
+        let link = root.join("escaped-leaf");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert!(
+            is_contained(&root, &link),
+            "lenient check allows the leaf symlink"
+        );
+        assert!(!is_contained_strict(&root, &link));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn strict_accepts_a_plain_nested_path() {
+        let root = temp_dir("strict-plain-root");
+        std::fs::create_dir_all(root.join("a/b")).expect("nested dirs");
+        assert!(is_contained_strict(&root, &root.join("a/b/file.txt")));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[cfg(unix)]

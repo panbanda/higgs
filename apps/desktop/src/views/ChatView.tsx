@@ -289,6 +289,10 @@ export function ChatView({ settings, onSettingsChange, presets, onPresetsChange,
   const stop = () => handleRef.current?.cancel();
 
   const replay = (requestBody: unknown) => {
+    // Defensive: the Replay button is disabled while busy, but guard against a stale
+    // handle anyway so a replay never runs concurrently with another turn.
+    handleRef.current?.cancel();
+
     const conversation = ensureConversation();
     const assistantMessage = newAssistantMessage(settings.model, settings.params);
 
@@ -460,7 +464,14 @@ export function ChatView({ settings, onSettingsChange, presets, onPresetsChange,
       </div>
 
       {inspectorOpen && selectedMessage && (
-        <RequestInspector system={data.system} message={selectedMessage} settings={settings} onReplay={replay} onCollapse={() => setInspectorOpen(false)} />
+        <RequestInspector
+          system={data.system}
+          message={selectedMessage}
+          settings={settings}
+          onReplay={replay}
+          replayDisabled={busy}
+          onCollapse={() => setInspectorOpen(false)}
+        />
       )}
       {inspectorOpen && !selectedMessage && (
         <aside className="inspector">

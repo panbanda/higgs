@@ -213,6 +213,20 @@ export function hubDelete(repo: string): Promise<void> {
   return local("hub_delete", { repo });
 }
 
+// Secrets (desktop app only, Keychain-backed; dev bridge holds them in memory)
+
+export function secretSet(name: string, value: string): Promise<void> {
+  return local("secret_set", { name, value });
+}
+
+export function secretGet(name: string): Promise<string | null> {
+  return local("secret_get", { name });
+}
+
+export function secretDelete(name: string): Promise<void> {
+  return local("secret_delete", { name });
+}
+
 // Browser fallbacks
 
 const browserAborts = new Map<string, AbortController>();
@@ -289,6 +303,10 @@ async function browserStream(
   body: unknown,
   onEvent: (event: StreamEvent) => void,
 ): Promise<void> {
+  if (connection.api_key && !apiKeyTransportAllowed(connection.base_url)) {
+    onEvent({ type: "error", message: API_KEY_TRANSPORT_ERROR });
+    return;
+  }
   const controller = new AbortController();
   browserAborts.set(requestId, controller);
   try {

@@ -1,6 +1,7 @@
 mod hub;
 mod local;
 mod paths;
+mod secrets;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -379,7 +380,10 @@ pub fn run() {
             hub::hub_download_start,
             hub::hub_download_status,
             hub::hub_cancel,
-            hub::hub_delete
+            hub::hub_delete,
+            secrets::secret_set,
+            secrets::secret_get,
+            secrets::secret_delete
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

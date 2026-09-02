@@ -34,9 +34,9 @@ pnpm tauri dev
 The app reads the same files the CLI uses: `~/.config/higgs/config[.profile].toml`,
 `logs/metrics[.profile].jsonl`, and `higgs[.profile].pid`, so it expects to run on
 the machine that runs Higgs. Set the profile, server URL, and `higgs` binary path
-in Settings. The API key and the Hugging Face token are kept in the app's local
-storage on this machine, not in the Keychain; leave them empty unless the server
-or a gated repo needs them.
+in Settings. The API key and the Hugging Face token are stored in the macOS
+Keychain (native app) or held only for the session (browser mode); leave them
+empty unless the server or a gated repo needs them.
 
 ## Metrics need config mode
 

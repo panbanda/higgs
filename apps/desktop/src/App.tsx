@@ -1,8 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useServerData } from "./hooks/useServerData";
 import { inTauri } from "./lib/api";
-import { loadPresets, loadSettings, savePresets, saveSettings } from "./lib/storage";
+import { loadPresets, loadSecrets, loadSettings, saveSecret, savePresets, saveSettings } from "./lib/storage";
 import type { Preset, Settings } from "./lib/types";
 import { ChatView } from "./views/ChatView";
 import { ConfigView } from "./views/ConfigView";
@@ -66,6 +66,34 @@ export default function App() {
 
   useEffect(() => saveSettings(settings), [settings]);
   useEffect(() => savePresets(presets), [presets]);
+
+  // Secrets live in the keychain (or in memory for browser mode), never in localStorage.
+  const loadedSecretsRef = useRef<{ apiKey: string; hfToken: string } | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    loadSecrets().then((secrets) => {
+      if (cancelled) return;
+      loadedSecretsRef.current = secrets;
+      setSettings((current) => ({ ...current, apiKey: secrets.apiKey, hfToken: secrets.hfToken }));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    const loaded = loadedSecretsRef.current;
+    if (loaded === null || settings.apiKey === loaded.apiKey) return;
+    loadedSecretsRef.current = { ...loaded, apiKey: settings.apiKey };
+    void saveSecret("apiKey", settings.apiKey);
+  }, [settings.apiKey]);
+
+  useEffect(() => {
+    const loaded = loadedSecretsRef.current;
+    if (loaded === null || settings.hfToken === loaded.hfToken) return;
+    loadedSecretsRef.current = { ...loaded, hfToken: settings.hfToken };
+    void saveSecret("hfToken", settings.hfToken);
+  }, [settings.hfToken]);
 
   // Pick a served model once the list arrives, keeping a valid explicit choice.
   useEffect(() => {

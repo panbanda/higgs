@@ -14,6 +14,10 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: -Dwarnings
+  # mlx-sys compiles the metallib location into MLX. Its default lives under
+  # $HOME/.mlx, which the rust-cache never restores, so a cached build cannot
+  # find the metallib at runtime. Keep it inside the cached target directory.
+  MLX_RS_METAL_PATH: ${{ github.workspace }}/target/mlx-metal
 
 jobs:
   test:

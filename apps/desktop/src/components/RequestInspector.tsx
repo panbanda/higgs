@@ -62,6 +62,7 @@ interface Props {
   settings: Settings;
   system: SystemInfo | null;
   onReplay: (requestBody: unknown) => void;
+  replayDisabled: boolean;
   onCollapse: () => void;
 }
 
@@ -451,14 +452,24 @@ function TokensTab({ trace, scope, message }: { trace: Trace; scope: InspectorSc
   );
 }
 
-function RequestTab({ round, settings, onReplay }: { round: TraceRound; settings: Settings; onReplay: (requestBody: unknown) => void }) {
+function RequestTab({
+  round,
+  settings,
+  onReplay,
+  replayDisabled,
+}: {
+  round: TraceRound;
+  settings: Settings;
+  onReplay: (requestBody: unknown) => void;
+  replayDisabled: boolean;
+}) {
   const pretty = JSON.stringify(round.requestBody, null, 2);
   return (
     <div className="inspector-tab">
       <div className="inspector-actions">
         <CopyButton text={pretty} />
         <CopyButton text={toCurl(settings.baseUrl, settings.apiKey, round.requestBody)} label="Copy as curl" />
-        <button type="button" className="btn small primary" onClick={() => onReplay(round.requestBody)}>
+        <button type="button" className="btn small primary" disabled={replayDisabled} onClick={() => onReplay(round.requestBody)}>
           Replay
         </button>
       </div>
@@ -493,7 +504,7 @@ function ResponseTab({ round, message }: { round: TraceRound; message: Assistant
   );
 }
 
-export function RequestInspector({ message, settings, system, onReplay, onCollapse }: Props) {
+export function RequestInspector({ message, settings, system, onReplay, replayDisabled, onCollapse }: Props) {
   const [tab, setTab] = useState<Tab>("trace");
   const [scope, setScope] = useState<InspectorScope>("all");
 
@@ -522,7 +533,8 @@ export function RequestInspector({ message, settings, system, onReplay, onCollap
     );
   }
 
-  const activeRoundIndex = scope === "all" || scope < 0 || scope >= rounds.length ? rounds.length - 1 : scope;
+  const safeScope: InspectorScope = scope === "all" || scope < 0 || scope >= rounds.length ? "all" : scope;
+  const activeRoundIndex = safeScope === "all" ? rounds.length - 1 : safeScope;
   const activeRound = rounds[activeRoundIndex];
 
   return (
@@ -553,10 +565,10 @@ export function RequestInspector({ message, settings, system, onReplay, onCollap
         ))}
       </div>
       <div className="inspector-body">
-        {tab === "trace" && <TraceTab trace={trace} scope={scope} spans={spans} />}
-        {tab === "throughput" && <ThroughputTab trace={trace} scope={scope} />}
-        {tab === "tokens" && <TokensTab trace={trace} scope={scope} message={message} />}
-        {tab === "request" && <RequestTab round={activeRound} settings={settings} onReplay={onReplay} />}
+        {tab === "trace" && <TraceTab trace={trace} scope={safeScope} spans={spans} />}
+        {tab === "throughput" && <ThroughputTab trace={trace} scope={safeScope} />}
+        {tab === "tokens" && <TokensTab trace={trace} scope={safeScope} message={message} />}
+        {tab === "request" && <RequestTab round={activeRound} settings={settings} onReplay={onReplay} replayDisabled={replayDisabled} />}
         {tab === "response" && <ResponseTab round={activeRound} message={message} />}
       </div>
     </aside>

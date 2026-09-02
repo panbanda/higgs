@@ -1,3 +1,4 @@
+import { localAvailable, secretDelete, secretGet, secretSet } from "./api";
 import { DEFAULT_PARAMS, DEFAULT_SETTINGS, type Conversation, type Preset, type Settings } from "./types";
 
 const SETTINGS_KEY = "higgs.settings.v2";
@@ -18,8 +19,26 @@ export function loadSettings(): Settings {
   return { ...DEFAULT_SETTINGS, ...stored, params: { ...DEFAULT_PARAMS, ...(stored.params ?? {}) } };
 }
 
+/** Secrets never touch localStorage; they are written to the OS keychain (or held in memory) separately. */
 export function saveSettings(settings: Settings): void {
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify({ ...settings, apiKey: "", hfToken: "" }));
+}
+
+const SECRET_NAMES = { apiKey: "api_key", hfToken: "hf_token" } as const;
+
+/** Reads the API key and Hugging Face token from the keychain (native app) or the dev bridge's in-memory store. */
+export async function loadSecrets(): Promise<{ apiKey: string; hfToken: string }> {
+  if (!localAvailable) return { apiKey: "", hfToken: "" };
+  const [apiKey, hfToken] = await Promise.all([secretGet(SECRET_NAMES.apiKey), secretGet(SECRET_NAMES.hfToken)]);
+  return { apiKey: apiKey ?? "", hfToken: hfToken ?? "" };
+}
+
+/** Writes a secret to the keychain (or dev bridge); an empty value deletes it. Falls back to memory-only when local access is unavailable. */
+export async function saveSecret(name: keyof typeof SECRET_NAMES, value: string): Promise<void> {
+  if (!localAvailable) return;
+  const secretName = SECRET_NAMES[name];
+  if (value === "") await secretDelete(secretName);
+  else await secretSet(secretName, value);
 }
 
 export function loadPresets(): Preset[] {

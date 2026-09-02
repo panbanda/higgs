@@ -72,10 +72,22 @@ export function RequestsView({ data }: RequestsViewProps) {
 
   const sorted = [...filtered].sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
 
+  // Two records can share every field recordKey looks at; append an occurrence
+  // count so keys stay unique and stable across refreshes for identical inputs.
+  const keyedSorted = (() => {
+    const seen = new Map<string, number>();
+    return sorted.map((record) => {
+      const base = recordKey(record);
+      const occurrence = seen.get(base) ?? 0;
+      seen.set(base, occurrence + 1);
+      return { record, key: occurrence === 0 ? base : `${base}-${occurrence}` };
+    });
+  })();
+
   const errorRate = filtered.length === 0 ? 0 : (filtered.filter(isError).length / filtered.length) * 100;
   const avgDuration = filtered.length === 0 ? 0 : filtered.reduce((sum, r) => sum + r.duration_ms, 0) / filtered.length;
 
-  const selectedRecord = sorted.find((record) => recordKey(record) === selected) ?? null;
+  const selectedRecord = keyedSorted.find((entry) => entry.key === selected)?.record ?? null;
 
   useEffect(() => {
     if (selected && !selectedRecord) setSelected(null);
@@ -166,9 +178,8 @@ export function RequestsView({ data }: RequestsViewProps) {
               In / out
             </span>
           </div>
-          {sorted.length === 0 && <div className="config-list-empty">No requests match these filters</div>}
-          {sorted.map((record) => {
-            const key = recordKey(record);
+          {keyedSorted.length === 0 && <div className="config-list-empty">No requests match these filters</div>}
+          {keyedSorted.map(({ record, key }) => {
             const cls = statusClass(record.status);
             const cachePercent = recordCachePercent(record);
             const tps = recordTokensPerSecond(record);
