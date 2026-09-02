@@ -59,7 +59,7 @@ export function ToolCallCard({ call }: { call: ToolCall }) {
         <span className={`toolcall-status ${call.status === "done" ? "ok" : call.status === "error" ? "bad" : ""}`}>
           {call.status === "done" ? "done" : call.status === "error" ? "failed" : call.status === "running" ? "running" : "preparing"}
         </span>
-        <span className="chevron">{open ? "▾" : "▸"}</span>
+        <svg className="chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ transform: open ? "rotate(90deg)" : "none" }}><path d="M9 6 L15 12 L9 18" /></svg>
       </button>
       {open && (
         <div className="toolcall-body">

@@ -54,9 +54,8 @@
 }
 
 .chat-conversation-item.active {
-  background: var(--bg-fresh);
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
   color: var(--text-accent);
-  box-shadow: inset 3px 0 0 var(--accent);
 }
 
 .chat-conversation-title {
@@ -262,6 +261,14 @@
 
 .inspector-header-spacer {
   flex: 1;
+}
+
+.inspector-controls {
+  flex-basis: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .inspector-collapse-btn {

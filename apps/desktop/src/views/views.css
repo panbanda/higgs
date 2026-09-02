@@ -256,7 +256,6 @@
 .config-nav-btn.on {
   background: color-mix(in srgb, var(--accent) 16%, transparent);
   color: var(--text);
-  box-shadow: inset 3px 0 0 var(--accent);
 }
 
 .config-nav-save {

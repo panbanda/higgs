@@ -191,7 +191,7 @@ function TraceTab({ trace, scope, spans }: { trace: Trace; scope: InspectorScope
   const stats = useMemo(() => traceStats(trace, scope, spans), [trace, scope, spans]);
   const ticks = useMemo(() => {
     const total = Math.max(1, window.to - window.from);
-    return Array.from({ length: 5 }, (_, i) => ({ pct: (i / 4) * 100, label: formatTick(window.from + (total * i) / 4), edge: i === 0 ? "start" : i === 4 ? "end" : "mid" }));
+    return Array.from({ length: 4 }, (_, i) => ({ pct: (i / 3) * 100, label: formatTick(window.from + (total * i) / 3), edge: i === 0 ? "start" : i === 3 ? "end" : "mid" }));
   }, [window.from, window.to]);
 
   const defaultSpan = [...clipped].reverse().find((span) => span.color === "accent") ?? clipped[clipped.length - 1] ?? null;
@@ -542,20 +542,23 @@ export function RequestInspector({ message, settings, system, onReplay, replayDi
       <div className="inspector-header">
         <span>Inspector</span>
         <div className="inspector-header-spacer" />
-        <div className="seg-group">
-          <button type="button" className={`seg ${scope === "all" ? "on" : ""}`} onClick={() => setScope("all")}>
-            Entire request
-          </button>
-          {rounds.map((_round, index) => (
-            <button key={index} type="button" className={`seg ${scope === index ? "on" : ""}`} onClick={() => setScope(index)}>
-              Round {index + 1}
-            </button>
-          ))}
-        </div>
-        <CopyButton text={traceToMarkdown(message, settings, system)} label="Copy as Markdown" />
         <button type="button" className="icon-btn inspector-collapse-btn" onClick={onCollapse} title="Collapse inspector">
           <ChevronRightIcon />
         </button>
+        <div className="inspector-controls">
+          <div className="seg-group">
+            <button type="button" className={`seg ${scope === "all" ? "on" : ""}`} onClick={() => setScope("all")}>
+              Entire request
+            </button>
+            {rounds.map((_round, index) => (
+              <button key={index} type="button" className={`seg ${scope === index ? "on" : ""}`} onClick={() => setScope(index)}>
+                Round {index + 1}
+              </button>
+            ))}
+          </div>
+          <div className="inspector-header-spacer" />
+          <CopyButton text={traceToMarkdown(message, settings, system)} label="Copy as Markdown" />
+        </div>
       </div>
       <div className="tabs">
         {TABS.map((item) => (

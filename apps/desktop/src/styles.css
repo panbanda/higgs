@@ -259,9 +259,8 @@ a:focus-visible {
 }
 
 .rail-item.active {
-  background: var(--bg-fresh);
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
   color: var(--text-accent);
-  box-shadow: inset 3px 0 0 var(--accent);
   font-weight: 600;
 }
 

@@ -47,7 +47,7 @@ export function ThinkingBlock({ message }: { message: AssistantMessage }) {
             {tokens} tokens · {segments} segment{segments === 1 ? "" : "s"}
           </span>
         )}
-        <span className="chevron">{open ? "▾" : "▸"}</span>
+        <svg className="chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ transform: open ? "rotate(90deg)" : "none" }}><path d="M9 6 L15 12 L9 18" /></svg>
       </button>
       {open && <div className="thinking-body">{message.reasoning || "…"}</div>}
     </div>
