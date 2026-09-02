@@ -11,6 +11,8 @@ of `higgs attach`, with a chat that doubles as a request profiler.
 brew install --cask panbanda/brews/higgs-desktop
 ```
 
+Once installed, `higgs ui` launches it from the terminal.
+
 The app bundles its own copy of the `higgs` CLI, so no separate CLI install is
 needed. A `higgs` already on `PATH` (for example from `brew install higgs`)
 takes precedence over the bundled copy.

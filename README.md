@@ -66,6 +66,7 @@ higgs init                    # writes ~/.config/higgs/config.toml
 higgs doctor                  # validates models, providers, and settings
 higgs start                   # background daemon with metrics
 higgs attach                  # terminal dashboard
+higgs ui                      # desktop app, if installed
 ```
 
 ## Desktop app
@@ -138,6 +139,7 @@ never count as traffic in metrics.
 - `higgs start`: start a background daemon from config or profile
 - `higgs stop`: stop a running daemon, or use `higgs stop --force`
 - `higgs attach`: open the daemon metrics dashboard
+- `higgs ui`: open the desktop app if it is installed (macOS)
 - `higgs init`: create `~/.config/higgs/config.toml`
 - `higgs doctor`: validate config, model paths, and providers
 - `higgs shellenv`: print `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` after verifying the server is reachable
