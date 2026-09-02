@@ -14,10 +14,11 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: -Dwarnings
-  # mlx-sys compiles the metallib location into MLX. Its default lives under
-  # $HOME/.mlx, which the rust-cache never restores, so a cached build cannot
-  # find the metallib at runtime. Keep it inside the cached target directory.
-  MLX_RS_METAL_PATH: ${{ github.workspace }}/target/mlx-metal
+  # mlx-sys compiles the metallib to MLX_RS_METAL_PATH (default $HOME/.mlx,
+  # which the rust-cache never restores). Keep it in the workspace, outside
+  # target/ because rust-cache prunes unknown files there on save, and cache
+  # it explicitly with cache-directories on every root rust-cache step.
+  MLX_RS_METAL_PATH: ${{ github.workspace }}/.mlx-metal
 
 jobs:
   test:
@@ -40,7 +41,8 @@ jobs:
         with:
           # Bust cache poisoned by mlx-sys .air built on a different Xcode/macOS
           # image (AIR 2.8 vs 2.7 link mismatch). Bump when the pinned image changes.
-          prefix-key: "v1-mlx-air-macos15"
+          prefix-key: "v2-mlx-air-macos15"
+          cache-directories: ${{ github.workspace }}/.mlx-metal
 
       - name: Run tests
         run: cargo test --all-features -- --test-threads=1
@@ -65,7 +67,8 @@ jobs:
         with:
           # Bust cache poisoned by mlx-sys .air built on a different Xcode/macOS
           # image (AIR 2.8 vs 2.7 link mismatch). Bump when the pinned image changes.
-          prefix-key: "v1-mlx-air-macos15"
+          prefix-key: "v2-mlx-air-macos15"
+          cache-directories: ${{ github.workspace }}/.mlx-metal
 
       - name: Build release
         run: cargo build --release
@@ -142,7 +145,8 @@ jobs:
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          prefix-key: "v1-mlx-air-macos15"
+          prefix-key: "v2-mlx-air-macos15"
+          cache-directories: ${{ github.workspace }}/.mlx-metal
 
       - name: Test validation PII scrubber
         run: python3 scripts/validate/test_scrub.py
@@ -171,7 +175,8 @@ jobs:
         with:
           # Bust cache poisoned by mlx-sys .air built on a different Xcode/macOS
           # image (AIR 2.8 vs 2.7 link mismatch). Bump when the pinned image changes.
-          prefix-key: "v1-mlx-air-macos15"
+          prefix-key: "v2-mlx-air-macos15"
+          cache-directories: ${{ github.workspace }}/.mlx-metal
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -199,7 +204,8 @@ jobs:
         with:
           # Bust cache poisoned by mlx-sys .air built on a different Xcode/macOS
           # image (AIR 2.8 vs 2.7 link mismatch). Bump when the pinned image changes.
-          prefix-key: "v1-mlx-air-macos15"
+          prefix-key: "v2-mlx-air-macos15"
+          cache-directories: ${{ github.workspace }}/.mlx-metal
 
       - name: Check MSRV
         run: cargo check --all-features
@@ -229,7 +235,8 @@ jobs:
         with:
           # Bust cache poisoned by mlx-sys .air built on a different Xcode/macOS
           # image (AIR 2.8 vs 2.7 link mismatch). Bump when the pinned image changes.
-          prefix-key: "v1-mlx-air-macos15"
+          prefix-key: "v2-mlx-air-macos15"
+          cache-directories: ${{ github.workspace }}/.mlx-metal
 
       - name: Generate coverage and enforce threshold
         run: |

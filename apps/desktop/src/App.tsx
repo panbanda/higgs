@@ -66,8 +66,17 @@ export default function App() {
     let cancelled = false;
     loadSecrets().then((secrets) => {
       if (cancelled) return;
-      loadedSecretsRef.current = secrets;
-      setSettings((current) => ({ ...current, apiKey: secrets.apiKey, hfToken: secrets.hfToken }));
+      // Settings start with empty secrets (they are stripped from localStorage), so a
+      // non-empty value here was typed before the keychain answered. Keep the edit and
+      // persist it instead of clobbering it with the stored value.
+      setSettings((current) => {
+        const apiKey = current.apiKey !== "" ? current.apiKey : secrets.apiKey;
+        const hfToken = current.hfToken !== "" ? current.hfToken : secrets.hfToken;
+        loadedSecretsRef.current = { apiKey, hfToken };
+        if (apiKey !== secrets.apiKey) void saveSecret("apiKey", apiKey);
+        if (hfToken !== secrets.hfToken) void saveSecret("hfToken", hfToken);
+        return apiKey === current.apiKey && hfToken === current.hfToken ? current : { ...current, apiKey, hfToken };
+      });
     });
     return () => {
       cancelled = true;
