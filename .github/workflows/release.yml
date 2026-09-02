@@ -94,7 +94,9 @@ jobs:
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created }}
     runs-on: macos-15 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link
-
+    # Protected environment: add required reviewers to it in the repo settings
+    # so publishing the bundle needs an approval.
+    environment: release
     permissions:
       contents: write
 
