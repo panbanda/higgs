@@ -3,6 +3,7 @@ pub mod bonsai_q1;
 pub mod cache;
 pub mod deepseek_v2;
 pub mod error;
+pub mod eschamoe;
 pub mod gemma2;
 pub mod gemma3;
 pub mod gemma4;

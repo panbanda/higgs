@@ -20,7 +20,9 @@
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::OnceLock;
 
-use mlx_rs::{Array, Stream, error::Exception};
+use mlx_rs::{Array, Dtype, Stream, error::Exception};
+
+use crate::eschamoe::EschaSpec;
 
 // ---------------------------------------------------------------------------
 // FFI error capture (per-thread, mirrors qwen3_next).
@@ -98,6 +100,469 @@ fn qmv_nsg(k_dim: i32) -> i32 {
 fn cstr_vec(names: &[&CStr]) -> mlx_sys::mlx_vector_string {
     let ptrs: Vec<*const c_char> = names.iter().map(|s| s.as_ptr()).collect();
     unsafe { mlx_sys::mlx_vector_string_new_data(ptrs.as_ptr().cast_mut(), ptrs.len()) }
+}
+
+// ---------------------------------------------------------------------------
+// Eschamoe trellis tile decode (Phase 2: decode only, no matvec).
+//
+// One threadgroup decodes one tile of 16 by 16. Thread t of 128 gives the
+// codes 2t and 2t + 1. The bit math copies `eschamoe::unpack_tile`. The hash
+// copies `eschamoe::decode_code`. The element order comes from the closed
+// form of `eschamoe::tile_perm`. The MSL keeps the closed form because the
+// form is eight lines and needs no table input.
+// ---------------------------------------------------------------------------
+
+// Phase 3 connects this kernel to the forward path. Until then, only the
+// tests use this chain. The allow attributes keep the lib target quiet.
+#[allow(dead_code)]
+const ESCHA_TILE_KERNEL_SOURCE: &str = r"
+// The packed tile holds 8 * K words of 32 bits.
+constexpr int WORDS = 8 * K;
+
+threadgroup uint w_sh[WORDS];
+
+uint tn = threadgroup_position_in_grid.y;
+uint tk = threadgroup_position_in_grid.z;
+uint t = thread_index_in_threadgroup;
+
+// Stage the tile words. Two 16-bit words make one 32-bit word.
+const device short* tile = code + (tk * uint(TN) + tn) * uint(16 * K);
+if (t < uint(WORDS)) {
+    uint lo = uint(ushort(tile[2 * t]));
+    uint hi = uint(ushort(tile[2 * t + 1]));
+    w_sh[t] = lo | (hi << 16);
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+// The bit offsets copy unpack_tile. The wrap term 256 * K comes before
+// the term -16. Thus the unsigned value stays 0 or more.
+uint b0 = 2u * t * uint(K) + uint(K) + 256u * uint(K) - 16u;
+uint b2 = b0 + uint(K) + 16u;
+uint j0 = b0 / 32u;
+uint j1 = (b2 - 1u) / 32u;
+uint s1 = (j1 + 1u) * 32u - b2;
+
+// The 64-bit funnel makes the shift safe when s1 is 0.
+ulong pair = (ulong(w_sh[j0 % uint(WORDS)]) << 32) | ulong(w_sh[j1 % uint(WORDS)]);
+uint w1 = uint(pair >> s1);
+
+uint pair_codes[2];
+pair_codes[0] = (w1 >> uint(K)) & 0xFFFFu;
+pair_codes[1] = w1 & 0xFFFFu;
+
+uint row_len = uint(TN) * 16u;
+for (uint e = 0u; e < 2u; ++e) {
+    uint i = 2u * t + e;
+
+    // The closed form of tile_perm. Stored element i goes to the
+    // row-major slot (r, c) inside the tile.
+    uint g = i >> 3;
+    uint ii = i & 3u;
+    uint r = (g % 4u) * 2u + (ii & 1u) + 8u * (ii >> 1);
+    uint c = g / 4u + 8u * ((i >> 2) & 1u);
+
+    // The codebook hash. The reduce step adds the two f16 halves. The
+    // four constants come from the cb input: multiply, add, mask, XOR.
+    uint x = pair_codes[e] * cb[0] + cb[1];
+    x = (x & cb[2]) ^ cb[3];
+    half2 h = as_type<half2>(x);
+    float v = float(h.x) + float(h.y);
+
+    dst[(tk * 16u + r) * row_len + tn * 16u + c] = half(v);
+}
+";
+
+#[allow(unsafe_code, dead_code)]
+fn create_escha_tile_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let in_vec = cstr_vec(&[c"code", c"cb"]);
+    let out_vec = cstr_vec(&[c"dst"]);
+    let source = CString::new(ESCHA_TILE_KERNEL_SOURCE).unwrap_or_default();
+    unsafe {
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_eschamoe_dequant_tiles".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,  // The tile pointer math needs a row-contiguous input.
+            false, // atomic_outputs
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+#[allow(dead_code)]
+static ESCHA_TILE_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+
+/// Decode the packed trellis tiles of one expert on the GPU.
+///
+/// The input is the `[tiles_k, tiles_n, 16 * K]` int16 code slice of one
+/// expert. The result is the `[in, out]` f16 matrix `Ŵ` in row-major order.
+/// The values equal the CPU decode in [`crate::eschamoe`]. This function
+/// does not apply the Hadamard or the channel scales.
+#[allow(unsafe_code, dead_code)]
+pub fn eschamoe_dequant_tiles(code: &Array, spec: &EschaSpec) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+
+    let [mul, add, mask, xor] = crate::eschamoe::gpu_codebook(spec).ok_or_else(|| {
+        Exception::custom("eschamoe_dequant_tiles: the codebook has no verified GPU decode")
+    })?;
+    if code.dtype() != Dtype::Int16 {
+        return Err(Exception::custom(format!(
+            "eschamoe_dequant_tiles: code dtype {:?} is not int16",
+            code.dtype()
+        )));
+    }
+    let k = i32::try_from(spec.k).unwrap_or(0);
+    if !(1..=8).contains(&k) {
+        return Err(Exception::custom(format!(
+            "eschamoe_dequant_tiles: K={k} out of range 1..=8"
+        )));
+    }
+    let (tiles_k, tiles_n) = spec.tiles();
+    let expected = [
+        i32::try_from(tiles_k).unwrap_or(i32::MAX),
+        i32::try_from(tiles_n).unwrap_or(i32::MAX),
+        i32::try_from(spec.words_per_tile()).unwrap_or(i32::MAX),
+    ];
+    if code.shape() != expected {
+        return Err(Exception::custom(format!(
+            "eschamoe_dequant_tiles: code shape {:?} does not match {expected:?}",
+            code.shape()
+        )));
+    }
+
+    let stream = Stream::task_local_or_default();
+    let cached = ESCHA_TILE_KERNEL.get_or_init(|| CachedMetalKernel(create_escha_tile_kernel()));
+    let out_shape = [spec.in_features, spec.out_features];
+    // A template value goes into the generated MSL function name. A negative
+    // value makes that name invalid. Thus the codebook constants travel in a
+    // small uint32 input, and only K and TN are template values.
+    let cb_arr = Array::from_slice(&[mul, add, mask, xor], &[4]);
+
+    unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"K".as_ptr(), k);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"TN".as_ptr(),
+            expected[1],
+        );
+        // One threadgroup of 128 threads decodes one tile. The grid gives
+        // the total thread count on each axis.
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, 128, expected[1], expected[0]);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 128, 1, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            out_shape.as_ptr(),
+            out_shape.len(),
+            mlx_sys::mlx_dtype__MLX_FLOAT16,
+        );
+
+        let input_ptrs = [code.as_ptr(), cb_arr.as_ptr()];
+        let inputs_vec = mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len());
+        let mut outputs_vec = mlx_sys::mlx_vector_array_new();
+        let status = mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
+        );
+
+        let result = if status == 0 {
+            let mut out_ptr = mlx_sys::mlx_array_new();
+            let get_status = mlx_sys::mlx_vector_array_get(&raw mut out_ptr, outputs_vec, 0);
+            if get_status == 0 {
+                Ok(Array::from_ptr(out_ptr))
+            } else {
+                mlx_sys::mlx_array_free(out_ptr);
+                Err(Exception::custom(format!(
+                    "eschamoe_dequant_tiles: output read failed: {}",
+                    take_last_error()
+                )))
+            }
+        } else {
+            Err(Exception::custom(format!(
+                "eschamoe_dequant_tiles failed: {}",
+                take_last_error()
+            )))
+        };
+
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+        result
+    }
+}
+
+const ESCHA_QMV_KERNEL_SOURCE: &str = r"
+// One simdgroup computes one output element for one selected expert.
+constexpr int WORDS = 8 * K;
+constexpr int IN = TK * 16;
+constexpr int OUT = TN * 16;
+
+threadgroup float x_sh[TK * 16];
+
+uint row = threadgroup_position_in_grid.y;
+uint tid = thread_index_in_threadgroup;
+uint sg = simdgroup_index_in_threadgroup;
+uint lane = thread_index_in_simdgroup;
+
+// Stage the transformed activation row of this expert.
+for (uint i = tid; i < uint(IN); i += 128u) {
+    x_sh[i] = xh[row * uint(IN) + i];
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+uint o = threadgroup_position_in_grid.x * 4u + sg;
+if (o >= uint(OUT)) {
+    return;
+}
+
+// Split the output index into a tile column and a slot column.
+uint tn = o >> 4;
+uint c = o & 15u;
+uint cb2 = (c >> 3) & 1u;
+uint c7 = c & 7u;
+
+const device short* base =
+    code + ulong(eids[row]) * ulong(TK) * ulong(TN) * ulong(16 * K);
+
+// Each lane owns one code pair. The pair index inverts the closed form
+// of tile_perm for a fixed column. One pair gives two adjacent rows.
+uint q = lane & 3u;
+uint rh = (lane >> 2) & 1u;
+uint t = 4u * (4u * c7 + q) + 2u * cb2 + rh;
+uint r0 = 8u * rh + 2u * q;
+
+// The bit offsets copy unpack_tile. The wrap term 256 * K comes before
+// the term -16. Thus the unsigned value stays 0 or more.
+uint b0 = 2u * t * uint(K) + uint(K) + 256u * uint(K) - 16u;
+uint b2 = b0 + uint(K) + 16u;
+uint i0 = (b0 / 32u) % uint(WORDS);
+uint i1w = (b2 - 1u) / 32u;
+uint s1 = (i1w + 1u) * 32u - b2;
+uint i1 = i1w % uint(WORDS);
+
+float acc = 0.0f;
+for (uint tk = lane >> 3; tk < uint(TK); tk += 4u) {
+    const device short* tile = base + (tk * uint(TN) + tn) * uint(16 * K);
+    uint w0 = uint(ushort(tile[2u * i0])) | (uint(ushort(tile[2u * i0 + 1u])) << 16);
+    uint wb = uint(ushort(tile[2u * i1])) | (uint(ushort(tile[2u * i1 + 1u])) << 16);
+
+    // The 64-bit funnel makes the shift safe when s1 is 0.
+    ulong pair = (ulong(w0) << 32) | ulong(wb);
+    uint w1 = uint(pair >> s1);
+
+    // The codebook hash. Refer to the tile decode kernel. The half cast
+    // repeats the f16 round of the CPU decode.
+    uint x0 = ((w1 >> uint(K)) & 0xFFFFu) * cb[0] + cb[1];
+    x0 = (x0 & cb[2]) ^ cb[3];
+    uint x1 = (w1 & 0xFFFFu) * cb[0] + cb[1];
+    x1 = (x1 & cb[2]) ^ cb[3];
+    half2 h0 = as_type<half2>(x0);
+    half2 h1 = as_type<half2>(x1);
+    float v0 = float(half(float(h0.x) + float(h0.y)));
+    float v1 = float(half(float(h1.x) + float(h1.y)));
+
+    acc = fma(x_sh[tk * 16u + r0], v0, acc);
+    acc = fma(x_sh[tk * 16u + r0 + 1u], v1, acc);
+}
+
+acc = simd_sum(acc);
+if (lane == 0u) {
+    dst[row * uint(OUT) + o] = acc;
+}
+";
+
+#[allow(unsafe_code, dead_code)]
+fn create_escha_qmv_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let in_vec = cstr_vec(&[c"xh", c"code", c"eids", c"cb"]);
+    let out_vec = cstr_vec(&[c"dst"]);
+    let source = CString::new(ESCHA_QMV_KERNEL_SOURCE).unwrap_or_default();
+    unsafe {
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_eschamoe_gather_qmv".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,  // The tile pointer math needs row-contiguous inputs.
+            false, // atomic_outputs
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+#[allow(dead_code)]
+static ESCHA_QMV_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+
+/// Check the gather inputs. Give the row count and the tile dims.
+#[allow(dead_code)]
+fn check_gather_inputs(
+    xh: &Array,
+    code: &Array,
+    expert_ids: &Array,
+    spec: &EschaSpec,
+) -> Result<(i32, [i32; 3]), Exception> {
+    let (tiles_k, tiles_n) = spec.tiles();
+    let tile_dims = [
+        i32::try_from(tiles_k).unwrap_or(i32::MAX),
+        i32::try_from(tiles_n).unwrap_or(i32::MAX),
+        i32::try_from(spec.words_per_tile()).unwrap_or(i32::MAX),
+    ];
+    // Bind the expert axis: the kernels index `code` by expert id with no
+    // bound check, so a short checkpoint would read out of bounds.
+    let code_ok =
+        matches!(code.shape(), &[e, a, b, c] if e == spec.num_experts && [a, b, c] == tile_dims);
+    if code.dtype() != Dtype::Int16 || !code_ok {
+        return Err(Exception::custom(format!(
+            "eschamoe_gather_qmv: code {:?} {:?} does not match [{}, {tile_dims:?}] int16",
+            code.dtype(),
+            code.shape(),
+            spec.num_experts
+        )));
+    }
+    let &[rows, cols] = xh.shape() else {
+        return Err(Exception::custom(format!(
+            "eschamoe_gather_qmv: xh has shape {:?}, not two dims",
+            xh.shape()
+        )));
+    };
+    if xh.dtype() != Dtype::Float32 || cols != spec.in_features {
+        return Err(Exception::custom(format!(
+            "eschamoe_gather_qmv: xh {:?} {:?} does not match [rows, {}] float32",
+            xh.dtype(),
+            xh.shape(),
+            spec.in_features
+        )));
+    }
+    if expert_ids.dtype() != Dtype::Uint32 || expert_ids.shape() != [rows] {
+        return Err(Exception::custom(format!(
+            "eschamoe_gather_qmv: expert_ids {:?} {:?} does not match [{rows}] uint32",
+            expert_ids.dtype(),
+            expert_ids.shape()
+        )));
+    }
+    Ok((rows, tile_dims))
+}
+
+/// Multiply activation rows with selected expert trellis weights.
+///
+/// The input `xh` is the `[rows, in]` float32 matrix. Each row already
+/// carries the input scales and the input Hadamard of its expert. The
+/// input `code` is the full `[experts, tiles_k, tiles_n, 16 * K]` int16
+/// trellis tensor. The input `expert_ids` maps each row to one expert.
+/// The kernel stages the whole activation row in `x_sh[TK * 16]`, which is
+/// static threadgroup memory: Apple GPUs cap it at 32 KiB, so past 8192
+/// floats the kernel stops compiling with an error that names nothing.
+const MAX_THREADGROUP_FLOATS: i32 = 32 * 1024 / 4;
+
+/// The result is `y_pre = xh @ Ŵ` as a `[rows, out]` float32 matrix. The
+/// caller applies the output Hadamard and the output scales.
+#[allow(unsafe_code, dead_code)]
+pub fn eschamoe_gather_qmv(
+    xh: &Array,
+    code: &Array,
+    expert_ids: &Array,
+    spec: &EschaSpec,
+) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+
+    let [mul, add, mask, xor] = crate::eschamoe::gpu_codebook(spec).ok_or_else(|| {
+        Exception::custom("eschamoe_gather_qmv: the codebook has no verified GPU decode")
+    })?;
+    let k = i32::try_from(spec.k).unwrap_or(0);
+    if !(1..=8).contains(&k) {
+        return Err(Exception::custom(format!(
+            "eschamoe_gather_qmv: K={k} out of range 1..=8"
+        )));
+    }
+    let (rows, tile_dims) = check_gather_inputs(xh, code, expert_ids, spec)?;
+    if spec.in_features > MAX_THREADGROUP_FLOATS {
+        return Err(Exception::custom(format!(
+            "eschamoe_gather_qmv: in_features {} exceeds the {}-float threadgroup staging limit",
+            spec.in_features, MAX_THREADGROUP_FLOATS
+        )));
+    }
+
+    let stream = Stream::task_local_or_default();
+    let cached = ESCHA_QMV_KERNEL.get_or_init(|| CachedMetalKernel(create_escha_qmv_kernel()));
+    let out_shape = [rows, spec.out_features];
+    // The codebook constants travel in a small uint32 input. Refer to
+    // the note on template values in eschamoe_dequant_tiles.
+    let cb_arr = Array::from_slice(&[mul, add, mask, xor], &[4]);
+
+    unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"K".as_ptr(), k);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"TK".as_ptr(),
+            tile_dims[0],
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"TN".as_ptr(),
+            tile_dims[1],
+        );
+        // One threadgroup holds 4 simdgroups. Each simdgroup computes one
+        // output element. The grid gives total thread counts.
+        let groups_x = (spec.out_features + 3) / 4;
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, groups_x * 128, rows, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 128, 1, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            out_shape.as_ptr(),
+            out_shape.len(),
+            mlx_sys::mlx_dtype__MLX_FLOAT32,
+        );
+
+        let input_ptrs = [
+            xh.as_ptr(),
+            code.as_ptr(),
+            expert_ids.as_ptr(),
+            cb_arr.as_ptr(),
+        ];
+        let inputs_vec = mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len());
+        let mut outputs_vec = mlx_sys::mlx_vector_array_new();
+        let status = mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
+        );
+
+        let result = if status == 0 {
+            let mut out_ptr = mlx_sys::mlx_array_new();
+            let get_status = mlx_sys::mlx_vector_array_get(&raw mut out_ptr, outputs_vec, 0);
+            if get_status == 0 {
+                Ok(Array::from_ptr(out_ptr))
+            } else {
+                mlx_sys::mlx_array_free(out_ptr);
+                Err(Exception::custom(format!(
+                    "eschamoe_gather_qmv: output read failed: {}",
+                    take_last_error()
+                )))
+            }
+        } else {
+            Err(Exception::custom(format!(
+                "eschamoe_gather_qmv failed: {}",
+                take_last_error()
+            )))
+        };
+
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+        result
+    }
 }
 
 // ---------------------------------------------------------------------------

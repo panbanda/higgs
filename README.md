@@ -100,6 +100,7 @@ curl http://localhost:8000/v1/chat/completions \
 
 - Serve MLX models from Hugging Face IDs or local paths.
 - Support current model families including Qwen 3.8, Qwen 3.x, Llama, Mistral, Gemma 2, Phi-3, Starcoder2, DeepSeek-V2, and LLaVA-Qwen2. Qwen 3.5+ checkpoints (3.5, 3.6, and 3.8; dense and MoE) use the Qwen 3.5 adapters, including `*ForConditionalGeneration` wrappers whose text-model config lives in `text_config`. Unknown newer versions in a supported family use the nearest structurally compatible adapter and log an untested-version warning; unknown families are rejected with the supported family/version list.
+- Load EschaLabs `eschamoe` trellis-quantized checkpoints (for example `EschaLabs/Qwen3.6-35B-A3B-Escha-W2`) with automatic detection and no config field needed. Experts remain in trellis form and decode on the GPU; the 35B release holds about 11 GB and loads in seconds. See [docs/models.md](docs/models.md#eschalabs-eschamoe-checkpoints).
 - Expose local serving through OpenAI and Anthropic-compatible endpoints.
 
 ### Use one endpoint for local and remote models
@@ -133,6 +134,7 @@ curl http://localhost:8000/v1/chat/completions \
 - `[local].raise_wired_limit` defaults to `false`. Enable it only when you explicitly want MLX to raise the process wired-memory limit.
 - `batch=true` is only supported for transformer families with true batched decode support.
 - For batch models, `prefill_yield_tokens` can interleave long prompt prefills with decode; use `0` or omit it for the synchronous default.
+- EschaLabs `eschamoe` checkpoints keep their experts in the trellis form by default: 12.3 GB on disk becomes ~11 GB resident for the 35B release, and the load takes seconds. Set `HIGGS_ESCHA_NATIVE=0` to decode every expert to affine 4-bit instead, which raises the same model to ~22 GB resident and ~140 s of CPU-bound conversion at start. `higgs doctor` estimates the resident size for the active mode and warns when it crowds system RAM.
 
 ## Performance
 

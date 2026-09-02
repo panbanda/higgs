@@ -2146,6 +2146,9 @@ pub(crate) struct SwitchMlpWeights {
     down_proj: QLinear,
     /// Lazily fused gate+up weights for `MoE` `gather_qmm` (3→2 calls per layer).
     fused_gate_up: Option<(Array, Array, Array, i32)>,
+    /// Native trellis expert weights. When set, the forward pass uses the
+    /// Escha kernels and skips the three `gather_qmm` calls.
+    escha: Option<crate::eschamoe::EschaSwitchMlp>,
 }
 
 impl SwitchMlpWeights {
@@ -2163,7 +2166,14 @@ impl SwitchMlpWeights {
             up_proj: QLinear::new(up.0, up.1)?,
             down_proj: QLinear::new(down.0, down.1)?,
             fused_gate_up: None,
+            escha: None,
         })
+    }
+
+    /// Install native trellis expert weights. The next forward call uses
+    /// them in place of the affine `gather_qmm` path.
+    pub(crate) fn set_escha(&mut self, escha: crate::eschamoe::EschaSwitchMlp) {
+        self.escha = Some(escha);
     }
 
     /// Apply the full `SwiGLU` `MoE` block for all selected experts in one shot
@@ -2179,6 +2189,11 @@ impl SwitchMlpWeights {
         indices: &Array,
         sorted: bool,
     ) -> Result<Array, Exception> {
+        // Native trellis weights have no affine gate/up tensors; route through
+        // the native gather path.
+        if self.escha.is_some() {
+            return self.forward_gather_global_sort(x, indices);
+        }
         // Reshape so x batch dims broadcast with the indices shape.
         // x: [B, L, D] -> [B, L, 1, 1, D]
         //   batch = [B, L, 1], M=1, K=D
@@ -2278,6 +2293,34 @@ impl SwitchMlpWeights {
         // idx_sorted: [N] — monotonically non-decreasing expert indices
         let idx_sorted = idx_flat.take_axis(&order, 0)?;
 
+        // Native trellis path. It reuses the sort above. Only the three
+        // gather_qmm calls change. Gate and up are one fused dispatch.
+        if let Some(escha) = &self.escha {
+            let x2 = x_sorted.reshape(&[b * l * top_k, d])?;
+            let eids = idx_sorted.as_dtype(Dtype::Uint32)?;
+            let gate_up = escha
+                .gate_up
+                .gather_forward(&x2, &eids)
+                .map_err(|e| Exception::custom(format!("escha gate_up: {e}")))?;
+            // The fused output is [N, 2 * intermediate]. Split it for SwiGLU.
+            let intermediate = escha.gate_up.spec.out_features / 2;
+            let parts = gate_up.split_axis(&[intermediate], Some(-1))?;
+            let gate_out = parts
+                .first()
+                .ok_or_else(|| Exception::custom("escha gate_up split failed"))?;
+            let up_out = parts
+                .get(1)
+                .ok_or_else(|| Exception::custom("escha gate_up split failed"))?;
+            let activated = swiglu(gate_out, up_out)?;
+            let down = escha
+                .down
+                .gather_forward(&activated, &eids)
+                .map_err(|e| Exception::custom(format!("escha down: {e}")))?;
+            let out_flat = down.as_dtype(x.dtype())?;
+            let out_unsorted = out_flat.take_axis(&inv_order, 0)?;
+            return out_unsorted.reshape(&[b, l, top_k, d]);
+        }
+
         // --- gather_qmm with coalesced access ---
         let gate_out = gather_qmm(
             &x_sorted,
@@ -2335,6 +2378,11 @@ impl SwitchMlpWeights {
         x: &Array,
         indices: &Array,
     ) -> Result<Array, Exception> {
+        // Native trellis weights replace the affine gate/up/down tensors, so
+        // the fused affine cache cannot be built. Use the native path instead.
+        if self.escha.is_some() {
+            return self.forward_gather_global_sort(x, indices);
+        }
         // Lazy-init: concatenate gate+up weights along axis 1 (intermediate dim).
         // MoE weights are [num_experts, intermediate_packed, hidden].
         if self.fused_gate_up.is_none() {
@@ -4479,7 +4527,8 @@ fn mtp_weight_layout_from_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> M
     let mut has_mtp = false;
     let mut has_unprefixed_mtp = false;
     let mut has_quantized_aux = false;
-    let mut has_moe_mlp = false;
+    let mut has_moe_router = false;
+    let mut has_moe_experts = false;
 
     for key in keys {
         if !is_mtp_key(key) {
@@ -4488,13 +4537,25 @@ fn mtp_weight_layout_from_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> M
         has_mtp = true;
         has_unprefixed_mtp |= key.starts_with("mtp.");
         has_quantized_aux |= key.ends_with(".scales") || key.ends_with(".biases");
-        has_moe_mlp |= key.contains(".mlp.gate.")
-            || key.contains(".mlp.shared_expert")
-            || key.contains(".mlp.switch_mlp")
-            || key.contains(".mlp.experts");
+        // The router and the shared expert show an MoE head. The routed
+        // experts are a different group of tensors.
+        has_moe_router |= key.contains(".mlp.gate.") || key.contains(".mlp.shared_expert");
+        has_moe_experts |= key.contains(".mlp.switch_mlp") || key.contains(".mlp.experts");
     }
 
-    if has_mtp && has_moe_mlp {
+    // Some checkpoints hold an MoE draft head but no routed expert weights.
+    // The eschamoe release of Qwen3.6-35B-A3B is an example: it has
+    // `mtp.layers.0.mlp.gate` and `mtp.layers.0.mlp.shared_expert`, but it has
+    // no `mtp.layers.0.mlp.experts`. The head cannot operate without those
+    // weights. Thus the function reports no MTP head, and the caller stops the
+    // MTP function for this checkpoint. The mirror case (routed experts with
+    // no router) is equally unusable: `MoeMtpHead` would build a router no
+    // tensor fills.
+    if has_mtp && (has_moe_router != has_moe_experts) {
+        return MtpWeightLayout::None;
+    }
+
+    if has_mtp && (has_moe_router || has_moe_experts) {
         MtpWeightLayout::MoeQuantized
     } else if has_quantized_aux {
         MtpWeightLayout::Quantized
@@ -4836,6 +4897,7 @@ pub(crate) fn load_qwen3_5_model_with_args(
     model_path: &Path,
     mut args: Qwen3NextModelArgs,
 ) -> Result<Qwen3NextCausalLM, ModelError> {
+    force_eschamoe_quant_layout(&mut args, model_path)?;
     maybe_disable_mtp_without_checkpoint_weights(&mut args, model_path)?;
 
     tracing::info!(
@@ -4877,6 +4939,7 @@ pub(crate) fn load_qwen3_5_moe_model_with_args(
     model_path: &Path,
     mut args: Qwen3NextModelArgs,
 ) -> Result<Qwen3NextCausalLM, ModelError> {
+    force_eschamoe_quant_layout(&mut args, model_path)?;
     maybe_disable_mtp_without_checkpoint_weights(&mut args, model_path)?;
 
     tracing::info!(
@@ -4915,6 +4978,35 @@ pub(crate) fn load_qwen3_5_moe_model_with_args(
 /// the direct loader. Otherwise try the fused loader; if it reports a mixed-bit
 /// `in_proj_ba` shape mismatch, rebuild the model with separate projections and
 /// retry via the direct loader.
+/// Install the native trellis expert weights on their layers.
+///
+/// The vector comes from [`load_qwen3_5_moe_weights_fused`]. Each entry
+/// names one decoder layer by its index.
+fn apply_escha_natives(
+    model: &mut Qwen3NextCausalLM,
+    natives: Vec<(usize, crate::eschamoe::EschaSwitchMlp)>,
+) -> Result<(), ModelError> {
+    let count = natives.len();
+    for (layer_idx, escha) in natives {
+        let switch = model
+            .model
+            .layers
+            .get_mut(layer_idx)
+            .and_then(|layer| layer.mlp.switch_mlp.as_mut())
+            .ok_or_else(|| {
+                ModelError::ShapeMismatch(format!(
+                    "native expert weights target layer {layer_idx}, but that layer has no \
+                     switch_mlp"
+                ))
+            })?;
+        switch.set_escha(escha);
+    }
+    if count > 0 {
+        tracing::info!(layers = count, "Installed native trellis expert weights");
+    }
+    Ok(())
+}
+
 fn load_qwen3_5_model_with_gdn_fallback(
     model_path: &Path,
     mut args: Qwen3NextModelArgs,
@@ -4923,7 +5015,22 @@ fn load_qwen3_5_model_with_gdn_fallback(
     let quantization = args.quantization.clone();
     let force_separate =
         args.use_separate_gdn_projections || std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok();
+    // The direct loader reads raw safetensors and never runs the escha
+    // conversion, so an eschamoe checkpoint would fail there with a
+    // placeholder report that names nothing. Reject the combination early.
+    let eschamoe = crate::eschamoe::is_eschamoe_checkpoint(model_path)?;
+    let reject_separate_escha = || {
+        ModelError::UnsupportedModel(
+            "HIGGS_SEPARATE_GDN_PROJ / use_separate_gdn_projections is not supported \
+             for eschamoe checkpoints: the direct loader cannot install native \
+             trellis experts. Unset the flag and use the fused path."
+                .to_owned(),
+        )
+    };
     if force_separate {
+        if eschamoe {
+            return Err(reject_separate_escha());
+        }
         args.use_separate_gdn_projections = true;
         let mut model = Qwen3NextCausalLM::new(args)?;
         load_qwen3_5_moe_weights_direct(&mut model, model_path, quantization.as_ref())?;
@@ -4938,11 +5045,15 @@ fn load_qwen3_5_model_with_gdn_fallback(
         gdn_dims,
         quantization.as_ref(),
     ) {
-        Ok(()) => {
+        Ok(natives) => {
+            apply_escha_natives(&mut fused_model, natives)?;
             tracing::info!("Using FUSED GDN projections (2 dispatches per layer)");
             Ok(fused_model)
         }
         Err(err) if is_mixed_bit_gdn_ba_fusion_error(&err) => {
+            if eschamoe {
+                return Err(reject_separate_escha());
+            }
             tracing::warn!(
                 error = %err,
                 "Detected mixed-bit GDN BA projection shapes; retrying with separate GDN projections"
@@ -5289,18 +5400,90 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
     Ok(())
 }
 
+/// Set the affine layout that an eschamoe checkpoint gets after conversion.
+///
+/// An eschamoe checkpoint has no MLX `quantization` block, so the argument
+/// code reads its `quantization_config` block. That block gives the trellis
+/// bit rate, for example 2.0. An affine layer cannot use that value. Thus this
+/// function replaces the layout with [`crate::eschamoe::CONVERSION_TARGET`],
+/// which is the layout that the conversion code makes.
+fn force_eschamoe_quant_layout(
+    args: &mut Qwen3NextModelArgs,
+    model_path: &Path,
+) -> Result<(), crate::error::ModelError> {
+    if !crate::eschamoe::is_eschamoe_checkpoint(model_path)? {
+        return Ok(());
+    }
+    // A checkpoint with its own `quantization` block already agrees with the
+    // conversion code, because both read that block. Do not change the
+    // arguments in that case. Only a checkpoint with no such block needs this
+    // correction, because the argument code would then read the eschamoe
+    // `quantization_config` block and get the trellis bit rate.
+    let config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(model_path.join("config.json"))?)?;
+    if config.get("quantization").is_some() {
+        return Ok(());
+    }
+    let target = crate::eschamoe::CONVERSION_TARGET;
+    let spec = serde_json::json!({ "group_size": target.group_size, "bits": target.bits });
+    args.quantization = Some(serde_json::from_value(spec.clone())?);
+    args.gate_quantization = Some(serde_json::from_value(spec)?);
+    tracing::info!(
+        group_size = target.group_size,
+        bits = target.bits,
+        "eschamoe checkpoint: using the affine layout of the conversion code"
+    );
+    Ok(())
+}
+
+/// Read every checkpoint tensor as `(key, value)` pairs, ready for the loader.
+///
+/// An eschamoe checkpoint needs a change of format first. The function
+/// [`crate::eschamoe::convert_checkpoint`] decodes the trellis tensors and the
+/// int8 tensors, and gives affine tensors with mlx-community key names. A
+/// standard checkpoint gives its safetensors contents with no change, but the
+/// keys of an MTP sidecar file get a prefix.
+///
+/// The second result holds the native expert weights of each layer. It is
+/// empty when `HIGGS_ESCHA_NATIVE=0` selects the affine mode.
+fn checkpoint_tensors(
+    model_path: &Path,
+    quantization: Option<&QuantizationConfig>,
+) -> Result<crate::eschamoe::ConvertedCheckpoint, crate::error::ModelError> {
+    if crate::eschamoe::is_eschamoe_checkpoint(model_path)? {
+        let config = model_path.join("config.json");
+        let text = std::fs::read_to_string(&config)?;
+        let value: serde_json::Value = serde_json::from_str(&text)?;
+        return crate::eschamoe::convert_checkpoint_auto(model_path, value.get("quantization"));
+    }
+
+    let mut out = Vec::new();
+    for file_path in crate::collect_safetensors_files(model_path)? {
+        let loaded = Array::load_safetensors(&file_path)
+            .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
+        crate::validate_quantized_tensor_widths(&loaded, quantization)?;
+        for (key, value) in loaded {
+            out.push((normalize_sidecar_mtp_key(&file_path, key), value));
+        }
+    }
+    Ok((out, Vec::new()))
+}
+
 /// Rearranges flat (qkv,z,b,a) projections to per-head-grouped (qkvz,ba)
 /// so the model uses the fused 2-dispatch forward path instead of 4 separate.
+///
+/// The result holds the native expert weights from [`checkpoint_tensors`].
+/// The caller installs them on the concrete model type.
 #[allow(clippy::too_many_lines, clippy::shadow_reuse)]
 fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     model: &mut M,
     model_path: &Path,
     gdn_dims: &GdnDims,
     quantization: Option<&QuantizationConfig>,
-) -> Result<(), crate::error::ModelError> {
+) -> Result<Vec<(usize, crate::eschamoe::EschaSwitchMlp)>, crate::error::ModelError> {
     use std::collections::HashMap;
 
-    let safetensors_files = crate::collect_safetensors_files(model_path)?;
+    let (tensors, escha_natives) = checkpoint_tensors(model_path, quantization)?;
     let mut params = model.parameters_mut().flatten();
 
     let qkvz_perm = build_qkvz_permutation(gdn_dims)
@@ -5316,47 +5499,39 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
         ("in_proj_b", "in_proj_a", "in_proj_ba"),
     ];
 
-    for file_path in &safetensors_files {
-        let loaded = Array::load_safetensors(file_path)
-            .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
-        crate::validate_quantized_tensor_widths(&loaded, quantization)?;
+    for (key, value) in tensors {
+        let Some(stripped) = qwen35_checkpoint_param_key(&key) else {
+            continue;
+        };
 
-        for (key, value) in loaded {
-            let key = normalize_sidecar_mtp_key(file_path, key);
-            let Some(stripped) = qwen35_checkpoint_param_key(&key) else {
-                continue;
-            };
-
-            let mut handled = false;
-            for &(part_a_name, part_b_name, combined_name) in gdn_remap {
-                for (is_b, split_name) in [(false, part_a_name), (true, part_b_name)] {
-                    let needle = format!(".{split_name}.");
-                    if let Some(pos) = stripped.find(&needle) {
-                        let pfx = &stripped[..pos];
-                        let sfx = &stripped[pos + needle.len()..];
-                        let map_key = format!("{pfx}.{combined_name}.{sfx}");
-                        let entry = gdn_parts.entry(map_key).or_insert((None, None));
-                        if is_b {
-                            entry.1 = Some(value.clone());
-                        } else {
-                            entry.0 = Some(value.clone());
-                        }
-                        handled = true;
-                        break;
+        let mut handled = false;
+        for &(part_a_name, part_b_name, combined_name) in gdn_remap {
+            for (is_b, split_name) in [(false, part_a_name), (true, part_b_name)] {
+                let needle = format!(".{split_name}.");
+                if let Some(pos) = stripped.find(&needle) {
+                    let pfx = &stripped[..pos];
+                    let sfx = &stripped[pos + needle.len()..];
+                    let map_key = format!("{pfx}.{combined_name}.{sfx}");
+                    let entry = gdn_parts.entry(map_key).or_insert((None, None));
+                    if is_b {
+                        entry.1 = Some(value.clone());
+                    } else {
+                        entry.0 = Some(value.clone());
                     }
-                }
-                if handled {
+                    handled = true;
                     break;
                 }
             }
+            if handled {
+                break;
+            }
+        }
 
-            if !handled {
-                if let Some((target_key, dense_mtp_target)) =
-                    qwen35_target_param_key(&params, stripped)
-                {
-                    if let Some(param) = params.get_mut(target_key.as_str()) {
-                        **param = qwen35_loaded_value(stripped, value, dense_mtp_target)?;
-                    }
+        if !handled {
+            if let Some((target_key, dense_mtp_target)) = qwen35_target_param_key(&params, stripped)
+            {
+                if let Some(param) = params.get_mut(target_key.as_str()) {
+                    **param = qwen35_loaded_value(stripped, value, dense_mtp_target)?;
                 }
             }
         }
@@ -5405,9 +5580,19 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
         total_pairs = gdn_parts.len(),
         "Fused GDN projections (4→2 dispatches per layer)"
     );
+    // In the native escha mode, the expert affine params get no tensors.
+    // The forward pass uses the native weights in their place. Thus the
+    // completeness check must not flag the `switch_mlp` placeholders — but
+    // only for layers the natives actually cover; an uncovered layer keeps
+    // its placeholders and must still fail validation.
+    let native_layers: std::collections::HashSet<String> = escha_natives
+        .iter()
+        .map(|(layer_idx, _)| format!("model.layers.{layer_idx}.mlp.switch_mlp."))
+        .collect();
     ensure_all_model_params_loaded(
         params
             .iter()
+            .filter(|(name, _)| !native_layers.iter().any(|p| name.contains(p.as_str())))
             .map(|(name, value)| (std::rc::Rc::<str>::clone(name), &**value)),
     )?;
 
@@ -5415,7 +5600,7 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
         .eval()
         .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
 
-    Ok(())
+    Ok(escha_natives)
 }
 
 #[allow(
@@ -5654,6 +5839,80 @@ mod tests {
             }"#,
         )
         .unwrap()
+    }
+
+    /// Every key shape an eschamoe checkpoint ships must resolve, after
+    /// [`crate::eschamoe::normalize_key`] and the existing prefix strip, onto a
+    /// real parameter of the constructed model.
+    ///
+    /// The raw keys are verbatim from the published checkpoint's
+    /// `model.safetensors.index.json`; the targets are verbatim from
+    /// `Qwen3NextCausalLM::parameters()`. This is what stops the loader from
+    /// silently dropping tensors — an unmatched key is skipped, not reported,
+    /// so only `ensure_all_model_params_loaded` would catch it, and only then
+    /// as an opaque "N params were not loaded".
+    #[test]
+    fn eschamoe_checkpoint_keys_resolve_to_parameters() {
+        use mlx_rs::module::ModuleParameters;
+
+        use crate::eschamoe::{self, Storage};
+
+        let mut model = Qwen3NextCausalLM::new(valid_causal_lm_args()).unwrap();
+        let params = model.parameters_mut().flatten();
+
+        // Layer 3 is full-attention here (full_attention_interval = 4); layer 0
+        // is a GDN layer, so each carries a different projection set.
+        let direct = [
+            "model.language_model.layers.3.self_attn.q_proj.weight_int8",
+            "model.language_model.layers.3.self_attn.o_proj.weight_scale",
+            "model.language_model.layers.3.self_attn.k_norm.weight",
+            "model.language_model.layers.0.linear_attn.out_proj.weight_int8",
+            "model.language_model.layers.0.linear_attn.conv1d.weight",
+            "model.language_model.layers.0.linear_attn.A_log",
+            "model.language_model.layers.0.mlp.shared_expert.up_proj.weight_int8",
+            "model.language_model.layers.0.mlp.shared_expert_gate.weight",
+            "model.language_model.layers.0.mlp.gate.weight",
+            "model.language_model.layers.0.input_layernorm.weight",
+            "model.language_model.norm.weight",
+            "model.language_model.embed_tokens.weight_int8",
+            "lm_head.weight_int8",
+        ];
+        for raw in direct {
+            let normalized = eschamoe::normalize_key(raw);
+            let stripped = qwen35_checkpoint_param_key(&normalized)
+                .unwrap_or_else(|| panic!("{raw} did not normalize into the loader's namespace"));
+            let (storage, prefix) = eschamoe::classify(stripped);
+            // Dense tensors land on themselves; quantized ones land on the
+            // `.weight` of the QLinear the loader rebuilds.
+            let target = match storage {
+                Storage::Dense => prefix.to_owned(),
+                Storage::Int8 | Storage::Trellis => format!("{prefix}.weight"),
+            };
+            assert!(
+                params.contains_key(target.as_str()),
+                "{raw} -> {target} is not a model parameter"
+            );
+        }
+
+        // The two trellis projections are the exception: escha stores gate and
+        // up fused, while the model wants three separate experts stacks.
+        let (storage, prefix) =
+            eschamoe::classify("model.layers.0.mlp.experts.gate_up_proj.escha_code");
+        assert_eq!(storage, Storage::Trellis);
+        assert_eq!(prefix, "model.layers.0.mlp.experts.gate_up_proj");
+        for target in [
+            "model.layers.0.mlp.switch_mlp.gate_proj.weight",
+            "model.layers.0.mlp.switch_mlp.up_proj.weight",
+            "model.layers.0.mlp.switch_mlp.down_proj.weight",
+        ] {
+            assert!(params.contains_key(target), "{target} missing");
+        }
+
+        // GDN projections are stored split and fused by the existing loader, so
+        // the fused names must exist while the split ones must not.
+        assert!(params.contains_key("model.layers.0.linear_attn.in_proj_qkvz.weight"));
+        assert!(params.contains_key("model.layers.0.linear_attn.in_proj_ba.weight"));
+        assert!(!params.contains_key("model.layers.0.linear_attn.in_proj_qkv.weight"));
     }
 
     #[test]
@@ -8043,6 +8302,7 @@ mod tests {
                     up_proj: make_switch_ql(d, d_inter),
                     down_proj: make_switch_ql(d_inter, d),
                     fused_gate_up: None,
+                    escha: None,
                 },
                 shared_expert: Qwen3NextMLP {
                     gate_proj: make_ql(d, shared_inter * 2, gs, bits),
@@ -15077,6 +15337,115 @@ mod tests {
             tokens.push(tok.item_cast::<u32>());
         }
         tokens
+    }
+
+    /// Give the resident set size of this process in GiB.
+    ///
+    /// The function reads the `rss` column of `ps` for its own pid.
+    fn own_rss_gib() -> f64 {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .expect("ps must run");
+        let kib: f64 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("rss must parse");
+        kib / (1024.0 * 1024.0)
+    }
+
+    /// Give the active and peak MLX buffer memory in GB.
+    ///
+    /// The `ps` value misses the Metal buffers. Thus the footprint gate
+    /// reads the MLX allocator counters.
+    fn mlx_mem_gb() -> (f64, f64) {
+        let mut active: usize = 0;
+        let mut peak: usize = 0;
+        #[allow(unsafe_code)]
+        unsafe {
+            mlx_sys::mlx_get_active_memory(&mut active as *mut _);
+            mlx_sys::mlx_get_peak_memory(&mut peak as *mut _);
+        }
+        (active as f64 / 1e9, peak as f64 / 1e9)
+    }
+
+    /// Load an eschamoe checkpoint and print parity and footprint data.
+    ///
+    /// `HIGGS_ESCHA_NATIVE` selects the load mode. The test sends one fixed
+    /// prompt through the model. Set `HIGGS_ESCHA_LOGITS_OUT` to save the
+    /// logits. Set `HIGGS_ESCHA_LOGITS_REF` to compare against a saved file.
+    /// Run the test once for each mode. The second run prints the max abs
+    /// difference between the two modes.
+    ///
+    /// ```bash
+    /// HIGGS_ESCHA_NATIVE=0 HIGGS_ESCHA_LOGITS_OUT=/tmp/escha_affine.safetensors \
+    ///   cargo test -p higgs-models --release -- escha_native_fixture --ignored --nocapture
+    /// HIGGS_ESCHA_NATIVE=1 HIGGS_ESCHA_LOGITS_REF=/tmp/escha_affine.safetensors \
+    ///   cargo test -p higgs-models --release -- escha_native_fixture --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "requires escha model files on disk"]
+    fn escha_native_fixture() {
+        use mlx_rs::transforms::eval;
+
+        let dir = std::env::var("HIGGS_ESCHA_TEST_MODEL").unwrap_or_else(|_| {
+            format!(
+                "{}/AI-Models/escha-subset",
+                std::env::var("HOME").unwrap_or_default()
+            )
+        });
+        if !std::path::Path::new(&dir).exists() {
+            eprintln!("Skipping: no escha checkpoint at {dir}");
+            return;
+        }
+        eprintln!("mode: native={}", crate::eschamoe::native_mode());
+
+        let t0 = std::time::Instant::now();
+        let mut model = load_qwen3_5_moe_model(&dir).unwrap();
+        let (active, peak) = mlx_mem_gb();
+        eprintln!(
+            "load: {:.1}s rss_after_load={:.2} GiB mlx_active={active:.2} GB mlx_peak={peak:.2} GB",
+            t0.elapsed().as_secs_f64(),
+            own_rss_gib()
+        );
+
+        let vocab = model.args.vocab_size as u32;
+        let tokens: Vec<u32> = (0..16u32).map(|i| (i * 977 + 3) % vocab).collect();
+        let input = Array::from_slice(&tokens, &[1, 16]);
+        let mut cache: Vec<Option<LayerCache>> = Vec::new();
+        let logits = model
+            .forward(&input, None, &mut cache)
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        eval([&logits]).unwrap();
+        let (active2, peak2) = mlx_mem_gb();
+        eprintln!(
+            "rss_after_forward={:.2} GiB mlx_active={active2:.2} GB mlx_peak={peak2:.2} GB",
+            own_rss_gib()
+        );
+
+        if let Ok(path) = std::env::var("HIGGS_ESCHA_LOGITS_OUT") {
+            let map = std::collections::HashMap::from([("logits".to_string(), logits.clone())]);
+            Array::save_safetensors(&map, None, &std::path::PathBuf::from(&path)).unwrap();
+            eprintln!("saved logits to {path}");
+        }
+        if let Ok(path) = std::env::var("HIGGS_ESCHA_LOGITS_REF") {
+            let refs = Array::load_safetensors(&path).unwrap();
+            let reference = refs.get("logits").expect("ref file must hold logits");
+            let diff = logits
+                .subtract(reference)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap();
+            let scale = reference.abs().unwrap().max(None).unwrap();
+            eval([&diff, &scale]).unwrap();
+            let (d, s) = (diff.item::<f32>(), scale.item::<f32>());
+            eprintln!("logits max abs diff vs {path}: {d:.6}");
+            eprintln!("ref max abs logit: {s:.6}  relative: {:.3e}", d / s);
+        }
     }
 
     // -----------------------------------------------------------------------
