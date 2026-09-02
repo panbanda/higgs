@@ -1,6 +1,6 @@
 <div align="center">
 
-# Higgs
+<img src="docs/images/higgs-header.png" alt="Higgs: model router for Apple hardware" width="920">
 
 **Local LLM inference server for Apple Silicon, with a router, an OpenAI and Anthropic compatible API, and a desktop console that shows how fast each local request ran.**
 
