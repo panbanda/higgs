@@ -1,3 +1,4 @@
+import type React from "react";
 import { Fragment, useEffect, useMemo, useState } from "react";
 import {
   buildTraceSpans,
@@ -16,6 +17,15 @@ import {
 import { formatMs, formatRate } from "../lib/format";
 import type { AssistantMessage, Settings, SystemInfo, Trace, TraceChunkKind, TraceRound } from "../lib/types";
 import { Sparkline } from "./charts/Sparkline";
+
+/** Button semantics for clickable rows: Enter and Space activate, everything else passes through. */
+function activateOnKey(event: React.KeyboardEvent<HTMLElement>, action: () => void) {
+  if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    action();
+  }
+}
+
 
 type Tab = "trace" | "throughput" | "tokens" | "request" | "response";
 
@@ -230,7 +240,14 @@ function TraceTab({ trace, scope, spans }: { trace: Trace; scope: InspectorScope
           const open = selected?.id === span.id;
           return (
             <Fragment key={span.id}>
-              <div className={`span-row ${open ? "on" : ""}`} onClick={() => setSelectedId(span.id)}>
+              <div
+                className={`span-row ${open ? "on" : ""}`}
+                role="button"
+                tabIndex={0}
+                aria-expanded={open}
+                onClick={() => setSelectedId(span.id)}
+                onKeyDown={(event) => activateOnKey(event, () => setSelectedId(span.id))}
+              >
                 <span className="span-label" style={{ paddingLeft: span.indent * 14 }}>
                   <span className="span-swatch" style={{ background: SPAN_BG[span.color] }} />
                   <span className="span-label-text">{span.label}</span>
@@ -484,7 +501,14 @@ function ResponseTab({ round, message }: { round: TraceRound; message: Assistant
     <div className="panel token-rows">
       {round.chunks.map((chunk, index) => (
         <Fragment key={index}>
-          <div className="chunk-row" onClick={() => setExpanded(expanded === index ? null : index)}>
+          <div
+            className="chunk-row"
+            role="button"
+            tabIndex={0}
+            aria-expanded={expanded === index}
+            onClick={() => setExpanded(expanded === index ? null : index)}
+            onKeyDown={(event) => activateOnKey(event, () => setExpanded(expanded === index ? null : index))}
+          >
             <span className="mono label">{formatMs(chunk.at)}</span>
             <span className="chunk-kind">
               <span className="span-swatch" style={{ background: SPAN_BG[KIND_COLOR[chunk.kind]] }} />

@@ -70,7 +70,8 @@
   opacity: 0;
 }
 
-.chat-conversation-item:hover .icon-btn {
+.chat-conversation-item:hover .icon-btn,
+.chat-conversation-item .icon-btn:focus-visible {
   opacity: 1;
 }
 
@@ -650,4 +651,11 @@
   height: 44px;
   padding: 0 20px;
   font-size: 14px;
+}
+
+.span-row:focus-visible,
+.chunk-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  border-radius: 4px;
 }
