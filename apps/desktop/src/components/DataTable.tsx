@@ -42,7 +42,23 @@ export function DataTable<T>({ columns, rows, rowKey, empty = "No data", onRowCl
           {rows.map((row) => {
             const key = rowKey(row);
             return (
-              <tr key={key} className={`${onRowClick ? "clickable" : ""} ${selectedKey === key ? "selected" : ""}`} onClick={() => onRowClick?.(row)}>
+              <tr
+                key={key}
+                className={`${onRowClick ? "clickable" : ""} ${selectedKey === key ? "selected" : ""}`}
+                onClick={() => onRowClick?.(row)}
+                role={onRowClick ? "button" : undefined}
+                tabIndex={onRowClick ? 0 : undefined}
+                onKeyDown={
+                  onRowClick
+                    ? (event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          onRowClick(row);
+                        }
+                      }
+                    : undefined
+                }
+              >
                 {columns.map((column) => (
                   <td key={column.key} style={{ textAlign: column.align ?? "left" }}>
                     {column.render(row)}

@@ -316,7 +316,15 @@ export function HubView({ settings, data }: HubViewProps) {
               <div
                 key={model.id}
                 className={`vrow clickable hub-grid ${selected === model.id ? "selected" : ""}`}
+                role="button"
+                tabIndex={0}
                 onClick={() => selectRepo(model.id)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    selectRepo(model.id);
+                  }
+                }}
               >
                 <span className="mono">{model.id}</span>
                 <span className="mono muted">{quantFromId(model.id) ?? "–"}</span>
@@ -395,7 +403,12 @@ export function HubView({ settings, data }: HubViewProps) {
                     Downloaded
                   </button>
                 ) : (
-                  <button type="button" className="btn primary" disabled={!data.localAvailable} onClick={() => void startDownload()}>
+                  <button
+                    type="button"
+                    className="btn primary"
+                    disabled={!data.localAvailable || downloadingRepo !== null}
+                    onClick={() => void startDownload()}
+                  >
                     Download
                   </button>
                 )}

@@ -7,8 +7,16 @@ of `higgs attach`, with a chat that doubles as a request profiler.
 
 ## Install
 
-Every GitHub release ships `Higgs_<version>_aarch64.dmg` and a zipped
-`Higgs.app` for Apple Silicon. The bundle is not notarized, so the first launch
+```bash
+brew install --cask panbanda/brews/higgs-desktop
+```
+
+The app bundles its own copy of the `higgs` CLI, so no separate CLI install is
+needed. A `higgs` already on `PATH` (for example from `brew install higgs`)
+takes precedence over the bundled copy.
+
+Or grab `Higgs_<version>_aarch64.dmg` or the zipped `Higgs.app` directly from a
+GitHub release. Either way the bundle is not notarized, so the first launch
 needs a right-click, Open, or:
 
 ```bash

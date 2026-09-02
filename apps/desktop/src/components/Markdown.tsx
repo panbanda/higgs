@@ -34,7 +34,7 @@ export function Markdown({ children }: { children: string }) {
         remarkPlugins={[remarkGfm]}
         components={{
           pre: ({ children }) => <>{children}</>,
-          code: ({ className, children, ...rest }) => {
+          code: ({ node: _node, className, children, ...rest }) => {
             const inline = !className && !String(children).includes("\n");
             return inline ? (
               <code {...rest}>{children}</code>

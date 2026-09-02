@@ -110,8 +110,10 @@ function tokenize(source: string): Token[] {
   return tokens;
 }
 
-const CONSTANTS: Record<string, number> = { pi: Math.PI, e: Math.E };
-const FUNCTIONS: Record<string, (...args: number[]) => number> = {
+// Null-prototype records so a model-supplied identifier like "constructor" or
+// "toString" can't resolve to an inherited Object.prototype member.
+const CONSTANTS: Record<string, number> = Object.assign(Object.create(null), { pi: Math.PI, e: Math.E });
+const FUNCTIONS: Record<string, (...args: number[]) => number> = Object.assign(Object.create(null), {
   sqrt: Math.sqrt,
   abs: Math.abs,
   round: Math.round,
@@ -125,7 +127,7 @@ const FUNCTIONS: Record<string, (...args: number[]) => number> = {
   exp: Math.exp,
   min: Math.min,
   max: Math.max,
-};
+});
 
 /** Recursive-descent evaluator; no `eval`, so model-supplied input stays inert. */
 export function evaluate(expression: string): number {

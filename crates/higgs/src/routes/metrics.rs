@@ -126,7 +126,7 @@ fn aggregate_tokens_per_second(records: &[&crate::metrics::RequestRecord]) -> Op
     let mut decode = Duration::ZERO;
     for record in records {
         if let Some(span) = record.decode_duration() {
-            if record.output_tokens > 0 {
+            if record.output_tokens > 0 && !span.is_zero() {
                 tokens = tokens.saturating_add(record.output_tokens);
                 decode = decode.saturating_add(span);
             }
@@ -267,5 +267,22 @@ mod tests {
         assert_eq!(model_a.ttft_p50_ms, Some(1000));
         assert_eq!(model_a.cached_tokens, 7);
         assert!((model_a.tokens_per_second.unwrap() - 20.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn zero_decode_span_does_not_contribute_to_throughput() {
+        let metrics = MetricsStore::new(Duration::from_secs(60));
+        let mut record = sample_record("model-a", "higgs", 200);
+        // TTFT at or past the whole request duration leaves no decode time,
+        // even though output tokens were recorded.
+        record.duration = Duration::from_secs(1);
+        record.timing = crate::metrics::RequestTiming {
+            ttft_ms: Some(1000),
+            cached_tokens: None,
+        };
+        metrics.record(record);
+
+        let response = build_metrics_response(&metrics);
+        assert!(response.tokens_per_second.is_none());
     }
 }

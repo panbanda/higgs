@@ -78,6 +78,7 @@ export function useServerData(settings: Settings): ServerData {
   const [tick, setTick] = useState(0);
   const logOffset = useRef<number | null>(null);
   const logPathRef = useRef<string | null>(null);
+  const pollInFlight = useRef(false);
 
   const config = useMemo(() => parseConfig(configFile?.parsed), [configFile]);
 
@@ -101,6 +102,15 @@ export function useServerData(settings: Settings): ServerData {
   useEffect(() => {
     let cancelled = false;
     const run = async () => {
+      if (pollInFlight.current) return;
+      pollInFlight.current = true;
+      try {
+        await poll();
+      } finally {
+        pollInFlight.current = false;
+      }
+    };
+    const poll = async () => {
       const [healthResult, modelsResult, metricsResult, systemResult] = await Promise.allSettled([
         checkHealth(connection),
         listModels(connection),

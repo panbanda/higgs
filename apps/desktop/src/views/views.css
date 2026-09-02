@@ -21,6 +21,11 @@
   cursor: pointer;
 }
 
+.vrow.clickable:focus-visible {
+  outline: 2px solid var(--text-accent);
+  outline-offset: -2px;
+}
+
 .vrow.head {
   min-height: 28px;
   cursor: default;

@@ -35,7 +35,7 @@ export function Composer({ disabled, busy, onSend, onStop }: Props) {
         disabled={disabled}
         onChange={(event) => setText(event.target.value)}
         onKeyDown={(event) => {
-          if (event.key === "Enter" && !event.shiftKey) {
+          if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
             event.preventDefault();
             submit();
           }

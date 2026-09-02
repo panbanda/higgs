@@ -45,7 +45,18 @@ export function SignalStrip({ settings, data }: Props) {
   const ttftP95 = usingLiveLog ? ttftSummary(windowed).p95 : (data.metrics?.ttft.p95_ms ?? 0);
   const ttftSamples = usingLiveLog ? ttftSummary(windowed).samples : (data.metrics?.ttft.samples ?? 0);
 
-  const requestsPerMin = requestCount / windowMinutes;
+  // requests_per_minute is one bucket per minute of the server's own metrics
+  // window, so its average over the last N buckets is the right rate even
+  // when that window doesn't line up with windowMinutes — totals.requests
+  // over windowMinutes would silently mix in a different span.
+  const requestsPerMin = usingLiveLog
+    ? requestCount / windowMinutes
+    : (() => {
+        const buckets = data.metrics?.requests_per_minute ?? [];
+        if (buckets.length === 0) return 0;
+        const recent = buckets.slice(-windowMinutes);
+        return recent.reduce((sum, value) => sum + value, 0) / recent.length;
+      })();
   const errorRate = requestCount > 0 ? (errorCount / requestCount) * 100 : 0;
   const serverInputTokens = data.metrics?.totals.input_tokens ?? 0;
   const serverCachedTokens = (data.metrics?.models ?? []).reduce((sum, m) => sum + m.cached_tokens, 0);

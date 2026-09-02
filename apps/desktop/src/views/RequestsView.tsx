@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { isError, routingLabel, statusClass, withinWindow } from "../lib/dashboard";
 import { formatCompact, formatMs, formatNumber, formatRate } from "../lib/format";
 import type { ServerData } from "../hooks/useServerData";
@@ -22,8 +22,8 @@ function matchesStatusOption(status: number, option: StatusOption): boolean {
   return status >= 500;
 }
 
-function recordKey(record: RequestRecord, index: number): string {
-  return `${record.timestamp}-${index}`;
+function recordKey(record: RequestRecord): string {
+  return `${record.timestamp}-${record.model ?? ""}-${record.duration_ms}-${record.input_tokens}-${record.output_tokens}`;
 }
 
 /** Decode throughput for a single record: output tokens over the post-TTFT span. */
@@ -75,7 +75,11 @@ export function RequestsView({ data }: RequestsViewProps) {
   const errorRate = filtered.length === 0 ? 0 : (filtered.filter(isError).length / filtered.length) * 100;
   const avgDuration = filtered.length === 0 ? 0 : filtered.reduce((sum, r) => sum + r.duration_ms, 0) / filtered.length;
 
-  const selectedRecord = sorted.find((record, index) => recordKey(record, index) === selected) ?? null;
+  const selectedRecord = sorted.find((record) => recordKey(record) === selected) ?? null;
+
+  useEffect(() => {
+    if (selected && !selectedRecord) setSelected(null);
+  }, [selected, selectedRecord]);
 
   return (
     <div className="view">
@@ -163,8 +167,8 @@ export function RequestsView({ data }: RequestsViewProps) {
             </span>
           </div>
           {sorted.length === 0 && <div className="config-list-empty">No requests match these filters</div>}
-          {sorted.map((record, index) => {
-            const key = recordKey(record, index);
+          {sorted.map((record) => {
+            const key = recordKey(record);
             const cls = statusClass(record.status);
             const cachePercent = recordCachePercent(record);
             const tps = recordTokensPerSecond(record);
@@ -172,7 +176,15 @@ export function RequestsView({ data }: RequestsViewProps) {
               <div
                 className={`vrow clickable requests-grid ${selected === key ? "selected" : ""}`}
                 key={key}
+                role="button"
+                tabIndex={0}
                 onClick={() => setSelected(key)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    setSelected(key);
+                  }
+                }}
               >
                 <span className="mono muted">{new Date(record.timestamp).toLocaleTimeString()}</span>
                 <span>{record.model ?? "–"}</span>

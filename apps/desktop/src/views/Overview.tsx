@@ -118,7 +118,7 @@ export function Overview({ settings, data, onOpenRequests }: OverviewProps) {
     ? [...windowed].sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp)).slice(0, 25)
     : [];
 
-  const maxRequestsPerMinute = Math.max(2, ...(requestBuckets?.map((b) => b.requests) ?? [2]));
+  const maxRequestsPerMinute = Math.max(2, ...requestsPerMinute.map((bucket) => bucket.value));
 
   const ttftBarPct = Math.min(100, (ttft.p95 / TTFT_SCALE_MAX) * 100);
   const ttftP50Pct = Math.min(100, (ttft.p50 / TTFT_SCALE_MAX) * 100);

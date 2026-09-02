@@ -4,6 +4,7 @@ import type {
   ConfigFile,
   DaemonStatus,
   HealthStatus,
+  HiggsBinaryInfo,
   HubDownloadStatus,
   HubModelDetail,
   HubModelSummary,
@@ -77,7 +78,11 @@ async function local<T>(command: string, args?: Record<string, unknown>): Promis
   if (!devBridge) throw new Error(LOCAL_UNAVAILABLE);
   const response = await fetch(`/__local/${command}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    // The bridge only accepts requests carrying this per-session token (see
+    // dev/local-bridge.ts and vite.config.ts's `define`), so another
+    // localhost-bound page can't call it even if it also passes the
+    // loopback check.
+    headers: { "Content-Type": "application/json", "X-Higgs-Bridge": __HIGGS_BRIDGE_TOKEN__ },
     body: JSON.stringify(args ?? {}),
   });
   const payload = (await response.json()) as { ok: boolean; result?: T; error?: string };
@@ -163,6 +168,15 @@ export function runHiggs(binary: string, args: string[]): Promise<CommandOutput>
   return local("run_higgs", { binary: binary || null, args });
 }
 
+/**
+ * Resolves the `higgs` binary the same way `runHiggs` would (an explicit
+ * path from Settings, then `PATH`, then the copy bundled with the desktop
+ * app) and reports where it came from and its `--version` output.
+ */
+export function higgsBinaryInfo(binary: string): Promise<HiggsBinaryInfo> {
+  return local("higgs_binary_info", { binary: binary || null });
+}
+
 export function modelCacheInfo(path: string): Promise<ModelCacheInfo> {
   return local("model_cache_info", { path });
 }
@@ -203,9 +217,31 @@ export function hubDelete(repo: string): Promise<void> {
 
 const browserAborts = new Map<string, AbortController>();
 
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
+
+/**
+ * The API key must never leave the machine in the clear: it is only sent
+ * when the base URL is https:, or http: to a loopback host.
+ *
+ * Rust native path (crates/higgs-desktop or equivalent invoke handlers) must
+ * apply the same rule before attaching the Authorization header.
+ */
+function apiKeyTransportAllowed(baseUrl: string): boolean {
+  try {
+    const url = new URL(baseUrl);
+    if (url.protocol === "https:") return true;
+    if (url.protocol === "http:") return LOOPBACK_HOSTS.has(url.hostname);
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 function browserHeaders(connection: Connection): HeadersInit {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (connection.api_key) headers.Authorization = `Bearer ${connection.api_key}`;
+  if (connection.api_key && apiKeyTransportAllowed(connection.base_url)) {
+    headers.Authorization = `Bearer ${connection.api_key}`;
+  }
   return headers;
 }
 
@@ -213,7 +249,12 @@ function browserUrl(connection: Connection, path: string): string {
   return `${connection.base_url.replace(/\/+$/, "")}${path}`;
 }
 
+const API_KEY_TRANSPORT_ERROR = "API key is only sent over HTTPS or loopback";
+
 async function browserHealth(connection: Connection): Promise<HealthStatus> {
+  if (connection.api_key && !apiKeyTransportAllowed(connection.base_url)) {
+    return { ok: false, detail: API_KEY_TRANSPORT_ERROR };
+  }
   try {
     const response = await fetch(browserUrl(connection, "/health"), { signal: AbortSignal.timeout(3000) });
     return response.ok ? { ok: true, detail: "ok" } : { ok: false, detail: `HTTP ${response.status}` };
@@ -234,6 +275,9 @@ async function browserError(response: Response): Promise<string> {
 }
 
 async function browserJson<T>(connection: Connection, path: string): Promise<T> {
+  if (connection.api_key && !apiKeyTransportAllowed(connection.base_url)) {
+    throw new Error(API_KEY_TRANSPORT_ERROR);
+  }
   const response = await fetch(browserUrl(connection, path), { headers: browserHeaders(connection) });
   if (!response.ok) throw new Error(await browserError(response));
   return (await response.json()) as T;

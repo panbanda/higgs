@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { runHiggs } from "../lib/api";
+import { daemonSelectorArgs } from "../views/ConfigView";
 import type { ServerData } from "../hooks/useServerData";
 import type { Settings } from "../lib/types";
 
@@ -21,13 +22,13 @@ export function Header({ settings, onSettingsChange, data, onNewChat }: Props) {
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  const profileArgs = settings.profile ? ["--profile", settings.profile] : [];
+  const selectorArgs = daemonSelectorArgs(settings.profile, data.configFile?.path ?? null);
   const run = async (label: string, steps: string[][]) => {
     setBusy(label);
     setNotice(null);
     try {
       for (const args of steps) {
-        const output = await runHiggs(settings.higgsBinary, [...args, ...profileArgs]);
+        const output = await runHiggs(settings.higgsBinary, [...args, ...selectorArgs]);
         if (output.exit_code !== 0) {
           setNotice(`${args[0]} failed: ${(output.stderr || output.stdout).trim().split("\n").slice(-3).join(" ")}`);
           return;

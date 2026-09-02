@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt as _;
 use tokio_util::sync::CancellationToken;
 
+use crate::paths::is_contained;
+
 const HUB_BASE: &str = "https://huggingface.co";
 const DEFAULT_AUTHOR: &str = "mlx-community";
 
@@ -82,9 +84,10 @@ fn is_safe_relative_path(rfilename: &str) -> bool {
 }
 
 /// Defense in depth: confirms a joined path actually landed inside the
-/// directory it was meant to.
+/// directory it was meant to, even accounting for a symlink placed
+/// somewhere in the cache layout. See [`crate::paths::is_contained`].
 fn path_within(base: &Path, candidate: &Path) -> bool {
-    candidate.starts_with(base)
+    is_contained(base, candidate)
 }
 
 fn client(timeout: Duration) -> Result<reqwest::Client, String> {
@@ -764,5 +767,20 @@ mod tests {
         assert!(!is_valid_token("has/slash"));
         assert!(!is_valid_token(""));
         assert!(is_valid_token("abc123.def-ghi_jkl"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_within_rejects_a_symlink_escaping_the_cache_root() {
+        let unique = std::process::id();
+        let root = std::env::temp_dir().join(format!("higgs-hub-test-root-{unique}"));
+        let outside = std::env::temp_dir().join(format!("higgs-hub-test-outside-{unique}"));
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::create_dir_all(&outside).expect("create outside dir");
+        let linked = root.join("models--escaped");
+        std::os::unix::fs::symlink(&outside, &linked).expect("symlink dir");
+        assert!(!path_within(&root, &linked.join("blobs/etag")));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 }

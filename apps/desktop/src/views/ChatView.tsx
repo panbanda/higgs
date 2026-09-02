@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ServerData } from "../hooks/useServerData";
-import { newAssistantMessage, runTurn, type TurnHandle } from "../lib/chat";
+import { newAssistantMessage, replayRequest, runTurn, type TurnHandle } from "../lib/chat";
 import { loadConversations, newId, saveConversations } from "../lib/storage";
 import { TOOL_DEFINITIONS } from "../lib/tools";
 import { DEFAULT_PARAMS, type AssistantMessage, type Conversation, type GenerationParams, type Preset, type ReasoningEffort, type Settings, type SystemInfo, type UserMessage } from "../lib/types";
@@ -196,8 +196,31 @@ export function ChatView({ settings, onSettingsChange, presets, onPresetsChange,
   const [selectedMessageId, setSelectedMessageId] = useState<string | null>(null);
   const [presetNameDraft, setPresetNameDraft] = useState<string | null>(null);
   const handleRef = useRef<TurnHandle | null>(null);
+  const conversationsRef = useRef<Conversation[]>(conversations);
 
   useEffect(() => saveConversations(conversations), [conversations]);
+  useEffect(() => {
+    conversationsRef.current = conversations;
+  }, [conversations]);
+
+  // On unmount, cancel any in-flight turn and persist a terminal status for
+  // whatever message it was streaming into, so a reload never finds a
+  // conversation stuck showing "queued"/"thinking"/"streaming"/"tools".
+  useEffect(() => {
+    return () => {
+      handleRef.current?.cancel();
+      const terminal = conversationsRef.current.map((conversation) => ({
+        ...conversation,
+        messages: conversation.messages.map((message) =>
+          message.role === "assistant" && ["queued", "thinking", "streaming", "tools"].includes(message.status)
+            ? { ...message, status: "cancelled" as const, stats: { ...message.stats, finishedAt: Date.now() } }
+            : message,
+        ),
+      }));
+      saveConversations(terminal);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (requestedModel && requestedModel !== settings.model) {
@@ -266,10 +289,17 @@ export function ChatView({ settings, onSettingsChange, presets, onPresetsChange,
   const stop = () => handleRef.current?.cancel();
 
   const replay = (requestBody: unknown) => {
-    if (!active) return;
-    const body = requestBody as { messages?: Array<{ role: string; content?: string }> };
-    const lastUser = [...(body.messages ?? [])].reverse().find((message) => message.role === "user");
-    if (lastUser?.content) send(lastUser.content);
+    const conversation = ensureConversation();
+    const assistantMessage = newAssistantMessage(settings.model, settings.params);
+
+    updateConversation(conversation.id, (current) => ({
+      ...current,
+      updatedAt: Date.now(),
+      messages: [...current.messages, assistantMessage],
+    }));
+    setSelectedMessageId(assistantMessage.id);
+
+    handleRef.current = replayRequest(settings, requestBody, (mutate) => updateMessage(conversation.id, assistantMessage.id, mutate));
   };
 
   const confirmSavePreset = () => {

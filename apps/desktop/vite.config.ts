@@ -4,8 +4,15 @@ import { devLocalBridge } from "./dev/local-bridge";
 
 const host = process.env.TAURI_DEV_HOST;
 
+const bridge = devLocalBridge();
+
 export default defineConfig({
-  plugins: [react(), devLocalBridge() as Plugin],
+  plugins: [react(), bridge as Plugin],
+  // Exposed to the page as `__HIGGS_BRIDGE_TOKEN__` (see
+  // src/vite-env.d.ts); `src/lib/api.ts` sends it back as the
+  // `X-Higgs-Bridge` header so the bridge middleware can tell this page's
+  // own requests apart from any other localhost-bound request.
+  define: { __HIGGS_BRIDGE_TOKEN__: JSON.stringify(bridge.token) },
   clearScreen: false,
   server: {
     port: 1420,

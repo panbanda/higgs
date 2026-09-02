@@ -1,5 +1,6 @@
 mod hub;
 mod local;
+mod paths;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -25,17 +26,86 @@ impl Connection {
         format!("{}{}", self.base_url.trim_end_matches('/'), path)
     }
 
-    fn apply_auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match self.api_key.as_deref().filter(|key| !key.is_empty()) {
-            Some(key) => request.bearer_auth(key),
-            None => request,
+    /// True when it is safe to send the API key on the wire: the URL is
+    /// `https:`, or `http:` restricted to a loopback host, so a bearer token
+    /// is never sent to a network peer in clear text.
+    fn allows_auth(&self) -> bool {
+        let Ok(parsed) = reqwest::Url::parse(&self.base_url) else {
+            return false;
+        };
+        match parsed.scheme() {
+            "https" => true,
+            "http" => parsed.host_str().is_some_and(is_loopback_host),
+            _ => false,
         }
     }
+
+    /// Attaches the API key as a bearer token, refusing to do so unless
+    /// [`Connection::allows_auth`] holds.
+    fn apply_auth(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder, String> {
+        match self.api_key.as_deref().filter(|key| !key.is_empty()) {
+            Some(key) => {
+                if !self.allows_auth() {
+                    return Err("API key is only sent over HTTPS or loopback".to_owned());
+                }
+                Ok(request.bearer_auth(key))
+            }
+            None => Ok(request),
+        }
+    }
+}
+
+/// True for `localhost` and loopback IP literals (`127.0.0.1`, `::1`, with
+/// or without the brackets a URL host puts around an IPv6 address).
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Pure decision behind the client's redirect policy: allow at most 5 hops,
+/// and refuse any redirect that downgrades from `https` to `http` or that
+/// targets a non-loopback `http` host, so a redirect can't be used to leak
+/// an `Authorization` header in clear text.
+fn evaluate_redirect(
+    previous_scheme: &str,
+    next: &reqwest::Url,
+    hops_so_far: usize,
+) -> Result<(), String> {
+    if hops_so_far > 5 {
+        return Err("too many redirects".to_owned());
+    }
+    if previous_scheme == "https" && next.scheme() == "http" {
+        return Err("redirect from https to http is not allowed".to_owned());
+    }
+    if next.scheme() == "http" && !next.host_str().is_some_and(is_loopback_host) {
+        return Err("redirect to a non-loopback http host is not allowed".to_owned());
+    }
+    Ok(())
+}
+
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let previous_scheme = attempt
+            .previous()
+            .last()
+            .map_or("https", reqwest::Url::scheme);
+        match evaluate_redirect(previous_scheme, attempt.url(), attempt.previous().len()) {
+            Ok(()) => attempt.follow(),
+            Err(reason) => attempt.error(reason),
+        }
+    })
 }
 
 fn client(timeout: Duration) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(timeout)
+        .redirect(redirect_policy())
         .build()
         .map_err(|error| error.to_string())
 }
@@ -99,7 +169,7 @@ async fn error_body(response: reqwest::Response) -> String {
 async fn list_models(connection: Connection) -> Result<Vec<ModelInfo>, String> {
     let request = client(Duration::from_secs(10))?.get(connection.url("/v1/models"));
     let response = connection
-        .apply_auth(request)
+        .apply_auth(request)?
         .send()
         .await
         .map_err(|error| error.to_string())?;
@@ -114,7 +184,7 @@ async fn list_models(connection: Connection) -> Result<Vec<ModelInfo>, String> {
 async fn fetch_metrics(connection: Connection) -> Result<serde_json::Value, String> {
     let request = client(Duration::from_secs(10))?.get(connection.url("/metrics"));
     let response = connection
-        .apply_auth(request)
+        .apply_auth(request)?
         .send()
         .await
         .map_err(|error| error.to_string())?;
@@ -128,7 +198,7 @@ async fn fetch_metrics(connection: Connection) -> Result<serde_json::Value, Stri
 async fn fetch_system(connection: Connection) -> Result<serde_json::Value, String> {
     let request = client(Duration::from_secs(10))?.get(connection.url("/v1/system"));
     let response = connection
-        .apply_auth(request)
+        .apply_auth(request)?
         .send()
         .await
         .map_err(|error| error.to_string())?;
@@ -186,11 +256,13 @@ async fn run_stream(
     on_event: &Channel<StreamEvent>,
     token: &CancellationToken,
 ) -> Result<(), String> {
-    let request = client(Duration::from_secs(60 * 60))?
-        .post(connection.url("/v1/chat/completions"))
-        .json(&body);
+    let request = connection.apply_auth(
+        client(Duration::from_secs(60 * 60))?
+            .post(connection.url("/v1/chat/completions"))
+            .json(&body),
+    )?;
     let response = tokio::select! {
-        response = connection.apply_auth(request).send() => response.map_err(|error| error.to_string())?,
+        response = request.send() => response.map_err(|error| error.to_string())?,
         () = token.cancelled() => return Ok(()),
     };
     if !response.status().is_success() {
@@ -210,8 +282,8 @@ async fn run_stream(
         let chunk = chunk.map_err(|error| error.to_string())?;
         buffer.extend_from_slice(&chunk);
 
-        while let Some(boundary) = find_frame_end(&buffer) {
-            let frame_bytes: Vec<u8> = buffer.drain(..boundary + 2).collect();
+        while let Some((boundary, separator_len)) = find_frame_end(&buffer) {
+            let frame_bytes: Vec<u8> = buffer.drain(..boundary + separator_len).collect();
             let frame = String::from_utf8_lossy(&frame_bytes[..boundary]).into_owned();
             match parse_sse_frame(&frame) {
                 None => {}
@@ -230,8 +302,17 @@ async fn run_stream(
     Ok(())
 }
 
-fn find_frame_end(buffer: &[u8]) -> Option<usize> {
-    buffer.windows(2).position(|pair| pair == b"\n\n")
+/// Finds the end of the next SSE frame, accepting both `\n\n` and `\r\n\r\n`
+/// separators. Returns the boundary offset and the separator's byte length.
+fn find_frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf_lf = buffer.windows(2).position(|pair| pair == b"\n\n");
+    let crlf_crlf = buffer.windows(4).position(|quad| quad == b"\r\n\r\n");
+    match (lf_lf, crlf_crlf) {
+        (Some(lf), Some(crlf)) if crlf < lf => Some((crlf, 4)),
+        (Some(lf), _) => Some((lf, 2)),
+        (None, Some(crlf)) => Some((crlf, 4)),
+        (None, None) => None,
+    }
 }
 
 enum SseData {
@@ -291,6 +372,7 @@ pub fn run() {
             local::daemon_status,
             local::read_text_tail,
             local::run_higgs,
+            local::higgs_binary_info,
             local::model_cache_info,
             hub::hub_search,
             hub::hub_model,
@@ -306,6 +388,61 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn connection(base_url: &str) -> Connection {
+        Connection {
+            base_url: base_url.to_owned(),
+            api_key: Some("secret".to_owned()),
+        }
+    }
+
+    #[test]
+    fn allows_auth_over_https() {
+        assert!(connection("https://api.example.com").allows_auth());
+    }
+
+    #[test]
+    fn allows_auth_over_http_loopback() {
+        assert!(connection("http://localhost:1234").allows_auth());
+        assert!(connection("http://127.0.0.1:1234").allows_auth());
+        assert!(connection("http://[::1]:1234").allows_auth());
+    }
+
+    #[test]
+    fn refuses_auth_over_http_to_a_remote_host() {
+        assert!(!connection("http://example.com").allows_auth());
+        assert!(!connection("http://192.168.1.5:1234").allows_auth());
+    }
+
+    fn url(value: &str) -> reqwest::Url {
+        reqwest::Url::parse(value).expect("valid url")
+    }
+
+    #[test]
+    fn allows_a_plain_https_redirect() {
+        assert!(evaluate_redirect("https", &url("https://example.com/next"), 1).is_ok());
+    }
+
+    #[test]
+    fn allows_an_http_redirect_to_loopback() {
+        assert!(evaluate_redirect("http", &url("http://127.0.0.1:8080/next"), 1).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_downgrade_from_https_to_http() {
+        assert!(evaluate_redirect("https", &url("http://example.com/next"), 1).is_err());
+    }
+
+    #[test]
+    fn rejects_an_http_redirect_to_a_remote_host() {
+        assert!(evaluate_redirect("http", &url("http://example.com/next"), 1).is_err());
+    }
+
+    #[test]
+    fn rejects_more_than_five_hops() {
+        assert!(evaluate_redirect("https", &url("https://example.com/next"), 5).is_ok());
+        assert!(evaluate_redirect("https", &url("https://example.com/next"), 6).is_err());
+    }
 
     #[test]
     fn parses_json_frame() {
@@ -325,8 +462,14 @@ mod tests {
 
     #[test]
     fn frame_end_is_found_on_bytes() {
-        assert_eq!(find_frame_end(b"data: x\n\nrest"), Some(7));
+        assert_eq!(find_frame_end(b"data: x\n\nrest"), Some((7, 2)));
         assert_eq!(find_frame_end(b"data: partial\n"), None);
+    }
+
+    #[test]
+    fn frame_end_is_found_on_crlf_bytes() {
+        assert_eq!(find_frame_end(b"data: x\r\n\r\nrest"), Some((7, 4)));
+        assert_eq!(find_frame_end(b"data: partial\r\n"), None);
     }
 
     #[test]

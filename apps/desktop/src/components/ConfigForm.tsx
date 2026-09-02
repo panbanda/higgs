@@ -119,7 +119,14 @@ export function ConfigForm({ draft, onChange, section }: ConfigFormProps) {
     for (const [name, entry] of entries) map[name] = entry;
     onChange({ ...draft, provider: entries.length > 0 ? map : undefined });
   };
+  const [duplicateProviderIndex, setDuplicateProviderIndex] = useState<number | null>(null);
   const updateProviderName = (index: number, name: string) => {
+    const isDuplicate = providerEntries.some(([existingName], existingIndex) => existingIndex !== index && existingName === name);
+    if (isDuplicate) {
+      setDuplicateProviderIndex(index);
+      return;
+    }
+    setDuplicateProviderIndex(null);
     const next = [...providerEntries];
     next[index] = [name, next[index][1]];
     setProviders(next);
@@ -360,6 +367,11 @@ export function ConfigForm({ draft, onChange, section }: ConfigFormProps) {
               <div className="field config-key-input">
                 <label>Name</label>
                 <input type="text" value={name} onChange={(event) => updateProviderName(index, event.target.value)} />
+                {duplicateProviderIndex === index && (
+                  <span className="field-hint" style={{ color: "var(--bad)" }}>
+                    A provider with this name already exists.
+                  </span>
+                )}
               </div>
               <div className="field" style={{ flex: 2 }}>
                 <label>URL</label>

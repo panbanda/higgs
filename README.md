@@ -27,6 +27,7 @@ Higgs is a Rust binary (plus its Metal shader library) built on [MLX](https://gi
 
 ```bash
 brew install panbanda/brews/higgs
+brew install --cask panbanda/brews/higgs-desktop # desktop app; bundles the CLI
 ```
 
 Or grab the binary and the desktop app from the [latest release](https://github.com/panbanda/higgs/releases/latest), or build from source with Rust 1.88+ and the Xcode Command Line Tools:

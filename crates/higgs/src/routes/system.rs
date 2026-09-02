@@ -139,6 +139,7 @@ fn process_rss_bytes() -> Option<u64> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn physical_memory_is_reported_on_macos() {
         assert!(PHYSICAL_MEMORY.is_some_and(|bytes| bytes > 0));

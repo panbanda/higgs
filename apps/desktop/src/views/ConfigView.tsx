@@ -19,7 +19,7 @@ type Tab = "form" | "raw";
  * Daemon commands must select the profile with `--profile <name>` and never
  * combine it with `--config <path>`; the default profile takes `--config`.
  */
-function daemonSelectorArgs(profile: string | null, configPath: string | null): string[] {
+export function daemonSelectorArgs(profile: string | null, configPath: string | null): string[] {
   return profile ? ["--profile", profile] : configPath ? ["--config", configPath] : [];
 }
 

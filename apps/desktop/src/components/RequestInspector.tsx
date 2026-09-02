@@ -274,16 +274,18 @@ function roundSummary(round: TraceRound) {
   const promptTokPerSec = round.promptProgress && round.promptProgress.time_ms > 0 && uncachedPromptTokens > 0 ? uncachedPromptTokens / (round.promptProgress.time_ms / 1000) : null;
   const firstReasoningAt = round.chunks.find((chunk) => chunk.kind === "reasoning")?.at ?? null;
   const firstVisibleAt = round.chunks.find((chunk) => chunk.kind === "content")?.at ?? null;
-  let previous = 0;
+  // Gaps start from the first chunk's `at`, not 0, so the prefill time
+  // before the first chunk arrives isn't counted as a mid-stream stall.
+  let previous = round.chunks[0]?.at ?? 0;
   let longestGap = -1;
   let longestGapIndex = -1;
   const gaps: number[] = [];
-  round.chunks.forEach((chunk, i) => {
+  round.chunks.slice(1).forEach((chunk, i) => {
     const gap = chunk.at - previous;
     gaps.push(gap);
     if (gap > longestGap) {
       longestGap = gap;
-      longestGapIndex = i;
+      longestGapIndex = i + 1;
     }
     previous = chunk.at;
   });
@@ -520,7 +522,7 @@ export function RequestInspector({ message, settings, system, onReplay, onCollap
     );
   }
 
-  const activeRoundIndex = scope === "all" ? rounds.length - 1 : scope;
+  const activeRoundIndex = scope === "all" || scope < 0 || scope >= rounds.length ? rounds.length - 1 : scope;
   const activeRound = rounds[activeRoundIndex];
 
   return (

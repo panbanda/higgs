@@ -4,6 +4,7 @@
  * the CLI. Endpoints are POST /__local/<command> with a JSON body of the
  * same camelCase args the Tauri commands take. Never served by `vite build`.
  */
+import crypto from "node:crypto";
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
@@ -19,12 +20,69 @@ const expandHome = (p: string) => (p.startsWith("~/") ? path.join(os.homedir(), 
 /** Thrown by path/command guards; mapped to an HTTP 403 by the middleware. */
 class ForbiddenError extends Error {}
 
-/** True when `candidate` is `dir` itself or nested somewhere inside it. */
+/** True when `candidate` is `dir` itself or nested somewhere inside it,
+ * purely lexically (no filesystem access). */
 function withinDir(candidate: string, dir: string): boolean {
   const resolvedCandidate = path.resolve(candidate);
   const resolvedDir = path.resolve(dir);
   const relative = path.relative(resolvedDir, resolvedCandidate);
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+/**
+ * Symlink-safe containment check mirroring `is_contained` in
+ * src-tauri/src/paths.rs: true when `candidate` lexically resolves under
+ * `root` AND no existing ancestor directory between `root` and `candidate`
+ * is itself a symlink, so a symlinked directory placed inside `root` cannot
+ * redirect a read or write outside it.
+ *
+ * Deliberately does not inspect `candidate` itself: callers that create or
+ * replace a symlink at `candidate` (the Hugging Face cache's blob links)
+ * must be able to do so even when a previous, legitimately-contained
+ * symlink already sits there.
+ *
+ * When `root` does not exist on disk yet, only the lexical check applies,
+ * since there is nothing to canonicalize.
+ */
+async function isContained(root: string, candidate: string): Promise<boolean> {
+  if (!withinDir(candidate, root)) return false;
+  const resolvedRoot = path.resolve(root);
+  const resolvedCandidate = path.resolve(candidate);
+  let canonicalRoot: string;
+  try {
+    canonicalRoot = await fs.realpath(resolvedRoot);
+  } catch {
+    return true;
+  }
+
+  // Walk every ancestor directory from `candidate`'s parent up to `root`,
+  // rejecting any that is itself a symlink. `lstat` reports the *last* path
+  // component's own symlink-ness without following it, even though earlier
+  // components are still resolved transparently by the OS, so this catches
+  // a symlink at any depth once the walk reaches it as the final segment
+  // being inspected.
+  let dir = path.dirname(resolvedCandidate);
+  let nearestExisting: string | null = null;
+  while (dir !== resolvedRoot) {
+    try {
+      const stats = await fs.lstat(dir);
+      if (stats.isSymbolicLink()) return false;
+      if (nearestExisting === null) nearestExisting = dir;
+    } catch {
+      // does not exist; keep walking up
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break; // reached the filesystem root without matching `root`
+    dir = parent;
+  }
+
+  const nearest = nearestExisting ?? resolvedRoot;
+  try {
+    const resolvedNearest = await fs.realpath(nearest);
+    return resolvedNearest === canonicalRoot || withinDir(resolvedNearest, canonicalRoot);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -79,8 +137,8 @@ async function assertAllowedPath(command: string, args: Record<string, unknown>)
   if (typeof raw !== "string" || !raw) throw new ForbiddenError("path required");
   const resolved = path.resolve(expandHome(raw));
   const dir = configDir();
-  if (withinDir(resolved, dir)) return;
-  if (command === "read_metrics_log" && withinDir(resolved, os.homedir())) {
+  if (await isContained(dir, resolved)) return;
+  if (command === "read_metrics_log" && (await isContained(os.homedir(), resolved))) {
     const allowed = await configuredMetricsLogPaths();
     if (allowed.has(resolved)) return;
   }
@@ -115,7 +173,94 @@ function run(program: string, args: string[]): Promise<{ code: number | null; st
   });
 }
 
-const ALLOWED = new Set(["doctor", "start", "stop", "config", "--version"]);
+/// Only whitelisted subcommands run from the UI so the bridge cannot be
+/// turned into a general shell.
+const ALLOWED_SUBCOMMANDS = new Set(["doctor", "start", "stop", "config", "--version"]);
+
+/** Mirrors `is_profile_name` in src-tauri/src/local.rs. */
+function isProfileName(value: string): boolean {
+  return value.length > 0 && /^[A-Za-z0-9._-]+$/.test(value);
+}
+
+/**
+ * Validates a trailing run of `--profile <name>` / `--config <path>`
+ * selector pairs, the only flags `doctor`, `start`, `stop`, and `config`
+ * accept beyond their own subcommand arguments. Mirrors
+ * `validate_selector_args` in src-tauri/src/local.rs.
+ */
+async function assertValidSelectorArgs(rest: string[]): Promise<void> {
+  let i = 0;
+  while (i < rest.length) {
+    const flag = rest[i];
+    if (flag === "--profile") {
+      const name = rest[i + 1];
+      if (name === undefined) throw new Error("--profile requires a value");
+      if (!isProfileName(name)) throw new Error(`invalid profile name: ${name}`);
+      i += 2;
+    } else if (flag === "--config") {
+      const configPath = rest[i + 1];
+      if (configPath === undefined) throw new Error("--config requires a value");
+      const resolved = path.resolve(expandHome(configPath));
+      if (!(await isContained(configDir(), resolved))) {
+        throw new Error(`path ${resolved} is outside the Higgs config directory`);
+      }
+      i += 2;
+    } else {
+      throw new Error(`unexpected argument: ${flag}`);
+    }
+  }
+}
+
+/** Mirrors `validate_config_subcommand_args` in src-tauri/src/local.rs. */
+async function assertValidConfigSubcommandArgs(rest: string[]): Promise<void> {
+  const sub = rest[0];
+  if (sub === "get") {
+    const key = rest[1];
+    if (key === undefined) throw new Error("`config get` requires a key");
+    if (key.startsWith("--")) throw new Error(`unexpected argument in place of a key: ${key}`);
+    await assertValidSelectorArgs(rest.slice(2));
+  } else if (sub === "set") {
+    const key = rest[1];
+    const value = rest[2];
+    if (key === undefined) throw new Error("`config set` requires a key");
+    if (value === undefined) throw new Error("`config set` requires a value");
+    if (key.startsWith("--")) throw new Error(`unexpected argument in place of a key: ${key}`);
+    await assertValidSelectorArgs(rest.slice(3));
+  } else if (sub === "path") {
+    await assertValidSelectorArgs(rest.slice(1));
+  } else if (sub === undefined) {
+    throw new Error("`config` requires a subcommand");
+  } else {
+    throw new Error(`unexpected config subcommand: ${sub}`);
+  }
+}
+
+/**
+ * Validates every argument after the subcommand, so the bridge cannot be
+ * used to smuggle arbitrary flags to the `higgs` binary. Mirrors
+ * `validate_subcommand_args` in src-tauri/src/local.rs so the two backends
+ * accept exactly the same argument shapes: `doctor`, `start`, and `stop`
+ * accept only `--profile <name>` / `--config <path>` selectors; `config`
+ * additionally accepts `get <key>`, `set <key> <value>`, or `path` before
+ * those same selectors; `--version` accepts nothing else.
+ */
+async function assertValidSubcommandArgs(subcommand: string, rest: string[]): Promise<void> {
+  switch (subcommand) {
+    case "doctor":
+    case "start":
+    case "stop":
+      await assertValidSelectorArgs(rest);
+      return;
+    case "config":
+      await assertValidConfigSubcommandArgs(rest);
+      return;
+    case "--version":
+      if (rest.length !== 0) throw new Error("--version accepts no further arguments");
+      return;
+    default:
+      throw new Error(`subcommand not allowed: ${subcommand}`);
+  }
+}
 
 // Hugging Face hub browsing, mirroring src-tauri/src/hub.rs so the dev
 // bridge exposes the same command surface as the desktop app.
@@ -200,6 +345,39 @@ function hubRepoDirName(repo: string): string {
   return `models--${repo.replace(/\//g, "--")}`;
 }
 
+/** Mirrors `is_valid_repo_id` in src-tauri/src/hub.rs. */
+const REPO_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/** Mirrors `is_valid_token` in src-tauri/src/hub.rs: a sha or an etag. */
+const HUB_TOKEN_PATTERN = /^[A-Za-z0-9._-]+$/;
+
+function assertValidRepoId(repo: string): void {
+  if (!REPO_ID_PATTERN.test(repo)) throw new ForbiddenError(`invalid repo id: ${repo}`);
+}
+
+function assertValidHubToken(value: string, label: string): void {
+  if (!HUB_TOKEN_PATTERN.test(value)) throw new ForbiddenError(`invalid ${label}: ${value}`);
+}
+
+/** Mirrors `is_safe_relative_path` in src-tauri/src/hub.rs: a repo-listed
+ * `rfilename` must be a relative path made entirely of normal components. */
+function assertSafeRelativePath(rfilename: string): void {
+  if (rfilename.length === 0 || path.isAbsolute(rfilename)) {
+    throw new ForbiddenError(`invalid rfilename: ${rfilename}`);
+  }
+  for (const part of rfilename.split("/")) {
+    if (part === "" || part === "." || part === "..") {
+      throw new ForbiddenError(`invalid rfilename: ${rfilename}`);
+    }
+  }
+}
+
+/** Defense in depth: confirms a joined path actually landed inside `dir`,
+ * even accounting for a symlink placed somewhere in the cache layout. */
+async function assertWithinDir(candidate: string, dir: string): Promise<void> {
+  if (!(await isContained(dir, candidate))) throw new ForbiddenError(`path escaped its directory: ${candidate}`);
+}
+
 function hubCacheRoot(): string {
   return process.env.HF_HOME ? path.join(process.env.HF_HOME, "hub") : path.join(os.homedir(), ".cache/huggingface/hub");
 }
@@ -260,7 +438,9 @@ async function hubResolveEtag(fileUrl: string, token: unknown, sha: string, rfil
 }
 
 async function hubLinkSnapshotFile(snapshotDir: string, rfilename: string, blobPath: string): Promise<void> {
+  assertSafeRelativePath(rfilename);
   const linkPath = path.join(snapshotDir, rfilename);
+  await assertWithinDir(linkPath, snapshotDir);
   await fs.mkdir(path.dirname(linkPath), { recursive: true });
   try {
     await fs.unlink(linkPath);
@@ -301,9 +481,12 @@ async function hubDownloadToBlob(
 
 async function hubRunDownload(repo: string, token: unknown, job: HubJob): Promise<void> {
   try {
+    assertValidRepoId(repo);
     const detail = await hubFetchModelDetail(repo, token);
+    assertValidHubToken(detail.sha, "sha");
     const root = hubCacheRoot();
     const repoDir = path.join(root, hubRepoDirName(repo));
+    await assertWithinDir(repoDir, root);
     const blobsDir = path.join(repoDir, "blobs");
     const snapshotDir = path.join(repoDir, "snapshots", detail.sha);
     const refsDir = path.join(repoDir, "refs");
@@ -318,6 +501,7 @@ async function hubRunDownload(repo: string, token: unknown, job: HubJob): Promis
 
     for (let index = 0; index < siblings.length; index += 1) {
       const sibling = siblings[index];
+      assertSafeRelativePath(sibling.rfilename);
       job.status.file = sibling.rfilename;
       job.status.file_index = index + 1;
       job.status.file_count = siblings.length;
@@ -328,7 +512,9 @@ async function hubRunDownload(repo: string, token: unknown, job: HubJob): Promis
 
       const fileUrl = `${HUB_BASE}/${repo}/resolve/${detail.sha}/${sibling.rfilename}`;
       const etag = await hubResolveEtag(fileUrl, token, detail.sha, sibling.rfilename);
+      assertValidHubToken(etag, "etag");
       const blobPath = path.join(blobsDir, etag);
+      await assertWithinDir(blobPath, blobsDir);
 
       const upToDate =
         (await exists(blobPath)) && (sibling.size == null || (await fs.stat(blobPath)).size === sibling.size);
@@ -469,7 +655,9 @@ const handlers: Record<string, Handler> = {
   },
   async run_higgs({ binary, args }) {
     const list = Array.isArray(args) ? args.map(String) : [];
-    if (!ALLOWED.has(list[0] ?? "")) throw new Error(`subcommand not allowed: ${list[0]}`);
+    const subcommand = list[0] ?? "";
+    if (!ALLOWED_SUBCOMMANDS.has(subcommand)) throw new Error(`subcommand not allowed: ${subcommand}`);
+    await assertValidSubcommandArgs(subcommand, list.slice(1));
     let program = typeof binary === "string" && binary.trim() ? binary : "";
     if (program) {
       const resolvedProgram = path.resolve(expandHome(program));
@@ -491,6 +679,33 @@ const handlers: Record<string, Handler> = {
     }
     const result = await run(program, list);
     return { program, exit_code: result.code, stdout: result.stdout, stderr: result.stderr };
+  },
+  // Mirrors src-tauri/src/local.rs's `higgs_binary_info`, minus the
+  // "bundled" outcome: the dev bridge has no app bundle to fall back to, so
+  // it only ever reports "settings", "path", or "missing".
+  async higgs_binary_info({ binary }) {
+    const missing = { path: null, source: "missing" as const, version: null };
+    let program = typeof binary === "string" && binary.trim() ? binary : "";
+    let source: "settings" | "path" = "path";
+    if (program) {
+      source = "settings";
+      const resolvedProgram = path.resolve(expandHome(program));
+      if (path.basename(resolvedProgram) !== "higgs") return missing;
+      try {
+        const stat = await fs.stat(resolvedProgram);
+        if (!stat.isFile()) return missing;
+      } catch {
+        return missing;
+      }
+      program = resolvedProgram;
+    } else {
+      const found = await run("/bin/zsh", ["-lc", "command -v higgs"]);
+      program = found.stdout.trim();
+      if (!program) return missing;
+    }
+    const result = await run(program, ["--version"]);
+    const version = result.code === 0 ? result.stdout.trim() || result.stderr.trim() || null : null;
+    return { path: program, source, version };
   },
   async model_cache_info({ path: p }) {
     const model = String(p);
@@ -566,19 +781,41 @@ const handlers: Record<string, Handler> = {
     return null;
   },
   async hub_delete({ repo }) {
+    const repoId = String(repo);
+    assertValidRepoId(repoId);
     const root = hubCacheRoot();
-    const repoDir = path.join(root, hubRepoDirName(String(repo)));
+    const repoDir = path.join(root, hubRepoDirName(repoId));
+    await assertWithinDir(repoDir, root);
     await fs.rm(repoDir, { recursive: true, force: true });
     return null;
   },
 };
 
+/**
+ * True for the loopback addresses Node reports on `socket.remoteAddress`:
+ * the raw IPv4/IPv6 forms and the IPv4-mapped IPv6 form a dual-stack socket
+ * can report. Unlike the `Host` header (client-supplied and trivially
+ * spoofed), this comes from the OS's own view of the connection.
+ */
+function isLoopbackAddress(address: string | undefined): boolean {
+  if (!address) return false;
+  if (address === "127.0.0.1" || address === "::1") return true;
+  return address === "::ffff:127.0.0.1";
+}
+
 const MAX_BODY_BYTES = 1024 * 1024;
 
-export function devLocalBridge(): Plugin {
+export function devLocalBridge(): Plugin & { token: string } {
+  // A fresh random token per dev-server run: exposed to the page via Vite's
+  // `define` (see vite.config.ts) as `__HIGGS_BRIDGE_TOKEN__` and sent back
+  // as the `X-Higgs-Bridge` header, so only this page's own tab can call the
+  // bridge even when the loopback check above is satisfied (e.g. another
+  // local process, or a page from a different origin bound to localhost).
+  const token = crypto.randomBytes(32).toString("hex");
   return {
     name: "higgs-dev-local-bridge",
     apply: "serve",
+    token,
     configureServer(server) {
       server.middlewares.use("/__local", (request, response) => {
         const command = (request.url ?? "/").replace(/^\/+/, "").split("?")[0];
@@ -586,6 +823,23 @@ export function devLocalBridge(): Plugin {
         if (request.method !== "POST" || !handler) {
           response.statusCode = 404;
           response.end(JSON.stringify({ error: `unknown local command: ${command}` }));
+          return;
+        }
+
+        // When Vite is started with TAURI_DEV_HOST set, the dev server binds
+        // to an external interface; refuse to serve local commands to a
+        // connection that didn't actually arrive over loopback, regardless
+        // of what the (client-controlled) Host header claims.
+        if (!isLoopbackAddress(request.socket.remoteAddress)) {
+          response.statusCode = 403;
+          response.end(JSON.stringify({ error: "forbidden: non-loopback connection" }));
+          return;
+        }
+
+        const bridgeToken = request.headers["x-higgs-bridge"];
+        if (bridgeToken !== token) {
+          response.statusCode = 401;
+          response.end(JSON.stringify({ error: "unauthorized: missing or invalid bridge token" }));
           return;
         }
 

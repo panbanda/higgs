@@ -298,6 +298,18 @@ export interface ModelCacheInfo {
   location: string | null;
 }
 
+/** Where a resolved `higgs` binary came from, in resolution-order
+ * preference: an explicit path from Settings, `PATH`, or the copy bundled
+ * with the desktop app (the dev bridge, which has no bundle, never reports
+ * "bundled"). */
+export type HiggsBinarySource = "settings" | "path" | "bundled" | "missing";
+
+export interface HiggsBinaryInfo {
+  path: string | null;
+  source: HiggsBinarySource;
+  version: string | null;
+}
+
 /** Shape of GET /api/models on huggingface.co, trimmed to what the Hub view needs. */
 export interface HubModelSummary {
   id: string;

@@ -1,9 +1,9 @@
-import { useState } from "react";
-import { devBridge, inTauri, runHiggs } from "../lib/api";
+import { useEffect, useState } from "react";
+import { devBridge, higgsBinaryInfo, inTauri } from "../lib/api";
 import { metricsLogPath, serverUrl } from "../lib/config";
 import { DEFAULT_SETTINGS } from "../lib/types";
 import type { ServerData } from "../hooks/useServerData";
-import type { Settings } from "../lib/types";
+import type { HiggsBinaryInfo, Settings } from "../lib/types";
 import "./views.css";
 
 export interface SettingsViewProps {
@@ -12,28 +12,42 @@ export interface SettingsViewProps {
   data: ServerData;
 }
 
+/** "Using: <path> (bundled 1.7.0 / on PATH / from settings)", or a not-found notice. */
+function describeBinaryInfo(info: HiggsBinaryInfo): string {
+  if (info.source === "missing" || !info.path) {
+    return "Not found. Set the binary path above, or install the Higgs CLI.";
+  }
+  const sourceLabel =
+    info.source === "bundled"
+      ? `bundled${info.version ? ` ${info.version}` : ""}`
+      : info.source === "path"
+        ? "on PATH"
+        : "from settings";
+  return `Using: ${info.path} (${sourceLabel})`;
+}
+
 export function SettingsView({ settings, onSettingsChange, data }: SettingsViewProps) {
   const [showApiKey, setShowApiKey] = useState(false);
   const [showHfToken, setShowHfToken] = useState(false);
   const [detecting, setDetecting] = useState(false);
-  const [detectResult, setDetectResult] = useState<{ ok: boolean; text: string } | null>(null);
+  const [binaryInfo, setBinaryInfo] = useState<HiggsBinaryInfo | null>(null);
 
   const detect = async () => {
     setDetecting(true);
-    setDetectResult(null);
     try {
-      const output = await runHiggs(settings.higgsBinary, ["--version"]);
-      if (output.exit_code === 0) {
-        setDetectResult({ ok: true, text: `${output.program}: ${output.stdout.trim() || output.stderr.trim()}` });
-      } else {
-        setDetectResult({ ok: false, text: (output.stderr || output.stdout).trim() || "not found" });
-      }
+      setBinaryInfo(await higgsBinaryInfo(settings.higgsBinary));
     } catch (error) {
-      setDetectResult({ ok: false, text: String(error) });
+      setBinaryInfo({ path: null, source: "missing", version: String(error) });
     } finally {
       setDetecting(false);
     }
   };
+
+  useEffect(() => {
+    void detect();
+    // Re-detect only when the pinned path changes; the button covers PATH/bundle changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings.higgsBinary]);
 
   const resetSettings = () => {
     onSettingsChange({ ...DEFAULT_SETTINGS, params: { ...DEFAULT_SETTINGS.params } });
@@ -114,7 +128,9 @@ export function SettingsView({ settings, onSettingsChange, data }: SettingsViewP
                 {detecting ? "Detecting…" : "Detect"}
               </button>
             </div>
-            {detectResult && <span className={`notice ${detectResult.ok ? "ok" : "bad"}`}>{detectResult.text}</span>}
+            {binaryInfo && (
+              <span className={`notice ${binaryInfo.source === "missing" ? "bad" : "ok"}`}>{describeBinaryInfo(binaryInfo)}</span>
+            )}
           </div>
         </div>
 

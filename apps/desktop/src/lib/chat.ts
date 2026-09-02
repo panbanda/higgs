@@ -169,10 +169,13 @@ export function traceSummary(trace: Trace): TraceSummary {
 
   const totalMs = first !== undefined && last?.finishedAt !== undefined ? last.sentAt + last.finishedAt - first.sentAt : null;
 
+  // Gaps start from the first chunk's `at`, not 0, so the prefill time
+  // before the first chunk arrives isn't counted as a mid-stream stall.
   const gaps: number[] = [];
   for (const round of rounds) {
-    let previous = 0;
-    for (const chunk of round.chunks) {
+    if (round.chunks.length === 0) continue;
+    let previous = round.chunks[0].at;
+    for (const chunk of round.chunks.slice(1)) {
       gaps.push(chunk.at - previous);
       previous = chunk.at;
     }
@@ -323,6 +326,52 @@ export function runTurn(settings: Settings, history: Message[], update: Updater)
   return handle;
 }
 
+/**
+ * Re-sends exactly the recorded request body from a past round (model,
+ * parameters, message history included) with no tool-execution loop, and
+ * appends the result as a new assistant message. Used by the inspector's
+ * Replay action so a trace's model/parameters are honored verbatim, unlike
+ * `runTurn` which re-derives the request from the live conversation and
+ * current settings.
+ */
+export function replayRequest(settings: Settings, requestBody: unknown, update: Updater): TurnHandle {
+  let currentRequestId: string | null = null;
+  let cancelled = false;
+
+  const handle: TurnHandle = {
+    cancel: () => {
+      cancelled = true;
+      if (currentRequestId) void cancelChat(currentRequestId);
+    },
+  };
+
+  const body = requestBody as Record<string, unknown>;
+  const model = typeof body.model === "string" ? body.model : settings.model;
+  const roundMessage = newAssistantMessage(model, settings.params);
+
+  void (async () => {
+    try {
+      if (cancelled) return;
+      currentRequestId = newId();
+      const result = await streamRound(currentRequestId, 0, settings, { body }, roundMessage, update);
+      currentRequestId = null;
+      update((message) => {
+        if (message.status !== "error") message.status = result === "cancelled" ? "cancelled" : "done";
+        message.stats.finishedAt = Date.now();
+        closeThinkingSegment(message, message.stats.finishedAt);
+      });
+    } catch (error) {
+      update((message) => {
+        message.status = "error";
+        message.error = (error as Error).message ?? String(error);
+        message.stats.finishedAt = Date.now();
+      });
+    }
+  })();
+
+  return handle;
+}
+
 async function executeCall(call: ToolCall, update: Updater): Promise<void> {
   const mark = (mutate: (target: ToolCall) => void) => {
     mutate(call);
@@ -361,11 +410,11 @@ function streamRound(
   requestId: string,
   roundIndex: number,
   settings: Settings,
-  wire: WireMessage[],
+  wire: WireMessage[] | { body: Record<string, unknown> },
   roundMessage: AssistantMessage,
   update: Updater,
 ): Promise<"done" | "cancelled"> {
-  const body = buildRequestBody(settings, wire);
+  const body = Array.isArray(wire) ? buildRequestBody(settings, wire) : wire.body;
   const sentAt = Date.now();
   const traceRound: TraceRound = {
     index: roundIndex,
@@ -565,13 +614,29 @@ function applyChunk(chunk: ChatChunk, roundIndex: number, sentAt: number, roundM
   }
 }
 
+/**
+ * Maps a round's streaming tool-call deltas (keyed by server-side protocol
+ * index, which can arrive out of order or with gaps) to calls in
+ * `toolCalls`, kept dense and ordered by that index — not by arrival order —
+ * so a delta for index 1 arriving before index 0 doesn't reverse the order
+ * calls are later executed in.
+ */
+const toolDeltaCalls = new WeakMap<AssistantMessage, Map<number, ToolCall>>();
+
 function mergeToolDelta(roundMessage: AssistantMessage, delta: { index: number; id?: string; function?: { name?: string; arguments?: string } }): void {
-  // Streaming tool deltas are keyed by per-round index; ids only arrive on
-  // the first fragment, so a placeholder id is minted if the server omits it.
-  let call = roundMessage.toolCalls[delta.index];
+  let calls = toolDeltaCalls.get(roundMessage);
+  if (!calls) {
+    calls = new Map();
+    toolDeltaCalls.set(roundMessage, calls);
+  }
+  let call = calls.get(delta.index);
   if (!call) {
+    // ids only arrive on the first fragment, so a placeholder id is minted
+    // if the server omits it.
     call = { id: delta.id ?? `call_${newId().slice(0, 8)}`, name: "", arguments: "", status: "streaming" };
-    roundMessage.toolCalls[delta.index] = call;
+    calls.set(delta.index, call);
+    const byIndex = calls;
+    roundMessage.toolCalls = [...byIndex.keys()].sort((a, b) => a - b).map((index) => byIndex.get(index)!);
   }
   if (delta.function?.name) call.name += delta.function.name;
   if (delta.function?.arguments) call.arguments += delta.function.arguments;

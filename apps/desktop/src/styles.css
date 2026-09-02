@@ -673,6 +673,11 @@ a:focus-visible {
   cursor: pointer;
 }
 
+.data-table tr.clickable:focus-visible {
+  outline: 2px solid var(--text-accent);
+  outline-offset: -2px;
+}
+
 .data-table tr.clickable:hover td {
   background: var(--bg-raised);
 }
