@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.8.0](https://github.com/panbanda/higgs/compare/higgs-v1.7.0...higgs-v1.8.0) (2026-09-02)
+
+
+### Features
+
+* **cli:** higgs ui opens the desktop app ([09a5b4c](https://github.com/panbanda/higgs/commit/09a5b4ce99360e76c866916e973ab847f5c93404))
+* **desktop:** Tauri dashboard app, request tracing, and richer server metrics ([72d8809](https://github.com/panbanda/higgs/commit/72d88094ed70fbd23fba3f83357bd8165c8c5c18))
+* **desktop:** Tauri dashboard app, request tracing, and richer server metrics ([487716f](https://github.com/panbanda/higgs/commit/487716f91797d85ae7429d090a79de4ee52abd42))
+
+
+### Bug Fixes
+
+* **desktop:** address review findings and bundle the CLI in the app ([bb9a5c3](https://github.com/panbanda/higgs/commit/bb9a5c3dd474655e68a545562a9b3f6bfee13ac5))
+
 ## [1.7.0](https://github.com/panbanda/higgs/compare/higgs-v1.6.1...higgs-v1.7.0) (2026-08-18)
 
 

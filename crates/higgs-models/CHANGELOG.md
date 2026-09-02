@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.0](https://github.com/panbanda/higgs/compare/higgs-models-v1.7.0...higgs-models-v1.8.0) (2026-09-02)
+
+
+### Bug Fixes
+
+* resolve new clippy lints from stable toolchain update ([#286](https://github.com/panbanda/higgs/issues/286)) ([8fb011c](https://github.com/panbanda/higgs/commit/8fb011c905b619ab017d66dff64156e6baced314))
+
 ## [1.7.0](https://github.com/panbanda/higgs/compare/higgs-models-v1.6.1...higgs-models-v1.7.0) (2026-08-18)
 
 
