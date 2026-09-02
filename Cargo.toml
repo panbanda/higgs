@@ -79,7 +79,7 @@ higgs-engine = { path = "crates/higgs-engine" }
 higgs-models = { path = "crates/higgs-models" }
 
 # MLX
-mlx-rs = { git = "https://github.com/oxideai/mlx-rs.git", rev = "cd70e2d07362d62d58dbd3b3c970f350e90675d5" }
+mlx-rs = { git = "https://github.com/oxideai/mlx-rs.git", rev = "d14407610042ade16fc42b39e209be5eecdab2bf" }
 mlx-sys = { git = "https://github.com/oxideai/mlx-rs.git", rev = "cd70e2d07362d62d58dbd3b3c970f350e90675d5" }
 
 # HTTP
