@@ -8,36 +8,36 @@
 :root {
   color-scheme: dark;
 
-  --bg: #14110d;
-  --bg-rail: #110e0b;
-  --bg-panel: #1a1611;
-  --bg-raised: #211c16;
-  --bg-fresh: #2a2118;
-  --border: #2b251e;
-  --border-strong: #3a332b;
+  --bg: #06071a;
+  --bg-rail: #040514;
+  --bg-panel: #0c0e28;
+  --bg-raised: #131637;
+  --bg-fresh: #1b1d4a;
+  --border: #1d2050;
+  --border-strong: #2c3070;
 
-  --text: #ece6dc;
-  --text-muted: #a39a8c;
-  --text-accent: #ffd9a8;
+  --text: #eceeff;
+  --text-muted: #9d9fcb;
+  --text-accent: #d6c8ff;
 
-  --accent: #f0a44b;
-  --accent-hover: #ffc27a;
-  --accent-text: #1a1408;
+  --accent: #8b6cff;
+  --accent-hover: #a78bfa;
+  --accent-text: #ffffff;
 
-  --ok: #6fcf8b;
-  --warn: #e5b25a;
-  --bad: #ef6b5c;
-  --thinking: #b8a6ff;
-  --neutral: #8a7f70;
+  --ok: #5fd3a3;
+  --warn: #f0c060;
+  --bad: #ff6b7a;
+  --thinking: #5fc8f3;
+  --neutral: #5d6194;
 
-  --chart-1: #8a7f70;
-  --chart-1-strong: #f0a44b;
+  --chart-1: #5d6194;
+  --chart-1-strong: #a78bfa;
 
   /* Legacy aliases used throughout the other views. */
   --bg-elevated: var(--bg-panel);
   --bg-muted: var(--bg-raised);
   --bg-sidebar: var(--bg-rail);
-  --bg-user: #211c16;
+  --bg-user: #131637;
 
   --mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
   --sans: "Manrope", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -1323,7 +1323,7 @@ a:focus-visible {
 .btn.stop,
 .btn.danger {
   background: var(--bad);
-  color: #1a1408;
+  color: var(--accent-text);
   border-color: var(--bad);
 }
 
