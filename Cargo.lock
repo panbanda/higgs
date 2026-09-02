@@ -1717,7 +1717,7 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "mlx-rs",
- "mlx-sys",
+ "mlx-sys 0.2.0 (git+https://github.com/oxideai/mlx-rs.git?rev=cd70e2d07362d62d58dbd3b3c970f350e90675d5)",
  "outlines-core",
  "serde",
  "serde_json",
@@ -1737,7 +1737,7 @@ dependencies = [
  "half",
  "image",
  "mlx-rs",
- "mlx-sys",
+ "mlx-sys 0.2.0 (git+https://github.com/oxideai/mlx-rs.git?rev=cd70e2d07362d62d58dbd3b3c970f350e90675d5)",
  "rand 0.10.2",
  "safetensors",
  "serde",
@@ -2471,7 +2471,7 @@ dependencies = [
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=cd70e2d07362d62d58dbd3b3c970f350e90675d5#cd70e2d07362d62d58dbd3b3c970f350e90675d5"
+source = "git+https://github.com/oxideai/mlx-rs.git?rev=d14407610042ade16fc42b39e209be5eecdab2bf#d14407610042ade16fc42b39e209be5eecdab2bf"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -2483,7 +2483,7 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=cd70e2d07362d62d58dbd3b3c970f350e90675d5#cd70e2d07362d62d58dbd3b3c970f350e90675d5"
+source = "git+https://github.com/oxideai/mlx-rs.git?rev=d14407610042ade16fc42b39e209be5eecdab2bf#d14407610042ade16fc42b39e209be5eecdab2bf"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -2494,7 +2494,7 @@ dependencies = [
 [[package]]
 name = "mlx-rs"
 version = "0.25.3"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=cd70e2d07362d62d58dbd3b3c970f350e90675d5#cd70e2d07362d62d58dbd3b3c970f350e90675d5"
+source = "git+https://github.com/oxideai/mlx-rs.git?rev=d14407610042ade16fc42b39e209be5eecdab2bf#d14407610042ade16fc42b39e209be5eecdab2bf"
 dependencies = [
  "dyn-clone",
  "half",
@@ -2503,7 +2503,7 @@ dependencies = [
  "mach-sys",
  "mlx-internal-macros",
  "mlx-macros",
- "mlx-sys",
+ "mlx-sys 0.2.0 (git+https://github.com/oxideai/mlx-rs.git?rev=d14407610042ade16fc42b39e209be5eecdab2bf)",
  "num-complex",
  "num-traits",
  "num_enum",
@@ -2518,6 +2518,16 @@ dependencies = [
 name = "mlx-sys"
 version = "0.2.0"
 source = "git+https://github.com/oxideai/mlx-rs.git?rev=cd70e2d07362d62d58dbd3b3c970f350e90675d5#cd70e2d07362d62d58dbd3b3c970f350e90675d5"
+dependencies = [
+ "bindgen",
+ "cc",
+ "cmake",
+]
+
+[[package]]
+name = "mlx-sys"
+version = "0.2.0"
+source = "git+https://github.com/oxideai/mlx-rs.git?rev=d14407610042ade16fc42b39e209be5eecdab2bf#d14407610042ade16fc42b39e209be5eecdab2bf"
 dependencies = [
  "bindgen",
  "cc",
