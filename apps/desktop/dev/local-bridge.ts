@@ -107,6 +107,32 @@ async function isContainedStrict(root: string, candidate: string): Promise<boole
  * log configured outside the config dir (still constrained to the user's
  * home directory).
  */
+/** `[[models]].path` from every config file in the config dir; the only local
+ * directories `model_cache_info` may size. */
+async function configuredModelPaths(): Promise<Set<string>> {
+  const dir = configDir();
+  const paths = new Set<string>();
+  let entries: string[];
+  try {
+    entries = await fs.readdir(dir);
+  } catch {
+    return paths;
+  }
+  for (const name of entries) {
+    if (name !== "config.toml" && !/^config\..+\.toml$/.test(name)) continue;
+    try {
+      const raw = await fs.readFile(path.join(dir, name), "utf8");
+      const parsed = parseToml(raw) as { models?: Array<{ path?: unknown }> };
+      for (const model of parsed.models ?? []) {
+        if (typeof model?.path === "string" && model.path) paths.add(expandHome(model.path));
+      }
+    } catch {
+      // Unreadable or invalid profiles contribute nothing.
+    }
+  }
+  return paths;
+}
+
 async function configuredMetricsLogPaths(): Promise<Set<string>> {
   const dir = configDir();
   const paths = new Set<string>();
@@ -736,10 +762,15 @@ const handlers: Record<string, Handler> = {
   async model_cache_info({ path: p }) {
     const model = String(p);
     const direct = expandHome(model);
-    if (await exists(direct)) return { path: model, cached: true, size_bytes: await dirSize(direct), location: direct };
+    // Only directories some profile lists under [[models]].path may be sized directly.
+    if ((await configuredModelPaths()).has(direct) && (await exists(direct))) {
+      return { path: model, cached: true, size_bytes: await dirSize(direct), location: direct };
+    }
     const hub = process.env.HF_HOME ? path.join(process.env.HF_HOME, "hub") : path.join(os.homedir(), ".cache/huggingface/hub");
     const repo = path.join(hub, `models--${model.replace(/\//g, "--")}`);
-    if (await exists(repo)) return { path: model, cached: true, size_bytes: await dirSize(path.join(repo, "blobs")), location: repo };
+    if ((await isContainedStrict(hub, repo)) && (await exists(repo))) {
+      return { path: model, cached: true, size_bytes: await dirSize(path.join(repo, "blobs")), location: repo };
+    }
     return { path: model, cached: false, size_bytes: 0, location: null };
   },
   async hub_search({ query, author, pipelineTag, token, limit }) {

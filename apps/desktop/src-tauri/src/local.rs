@@ -110,6 +110,36 @@ fn configured_metrics_logs(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// `[[models]].path` from every config file in the config dir. Local model
+/// directories may only be inspected when a profile actually references them.
+fn configured_model_paths(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("config") && name.ends_with(".toml")
+        })
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .filter_map(|raw| toml::from_str::<toml::Value>(&raw).ok())
+        .flat_map(|value| {
+            value
+                .get("models")
+                .and_then(|models| models.as_array())
+                .map(|models| {
+                    models
+                        .iter()
+                        .filter_map(|model| model.get("path")?.as_str().map(expand_home))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
 /// True when `candidate` is `allowed` itself or one of its numbered
 /// rotations (`metrics.jsonl.1`, `metrics.jsonl.2`, ...).
 fn is_same_or_rotation(allowed: &Path, candidate: &Path) -> bool {
@@ -793,8 +823,18 @@ fn dir_size(path: &Path) -> u64 {
 
 #[tauri::command]
 pub fn model_cache_info(path: String) -> ModelCacheInfo {
+    model_cache_info_in(&config_dir(), path)
+}
+
+/// Sizes a model on disk. `path` is either a Hugging Face repo id resolved
+/// inside the hub cache, or a local directory that some profile lists under
+/// `[[models]].path`; arbitrary paths are never inspected.
+fn model_cache_info_in(config_dir: &Path, path: String) -> ModelCacheInfo {
     let direct = expand_home(&path);
-    if direct.is_dir() {
+    let allowed_local = configured_model_paths(config_dir)
+        .iter()
+        .any(|allowed| allowed == &direct);
+    if allowed_local && direct.is_dir() {
         return ModelCacheInfo {
             path,
             cached: true,
@@ -806,7 +846,10 @@ pub fn model_cache_info(path: String) -> ModelCacheInfo {
         .map(|home| PathBuf::from(home).join("hub"))
         .ok()
         .or_else(|| home_dir().map(|home| home.join(".cache/huggingface/hub")));
-    let repo_dir = hub.map(|hub| hub.join(format!("models--{}", path.replace('/', "--"))));
+    let repo_dir = hub.and_then(|hub| {
+        let dir = hub.join(format!("models--{}", path.replace('/', "--")));
+        crate::paths::is_contained_strict(&hub, &dir).then_some(dir)
+    });
     match repo_dir {
         Some(dir) if dir.is_dir() => ModelCacheInfo {
             path,
@@ -853,6 +896,32 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn model_cache_info_only_sizes_configured_local_paths() {
+        let dir = TempDir::new("model-cache-info");
+        let listed = dir.path.join("listed-model");
+        let unlisted = dir.path.join("unlisted-model");
+        std::fs::create_dir_all(&listed).expect("create listed");
+        std::fs::create_dir_all(&unlisted).expect("create unlisted");
+        std::fs::write(listed.join("weights.bin"), [0u8; 16]).expect("write weights");
+        std::fs::write(
+            dir.path.join("config.toml"),
+            format!(
+                "[[models]]\nname = \"m\"\npath = \"{}\"\n",
+                listed.display()
+            ),
+        )
+        .expect("write config");
+
+        let info = model_cache_info_in(&dir.path, listed.to_string_lossy().into_owned());
+        assert!(info.cached);
+        assert_eq!(info.size_bytes, 16);
+
+        let info = model_cache_info_in(&dir.path, unlisted.to_string_lossy().into_owned());
+        assert!(!info.cached);
+        assert_eq!(info.location, None);
     }
 
     #[test]
