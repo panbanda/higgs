@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt as _;
 use tokio_util::sync::CancellationToken;
 
-use crate::paths::is_contained;
+use crate::paths::{is_contained, is_contained_strict};
 
 const HUB_BASE: &str = "https://huggingface.co";
 const DEFAULT_AUTHOR: &str = "mlx-community";
@@ -88,6 +88,20 @@ fn is_safe_relative_path(rfilename: &str) -> bool {
 /// somewhere in the cache layout. See [`crate::paths::is_contained`].
 fn path_within(base: &Path, candidate: &Path) -> bool {
     is_contained(base, candidate)
+}
+
+/// Creates `dir` (and parents) only if it sits inside `base` and is not itself a
+/// symlink, so a planted link such as `models--x--y -> /elsewhere` cannot redirect
+/// cache writes outside the cache root.
+fn create_dir_within(base: &Path, dir: &Path) -> Result<(), String> {
+    if !is_contained_strict(base, dir) {
+        return Err(format!(
+            "refusing to write through {}: outside or symlinked within {}",
+            dir.display(),
+            base.display()
+        ));
+    }
+    std::fs::create_dir_all(dir).map_err(|error| error.to_string())
 }
 
 fn client(timeout: Duration) -> Result<reqwest::Client, String> {
@@ -467,9 +481,11 @@ async fn do_hub_download(
     let blobs_dir = repo_dir.join("blobs");
     let snapshot_dir = repo_dir.join("snapshots").join(&detail.sha);
     let refs_dir = repo_dir.join("refs");
-    std::fs::create_dir_all(&blobs_dir).map_err(|error| error.to_string())?;
-    std::fs::create_dir_all(&snapshot_dir).map_err(|error| error.to_string())?;
-    std::fs::create_dir_all(&refs_dir).map_err(|error| error.to_string())?;
+    create_dir_within(&root, &repo_dir)?;
+    create_dir_within(&root, &blobs_dir)?;
+    create_dir_within(&root, &repo_dir.join("snapshots"))?;
+    create_dir_within(&root, &snapshot_dir)?;
+    create_dir_within(&root, &refs_dir)?;
     std::fs::write(refs_dir.join("main"), &detail.sha).map_err(|error| error.to_string())?;
 
     let total_bytes: u64 = detail.siblings.iter().filter_map(|s| s.size).sum();
@@ -509,7 +525,7 @@ async fn do_hub_download(
             return Err(format!("invalid blob etag: {etag}"));
         }
         let blob_path = blobs_dir.join(&etag);
-        if !path_within(&blobs_dir, &blob_path) {
+        if !is_contained_strict(&blobs_dir, &blob_path) {
             return Err(format!(
                 "blob path escaped blobs dir: {}",
                 blob_path.display()
@@ -648,7 +664,7 @@ fn link_snapshot_file(
         ));
     }
     if let Some(parent) = link_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        create_dir_within(snapshot_dir, parent)?;
     }
     if link_path.exists() || link_path.is_symlink() {
         std::fs::remove_file(&link_path).map_err(|error| error.to_string())?;
@@ -696,7 +712,7 @@ pub fn hub_delete(repo: String) -> Result<(), String> {
     }
     let root = hub_cache_root()?;
     let repo_dir = root.join(repo_dir_name(&repo));
-    if !path_within(&root, &repo_dir) {
+    if !is_contained_strict(&root, &repo_dir) {
         return Err(format!(
             "repo path escaped cache root: {}",
             repo_dir.display()
@@ -780,6 +796,29 @@ mod tests {
         let linked = root.join("models--escaped");
         std::os::unix::fs::symlink(&outside, &linked).expect("symlink dir");
         assert!(!path_within(&root, &linked.join("blobs/etag")));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_within_rejects_a_symlinked_repo_dir() {
+        let unique = std::process::id();
+        let root = std::env::temp_dir().join(format!("higgs-hub-test-mkdir-root-{unique}"));
+        let outside = std::env::temp_dir().join(format!("higgs-hub-test-mkdir-outside-{unique}"));
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::create_dir_all(&outside).expect("create outside dir");
+        let linked = root.join("models--planted");
+        std::os::unix::fs::symlink(&outside, &linked).expect("symlink dir");
+
+        assert!(create_dir_within(&root, &linked).is_err());
+        assert!(create_dir_within(&root, &linked.join("blobs")).is_err());
+        assert!(!outside.join("blobs").exists());
+
+        let honest = root.join("models--honest").join("blobs");
+        assert!(create_dir_within(&root, &honest).is_ok());
+        assert!(honest.is_dir());
+
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&outside).ok();
     }
