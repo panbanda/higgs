@@ -107,19 +107,14 @@ export default function App() {
     else window.open(GITHUB_URL, "_blank", "noopener,noreferrer");
   };
 
-  const healthy = data.health?.ok ?? false;
-  const servingModel = data.system?.models.find((model) => model.name === settings.model) ?? data.system?.models[0] ?? null;
 
   return (
     <div className="app">
       <nav className="rail" data-tauri-drag-region>
         <div className="rail-brand" data-tauri-drag-region>
-          <img className="rail-brand-mark" src="/brand.png" alt="" width={30} height={30} />
           <div className="rail-brand-text">
             <span className="rail-brand-name">Higgs</span>
-            <span className="label" style={{ fontSize: 11 }}>
-              Inference console
-            </span>
+            <span className="rail-brand-tagline">Inference console</span>
           </div>
         </div>
         <div className="rail-nav">
@@ -137,10 +132,6 @@ export default function App() {
         </div>
         <div className="rail-spacer" />
         <div className="rail-foot">
-          <div className="rail-foot-serving">
-            <span className={`status-dot ${data.health === null ? "unknown" : healthy ? "ok" : "bad"}`} />
-            <span>{servingModel ? `${servingModel.name} · ${servingModel.engine} · ${healthy ? "serving" : "stopped"}` : "no model loaded"}</span>
-          </div>
           <div className="rail-foot-meta">
             <span className="mono">{data.system ? `v${data.system.version}` : "–"}</span>
             <a
