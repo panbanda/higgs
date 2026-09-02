@@ -128,6 +128,7 @@ mod tests {
             input_tokens: 100,
             output_tokens: 200,
             error_body: None,
+            timing: crate::metrics::RequestTiming::default(),
         }
     }
 

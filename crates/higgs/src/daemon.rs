@@ -52,6 +52,36 @@ pub fn write_pid_file(profile: Option<&str>) {
     }
 }
 
+/// Bundle identifier of the desktop app, matching `apps/desktop/src-tauri/tauri.conf.json`.
+pub const DESKTOP_BUNDLE_ID: &str = "com.panbanda.higgs";
+
+/// Launch the desktop app. Returns a process exit code.
+#[allow(clippy::print_stderr)]
+pub fn cmd_ui() -> i32 {
+    if !cfg!(target_os = "macos") {
+        eprintln!("the Higgs desktop app is only available on macOS");
+        return 1;
+    }
+    // LaunchServices prints its own lookup failure to stderr; the hint below is enough.
+    match std::process::Command::new("open")
+        .args(["-b", DESKTOP_BUNDLE_ID])
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => 0,
+        Ok(_) => {
+            eprintln!(
+                "Higgs.app is not installed. Install it with:\n  brew install --cask panbanda/brews/higgs-desktop\nor download it from https://github.com/panbanda/higgs/releases"
+            );
+            1
+        }
+        Err(e) => {
+            eprintln!("failed to run open: {e}");
+            1
+        }
+    }
+}
+
 #[allow(clippy::print_stderr)]
 pub fn cmd_stop(profile: Option<&str>, force: bool) -> i32 {
     let label = profile.map_or_else(|| "higgs".to_owned(), |p| format!("higgs [{p}]"));

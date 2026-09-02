@@ -1,0 +1,192 @@
+/* Overview only. Shared primitives (.view, .card, .panel, .data-table, .pill, ...)
+   live in ../styles.css. */
+
+.hero-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 320px;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.hero-panel {
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.hero-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.hero-value-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.hero-value {
+  font-size: 36px;
+}
+
+.hero-note {
+  font-size: 12px;
+}
+
+.hero-note.ok {
+  color: var(--ok);
+}
+
+.hero-note.bad {
+  color: var(--bad);
+}
+
+.hero-note.neutral {
+  color: var(--text-muted);
+}
+
+.hero-footer {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* TTFT threshold bar */
+.threshold-bar {
+  position: relative;
+  height: 10px;
+  background: var(--bg-raised);
+  border-radius: 2px;
+}
+
+.threshold-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  background: var(--neutral);
+  border-radius: 2px;
+}
+
+.threshold-marker {
+  position: absolute;
+  top: -3px;
+  width: 2px;
+  height: 16px;
+}
+
+.threshold-marker.warn {
+  background: var(--warn);
+}
+
+.threshold-marker.ok {
+  background: var(--ok);
+}
+
+/* Latency bars */
+.latency-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.latency-row {
+  display: grid;
+  grid-template-columns: 36px 1fr 64px;
+  align-items: center;
+  gap: 10px;
+}
+
+.latency-bar {
+  height: 6px;
+  background: var(--bg-raised);
+  border-radius: 2px;
+}
+
+.latency-bar-fill {
+  height: 100%;
+  border-radius: 2px;
+}
+
+.latency-bar-fill.neutral {
+  background: var(--neutral);
+}
+
+.latency-bar-fill.warn {
+  background: var(--warn);
+}
+
+.latency-value {
+  font-size: 12px;
+  text-align: right;
+}
+
+/* Row 2: live log + side column */
+.live-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 16px;
+  flex: 1;
+  min-height: 0;
+}
+
+.live-log-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+.live-log-panel .table-wrap {
+  overflow-y: auto;
+}
+
+.live-log-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+}
+
+.side-col {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px 16px 16px;
+  overflow-y: auto;
+}
+
+.side-col-header {
+  display: flex;
+  justify-content: space-between;
+}
+
+.side-col-footnote {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.status-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.status-row {
+  display: grid;
+  grid-template-columns: 6px 1fr 40px;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.status-count {
+  text-align: right;
+}

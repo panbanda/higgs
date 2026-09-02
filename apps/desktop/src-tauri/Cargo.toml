@@ -1,0 +1,30 @@
+[package]
+name = "higgs-desktop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+license = "MIT"
+description = "Desktop chat UI for the Higgs inference server"
+
+# Standalone workspace so the root `cargo build` does not pull in Tauri.
+[workspace]
+
+[lib]
+name = "higgs_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
+tokio = { version = "1", features = ["sync", "macros", "fs", "io-util"] }
+tokio-util = "0.7"
+toml = "0.8"
+security-framework = "3"
+directories = "6"

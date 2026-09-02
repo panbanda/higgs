@@ -68,6 +68,7 @@ async fn metrics_endpoint_returns_snapshot_json() {
         input_tokens: 12,
         output_tokens: 34,
         error_body: None,
+        timing: higgs::metrics::RequestTiming::default(),
     });
 
     let app = build_router(build_test_state(Some(metrics)), 300.0, None, 0, 1024, None);

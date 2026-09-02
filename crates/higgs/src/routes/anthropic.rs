@@ -18,7 +18,7 @@ use crate::{
     anthropic_adapter::{anthropic_messages_to_engine, openai_finish_to_anthropic_stop},
     config::ApiFormat,
     error::ServerError,
-    metrics::{MetricsStore, RequestMetricsContext},
+    metrics::{MetricsStore, RequestMetricsContext, RequestTiming},
     router::ResolvedRoute,
     state::{Engine, SharedState},
     types::anthropic::{
@@ -37,6 +37,9 @@ pub async fn create_message(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<axum::response::Response, ServerError> {
+    // Captured before parsing and prompt preparation so TTFT measures
+    // the client-observed wait, not only generation.
+    let received_at = Instant::now();
     let mut req: CreateMessageRequest = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("Invalid request body: {e}")))?;
     request_metrics.set_requested_model(&req.model);
@@ -69,8 +72,13 @@ pub async fn create_message(
             req.model = model_name;
             let start = Instant::now();
             if req.stream == Some(true) {
-                let stream =
-                    create_message_stream(req, engine, state.metrics.clone(), routing_method)?;
+                let stream = create_message_stream(
+                    req,
+                    engine,
+                    state.metrics.clone(),
+                    routing_method,
+                    received_at,
+                )?;
                 let sse = Sse::new(stream).keep_alive(KeepAlive::default());
                 if state.metrics.is_some() {
                     request_metrics.mark_recorded();
@@ -91,6 +99,7 @@ pub async fn create_message(
                         input_tokens: u64::from(response.usage.input_tokens),
                         output_tokens: u64::from(response.usage.output_tokens),
                         error_body: None,
+                        timing: crate::metrics::RequestTiming::default(),
                     });
                     request_metrics.mark_recorded();
                 }
@@ -221,6 +230,7 @@ pub async fn create_message(
                     input_tokens: usage.0,
                     output_tokens: usage.1,
                     error_body: None,
+                    timing: crate::metrics::RequestTiming::default(),
                 });
                 request_metrics.mark_recorded();
             }
@@ -318,6 +328,7 @@ fn create_message_stream(
     engine: Arc<Engine>,
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,
+    received_at: Instant,
 ) -> Result<impl Stream<Item = Result<Event, Infallible>>, ServerError> {
     let max_tokens = req.max_tokens;
     let sampling = SamplingParams {
@@ -358,8 +369,9 @@ fn create_message_stream(
             None,
             &tx,
             thinking_enabled,
-            // Anthropic streaming does not surface prefill progress.
-            false,
+            // Progress events are consumed for metrics only; the Anthropic
+            // stream never surfaces them.
+            true,
             None,
             None,
         );
@@ -368,7 +380,7 @@ fn create_message_stream(
         }
     });
 
-    let start = Instant::now();
+    let start = received_at;
     let metrics_id = metrics.as_ref().map(|m| {
         m.record_pending(crate::metrics::RequestRecord {
             id: 0,
@@ -382,6 +394,7 @@ fn create_message_stream(
             input_tokens: u64::from(prompt_token_count),
             output_tokens: 0,
             error_body: None,
+            timing: crate::metrics::RequestTiming::default(),
         })
     });
 
@@ -431,7 +444,15 @@ fn create_message_stream(
         };
 
         let mut delta_writer = crate::sse::AnthropicDeltaWriter::new();
+        let mut timing = RequestTiming::default();
         while let Some(output) = rx.recv().await {
+            if let Some(p) = output.prefill_progress {
+                timing.cached_tokens = Some(u64::from(p.cached));
+                continue;
+            }
+            if timing.ttft_ms.is_none() {
+                timing.ttft_ms = Some(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
+            }
             let (visible, _reasoning) = reasoning_tracker.process(&output.new_text);
 
             if !visible.is_empty() {
@@ -465,7 +486,7 @@ fn create_message_stream(
 
         if let Some(ref m) = metrics {
             if let Some(id) = metrics_id {
-                m.finalize_stream(id, u64::from(total_output_tokens), start.elapsed());
+                m.finalize_stream(id, u64::from(total_output_tokens), start.elapsed(), timing);
             }
         }
 

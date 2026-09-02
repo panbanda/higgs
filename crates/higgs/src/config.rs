@@ -54,6 +54,8 @@ pub enum Commands {
     Stop(StopArgs),
     /// Open the daemon metrics dashboard.
     Attach,
+    /// Open the Higgs desktop app (macOS).
+    Ui,
     /// Create a default config file at ~/.config/higgs/config.toml.
     Init,
     /// Print shell environment variables (for eval).

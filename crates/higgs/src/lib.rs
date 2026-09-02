@@ -23,7 +23,7 @@ pub mod types;
 
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -50,7 +50,8 @@ use crate::state::SharedState;
 type SharedRateLimiter = Arc<RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>>;
 
 // Observability/control-plane routes must never perturb API traffic metrics.
-const INFRASTRUCTURE_PATHS: &[&str] = &["/health", "/metrics"];
+/// Requests that dashboards poll; they never count as traffic in metrics.
+const INFRASTRUCTURE_PATHS: &[&str] = &["/health", "/metrics", "/v1/models", "/v1/system"];
 
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
@@ -70,8 +71,10 @@ pub fn build_router(
 ) -> Router {
     let timeout_duration = Duration::from_secs_f64(timeout_secs);
 
+    LazyLock::force(&routes::system::STARTED_AT);
     let mut api_routes = Router::new()
         .route("/metrics", get(routes::metrics::metrics))
+        .route("/v1/system", get(routes::system::system))
         .route("/v1/models", get(routes::models::list_models))
         .route("/v1/chat/completions", post(routes::chat::chat_completions))
         .route("/v1/completions", post(routes::completions::completions))
@@ -154,6 +157,7 @@ async fn record_http_response(
             output_tokens: 0,
             error_body: (!status.is_success())
                 .then(|| status.canonical_reason().unwrap_or("HTTP error").to_owned()),
+            timing: crate::metrics::RequestTiming::default(),
         });
     }
 

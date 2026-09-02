@@ -1,0 +1,12 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+
+# The bundled `higgs` CLI and mlx.metallib copied in by the release workflow
+# (see .github/workflows/release.yml, `desktop` job) before `tauri build`.
+# tauri.conf.json's bundle.resources only matters to `tauri build`; `tauri
+# dev` and `cargo check`/`cargo build` never read this directory, so local
+# dev works fine with it empty.
+src-tauri/resources/bin/*
+!src-tauri/resources/bin/.gitkeep

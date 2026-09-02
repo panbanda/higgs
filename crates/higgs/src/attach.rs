@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::config::MetricsLogConfig;
-use crate::metrics::{MetricsStore, RequestRecord, RoutingMethod};
+use crate::metrics::{MetricsStore, RequestRecord, RequestTiming, RoutingMethod};
 use crate::metrics_log::rotated_path;
 
 #[derive(Debug, Deserialize)]
@@ -22,6 +22,10 @@ struct LogEntry {
     input_tokens: u64,
     output_tokens: u64,
     error: Option<String>,
+    #[serde(default)]
+    ttft_ms: Option<u64>,
+    #[serde(default)]
+    cached_tokens: Option<u64>,
 }
 
 pub fn parse_log_entry(line: &str) -> Option<RequestRecord> {
@@ -47,6 +51,10 @@ pub fn parse_log_entry(line: &str) -> Option<RequestRecord> {
         input_tokens: entry.input_tokens,
         output_tokens: entry.output_tokens,
         error_body: entry.error,
+        timing: RequestTiming {
+            ttft_ms: entry.ttft_ms,
+            cached_tokens: entry.cached_tokens,
+        },
     })
 }
 

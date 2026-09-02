@@ -98,6 +98,7 @@ pub async fn embeddings(
                     input_tokens: u64::from(total_tokens),
                     output_tokens: 0,
                     error_body: None,
+                    timing: crate::metrics::RequestTiming::default(),
                 });
                 request_metrics.mark_recorded();
             }
@@ -159,6 +160,7 @@ pub async fn embeddings(
                     input_tokens: 0,
                     output_tokens: 0,
                     error_body: None,
+                    timing: crate::metrics::RequestTiming::default(),
                 });
                 request_metrics.mark_recorded();
             }

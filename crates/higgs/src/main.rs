@@ -51,6 +51,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             higgs::daemon::run_attached(&config, profile);
             Ok(())
         }
+        Commands::Ui => {
+            let exit_code = higgs::daemon::cmd_ui();
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
         Commands::Init => {
             higgs::daemon::cmd_init(profile);
             Ok(())

@@ -235,3 +235,31 @@ higgs exec -- aider --model openai/gpt-4o
 - `higgs start` no longer accepts serve-style flags like `--model`, `--port`, or `--batch`.
 - `higgs attach` now fails fast unless the daemon is alive, `/health` passes, and metrics logging is enabled.
 - `/metrics` is available and `server.max_body_size` is enforced on API routes.
+
+## Local model options
+
+For a local model, set `kv_disk_dir` in its `[[models]]` entry to retain block-aligned
+prefix KV state across restarts. `kv_disk_space_mb` controls its on-disk LRU budget
+(default `4096`, minimum `64`). The disk tier is model, quantization, configuration,
+tokenizer, and chat-template bound; incompatible entries are ignored.
+
+For DeepSeek-V2 models, set `mla_latent_cache = true` in its `[[models]]` entry to store
+the MLA KV cache as compressed latent rows instead of dense per-head tensors (default
+off). It cannot be combined with `kv_cache = "turboquant"`, and is a no-op for
+non-DeepSeek-V2 architectures. The `HIGGS_MLA_LATENT_CACHE` env var, when set to a
+recognized value (`1`/`0`, `true`/`false`, `on`/`off`, `yes`/`no`), overrides the config
+value either way.
+
+## Migration notes
+
+- Replace old `higgs start --model ...` usage with `higgs serve --model ...`.
+- `higgs attach` fails fast when the daemon is down or metrics logging is disabled; it is a
+  metrics dashboard, not a best-effort log viewer.
+- Exact local model names now beat regex routes; rename a local model or route if you relied
+  on a regex overriding a local model of the same name.
+- The server binds `127.0.0.1` by default. Set `server.host = "0.0.0.0"` and an `api_key` to
+  expose it on the network.
+- CORS headers are only sent when `server.cors_origins` is set (`["*"]` restores the old
+  permissive behavior).
+- Source builds need `mlx.metallib` next to the executable; `cargo build` restores it from
+  Cargo output when possible.
