@@ -330,7 +330,7 @@ jobs:
             desc "Desktop dashboard and chat UI for the Higgs inference server; bundles the higgs CLI"
             homepage "https://github.com/panbanda/higgs"
 
-            depends_on macos: ">= :sonoma"
+            depends_on macos: :sonoma
             depends_on arch: :arm64
 
             app "Higgs.app"
