@@ -91,7 +91,7 @@ whole call: request accepted, per-round prefill (with cache hits), thinking,
 generation, tool execution, stream closed, on a time axis with duration and
 share per span and stalls over one second marked. The scope switch narrows the
 axis to one round. Throughput, Tokens, Request (with Replay and Copy as curl),
-and Response (every SSE chunk) cover the rest. "Copy as Markdown" produces a
+and Response (every SSE chunk) cover the rest. The "Markdown" button produces a
 fixed-format report of the run for sharing speed numbers.
 
 **Config.** Form and raw TOML editors for the active config or profile, saved

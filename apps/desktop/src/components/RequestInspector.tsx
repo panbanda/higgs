@@ -84,12 +84,13 @@ function ChevronRightIcon() {
   );
 }
 
-function CopyButton({ text, label = "Copy" }: { text: string; label?: string }) {
+function CopyButton({ text, label = "Copy", title }: { text: string; label?: string; title?: string }) {
   const [copied, setCopied] = useState(false);
   return (
     <button
       type="button"
       className="btn small ghost"
+      title={title}
       onClick={() => {
         void navigator.clipboard.writeText(text).then(() => {
           setCopied(true);
@@ -581,7 +582,7 @@ export function RequestInspector({ message, settings, system, onReplay, replayDi
             ))}
           </div>
           <div className="inspector-header-spacer" />
-          <CopyButton text={traceToMarkdown(message, settings, system)} label="Copy as Markdown" />
+          <CopyButton text={traceToMarkdown(message, settings, system)} label="Markdown" title="Copy the full trace as Markdown" />
         </div>
       </div>
       <div className="tabs">

@@ -366,6 +366,7 @@ a:focus-visible {
 }
 
 .signal-top {
+  white-space: nowrap;
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -375,6 +376,8 @@ a:focus-visible {
 .signal-state {
   font-family: var(--mono);
   font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .signal-state.ok {

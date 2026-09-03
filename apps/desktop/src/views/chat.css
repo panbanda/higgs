@@ -109,8 +109,8 @@
   min-height: 56px;
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 10px 16px;
+  gap: 8px;
+  padding: 10px 12px;
   border-bottom: 1px solid var(--border);
   flex-wrap: nowrap;
   overflow: hidden;
@@ -190,9 +190,8 @@
 }
 
 .chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
+  display: inline-block;
+  line-height: 20px;
   flex-shrink: 1;
   min-width: 0;
   max-width: 160px;
@@ -233,7 +232,7 @@
 
 /* Right: request inspector */
 .inspector {
-  width: 480px;
+  width: clamp(340px, 34%, 440px);
   flex-shrink: 0;
   border-left: 1px solid var(--border);
   background: var(--bg-rail);
@@ -658,4 +657,50 @@
   outline: 2px solid var(--accent);
   outline-offset: -2px;
   border-radius: 4px;
+}
+
+/* Narrow windows: keep the message column usable by shrinking the side panels. */
+@media (max-width: 1260px) {
+  .chat-sidebar:not(.collapsed) {
+    width: 180px;
+  }
+}
+
+.chat-main {
+  min-width: 320px;
+}
+
+.composer textarea {
+  min-width: 0;
+}
+
+/* In the top bar the chips share one line and shrink with an ellipsis
+   instead of wrapping or clipping. */
+.chat-topbar .param-chips {
+  flex: 1;
+  min-width: 0;
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+
+.chat-topbar > .btn,
+.chat-topbar > .icon-btn {
+  flex-shrink: 0;
+}
+
+/* Below 1700px the top bar cannot fit the model detail and the glance chips;
+   the detail is also in the Models view, so drop it first. */
+@media (max-width: 1700px) {
+  .chat-model-detail {
+    display: none;
+  }
+}
+
+/* The trace axis is ~100px wide when the inspector is at its narrow size;
+   keep only the start and end labels so they never overlap. */
+@media (max-width: 1700px) {
+  .waterfall-ticks span:nth-child(2),
+  .waterfall-ticks span:nth-child(3) {
+    display: none;
+  }
 }
