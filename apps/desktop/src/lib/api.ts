@@ -66,7 +66,7 @@ export interface ChatChunk {
  */
 export const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
-export const devBridge = !inTauri && import.meta.env.DEV;
+export const devBridge = import.meta.env.DEV && !inTauri;
 
 /** True when config, log, and daemon commands can run at all. */
 export const localAvailable = inTauri || devBridge;
