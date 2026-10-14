@@ -46,6 +46,8 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Use the opt-in fixed native image-to-mesh runtime.
+    Mesh(crate::mesh::MeshArgs),
     /// Start the server in the foreground.
     Serve(ServeArgs),
     /// Start the server as a background daemon from config or profile.
