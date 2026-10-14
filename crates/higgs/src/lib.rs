@@ -6,6 +6,7 @@ pub mod config;
 pub mod daemon;
 pub mod doctor;
 pub mod error;
+pub mod mesh;
 pub mod metrics;
 pub mod metrics_log;
 pub mod model_download;

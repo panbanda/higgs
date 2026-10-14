@@ -140,7 +140,6 @@ pub fn cmd_init(profile: Option<&str>) {
         |name| format!("config.{name}.toml"),
     );
     let path = dir.join(filename);
-
     if path.exists() {
         eprintln!("config already exists: {}", path.display());
         return;
@@ -155,9 +154,8 @@ pub fn cmd_init(profile: Option<&str>) {
         || "~/.config/higgs/logs/metrics.jsonl".to_owned(),
         |name| format!("~/.config/higgs/logs/metrics.{name}.jsonl"),
     );
-
     let default_config = format!(
-        r#"[server]
+        r#"[server] # Optional mesh: ~/.local/share/higgs/mesh-runtime; `higgs mesh capabilities`; init never downloads checkpoints.
 # Bind to loopback by default. To expose on the network, set host = "0.0.0.0"
 # and set an api_key.
 host = "127.0.0.1"

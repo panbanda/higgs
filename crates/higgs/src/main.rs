@@ -32,6 +32,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let profile = cli.profile.as_deref();
 
     match cli.command {
+        Commands::Mesh(ref args) => {
+            let status = higgs::mesh::run(args)?;
+            if !status.success() {
+                return Err("Native mesh adapter failed".into());
+            }
+            Ok(())
+        }
         Commands::Serve(ref args) => cmd_serve(&cli, args).await,
         Commands::Start(ref args) => {
             reject_legacy_start_flags(args)?;
