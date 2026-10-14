@@ -33,11 +33,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Mesh(ref args) => {
+            use std::os::unix::process::ExitStatusExt;
+
             let status = higgs::mesh::run(args)?;
-            if !status.success() {
-                return Err("Native mesh adapter failed".into());
-            }
-            Ok(())
+            let code = status
+                .code()
+                .unwrap_or_else(|| status.signal().map_or(1, |signal| 128 + signal));
+            std::process::exit(code)
         }
         Commands::Serve(ref args) => cmd_serve(&cli, args).await,
         Commands::Start(ref args) => {
