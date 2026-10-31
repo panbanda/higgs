@@ -319,7 +319,26 @@ dependencies = [
  "quote",
  "regex",
  "rustc-hash",
- "shlex",
+ "shlex 1.3.0",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "bindgen"
+version = "0.73.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "787ef8ef523575546b106a58213d6e6b06198a05c2f757258c68a74273670cfa"
+dependencies = [
+ "bitflags 2.13.0",
+ "cexpr",
+ "clang-sys",
+ "log",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash",
+ "shlex 2.0.1",
  "syn 2.0.117",
 ]
 
@@ -460,7 +479,7 @@ dependencies = [
  "find-msvc-tools",
  "jobserver",
  "libc",
- "shlex",
+ "shlex 1.3.0",
 ]
 
 [[package]]
@@ -1717,7 +1736,7 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "mlx-rs",
- "mlx-sys",
+ "mlx-sys 0.7.0",
  "outlines-core",
  "serde",
  "serde_json",
@@ -1737,7 +1756,7 @@ dependencies = [
  "half",
  "image",
  "mlx-rs",
- "mlx-sys",
+ "mlx-sys 0.7.0",
  "rand 0.10.2",
  "safetensors",
  "serde",
@@ -2503,7 +2522,7 @@ dependencies = [
  "mach-sys",
  "mlx-internal-macros",
  "mlx-macros",
- "mlx-sys",
+ "mlx-sys 0.2.0",
  "num-complex",
  "num-traits",
  "num_enum",
@@ -2519,7 +2538,17 @@ name = "mlx-sys"
 version = "0.2.0"
 source = "git+https://github.com/oxideai/mlx-rs.git?rev=cd70e2d07362d62d58dbd3b3c970f350e90675d5#cd70e2d07362d62d58dbd3b3c970f350e90675d5"
 dependencies = [
- "bindgen",
+ "bindgen 0.72.1",
+ "cc",
+ "cmake",
+]
+
+[[package]]
+name = "mlx-sys"
+version = "0.7.0"
+source = "git+https://github.com/oxideai/mlx-rs.git?rev=409cebbd9ad402e8f902e27f914ae328dc3abd8f#409cebbd9ad402e8f902e27f914ae328dc3abd8f"
+dependencies = [
+ "bindgen 0.73.2",
  "cc",
  "cmake",
 ]
@@ -3802,6 +3831,12 @@ name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
+
+[[package]]
+name = "shlex"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "signal-hook"
