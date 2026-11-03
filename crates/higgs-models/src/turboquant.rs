@@ -21,6 +21,8 @@ const TWO_BIT_CENTROIDS: [f32; 4] = [-1.5104, -0.4528, 0.4528, 1.5104];
 const THREE_BIT_CENTROIDS: [f32; 8] = [
     -2.1520, -1.3440, -0.7560, -0.2451, 0.2451, 0.7560, 1.3440, 2.1520,
 ];
+// Lloyd-Max centroids for a unit Gaussian; ±1.6180 matches the golden ratio only by coincidence.
+#[allow(clippy::approx_constant)]
 const FOUR_BIT_CENTROIDS: [f32; 16] = [
     -2.7326, -2.0690, -1.6180, -1.2562, -0.9424, -0.6568, -0.3881, -0.1284, 0.1284, 0.3881, 0.6568,
     0.9424, 1.2562, 1.6180, 2.0690, 2.7326,

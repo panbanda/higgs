@@ -695,7 +695,7 @@ mod tests {
         assert_eq!(args.num_experts_per_tok, 8);
         assert_eq!(args.moe_intermediate_size, 1536);
         assert_eq!(args.decoder_sparse_step, 1);
-        assert!(args.mlp_only_layers.is_empty());
+        assert_eq!(args.mlp_only_layers, Vec::<i32>::new());
         assert!(args.norm_topk_prob);
         assert!(!args.tie_word_embeddings);
         assert!(!args.attention_bias);
@@ -735,7 +735,7 @@ mod tests {
         assert_eq!(args.num_experts_per_tok, 0);
         assert_eq!(args.moe_intermediate_size, 0);
         assert_eq!(args.decoder_sparse_step, 0);
-        assert!(args.mlp_only_layers.is_empty());
+        assert_eq!(args.mlp_only_layers, Vec::<i32>::new());
         assert!(!args.norm_topk_prob);
         assert!(args.quantization.is_none());
     }

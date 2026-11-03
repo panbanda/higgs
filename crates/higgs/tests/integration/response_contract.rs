@@ -374,7 +374,7 @@ fn anthropic_message_start_event() {
     let json = assert_event_type(&event, "message_start");
     assert_eq!(json["message"]["type"], "message");
     assert_eq!(json["message"]["role"], "assistant");
-    assert!(json["message"]["content"].as_array().unwrap().is_empty());
+    assert_eq!(json["message"]["content"], serde_json::json!([]));
     assert!(json["message"]["stop_reason"].is_null());
 }
 

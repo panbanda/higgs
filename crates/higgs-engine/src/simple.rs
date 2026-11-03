@@ -3244,18 +3244,24 @@ mod tests {
 
     #[test]
     fn test_extract_eos_tokens_missing_field() {
-        assert!(eos_from_config(r#"{"model_type": "qwen2"}"#).is_empty());
+        assert_eq!(
+            eos_from_config(r#"{"model_type": "qwen2"}"#),
+            Vec::<u32>::new()
+        );
     }
 
     #[test]
     fn test_extract_eos_tokens_unexpected_type() {
-        assert!(eos_from_config(r#"{"eos_token_id": "string"}"#).is_empty());
+        assert_eq!(
+            eos_from_config(r#"{"eos_token_id": "string"}"#),
+            Vec::<u32>::new()
+        );
     }
 
     #[test]
     fn test_extract_eos_tokens_missing_config_file() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(super::extract_eos_tokens(dir.path()).is_empty());
+        assert_eq!(super::extract_eos_tokens(dir.path()), Vec::<u32>::new());
     }
 
     // -- Additional check_stop_sequences edge cases --
@@ -3293,35 +3299,53 @@ mod tests {
     #[test]
     fn test_extract_eos_tokens_float_value() {
         // serde_json parses 151643.0 as a float, and as_u64() returns None for floats
-        assert!(eos_from_config(r#"{"eos_token_id": 151643.0}"#).is_empty());
+        assert_eq!(
+            eos_from_config(r#"{"eos_token_id": 151643.0}"#),
+            Vec::<u32>::new()
+        );
     }
 
     #[test]
     fn test_extract_eos_tokens_string_value() {
-        assert!(eos_from_config(r#"{"eos_token_id": "not_a_number"}"#).is_empty());
+        assert_eq!(
+            eos_from_config(r#"{"eos_token_id": "not_a_number"}"#),
+            Vec::<u32>::new()
+        );
     }
 
     #[test]
     fn test_extract_eos_tokens_nested_array() {
         // Inner arrays are not numbers, so as_u64() returns None for them
-        assert!(eos_from_config(r#"{"eos_token_id": [[1, 2], [3, 4]]}"#).is_empty());
+        assert_eq!(
+            eos_from_config(r#"{"eos_token_id": [[1, 2], [3, 4]]}"#),
+            Vec::<u32>::new()
+        );
     }
 
     #[test]
     fn test_extract_eos_tokens_negative_number() {
         // as_u64() returns None for negative numbers
-        assert!(eos_from_config(r#"{"eos_token_id": -1}"#).is_empty());
+        assert_eq!(
+            eos_from_config(r#"{"eos_token_id": -1}"#),
+            Vec::<u32>::new()
+        );
     }
 
     #[test]
     fn test_extract_eos_tokens_very_large_number() {
         // u32::MAX is 4294967295; as_u64() succeeds but u32::try_from fails
-        assert!(eos_from_config(r#"{"eos_token_id": 4294967296}"#).is_empty());
+        assert_eq!(
+            eos_from_config(r#"{"eos_token_id": 4294967296}"#),
+            Vec::<u32>::new()
+        );
     }
 
     #[test]
     fn test_extract_eos_tokens_empty_array() {
-        assert!(eos_from_config(r#"{"eos_token_id": []}"#).is_empty());
+        assert_eq!(
+            eos_from_config(r#"{"eos_token_id": []}"#),
+            Vec::<u32>::new()
+        );
     }
 
     #[test]

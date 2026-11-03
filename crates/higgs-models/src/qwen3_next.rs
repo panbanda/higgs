@@ -5804,7 +5804,7 @@ mod tests {
         assert_eq!(args.num_experts_per_tok, 0);
         assert_eq!(args.decoder_sparse_step, 0);
         assert!(args.norm_topk_prob);
-        assert!(args.mlp_only_layers.is_empty());
+        assert_eq!(args.mlp_only_layers, Vec::<i32>::new());
     }
 
     #[test]

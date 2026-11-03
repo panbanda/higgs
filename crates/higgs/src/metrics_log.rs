@@ -173,7 +173,7 @@ mod tests {
 
         // The main file should now be empty (new file created after rotation).
         let main_content = fs::read_to_string(&log_path).unwrap();
-        assert!(main_content.is_empty());
+        assert_eq!(main_content, "");
     }
 
     #[test]

@@ -103,7 +103,7 @@ fn chat_request_stop_array() {
 #[test]
 fn stop_sequence_extract_none() {
     let result = StopSequence::extract(None);
-    assert!(result.is_empty());
+    assert_eq!(result, Vec::<String>::new());
 }
 
 #[test]
