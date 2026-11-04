@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.1](https://github.com/panbanda/higgs/compare/higgs-v1.8.0...higgs-v1.8.1) (2026-11-04)
+
+
+### Bug Fixes
+
+* satisfy clippy lints added in Rust 1.99 ([#302](https://github.com/panbanda/higgs/issues/302)) ([837f1c2](https://github.com/panbanda/higgs/commit/837f1c2ac055e763bfc8f46eb4a263d0bd1582eb))
+
 ## [1.8.0](https://github.com/panbanda/higgs/compare/higgs-v1.7.0...higgs-v1.8.0) (2026-09-02)
 
 
