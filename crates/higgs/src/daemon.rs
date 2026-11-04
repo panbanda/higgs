@@ -118,18 +118,16 @@ pub fn cmd_stop(profile: Option<&str>, force: bool) -> i32 {
             }
             remove_pid_file(profile);
             eprintln!("stopped {label} (pid {pid})");
-            0
         }
         Some(_) => {
             remove_pid_file(profile);
             eprintln!("{label} is not running (stale pid file removed)");
-            0
         }
         None => {
             eprintln!("{label} is not running (no pid file)");
-            0
         }
     }
+    0
 }
 
 #[allow(clippy::print_stderr)]

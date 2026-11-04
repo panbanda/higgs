@@ -275,7 +275,7 @@ mod tests {
     fn only_think_block_no_visible() {
         let input = "<think>All reasoning, no response.</think>";
         let result = parse_reasoning(input);
-        assert!(result.text.is_empty());
+        assert_eq!(result.text, "");
         assert_eq!(
             result.reasoning.as_deref(),
             Some("All reasoning, no response.")
@@ -287,7 +287,7 @@ mod tests {
         let mut tracker = StreamingReasoningTracker::new();
 
         let (vis, reas) = tracker.process("<think>thinking");
-        assert!(vis.is_empty());
+        assert_eq!(vis, "");
         assert!(reas.contains("thinking") || tracker.has_reasoning());
 
         let (vis, reas) = tracker.process("</think>answer");
@@ -307,7 +307,7 @@ mod tests {
         let total_visible = format!("{vis}{vis2}");
         let total_reasoning = format!("{reas}{reas2}");
         assert!(total_visible.contains("Hello world"));
-        assert!(total_reasoning.is_empty());
+        assert_eq!(total_reasoning, "");
         assert!(!tracker.has_reasoning());
     }
 

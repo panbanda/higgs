@@ -91,7 +91,7 @@ pub(crate) fn compute_yarn_freqs(
         let mask = 1.0 - ramp;
         let inter = freq_inter[i];
         let extra = freq_extra[i];
-        let denom = inter * mask + extra * (1.0 - mask);
+        let denom = inter.mul_add(mask, extra * (1.0 - mask));
         freqs.push((inter * extra) / denom);
     }
 

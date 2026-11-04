@@ -675,7 +675,7 @@ mod tests {
 
     #[test]
     fn test_stop_sequence_extract() {
-        assert!(StopSequence::extract(None).is_empty());
+        assert_eq!(StopSequence::extract(None), Vec::<String>::new());
 
         let single = StopSequence::extract(Some(StopSequence::Single("x".to_owned())));
         assert_eq!(single, vec!["x"]);

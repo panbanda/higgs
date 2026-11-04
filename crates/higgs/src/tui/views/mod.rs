@@ -44,7 +44,7 @@ pub fn format_duration(dur: std::time::Duration) -> String {
     let total_secs = dur.as_secs_f64();
     if total_secs >= 60.0 {
         let mut minutes = (total_secs / 60.0).floor();
-        let mut seconds = total_secs - minutes * 60.0;
+        let mut seconds = minutes.mul_add(-60.0, total_secs);
         // Clamp to avoid "1m60.0s" from rounding
         if seconds >= 59.95 {
             minutes += 1.0;

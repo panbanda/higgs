@@ -822,13 +822,13 @@ mod tests {
     fn prompt_lookup_ignores_current_tail_self_match() {
         let context = [1, 2, 3, 4];
 
-        assert!(prompt_lookup_draft(&context, 3, 4, 64).is_empty());
+        assert_eq!(prompt_lookup_draft(&context, 3, 4, 64), Vec::<u32>::new());
     }
 
     #[test]
     fn prompt_lookup_respects_search_window() {
         let context = [1, 2, 3, 4, 5, 1, 2];
 
-        assert!(prompt_lookup_draft(&context, 3, 4, 3).is_empty());
+        assert_eq!(prompt_lookup_draft(&context, 3, 4, 3), Vec::<u32>::new());
     }
 }

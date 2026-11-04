@@ -71,7 +71,7 @@ mod tests {
     fn non_interactive_writes_no_prompt() {
         let mut out = Vec::new();
         let _ = offer_download("org/model", false, &mut out, b"".as_slice(), ok_download);
-        assert!(out.is_empty());
+        assert_eq!(out, Vec::<u8>::new());
     }
 
     #[test]

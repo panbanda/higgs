@@ -66,7 +66,7 @@ mod tests {
             completion_tokens: 0,
             token_logprobs: None,
         };
-        assert!(output.text.is_empty());
+        assert_eq!(output.text, "");
         assert_eq!(output.prompt_tokens, 0);
         assert_eq!(output.completion_tokens, 0);
     }
@@ -113,7 +113,7 @@ mod tests {
             token_logprob: None,
             prefill_progress: None,
         };
-        assert!(output.new_text.is_empty());
+        assert_eq!(output.new_text, "");
         assert_eq!(output.prompt_tokens, 0);
         assert_eq!(output.completion_tokens, 0);
     }

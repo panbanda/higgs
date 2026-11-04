@@ -794,7 +794,7 @@ mod tests {
 {"name": "get_weather", "arguments": {"city": "London"}}
 </tool_call>"#;
         let result = assert_parse(input, 1, None);
-        assert!(result.text.is_empty());
+        assert_eq!(result.text, "");
         assert_eq!(first_tool_name(&result), "get_weather");
     }
 
@@ -861,7 +861,7 @@ I've requested the weather."#;
     #[test]
     fn test_empty_text() {
         let result = assert_parse("", 0, None);
-        assert!(result.text.is_empty());
+        assert_eq!(result.text, "");
     }
 
     #[test]
@@ -1206,7 +1206,7 @@ After last."#;
         let tc = result.tool_calls.first().unwrap();
         assert_eq!(tc.name, "get_weather");
         assert_eq!(tc.arguments, serde_json::json!({ "city": "London" }));
-        assert!(result.text.is_empty());
+        assert_eq!(result.text, "");
     }
 
     /// Multiple parameters, and a multi-line value: only the single wrapping
@@ -1404,7 +1404,7 @@ After last."#;
         let tc = result.tool_calls.first().unwrap();
         assert_eq!(tc.name, "get_weather");
         assert_eq!(tc.arguments, serde_json::json!({ "city": "London" }));
-        assert!(result.text.is_empty());
+        assert_eq!(result.text, "");
     }
 
     /// Multiple consecutive blocks, with text before/between them preserved.
@@ -1446,7 +1446,7 @@ After last."#;
         assert!(code.contains("fn main()"));
         assert!(code.contains("</function> not a real close"));
         assert!(code.contains('\n'));
-        assert!(result.text.is_empty());
+        assert_eq!(result.text, "");
     }
 
     /// Declared schema coerces `MiniCPM` param values; a `string`-typed `"123"`

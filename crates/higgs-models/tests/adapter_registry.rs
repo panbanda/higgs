@@ -262,7 +262,7 @@ fn unknown_family_error_lists_supported_ranges() {
 #[test]
 fn supported_adapter_ids_are_unique() {
     let supported = adapter::supported();
-    assert!(!supported.is_empty());
+    assert_ne!(supported.len(), 0);
     let mut ids = supported.iter().map(|info| info.id).collect::<Vec<_>>();
     ids.sort_unstable();
     ids.dedup();
