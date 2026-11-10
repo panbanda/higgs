@@ -9,8 +9,8 @@ use higgs_engine::mlx_tuning::MlxRuntimeTuning;
 use higgs_engine::simple::SimpleEngine;
 use higgs_engine::tokenizers::Tokenizer;
 use higgs_models::SamplingParams;
+use higgs_models::siglip::PixelValues;
 use higgs_models::turboquant::KvCacheConfig;
-use mlx_rs::Array;
 
 use crate::config::HiggsConfig;
 use crate::metrics::MetricsStore;
@@ -177,7 +177,7 @@ impl Engine {
         logprobs: bool,
         top_logprobs: Option<u32>,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        pixel_values: Option<PixelValues>,
     ) -> Result<GenerationOutput, EngineError> {
         self.generate_with_thinking(
             prompt_tokens,
@@ -203,7 +203,7 @@ impl Engine {
         top_logprobs: Option<u32>,
         enable_thinking: bool,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        pixel_values: Option<PixelValues>,
     ) -> Result<GenerationOutput, EngineError> {
         match self {
             Self::Simple(e) => e.generate_with_thinking(
@@ -244,7 +244,7 @@ impl Engine {
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        pixel_values: Option<PixelValues>,
     ) -> Result<(), EngineError> {
         self.generate_streaming_with_thinking(
             prompt_tokens,
@@ -275,7 +275,7 @@ impl Engine {
         enable_thinking: bool,
         return_progress: bool,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        pixel_values: Option<PixelValues>,
     ) -> Result<(), EngineError> {
         match self {
             Self::Simple(e) => e.generate_streaming_with_thinking(
