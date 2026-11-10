@@ -25,6 +25,6 @@ reqwest = { version = "0.13", features = ["json", "query", "stream"] }
 futures-util = "0.3"
 tokio = { version = "1", features = ["sync", "macros", "fs", "io-util"] }
 tokio-util = "0.7"
-toml = "0.8"
+toml = "0.9"
 security-framework = "3"
 directories = "6"
