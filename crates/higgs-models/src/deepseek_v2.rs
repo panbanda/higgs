@@ -397,8 +397,11 @@ impl DeepSeekV2Attention {
                 &self.kv_b_proj.weight,
                 &self.kv_b_proj.scales,
                 &*self.kv_b_proj.biases,
-                self.kv_b_proj.group_size,
-                self.kv_b_proj.bits,
+                ops::DequantizeOptions {
+                    group_size: Some(self.kv_b_proj.group_size),
+                    bits: Some(self.kv_b_proj.bits),
+                    ..Default::default()
+                },
             )?;
             // `kv_b_proj` output rows are contiguous within each head:
             // [head0 K, head0 V, head1 K, head1 V, ...]. Split after reshaping
@@ -1274,7 +1277,8 @@ mod tests {
         let bits = 4;
         let raw =
             mlx_rs::random::normal::<f32>(&[output_dim, input_dim], None, None, None).unwrap();
-        let (weight, scales, biases) = ops::quantize(&raw, group_size, bits).unwrap();
+        let (weight, scales, biases) =
+            crate::test_support::quantize_affine(&raw, group_size, bits).unwrap();
         QLinear {
             weight: Param::new(weight),
             scales: Param::new(scales),
