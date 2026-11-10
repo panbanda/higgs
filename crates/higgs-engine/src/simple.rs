@@ -7,11 +7,11 @@
 )]
 
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use higgs_models::{
     AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample,
-    turboquant::KvCacheConfig,
+    siglip::PixelValues, turboquant::KvCacheConfig,
 };
 use mlx_rs::{
     Array, Dtype, Stream,
@@ -26,6 +26,7 @@ use crate::{
     chat_template::{ChatMessage, ChatTemplateRenderer},
     disk_prefix_store::{DiskPrefixStore, StoreIdentity},
     engine::{GenerationOutput, StreamingOutput},
+    engine_thread::EngineThread,
     error::EngineError,
     mlx_tuning::MlxRuntimeTuning,
     model_loader,
@@ -233,7 +234,24 @@ pub struct Session {
 /// Uses paged KV cache for efficient memory management during single-request
 /// generation. Session-based batched stepping APIs are not wired to real decode
 /// yet and return explicit errors instead of placeholder output.
+///
+/// The model, caches and sessions live on a dedicated [`EngineThread`]; this
+/// handle shares the tokenizer and chat template with it and forwards each
+/// generation there, so it can be used from any thread.
 pub struct SimpleEngine {
+    engine: EngineThread<SimpleEngineCore>,
+    tokenizer: Arc<Tokenizer>,
+    template: Option<Arc<ChatTemplateRenderer>>,
+    model_name: String,
+    eos_token_ids: Vec<u32>,
+    enable_thinking: bool,
+    is_vlm: bool,
+    vlm_image_size: Option<i32>,
+    hidden_size: i32,
+}
+
+/// The engine state that holds MLX arrays, owned by the engine thread.
+struct SimpleEngineCore {
     model: Mutex<AnyModel>,
     prefix_cache: Mutex<PagedPrefixCache>,
     disk_prefix_store: Option<DiskPrefixStore>,
@@ -243,8 +261,8 @@ pub struct SimpleEngine {
     scheduler: Mutex<RoundRobinScheduler>,
     /// Active sessions
     sessions: Mutex<std::collections::HashMap<u64, Session>>,
-    tokenizer: Tokenizer,
-    template: Option<ChatTemplateRenderer>,
+    tokenizer: Arc<Tokenizer>,
+    template: Option<Arc<ChatTemplateRenderer>>,
     model_name: String,
     eos_token_ids: Vec<u32>,
     /// Control tokens stripped from decoded output (EOS + `<|…|>` chat
@@ -280,6 +298,339 @@ struct PreparedGeneration<'a> {
 impl SimpleEngine {
     /// Load a model and tokenizer from a directory.
     pub fn load<P: AsRef<Path>>(
+        dir: P,
+        kv_cache_config: KvCacheConfig,
+        tuning: MlxRuntimeTuning,
+        raise_wired_limit: bool,
+        disk_prefix_dir: Option<&Path>,
+        disk_prefix_budget: u64,
+    ) -> Result<Self, EngineError> {
+        let model_dir = dir.as_ref().to_path_buf();
+        let prefix_dir = disk_prefix_dir.map(Path::to_path_buf);
+        let engine = EngineThread::spawn("simple-engine", move || {
+            SimpleEngineCore::load(
+                &model_dir,
+                kv_cache_config,
+                tuning,
+                raise_wired_limit,
+                prefix_dir.as_deref(),
+                disk_prefix_budget,
+            )
+        })?;
+        let (tokenizer, template, model_name, eos_token_ids, enable_thinking) =
+            engine.run(|core| {
+                (
+                    Arc::clone(&core.tokenizer),
+                    core.template.clone(),
+                    core.model_name.clone(),
+                    core.eos_token_ids.clone(),
+                    core.enable_thinking,
+                )
+            })?;
+        let (is_vlm, vlm_image_size, hidden_size) =
+            engine.run(|core| (core.is_vlm(), core.vlm_image_size(), core.hidden_size()))?;
+
+        Ok(Self {
+            engine,
+            tokenizer,
+            template,
+            model_name,
+            eos_token_ids,
+            enable_thinking,
+            is_vlm,
+            vlm_image_size,
+            hidden_size,
+        })
+    }
+
+    /// Get the model name.
+    pub fn model_name(&self) -> &str {
+        &self.model_name
+    }
+
+    /// Get a reference to the tokenizer.
+    pub fn tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
+
+    /// Get the model's EOS token IDs.
+    pub fn eos_token_ids(&self) -> &[u32] {
+        &self.eos_token_ids
+    }
+
+    /// Whether the engine has thinking mode enabled.
+    pub const fn enable_thinking(&self) -> bool {
+        self.enable_thinking
+    }
+
+    /// Whether the loaded model is a vision-language model.
+    pub const fn is_vlm(&self) -> bool {
+        self.is_vlm
+    }
+
+    /// The expected image size for the VLM's vision encoder, or `None`.
+    pub const fn vlm_image_size(&self) -> Option<i32> {
+        self.vlm_image_size
+    }
+
+    /// The model's hidden dimension (embedding output size).
+    pub const fn hidden_size(&self) -> i32 {
+        self.hidden_size
+    }
+
+    /// Apply chat template and tokenize messages with explicit thinking control.
+    pub fn prepare_chat_prompt_with_thinking(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: bool,
+    ) -> Result<Vec<u32>, EngineError> {
+        let renderer = self.template.as_ref().ok_or_else(|| {
+            EngineError::Template(
+                "This model has no chat template; use /v1/completions instead".to_owned(),
+            )
+        })?;
+        let prompt = renderer.apply_with_thinking(messages, tools, true, enable_thinking)?;
+        let encoding = self
+            .tokenizer
+            .encode(prompt.as_str(), false)
+            .map_err(|e| EngineError::Tokenization(e.to_string()))?;
+        Ok(encoding.get_ids().to_vec())
+    }
+
+    /// Apply chat template and tokenize messages.
+    pub fn prepare_chat_prompt(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+    ) -> Result<Vec<u32>, EngineError> {
+        self.prepare_chat_prompt_with_thinking(messages, tools, self.enable_thinking)
+    }
+
+    /// Replace image placeholder tokens with `IMAGE_TOKEN_INDEX` in the token
+    /// sequence. The `<image>` token ID is looked up from the tokenizer.
+    #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
+    pub fn replace_image_tokens(&self, tokens: &mut [u32]) {
+        let Some(image_token_id) = self.tokenizer.token_to_id("<image>") else {
+            return;
+        };
+        let image_token_u32 = higgs_models::llava_qwen2::IMAGE_TOKEN_INDEX as u32;
+        for token in tokens.iter_mut() {
+            if *token == image_token_id {
+                *token = image_token_u32;
+            }
+        }
+    }
+
+    /// Compute embeddings for a sequence of token IDs.
+    ///
+    /// Runs a single forward pass through the model to get hidden states,
+    /// mean-pools across the sequence dimension, and L2-normalizes.
+    pub fn embed(&self, token_ids: &[u32]) -> Result<Vec<f32>, EngineError> {
+        let tokens = token_ids.to_vec();
+        self.engine.run(move |core| core.embed(&tokens))?
+    }
+
+    /// Create a new session for batched generation.
+    ///
+    /// Returns the session ID.
+    pub fn create_session(
+        &self,
+        _prompt_tokens: &[u32],
+        _max_tokens: usize,
+    ) -> Result<u64, EngineError> {
+        Err(EngineError::Generation(
+            "session generation is not implemented for SimpleEngine yet".to_owned(),
+        ))
+    }
+
+    /// Get session state.
+    pub fn get_session(&self, session_id: u64) -> Option<Session> {
+        self.engine
+            .run(move |core| core.get_session(session_id))
+            .ok()
+            .flatten()
+    }
+
+    /// Remove a session and free its resources.
+    pub fn remove_session(&self, session_id: u64) -> Result<(), EngineError> {
+        self.engine
+            .run(move |core| core.remove_session(session_id))?
+    }
+
+    /// Check if session is finished.
+    pub fn is_session_finished(&self, session_id: u64) -> bool {
+        self.engine
+            .run(move |core| core.is_session_finished(session_id))
+            .unwrap_or(true)
+    }
+
+    /// Step one token for all active sessions (batched generation).
+    ///
+    /// Returns outputs for each session that produced a token.
+    ///
+    /// Note: Current implementation processes sessions sequentially.
+    /// True batched generation (parallel decode across sessions) is TODO.
+    pub fn step(
+        &self,
+        _params: &SamplingParams,
+    ) -> Result<Vec<(u64, GenerationOutput)>, EngineError> {
+        Err(EngineError::Generation(
+            "session stepping is not implemented for SimpleEngine yet".to_owned(),
+        ))
+    }
+
+    /// Generate a complete response for a session (batched mode).
+    ///
+    /// This is a helper for batched generation that generates all tokens
+    /// for a session in one call, using the paged cache.
+    pub fn generate_session(
+        &self,
+        session_id: u64,
+        _params: &SamplingParams,
+        _stop_sequences: &[String],
+        _logprobs: bool,
+        _top_logprobs: Option<u32>,
+    ) -> Result<GenerationOutput, EngineError> {
+        Err(EngineError::Generation(format!(
+            "session generation is not implemented for SimpleEngine yet (session {session_id})"
+        )))
+    }
+
+    /// Generate a complete response from a token prompt.
+    ///
+    /// For multimodal requests, pass `pixel_values` with preprocessed image
+    /// data and ensure `prompt_tokens` contains `IMAGE_TOKEN_INDEX` at image
+    /// positions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        constraint: Option<crate::constrained::ConstrainedGenerator>,
+        pixel_values: Option<PixelValues>,
+    ) -> Result<GenerationOutput, EngineError> {
+        self.generate_with_thinking(
+            prompt_tokens,
+            max_tokens,
+            params,
+            stop_sequences,
+            logprobs,
+            top_logprobs,
+            self.enable_thinking,
+            constraint,
+            pixel_values,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_thinking(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        enable_thinking: bool,
+        constraint: Option<crate::constrained::ConstrainedGenerator>,
+        pixel_values: Option<PixelValues>,
+    ) -> Result<GenerationOutput, EngineError> {
+        let prompt = prompt_tokens.to_vec();
+        let sampling = params.clone();
+        let stops = stop_sequences.to_vec();
+        self.engine.run(move |core| {
+            core.generate_with_thinking(
+                &prompt,
+                max_tokens,
+                &sampling,
+                &stops,
+                logprobs,
+                top_logprobs,
+                enable_thinking,
+                constraint,
+                pixel_values.as_ref().map(PixelValues::to_array),
+            )
+        })?
+    }
+
+    /// Generate tokens one at a time, sending each via the provided channel.
+    ///
+    /// If the receiver is dropped (client disconnected), generation stops early.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_streaming(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        constraint: Option<crate::constrained::ConstrainedGenerator>,
+        pixel_values: Option<PixelValues>,
+    ) -> Result<(), EngineError> {
+        self.generate_streaming_with_thinking(
+            prompt_tokens,
+            max_tokens,
+            params,
+            stop_sequences,
+            logprobs,
+            top_logprobs,
+            sender,
+            self.enable_thinking,
+            // Non-thinking convenience entry (used by /v1/completions) never
+            // streams prefill progress.
+            false,
+            constraint,
+            pixel_values,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_streaming_with_thinking(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        enable_thinking: bool,
+        return_progress: bool,
+        constraint: Option<crate::constrained::ConstrainedGenerator>,
+        pixel_values: Option<PixelValues>,
+    ) -> Result<(), EngineError> {
+        let prompt = prompt_tokens.to_vec();
+        let sampling = params.clone();
+        let stops = stop_sequences.to_vec();
+        let stream = sender.clone();
+        self.engine.run(move |core| {
+            core.generate_streaming_with_thinking(
+                &prompt,
+                max_tokens,
+                &sampling,
+                &stops,
+                logprobs,
+                top_logprobs,
+                &stream,
+                enable_thinking,
+                return_progress,
+                constraint,
+                pixel_values.as_ref().map(PixelValues::to_array),
+            )
+        })?
+    }
+}
+
+impl SimpleEngineCore {
+    /// Load a model and tokenizer from a directory.
+    fn load<P: AsRef<Path>>(
         dir: P,
         kv_cache_config: KvCacheConfig,
         tuning: MlxRuntimeTuning,
@@ -455,8 +806,8 @@ impl SimpleEngine {
             paged_cache: paged_cache.map(Mutex::new),
             scheduler: Mutex::new(RoundRobinScheduler::new()),
             sessions: Mutex::new(std::collections::HashMap::new()),
-            tokenizer,
-            template,
+            tokenizer: Arc::new(tokenizer),
+            template: template.map(Arc::new),
             model_name,
             eos_token_ids,
             decode_skip_ids,
@@ -468,57 +819,8 @@ impl SimpleEngine {
         })
     }
 
-    /// Get the model name.
-    pub fn model_name(&self) -> &str {
-        &self.model_name
-    }
-
-    /// Get a reference to the tokenizer.
-    pub const fn tokenizer(&self) -> &Tokenizer {
-        &self.tokenizer
-    }
-
-    /// Get the model's EOS token IDs.
-    pub fn eos_token_ids(&self) -> &[u32] {
-        &self.eos_token_ids
-    }
-
-    /// Whether the engine has thinking mode enabled.
-    pub const fn enable_thinking(&self) -> bool {
-        self.enable_thinking
-    }
-
-    /// Apply chat template and tokenize messages with explicit thinking control.
-    pub fn prepare_chat_prompt_with_thinking(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[serde_json::Value]>,
-        enable_thinking: bool,
-    ) -> Result<Vec<u32>, EngineError> {
-        let renderer = self.template.as_ref().ok_or_else(|| {
-            EngineError::Template(
-                "This model has no chat template; use /v1/completions instead".to_owned(),
-            )
-        })?;
-        let prompt = renderer.apply_with_thinking(messages, tools, true, enable_thinking)?;
-        let encoding = self
-            .tokenizer
-            .encode(prompt.as_str(), false)
-            .map_err(|e| EngineError::Tokenization(e.to_string()))?;
-        Ok(encoding.get_ids().to_vec())
-    }
-
-    /// Apply chat template and tokenize messages.
-    pub fn prepare_chat_prompt(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[serde_json::Value]>,
-    ) -> Result<Vec<u32>, EngineError> {
-        self.prepare_chat_prompt_with_thinking(messages, tools, self.enable_thinking)
-    }
-
     /// Whether the loaded model is a vision-language model.
-    pub fn is_vlm(&self) -> bool {
+    fn is_vlm(&self) -> bool {
         let model = self
             .model
             .lock()
@@ -527,27 +829,12 @@ impl SimpleEngine {
     }
 
     /// The expected image size for the VLM's vision encoder, or `None`.
-    pub fn vlm_image_size(&self) -> Option<i32> {
+    fn vlm_image_size(&self) -> Option<i32> {
         let model = self
             .model
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         model.image_size()
-    }
-
-    /// Replace image placeholder tokens with `IMAGE_TOKEN_INDEX` in the token
-    /// sequence. The `<image>` token ID is looked up from the tokenizer.
-    #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
-    pub fn replace_image_tokens(&self, tokens: &mut [u32]) {
-        let Some(image_token_id) = self.tokenizer.token_to_id("<image>") else {
-            return;
-        };
-        let image_token_u32 = higgs_models::llava_qwen2::IMAGE_TOKEN_INDEX as u32;
-        for token in tokens.iter_mut() {
-            if *token == image_token_id {
-                *token = image_token_u32;
-            }
-        }
     }
 
     /// Convert prompt length to u32, returning a descriptive error on overflow.
@@ -936,19 +1223,6 @@ impl SimpleEngine {
     // Session Management (Batched Generation)
     // =========================================================================
 
-    /// Create a new session for batched generation.
-    ///
-    /// Returns the session ID.
-    pub fn create_session(
-        &self,
-        _prompt_tokens: &[u32],
-        _max_tokens: usize,
-    ) -> Result<u64, EngineError> {
-        Err(EngineError::Generation(
-            "session generation is not implemented for SimpleEngine yet".to_owned(),
-        ))
-    }
-
     /// Get session state.
     pub fn get_session(&self, session_id: u64) -> Option<Session> {
         let sessions = lock_or_recover(&self.sessions);
@@ -977,70 +1251,8 @@ impl SimpleEngine {
         sessions.get(&session_id).is_none_or(|s| s.finished)
     }
 
-    /// Step one token for all active sessions (batched generation).
-    ///
-    /// Returns outputs for each session that produced a token.
-    ///
-    /// Note: Current implementation processes sessions sequentially.
-    /// True batched generation (parallel decode across sessions) is TODO.
-    pub fn step(
-        &self,
-        _params: &SamplingParams,
-    ) -> Result<Vec<(u64, GenerationOutput)>, EngineError> {
-        Err(EngineError::Generation(
-            "session stepping is not implemented for SimpleEngine yet".to_owned(),
-        ))
-    }
-
-    /// Generate a complete response for a session (batched mode).
-    ///
-    /// This is a helper for batched generation that generates all tokens
-    /// for a session in one call, using the paged cache.
-    pub fn generate_session(
-        &self,
-        session_id: u64,
-        _params: &SamplingParams,
-        _stop_sequences: &[String],
-        _logprobs: bool,
-        _top_logprobs: Option<u32>,
-    ) -> Result<GenerationOutput, EngineError> {
-        Err(EngineError::Generation(format!(
-            "session generation is not implemented for SimpleEngine yet (session {session_id})"
-        )))
-    }
-
-    /// Generate a complete response from a token prompt.
-    ///
-    /// For multimodal requests, pass `pixel_values` with preprocessed image
-    /// data and ensure `prompt_tokens` contains `IMAGE_TOKEN_INDEX` at image
-    /// positions.
-    #[allow(clippy::significant_drop_tightening, clippy::too_many_arguments)]
-    pub fn generate(
-        &self,
-        prompt_tokens: &[u32],
-        max_tokens: u32,
-        params: &SamplingParams,
-        stop_sequences: &[String],
-        logprobs: bool,
-        top_logprobs: Option<u32>,
-        constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
-    ) -> Result<GenerationOutput, EngineError> {
-        self.generate_with_thinking(
-            prompt_tokens,
-            max_tokens,
-            params,
-            stop_sequences,
-            logprobs,
-            top_logprobs,
-            self.enable_thinking,
-            constraint,
-            pixel_values,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_with_thinking(
+    fn generate_with_thinking(
         &self,
         prompt_tokens: &[u32],
         max_tokens: u32,
@@ -2190,42 +2402,8 @@ impl SimpleEngine {
     /// Generate tokens one at a time, sending each via the provided channel.
     ///
     /// If the receiver is dropped (client disconnected), generation stops early.
-    #[allow(
-        clippy::too_many_lines,
-        clippy::too_many_arguments,
-        clippy::significant_drop_tightening
-    )]
-    pub fn generate_streaming(
-        &self,
-        prompt_tokens: &[u32],
-        max_tokens: u32,
-        params: &SamplingParams,
-        stop_sequences: &[String],
-        logprobs: bool,
-        top_logprobs: Option<u32>,
-        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
-        constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
-    ) -> Result<(), EngineError> {
-        self.generate_streaming_with_thinking(
-            prompt_tokens,
-            max_tokens,
-            params,
-            stop_sequences,
-            logprobs,
-            top_logprobs,
-            sender,
-            self.enable_thinking,
-            // Non-thinking convenience entry (used by /v1/completions) never
-            // streams prefill progress.
-            false,
-            constraint,
-            pixel_values,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_streaming_with_thinking(
+    fn generate_streaming_with_thinking(
         &self,
         prompt_tokens: &[u32],
         max_tokens: u32,

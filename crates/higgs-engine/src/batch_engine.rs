@@ -132,21 +132,31 @@ impl BatchEngine {
 
         tracing::info!(model_dir = %model_dir.display(), "Loading model (batch engine)");
 
-        let model = model_loader::load_model(model_dir)?;
         let tokenizer = model_loader::load_tokenizer(model_dir)?;
         let template = ChatTemplateRenderer::from_model_dir(model_dir)?;
         let eos_token_ids = crate::simple::extract_eos_tokens(model_dir);
-        let hidden_size = model.hidden_size();
-
-        crate::simple::set_wired_limit_to_max(raise_wired_limit);
 
         let (request_tx, request_rx) = tokio::sync::mpsc::channel(REQUEST_QUEUE_CAPACITY);
         let eos_ids = eos_token_ids.clone();
         let tok = tokenizer.clone();
+        let worker_model_dir = model_dir.to_path_buf();
+        // MLX arrays are bound to the thread that builds them (`AnyModel` is not `Send`), so
+        // the worker loads the model itself and reports back only plain data.
+        let (loaded_tx, loaded_rx) = std::sync::mpsc::sync_channel::<Result<i32, EngineError>>(1);
 
         std::thread::Builder::new()
             .name("batch-engine".into())
             .spawn(move || {
+                let model = match model_loader::load_model(&worker_model_dir) {
+                    Ok(model) => model,
+                    Err(error) => {
+                        let _ = loaded_tx.send(Err(error));
+                        return;
+                    }
+                };
+                if loaded_tx.send(Ok(model.hidden_size())).is_err() {
+                    return;
+                }
                 worker_loop(
                     model,
                     &tok,
@@ -156,6 +166,12 @@ impl BatchEngine {
                 );
             })
             .map_err(|e| EngineError::Generation(format!("Failed to spawn worker: {e}")))?;
+
+        let hidden_size = loaded_rx.recv().map_err(|_| {
+            EngineError::Generation("batch engine worker exited while loading the model".to_owned())
+        })??;
+
+        crate::simple::set_wired_limit_to_max(raise_wired_limit);
 
         tracing::info!(
             model_name = %model_name,
@@ -224,7 +240,7 @@ impl BatchEngine {
         logprobs: bool,
         top_logprobs: Option<u32>,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<mlx_rs::Array>,
+        pixel_values: Option<higgs_models::siglip::PixelValues>,
     ) -> Result<GenerationOutput, EngineError> {
         self.generate_with_thinking(
             prompt_tokens,
@@ -250,7 +266,7 @@ impl BatchEngine {
         top_logprobs: Option<u32>,
         _enable_thinking: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<mlx_rs::Array>,
+        pixel_values: Option<higgs_models::siglip::PixelValues>,
     ) -> Result<GenerationOutput, EngineError> {
         if pixel_values.is_some() {
             return Err(EngineError::Generation(
@@ -332,7 +348,7 @@ impl BatchEngine {
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<mlx_rs::Array>,
+        pixel_values: Option<higgs_models::siglip::PixelValues>,
     ) -> Result<(), EngineError> {
         self.generate_streaming_with_thinking(
             prompt_tokens,
@@ -364,7 +380,7 @@ impl BatchEngine {
         // share the streaming interface with SimpleEngine.
         _return_progress: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<mlx_rs::Array>,
+        pixel_values: Option<higgs_models::siglip::PixelValues>,
     ) -> Result<(), EngineError> {
         if pixel_values.is_some() {
             return Err(EngineError::Generation(
@@ -1153,6 +1169,32 @@ mod tests {
 
     fn make_tokenizer() -> Tokenizer {
         Tokenizer::new(tokenizers::models::bpe::BPE::default())
+    }
+
+    #[test]
+    fn load_returns_model_load_failure_to_caller() {
+        // Tokenizer and template load; only the model itself fails.
+        let dir = tempfile::tempdir().unwrap();
+        make_tokenizer()
+            .save(dir.path().join("tokenizer.json"), false)
+            .unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"chat_template": "{{ messages }}"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type": "not-a-real-architecture"}"#,
+        )
+        .unwrap();
+
+        let result = BatchEngine::load(dir.path(), KvCacheConfig::default(), false, None);
+
+        assert!(
+            matches!(result, Err(EngineError::Model(_))),
+            "a model that fails to load must surface as EngineError::Model from load()"
+        );
     }
 
     #[test]

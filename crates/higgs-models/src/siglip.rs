@@ -284,7 +284,7 @@ impl SigLipVisionModel {
 pub fn preprocess_image(
     image_bytes: &[u8],
     image_size: u32,
-) -> Result<Array, crate::error::ModelError> {
+) -> Result<PixelValues, crate::error::ModelError> {
     use image::imageops::FilterType;
     let img = image::load_from_memory(image_bytes)
         .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e)))?;
@@ -302,17 +302,48 @@ pub fn preprocess_image(
         *pixel = (*pixel - 0.5) / 0.5;
     }
 
-    #[allow(clippy::as_conversions, clippy::cast_possible_wrap)]
-    let array = Array::from_slice(&float_pixels, &[1, h as i32, w as i32, 3]);
+    let height = i32::try_from(h).map_err(|_| image_too_large(h))?;
+    let width = i32::try_from(w).map_err(|_| image_too_large(w))?;
 
-    Ok(array)
+    Ok(PixelValues {
+        data: float_pixels,
+        height,
+        width,
+    })
+}
+
+fn image_too_large(dimension: u32) -> crate::error::ModelError {
+    crate::error::ModelError::ShapeMismatch(format!("image dimension {dimension} is too large"))
+}
+
+/// A preprocessed image: normalized RGB pixels in `[1, height, width, 3]` layout.
+///
+/// Plain data rather than an MLX array, so it can be built on a request thread and handed to
+/// the thread that owns the model, which turns it into an array with [`Self::to_array`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PixelValues {
+    data: Vec<f32>,
+    height: i32,
+    width: i32,
+}
+
+impl PixelValues {
+    /// The normalized pixel values, row-major with interleaved RGB channels.
+    pub fn data(&self) -> &[f32] {
+        &self.data
+    }
+
+    /// Build the `[1, height, width, 3]` array the vision encoder consumes.
+    pub fn to_array(&self) -> Array {
+        Array::from_slice(&self.data, &[1, self.height, self.width, 3])
+    }
 }
 
 /// Preprocess an image from a file path.
 pub fn preprocess_image_from_path(
     path: &std::path::Path,
     image_size: u32,
-) -> Result<Array, crate::error::ModelError> {
+) -> Result<PixelValues, crate::error::ModelError> {
     let bytes = std::fs::read(path)?;
     preprocess_image(&bytes, image_size)
 }
@@ -382,4 +413,33 @@ pub fn load_siglip_weights(
     eval(all_params)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+
+    fn solid_png(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
+        let image = image::RgbImage::from_pixel(width, height, image::Rgb(rgb));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        bytes.into_inner()
+    }
+
+    #[test]
+    fn preprocess_image_returns_normalized_pixels_in_nhwc_layout() {
+        let pixels = preprocess_image(&solid_png(2, 2, [255, 0, 128]), 2).unwrap();
+
+        assert_eq!(pixels.data().len(), 2 * 2 * 3);
+        let first = &pixels.data()[..3];
+        assert!((first[0] - 1.0).abs() < 1e-6, "red: {}", first[0]);
+        assert!((first[1] + 1.0).abs() < 1e-6, "green: {}", first[1]);
+        assert!(
+            (first[2] - (128.0 / 255.0 - 0.5) / 0.5).abs() < 1e-6,
+            "blue: {}",
+            first[2]
+        );
+        assert_eq!(pixels.to_array().shape(), &[1, 2, 2, 3]);
+    }
 }
