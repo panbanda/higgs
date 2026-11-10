@@ -14,6 +14,9 @@ workspace = true
 higgs-engine.workspace = true
 higgs-models.workspace = true
 mlx-rs.workspace = true
+# Only build.rs uses it: a direct dependency on the `links = "mlx"` crate makes Cargo run its build
+# script first and pass its metadata as DEP_MLX_*.
+mlx-sys.workspace = true
 axum.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
