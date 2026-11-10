@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.2](https://github.com/panbanda/higgs/compare/higgs-v1.8.1...higgs-v1.8.2) (2026-11-10)
+
+
+### Bug Fixes
+
+* **build:** copy the metallib of the linked mlx-sys build ([#325](https://github.com/panbanda/higgs/issues/325)) ([d79ae29](https://github.com/panbanda/higgs/commit/d79ae2931f5860fe29096740adbea50a3af94056))
+
 ## [1.8.1](https://github.com/panbanda/higgs/compare/higgs-v1.8.0...higgs-v1.8.1) (2026-11-10)
 
 
