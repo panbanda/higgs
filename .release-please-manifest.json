@@ -1,6 +1,6 @@
 {
-  "crates/higgs-models": "1.8.1",
-  "crates/higgs-engine": "1.8.1",
-  "crates/higgs": "1.8.1",
-  "crates/higgs-bench": "1.0.3"
+  "crates/higgs-models": "1.8.2",
+  "crates/higgs-engine": "1.8.2",
+  "crates/higgs": "1.8.2",
+  "crates/higgs-bench": "1.0.4"
 }
