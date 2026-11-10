@@ -240,7 +240,7 @@ impl BatchEngine {
         logprobs: bool,
         top_logprobs: Option<u32>,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<mlx_rs::Array>,
+        pixel_values: Option<higgs_models::siglip::PixelValues>,
     ) -> Result<GenerationOutput, EngineError> {
         self.generate_with_thinking(
             prompt_tokens,
@@ -266,7 +266,7 @@ impl BatchEngine {
         top_logprobs: Option<u32>,
         _enable_thinking: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<mlx_rs::Array>,
+        pixel_values: Option<higgs_models::siglip::PixelValues>,
     ) -> Result<GenerationOutput, EngineError> {
         if pixel_values.is_some() {
             return Err(EngineError::Generation(
@@ -348,7 +348,7 @@ impl BatchEngine {
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<mlx_rs::Array>,
+        pixel_values: Option<higgs_models::siglip::PixelValues>,
     ) -> Result<(), EngineError> {
         self.generate_streaming_with_thinking(
             prompt_tokens,
@@ -380,7 +380,7 @@ impl BatchEngine {
         // share the streaming interface with SimpleEngine.
         _return_progress: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<mlx_rs::Array>,
+        pixel_values: Option<higgs_models::siglip::PixelValues>,
     ) -> Result<(), EngineError> {
         if pixel_values.is_some() {
             return Err(EngineError::Generation(
