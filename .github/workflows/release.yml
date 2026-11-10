@@ -62,7 +62,7 @@ jobs:
           toolchain: stable
 
       - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
@@ -219,7 +219,7 @@ jobs:
 
       - name: Cache cargo registry and build
         if: ${{ steps.publishability.outputs.publishable == 'true' }}
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Publish higgs-models
         if: ${{ steps.publishability.outputs.publishable == 'true' }}
