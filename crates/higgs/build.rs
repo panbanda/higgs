@@ -1,4 +1,7 @@
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -13,64 +16,38 @@ fn main() {
     }
 }
 
-/// Search the mlx-sys build output for mlx.metallib and copy it next to the binary.
+/// Copy the metallib of the mlx-sys build this binary links next to the binary.
 /// MLX's runtime uses dladdr to look for mlx.metallib next to the executable.
-fn copy_metallib() -> Result<(), &'static str> {
-    let Some(out_dir) = env::var("OUT_DIR").map(PathBuf::from).ok() else {
-        return Err("OUT_DIR not set");
-    };
+fn copy_metallib() -> Result<(), String> {
+    // mlx-sys publishes compile_commands.json from its CMake build directory, which also holds
+    // the compiled lib/mlx.metallib. Scanning target/*/build/mlx-sys-* instead can pick up a
+    // lingering build of another mlx-sys version.
+    let compile_commands = env::var_os("DEP_MLX_COMPILE_COMMANDS")
+        .ok_or("mlx-sys did not publish DEP_MLX_COMPILE_COMMANDS")?;
+    let metallib = Path::new(&compile_commands)
+        .with_file_name("lib")
+        .join("mlx.metallib");
+    if !metallib.is_file() {
+        return Err(format!("{} does not exist", metallib.display()));
+    }
 
     // OUT_DIR is target/<profile>/build/<crate>-<hash>/out
-    // Walk up to target/<profile>/build/ to search mlx-sys-*/out/
-    let Some(build_dir) = out_dir.ancestors().nth(2) else {
-        return Err("could not derive build dir from OUT_DIR");
-    };
-
-    let Ok(entries) = fs::read_dir(build_dir) else {
-        return Err("could not read build dir");
-    };
-
-    // Collect candidates and pick the most recently modified, since read_dir
-    // iteration order is unspecified and stale build dirs may linger.
-    let mut candidates: Vec<PathBuf> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let is_mlx_sys = entry
-                .file_name()
-                .to_str()
-                .is_some_and(|s| s.starts_with("mlx-sys-"));
-            if !is_mlx_sys {
-                return None;
-            }
-            let metallib = entry.path().join("out/build/lib/mlx.metallib");
-            metallib.exists().then_some(metallib)
-        })
-        .collect();
-
-    candidates.sort_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok());
-    let Some(metallib) = candidates.pop() else {
-        return Err("mlx.metallib not found in mlx-sys build output");
-    };
-
-    // NOTE: don't emit `cargo:rerun-if-changed` for this specific metallib path.
-    // When mlx-sys rebuilds in a new build directory (different hash), the old
-    // path wouldn't change, so cargo wouldn't re-run this script, leaving a
-    // stale metallib that can cause silent Metal failures.
-
-    // Copy to target profile dir (e.g. target/release/) so the binary finds it via dladdr
-    let Some(profile_dir) = out_dir.ancestors().nth(3) else {
-        return Err("could not derive target profile dir from OUT_DIR");
-    };
-    let dst = profile_dir.join("mlx.metallib");
-    if let Err(err) = fs::copy(&metallib, &dst) {
-        println!(
-            "cargo:warning=failed to copy {} to {}: {}",
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR not set")?);
+    let profile_dir = out_dir
+        .ancestors()
+        .nth(3)
+        .ok_or("could not derive target profile dir from OUT_DIR")?;
+    let destination = profile_dir.join("mlx.metallib");
+    fs::copy(&metallib, &destination).map_err(|error| {
+        format!(
+            "failed to copy {} to {}: {error}",
             metallib.display(),
-            dst.display(),
-            err
-        );
-        return Err("copy failed (see warning above)");
-    }
-    println!("cargo:warning=Copied mlx.metallib to {}", dst.display());
+            destination.display()
+        )
+    })?;
+    println!(
+        "cargo:warning=Copied mlx.metallib to {}",
+        destination.display()
+    );
     Ok(())
 }
