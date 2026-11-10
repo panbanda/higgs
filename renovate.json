@@ -11,6 +11,16 @@
         "mlx-sys"
       ],
       "groupName": "mlx-rs"
+    },
+    {
+      "description": "Tauri refuses to build when a Rust crate and its npm package differ in major/minor version, so the crates and @tauri-apps packages move together.",
+      "matchPackageNames": [
+        "tauri",
+        "tauri-build",
+        "/^tauri-plugin-/",
+        "/^@tauri-apps\\//"
+      ],
+      "groupName": "tauri"
     }
   ]
 }
