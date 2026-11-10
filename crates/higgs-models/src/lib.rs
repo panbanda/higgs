@@ -18,6 +18,8 @@ pub mod registry;
 pub mod siglip;
 pub mod spec_prefill;
 pub mod starcoder2;
+#[cfg(test)]
+mod test_support;
 pub mod transformer;
 pub mod turboquant;
 pub mod utils;

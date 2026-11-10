@@ -243,7 +243,19 @@ pub(crate) fn quantized_forward(
     group_size: i32,
     bits: i32,
 ) -> Result<Array, Exception> {
-    ops::quantized_matmul(x, weight, scales, biases, true, group_size, bits)
+    ops::quantized_matmul(
+        x,
+        weight,
+        scales,
+        biases,
+        ops::QuantizedMatmulOptions {
+            group_size: Some(group_size),
+            bits: Some(bits),
+            transpose: true,
+            ..Default::default()
+        },
+    )
+    .map_err(Exception::from)
 }
 
 /// Quantized linear layer stored as raw weight/scales/biases arrays.
@@ -376,7 +388,16 @@ impl QEmbedding {
         } else {
             let s = (*self.scales).take_axis(&flat, 0)?;
             let b = (*self.biases).take_axis(&flat, 0)?;
-            ops::dequantize(&w, &s, &b, self.group_size, self.bits)?
+            ops::dequantize(
+                &w,
+                &s,
+                &b,
+                ops::DequantizeOptions {
+                    group_size: Some(self.group_size),
+                    bits: Some(self.bits),
+                    ..Default::default()
+                },
+            )?
         };
         let mut ret_shape: Vec<i32> = shape;
         ret_shape.push(-1);
@@ -6306,7 +6327,8 @@ mod tests {
     /// Quantize a float matrix and return (weight, scales, biases) suitable for
     /// `gather_qmm` / `quantized_matmul`.
     fn quantize_weights(w: &Array, group_size: i32, bits: i32) -> (Array, Array, Array) {
-        let (qw, scales, biases) = ops::quantize(w, group_size, bits).unwrap();
+        let (qw, scales, biases) =
+            crate::test_support::quantize_affine(w, group_size, bits).unwrap();
         (qw, scales, biases)
     }
 
@@ -6369,7 +6391,7 @@ mod tests {
             .unwrap()
             .squeeze_axes(&[0])
             .unwrap();
-        let old_result = ops::quantized_matmul(&x, &ew, &es, &eb, true, 64, 4).unwrap();
+        let old_result = quantized_forward(&x, &ew, &es, &eb, 64, 4).unwrap();
 
         // New path: gather_qmm
         let x_expanded = x.expand_dims(-2).unwrap(); // [1, 1, 64]
@@ -7320,7 +7342,7 @@ mod tests {
         for _ in 0..3 {
             let mut y4 = x_qm.clone();
             for _ in 0..144 {
-                y4 = ops::quantized_matmul(&y4, &qm_w, &qm_s, &qm_b, true, 64, 4).unwrap();
+                y4 = quantized_forward(&y4, &qm_w, &qm_s, &qm_b, 64, 4).unwrap();
             }
             mlx_rs::transforms::eval([&y4]).unwrap();
         }
@@ -7332,7 +7354,7 @@ mod tests {
             let t0 = std::time::Instant::now();
             let mut y4 = x_qm.clone();
             for _ in 0..144 {
-                y4 = ops::quantized_matmul(&y4, &qm_w, &qm_s, &qm_b, true, 64, 4).unwrap();
+                y4 = quantized_forward(&y4, &qm_w, &qm_s, &qm_b, 64, 4).unwrap();
             }
             let t1 = std::time::Instant::now();
             mlx_rs::transforms::eval([&y4]).unwrap();
@@ -7451,7 +7473,7 @@ mod tests {
 
         let x = ops::ones_dtype(&[1, 1, 2048], Dtype::Float16).unwrap();
         let raw_w = ops::ones_dtype(&[2048, 2048], Dtype::Float16).unwrap();
-        let (w, s, b) = ops::quantize(&raw_w, 64, 4).unwrap();
+        let (w, s, b) = crate::test_support::quantize_affine(&raw_w, 64, 4).unwrap();
         mlx_rs::transforms::eval([&x, &w, &s, &b]).unwrap();
 
         let n_ops = 200;
@@ -7461,7 +7483,7 @@ mod tests {
         for _ in 0..10 {
             let mut y = x.clone();
             for _ in 0..n_ops {
-                y = ops::quantized_matmul(&y, &w, &s, &b, true, 64, 4).unwrap();
+                y = quantized_forward(&y, &w, &s, &b, 64, 4).unwrap();
             }
             mlx_rs::transforms::eval([&y]).unwrap();
         }
@@ -7472,7 +7494,7 @@ mod tests {
             let t0 = std::time::Instant::now();
             let mut y = x.clone();
             for _ in 0..n_ops {
-                y = ops::quantized_matmul(&y, &w, &s, &b, true, 64, 4).unwrap();
+                y = quantized_forward(&y, &w, &s, &b, 64, 4).unwrap();
             }
             let t1 = std::time::Instant::now();
             mlx_rs::transforms::eval([&y]).unwrap();
@@ -7539,14 +7561,14 @@ mod tests {
                 .unwrap()
                 .as_dtype(Dtype::Float16)
                 .unwrap();
-            ops::quantize(&raw, gs, bits).unwrap()
+            crate::test_support::quantize_affine(&raw, gs, bits).unwrap()
         };
         let make_sw = |d_in: i32, d_out: i32| -> (Array, Array, Array) {
             let raw = mlx_rs::random::normal::<f32>(&[n_experts, d_out, d_in], None, None, None)
                 .unwrap()
                 .as_dtype(Dtype::Float16)
                 .unwrap();
-            ops::quantize(&raw, gs, bits).unwrap()
+            crate::test_support::quantize_affine(&raw, gs, bits).unwrap()
         };
 
         let hk = 16i32;
@@ -7649,52 +7671,21 @@ mod tests {
                 let normed = fast::rms_norm(&h, Some(&l.norm_w), 1e-6).unwrap();
 
                 // Attention projections (matching real model's GDN layer ops)
-                let _q = ops::quantized_matmul(
-                    &normed,
-                    &l.q_proj.0,
-                    &l.q_proj.1,
-                    &l.q_proj.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
-                let _k = ops::quantized_matmul(
-                    &normed,
-                    &l.k_proj.0,
-                    &l.k_proj.1,
-                    &l.k_proj.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
-                let v = ops::quantized_matmul(
-                    &normed,
-                    &l.v_proj.0,
-                    &l.v_proj.1,
-                    &l.v_proj.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
-                let g = ops::quantized_matmul(
-                    &normed,
-                    &l.g_proj.0,
-                    &l.g_proj.1,
-                    &l.g_proj.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
-                let _beta = ops::quantized_matmul(
+                let _q =
+                    quantized_forward(&normed, &l.q_proj.0, &l.q_proj.1, &l.q_proj.2, gs, bits)
+                        .unwrap();
+                let _k =
+                    quantized_forward(&normed, &l.k_proj.0, &l.k_proj.1, &l.k_proj.2, gs, bits)
+                        .unwrap();
+                let v = quantized_forward(&normed, &l.v_proj.0, &l.v_proj.1, &l.v_proj.2, gs, bits)
+                    .unwrap();
+                let g = quantized_forward(&normed, &l.g_proj.0, &l.g_proj.1, &l.g_proj.2, gs, bits)
+                    .unwrap();
+                let _beta = quantized_forward(
                     &normed,
                     &l.beta_proj.0,
                     &l.beta_proj.1,
                     &l.beta_proj.2,
-                    true,
                     gs,
                     bits,
                 )
@@ -7702,25 +7693,16 @@ mod tests {
                 let attn_proxy = v
                     .multiply(&nn::sigmoid(&g.sum_axes(&[-1], true).unwrap()).unwrap())
                     .unwrap();
-                let o = ops::quantized_matmul(
-                    &attn_proxy,
-                    &l.o_proj.0,
-                    &l.o_proj.1,
-                    &l.o_proj.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
+                let o =
+                    quantized_forward(&attn_proxy, &l.o_proj.0, &l.o_proj.1, &l.o_proj.2, gs, bits)
+                        .unwrap();
 
                 let h2 = h.add(o).unwrap();
                 let normed2 = fast::rms_norm(&h2, Some(&l.norm_w), 1e-6).unwrap();
 
                 // Router
-                let gate_out = ops::quantized_matmul(
-                    &normed2, &l.gate.0, &l.gate.1, &l.gate.2, true, gs, bits,
-                )
-                .unwrap();
+                let gate_out =
+                    quantized_forward(&normed2, &l.gate.0, &l.gate.1, &l.gate.2, gs, bits).unwrap();
                 let gates = ops::softmax_axis(&gate_out, -1, true).unwrap();
                 let neg_k = -top_k;
                 let all_inds = ops::argpartition_axis(&gates, neg_k, -1).unwrap();
@@ -7770,38 +7752,22 @@ mod tests {
                     .unwrap();
 
                 // Shared expert (per-layer weights)
-                let sh_g = ops::quantized_matmul(
-                    &normed2,
-                    &l.se_gate.0,
-                    &l.se_gate.1,
-                    &l.se_gate.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
-                let sh_u = ops::quantized_matmul(
-                    &normed2, &l.se_up.0, &l.se_up.1, &l.se_up.2, true, gs, bits,
-                )
-                .unwrap();
+                let sh_g =
+                    quantized_forward(&normed2, &l.se_gate.0, &l.se_gate.1, &l.se_gate.2, gs, bits)
+                        .unwrap();
+                let sh_u =
+                    quantized_forward(&normed2, &l.se_up.0, &l.se_up.1, &l.se_up.2, gs, bits)
+                        .unwrap();
                 let sh_act = swiglu(&sh_g, &sh_u).unwrap();
-                let sh_d = ops::quantized_matmul(
-                    &sh_act,
-                    &l.se_down.0,
-                    &l.se_down.1,
-                    &l.se_down.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
+                let sh_d =
+                    quantized_forward(&sh_act, &l.se_down.0, &l.se_down.1, &l.se_down.2, gs, bits)
+                        .unwrap();
                 let sh_gate_val = nn::sigmoid(
-                    &ops::quantized_matmul(
+                    &quantized_forward(
                         &normed2,
                         &l.se_gate_proj.0,
                         &l.se_gate_proj.1,
                         &l.se_gate_proj.2,
-                        true,
                         gs,
                         bits,
                     )
@@ -8009,7 +7975,7 @@ mod tests {
                 .unwrap()
                 .as_dtype(Dtype::Float16)
                 .unwrap();
-            let (w, s, b) = ops::quantize(&raw, gs, bits).unwrap();
+            let (w, s, b) = crate::test_support::quantize_affine(&raw, gs, bits).unwrap();
             QLinear {
                 weight: Param::new(w),
                 scales: Param::new(s),
@@ -8024,7 +7990,7 @@ mod tests {
                 .unwrap()
                 .as_dtype(Dtype::Float16)
                 .unwrap();
-            let (w, s, b) = ops::quantize(&raw, gs, bits).unwrap();
+            let (w, s, b) = crate::test_support::quantize_affine(&raw, gs, bits).unwrap();
             QLinear {
                 weight: Param::new(w),
                 scales: Param::new(s),
@@ -8181,10 +8147,8 @@ mod tests {
                 let normed2 = fast::rms_norm(&h2, Some(&norm_w), 1e-6).unwrap();
 
                 // Inline MoE (same code as bench_simulated_forward)
-                let gate_out = ops::quantized_matmul(
-                    &normed2, &l.gate.0, &l.gate.1, &l.gate.2, true, gs, bits,
-                )
-                .unwrap();
+                let gate_out =
+                    quantized_forward(&normed2, &l.gate.0, &l.gate.1, &l.gate.2, gs, bits).unwrap();
                 let gates = ops::softmax_axis(&gate_out, -1, true).unwrap();
                 let neg_k = -top_k;
                 let all_inds = ops::argpartition_axis(&gates, neg_k, -1).unwrap();
@@ -8232,38 +8196,22 @@ mod tests {
                     .sum_axes(&[-2], false)
                     .unwrap();
 
-                let sh_g = ops::quantized_matmul(
-                    &normed2,
-                    &l.se_gate.0,
-                    &l.se_gate.1,
-                    &l.se_gate.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
-                let sh_u = ops::quantized_matmul(
-                    &normed2, &l.se_up.0, &l.se_up.1, &l.se_up.2, true, gs, bits,
-                )
-                .unwrap();
+                let sh_g =
+                    quantized_forward(&normed2, &l.se_gate.0, &l.se_gate.1, &l.se_gate.2, gs, bits)
+                        .unwrap();
+                let sh_u =
+                    quantized_forward(&normed2, &l.se_up.0, &l.se_up.1, &l.se_up.2, gs, bits)
+                        .unwrap();
                 let sh_act = swiglu(&sh_g, &sh_u).unwrap();
-                let sh_d = ops::quantized_matmul(
-                    &sh_act,
-                    &l.se_down.0,
-                    &l.se_down.1,
-                    &l.se_down.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
+                let sh_d =
+                    quantized_forward(&sh_act, &l.se_down.0, &l.se_down.1, &l.se_down.2, gs, bits)
+                        .unwrap();
                 let sh_gate_val = nn::sigmoid(
-                    &ops::quantized_matmul(
+                    &quantized_forward(
                         &normed2,
                         &l.se_gate_proj.0,
                         &l.se_gate_proj.1,
                         &l.se_gate_proj.2,
-                        true,
                         gs,
                         bits,
                     )
@@ -8285,7 +8233,7 @@ mod tests {
                 .unwrap()
                 .as_dtype(Dtype::Float16)
                 .unwrap();
-            ops::quantize(&raw, gs, bits).unwrap()
+            crate::test_support::quantize_affine(&raw, gs, bits).unwrap()
         };
         let attn_weights: Vec<(Array, Array, Array)> = (0..48).map(|_| make_qw(d, d)).collect();
         let per_layer_norms: Vec<Array> = (0..48)
@@ -8311,12 +8259,11 @@ mod tests {
             let mut h = x.clone();
             for (i, l) in extracted.iter().take(n_layers).enumerate() {
                 let normed = fast::rms_norm(&h, Some(&per_layer_norms[i]), 1e-6).unwrap();
-                let attn_out = ops::quantized_matmul(
+                let attn_out = quantized_forward(
                     &normed,
                     &attn_weights[i].0,
                     &attn_weights[i].1,
                     &attn_weights[i].2,
-                    true,
                     gs,
                     bits,
                 )
@@ -8324,10 +8271,8 @@ mod tests {
                 let h2 = h.add(attn_out).unwrap();
                 let normed2 = fast::rms_norm(&h2, Some(&per_layer_norms[i]), 1e-6).unwrap();
 
-                let gate_out = ops::quantized_matmul(
-                    &normed2, &l.gate.0, &l.gate.1, &l.gate.2, true, gs, bits,
-                )
-                .unwrap();
+                let gate_out =
+                    quantized_forward(&normed2, &l.gate.0, &l.gate.1, &l.gate.2, gs, bits).unwrap();
                 let gates = ops::softmax_axis(&gate_out, -1, true).unwrap();
                 let neg_k = -top_k;
                 let all_inds = ops::argpartition_axis(&gates, neg_k, -1).unwrap();
@@ -8375,38 +8320,22 @@ mod tests {
                     .sum_axes(&[-2], false)
                     .unwrap();
 
-                let sh_g = ops::quantized_matmul(
-                    &normed2,
-                    &l.se_gate.0,
-                    &l.se_gate.1,
-                    &l.se_gate.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
-                let sh_u = ops::quantized_matmul(
-                    &normed2, &l.se_up.0, &l.se_up.1, &l.se_up.2, true, gs, bits,
-                )
-                .unwrap();
+                let sh_g =
+                    quantized_forward(&normed2, &l.se_gate.0, &l.se_gate.1, &l.se_gate.2, gs, bits)
+                        .unwrap();
+                let sh_u =
+                    quantized_forward(&normed2, &l.se_up.0, &l.se_up.1, &l.se_up.2, gs, bits)
+                        .unwrap();
                 let sh_act = swiglu(&sh_g, &sh_u).unwrap();
-                let sh_d = ops::quantized_matmul(
-                    &sh_act,
-                    &l.se_down.0,
-                    &l.se_down.1,
-                    &l.se_down.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
+                let sh_d =
+                    quantized_forward(&sh_act, &l.se_down.0, &l.se_down.1, &l.se_down.2, gs, bits)
+                        .unwrap();
                 let sh_gate_val = nn::sigmoid(
-                    &ops::quantized_matmul(
+                    &quantized_forward(
                         &normed2,
                         &l.se_gate_proj.0,
                         &l.se_gate_proj.1,
                         &l.se_gate_proj.2,
-                        true,
                         gs,
                         bits,
                     )
@@ -8430,10 +8359,8 @@ mod tests {
                 let h2 = h.add(dummy_attn).unwrap();
                 let normed2 = fast::rms_norm(&h2, Some(&per_layer_norms[i]), 1e-6).unwrap();
 
-                let gate_out = ops::quantized_matmul(
-                    &normed2, &l.gate.0, &l.gate.1, &l.gate.2, true, gs, bits,
-                )
-                .unwrap();
+                let gate_out =
+                    quantized_forward(&normed2, &l.gate.0, &l.gate.1, &l.gate.2, gs, bits).unwrap();
                 let gates = ops::softmax_axis(&gate_out, -1, true).unwrap();
                 let neg_k = -top_k;
                 let all_inds = ops::argpartition_axis(&gates, neg_k, -1).unwrap();
@@ -8481,38 +8408,22 @@ mod tests {
                     .sum_axes(&[-2], false)
                     .unwrap();
 
-                let sh_g = ops::quantized_matmul(
-                    &normed2,
-                    &l.se_gate.0,
-                    &l.se_gate.1,
-                    &l.se_gate.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
-                let sh_u = ops::quantized_matmul(
-                    &normed2, &l.se_up.0, &l.se_up.1, &l.se_up.2, true, gs, bits,
-                )
-                .unwrap();
+                let sh_g =
+                    quantized_forward(&normed2, &l.se_gate.0, &l.se_gate.1, &l.se_gate.2, gs, bits)
+                        .unwrap();
+                let sh_u =
+                    quantized_forward(&normed2, &l.se_up.0, &l.se_up.1, &l.se_up.2, gs, bits)
+                        .unwrap();
                 let sh_act = swiglu(&sh_g, &sh_u).unwrap();
-                let sh_d = ops::quantized_matmul(
-                    &sh_act,
-                    &l.se_down.0,
-                    &l.se_down.1,
-                    &l.se_down.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
+                let sh_d =
+                    quantized_forward(&sh_act, &l.se_down.0, &l.se_down.1, &l.se_down.2, gs, bits)
+                        .unwrap();
                 let sh_gate_val = nn::sigmoid(
-                    &ops::quantized_matmul(
+                    &quantized_forward(
                         &normed2,
                         &l.se_gate_proj.0,
                         &l.se_gate_proj.1,
                         &l.se_gate_proj.2,
-                        true,
                         gs,
                         bits,
                     )
@@ -8536,10 +8447,8 @@ mod tests {
                 let h2 = h.add(dummy_attn).unwrap();
                 let normed2 = fast::rms_norm(&h2, Some(&norm_w), 1e-6).unwrap();
 
-                let gate_out = ops::quantized_matmul(
-                    &normed2, &l.gate.0, &l.gate.1, &l.gate.2, true, gs, bits,
-                )
-                .unwrap();
+                let gate_out =
+                    quantized_forward(&normed2, &l.gate.0, &l.gate.1, &l.gate.2, gs, bits).unwrap();
                 let gates = ops::softmax_axis(&gate_out, -1, true).unwrap();
                 let neg_k = -top_k;
                 let all_inds = ops::argpartition_axis(&gates, neg_k, -1).unwrap();
@@ -8587,38 +8496,22 @@ mod tests {
                     .sum_axes(&[-2], false)
                     .unwrap();
 
-                let sh_g = ops::quantized_matmul(
-                    &normed2,
-                    &l.se_gate.0,
-                    &l.se_gate.1,
-                    &l.se_gate.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
-                let sh_u = ops::quantized_matmul(
-                    &normed2, &l.se_up.0, &l.se_up.1, &l.se_up.2, true, gs, bits,
-                )
-                .unwrap();
+                let sh_g =
+                    quantized_forward(&normed2, &l.se_gate.0, &l.se_gate.1, &l.se_gate.2, gs, bits)
+                        .unwrap();
+                let sh_u =
+                    quantized_forward(&normed2, &l.se_up.0, &l.se_up.1, &l.se_up.2, gs, bits)
+                        .unwrap();
                 let sh_act = swiglu(&sh_g, &sh_u).unwrap();
-                let sh_d = ops::quantized_matmul(
-                    &sh_act,
-                    &l.se_down.0,
-                    &l.se_down.1,
-                    &l.se_down.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
+                let sh_d =
+                    quantized_forward(&sh_act, &l.se_down.0, &l.se_down.1, &l.se_down.2, gs, bits)
+                        .unwrap();
                 let sh_gate_val = nn::sigmoid(
-                    &ops::quantized_matmul(
+                    &quantized_forward(
                         &normed2,
                         &l.se_gate_proj.0,
                         &l.se_gate_proj.1,
                         &l.se_gate_proj.2,
-                        true,
                         gs,
                         bits,
                     )
@@ -8643,10 +8536,8 @@ mod tests {
                 let h2 = h.add(dummy_attn).unwrap();
                 let normed2 = fast::rms_norm(&h2, Some(&norm_w), 1e-6).unwrap();
 
-                let gate_out = ops::quantized_matmul(
-                    &normed2, &l.gate.0, &l.gate.1, &l.gate.2, true, gs, bits,
-                )
-                .unwrap();
+                let gate_out =
+                    quantized_forward(&normed2, &l.gate.0, &l.gate.1, &l.gate.2, gs, bits).unwrap();
                 let gates = ops::softmax_axis(&gate_out, -1, true).unwrap();
                 let neg_k = -top_k;
                 let all_inds = ops::argpartition_axis(&gates, neg_k, -1).unwrap();
@@ -8694,38 +8585,22 @@ mod tests {
                     .sum_axes(&[-2], false)
                     .unwrap();
 
-                let sh_g = ops::quantized_matmul(
-                    &normed2,
-                    &l.se_gate.0,
-                    &l.se_gate.1,
-                    &l.se_gate.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
-                let sh_u = ops::quantized_matmul(
-                    &normed2, &l.se_up.0, &l.se_up.1, &l.se_up.2, true, gs, bits,
-                )
-                .unwrap();
+                let sh_g =
+                    quantized_forward(&normed2, &l.se_gate.0, &l.se_gate.1, &l.se_gate.2, gs, bits)
+                        .unwrap();
+                let sh_u =
+                    quantized_forward(&normed2, &l.se_up.0, &l.se_up.1, &l.se_up.2, gs, bits)
+                        .unwrap();
                 let sh_act = swiglu(&sh_g, &sh_u).unwrap();
-                let sh_d = ops::quantized_matmul(
-                    &sh_act,
-                    &l.se_down.0,
-                    &l.se_down.1,
-                    &l.se_down.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
+                let sh_d =
+                    quantized_forward(&sh_act, &l.se_down.0, &l.se_down.1, &l.se_down.2, gs, bits)
+                        .unwrap();
                 let sh_gate_val = nn::sigmoid(
-                    &ops::quantized_matmul(
+                    &quantized_forward(
                         &normed2,
                         &l.se_gate_proj.0,
                         &l.se_gate_proj.1,
                         &l.se_gate_proj.2,
-                        true,
                         gs,
                         bits,
                     )
@@ -8748,10 +8623,8 @@ mod tests {
                 let h2 = h.clone();
                 let normed2 = fast::rms_norm(&h2, Some(&norm_w), 1e-6).unwrap();
 
-                let gate_out = ops::quantized_matmul(
-                    &normed2, &l.gate.0, &l.gate.1, &l.gate.2, true, gs, bits,
-                )
-                .unwrap();
+                let gate_out =
+                    quantized_forward(&normed2, &l.gate.0, &l.gate.1, &l.gate.2, gs, bits).unwrap();
                 let gates = ops::softmax_axis(&gate_out, -1, true).unwrap();
                 let neg_k = -top_k;
                 let all_inds = ops::argpartition_axis(&gates, neg_k, -1).unwrap();
@@ -8799,38 +8672,22 @@ mod tests {
                     .sum_axes(&[-2], false)
                     .unwrap();
 
-                let sh_g = ops::quantized_matmul(
-                    &normed2,
-                    &l.se_gate.0,
-                    &l.se_gate.1,
-                    &l.se_gate.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
-                let sh_u = ops::quantized_matmul(
-                    &normed2, &l.se_up.0, &l.se_up.1, &l.se_up.2, true, gs, bits,
-                )
-                .unwrap();
+                let sh_g =
+                    quantized_forward(&normed2, &l.se_gate.0, &l.se_gate.1, &l.se_gate.2, gs, bits)
+                        .unwrap();
+                let sh_u =
+                    quantized_forward(&normed2, &l.se_up.0, &l.se_up.1, &l.se_up.2, gs, bits)
+                        .unwrap();
                 let sh_act = swiglu(&sh_g, &sh_u).unwrap();
-                let sh_d = ops::quantized_matmul(
-                    &sh_act,
-                    &l.se_down.0,
-                    &l.se_down.1,
-                    &l.se_down.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
+                let sh_d =
+                    quantized_forward(&sh_act, &l.se_down.0, &l.se_down.1, &l.se_down.2, gs, bits)
+                        .unwrap();
                 let sh_gate_val = nn::sigmoid(
-                    &ops::quantized_matmul(
+                    &quantized_forward(
                         &normed2,
                         &l.se_gate_proj.0,
                         &l.se_gate_proj.1,
                         &l.se_gate_proj.2,
-                        true,
                         gs,
                         bits,
                     )
@@ -8872,7 +8729,7 @@ mod tests {
                 .unwrap()
                 .as_dtype(Dtype::Float16)
                 .unwrap();
-            let (w, s, b) = ops::quantize(&raw, gs, bits).unwrap();
+            let (w, s, b) = crate::test_support::quantize_affine(&raw, gs, bits).unwrap();
             (w, s, b)
         };
 
@@ -8952,22 +8809,20 @@ mod tests {
                            state: &Array,
                            conv_state: &Array|
          -> (Array, Array, Array) {
-            let qkvz = ops::quantized_matmul(
+            let qkvz = quantized_forward(
                 h,
                 &l.in_proj_qkvz.0,
                 &l.in_proj_qkvz.1,
                 &l.in_proj_qkvz.2,
-                true,
                 gs,
                 bits,
             )
             .unwrap();
-            let ba = ops::quantized_matmul(
+            let ba = quantized_forward(
                 h,
                 &l.in_proj_ba.0,
                 &l.in_proj_ba.1,
                 &l.in_proj_ba.2,
-                true,
                 gs,
                 bits,
             )
@@ -9040,12 +8895,11 @@ mod tests {
             let gated = swiglu(&z_shaped, &normed).unwrap();
 
             // Output proj
-            let out = ops::quantized_matmul(
+            let out = quantized_forward(
                 &gated.reshape(&[1, 1, -1]).unwrap(),
                 &l.out_proj.0,
                 &l.out_proj.1,
                 &l.out_proj.2,
-                true,
                 gs,
                 bits,
             )
@@ -9129,7 +8983,7 @@ mod tests {
                 .unwrap()
                 .as_dtype(Dtype::Float16)
                 .unwrap();
-            let (w, s, b) = ops::quantize(&raw, gs, bits).unwrap();
+            let (w, s, b) = crate::test_support::quantize_affine(&raw, gs, bits).unwrap();
             (w, s, b)
         };
         let make_sw = |d_in: i32, d_out: i32| -> (Array, Array, Array) {
@@ -9137,7 +8991,7 @@ mod tests {
                 .unwrap()
                 .as_dtype(Dtype::Float16)
                 .unwrap();
-            let (w, s, b) = ops::quantize(&raw, gs, bits).unwrap();
+            let (w, s, b) = crate::test_support::quantize_affine(&raw, gs, bits).unwrap();
             (w, s, b)
         };
 
@@ -9344,22 +9198,20 @@ mod tests {
                 // Attention
                 let r = if gdn_layers[i].is_some() {
                     let l = gdn_layers[i].as_ref().unwrap();
-                    let qkvz = ops::quantized_matmul(
+                    let qkvz = quantized_forward(
                         &normed,
                         &l.in_proj_qkvz.0,
                         &l.in_proj_qkvz.1,
                         &l.in_proj_qkvz.2,
-                        true,
                         gs,
                         bits,
                     )
                     .unwrap();
-                    let ba = ops::quantized_matmul(
+                    let ba = quantized_forward(
                         &normed,
                         &l.in_proj_ba.0,
                         &l.in_proj_ba.1,
                         &l.in_proj_ba.2,
-                        true,
                         gs,
                         bits,
                     )
@@ -9437,12 +9289,11 @@ mod tests {
                         .reshape(&[1, 1, hv, dv])
                         .unwrap();
                     let gated = swiglu(&z_shaped, &normed_y).unwrap();
-                    ops::quantized_matmul(
+                    quantized_forward(
                         &gated.reshape(&[1, 1, -1]).unwrap(),
                         &l.out_proj.0,
                         &l.out_proj.1,
                         &l.out_proj.2,
-                        true,
                         gs,
                         bits,
                     )
@@ -9450,32 +9301,29 @@ mod tests {
                 } else {
                     // Simplified attention: just qkvo matmuls
                     let al = attn_layers[i].as_ref().unwrap();
-                    let q = ops::quantized_matmul(
+                    let q = quantized_forward(
                         &normed,
                         &al.q_proj.0,
                         &al.q_proj.1,
                         &al.q_proj.2,
-                        true,
                         gs,
                         bits,
                     )
                     .unwrap();
-                    let _k = ops::quantized_matmul(
+                    let _k = quantized_forward(
                         &normed,
                         &al.k_proj.0,
                         &al.k_proj.1,
                         &al.k_proj.2,
-                        true,
                         gs,
                         bits,
                     )
                     .unwrap();
-                    let v = ops::quantized_matmul(
+                    let v = quantized_forward(
                         &normed,
                         &al.v_proj.0,
                         &al.v_proj.1,
                         &al.v_proj.2,
-                        true,
                         gs,
                         bits,
                     )
@@ -9483,16 +9331,8 @@ mod tests {
                     let proxy = v
                         .multiply(nn::sigmoid(&q.sum_axes(&[-1], true).unwrap()).unwrap())
                         .unwrap();
-                    ops::quantized_matmul(
-                        &proxy,
-                        &al.o_proj.0,
-                        &al.o_proj.1,
-                        &al.o_proj.2,
-                        true,
-                        gs,
-                        bits,
-                    )
-                    .unwrap()
+                    quantized_forward(&proxy, &al.o_proj.0, &al.o_proj.1, &al.o_proj.2, gs, bits)
+                        .unwrap()
                 };
 
                 let h2 = h.add(r).unwrap();
@@ -9500,10 +9340,8 @@ mod tests {
 
                 // MoE
                 let m = &moe_layers[i];
-                let gate_out = ops::quantized_matmul(
-                    &normed2, &m.gate.0, &m.gate.1, &m.gate.2, true, gs, bits,
-                )
-                .unwrap();
+                let gate_out =
+                    quantized_forward(&normed2, &m.gate.0, &m.gate.1, &m.gate.2, gs, bits).unwrap();
                 let gates = ops::softmax_axis(&gate_out, -1, true).unwrap();
                 let neg_k = -top_k;
                 let all_inds = ops::argpartition_axis(&gates, neg_k, -1).unwrap();
@@ -9551,38 +9389,22 @@ mod tests {
                     .sum_axes(&[-2], false)
                     .unwrap();
 
-                let sh_g = ops::quantized_matmul(
-                    &normed2,
-                    &m.se_gate.0,
-                    &m.se_gate.1,
-                    &m.se_gate.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
-                let sh_u = ops::quantized_matmul(
-                    &normed2, &m.se_up.0, &m.se_up.1, &m.se_up.2, true, gs, bits,
-                )
-                .unwrap();
+                let sh_g =
+                    quantized_forward(&normed2, &m.se_gate.0, &m.se_gate.1, &m.se_gate.2, gs, bits)
+                        .unwrap();
+                let sh_u =
+                    quantized_forward(&normed2, &m.se_up.0, &m.se_up.1, &m.se_up.2, gs, bits)
+                        .unwrap();
                 let sh_act = swiglu(&sh_g, &sh_u).unwrap();
-                let sh_d = ops::quantized_matmul(
-                    &sh_act,
-                    &m.se_down.0,
-                    &m.se_down.1,
-                    &m.se_down.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
+                let sh_d =
+                    quantized_forward(&sh_act, &m.se_down.0, &m.se_down.1, &m.se_down.2, gs, bits)
+                        .unwrap();
                 let sh_gate_val = nn::sigmoid(
-                    ops::quantized_matmul(
+                    quantized_forward(
                         &normed2,
                         &m.se_gate_proj.0,
                         &m.se_gate_proj.1,
                         &m.se_gate_proj.2,
-                        true,
                         gs,
                         bits,
                     )
@@ -9657,22 +9479,20 @@ mod tests {
                 }
                 let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
                 let l = gdn_layers[i].as_ref().unwrap();
-                let qkvz = ops::quantized_matmul(
+                let qkvz = quantized_forward(
                     &normed,
                     &l.in_proj_qkvz.0,
                     &l.in_proj_qkvz.1,
                     &l.in_proj_qkvz.2,
-                    true,
                     gs,
                     bits,
                 )
                 .unwrap();
-                let ba = ops::quantized_matmul(
+                let ba = quantized_forward(
                     &normed,
                     &l.in_proj_ba.0,
                     &l.in_proj_ba.1,
                     &l.in_proj_ba.2,
-                    true,
                     gs,
                     bits,
                 )
@@ -9745,12 +9565,11 @@ mod tests {
                     .reshape(&[1, 1, hv, dv])
                     .unwrap();
                 let gated = swiglu(&z_shaped, &normed_y).unwrap();
-                let r = ops::quantized_matmul(
+                let r = quantized_forward(
                     &gated.reshape(&[1, 1, -1]).unwrap(),
                     &l.out_proj.0,
                     &l.out_proj.1,
                     &l.out_proj.2,
-                    true,
                     gs,
                     bits,
                 )
@@ -9766,12 +9585,11 @@ mod tests {
             for i in 0..n_layers as usize {
                 let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
                 // Simple attn proxy
-                let attn_out = ops::quantized_matmul(
+                let attn_out = quantized_forward(
                     &normed,
                     &moe_layers[i].gate.0,
                     &moe_layers[i].gate.1,
                     &moe_layers[i].gate.2,
-                    true,
                     gs,
                     bits,
                 )
@@ -9779,10 +9597,8 @@ mod tests {
                 let h2 = h.add(attn_out.sum_axes(&[-1], true).unwrap()).unwrap();
                 let normed2 = fast::rms_norm(&h2, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
                 let m = &moe_layers[i];
-                let gate_out = ops::quantized_matmul(
-                    &normed2, &m.gate.0, &m.gate.1, &m.gate.2, true, gs, bits,
-                )
-                .unwrap();
+                let gate_out =
+                    quantized_forward(&normed2, &m.gate.0, &m.gate.1, &m.gate.2, gs, bits).unwrap();
                 let gates = ops::softmax_axis(&gate_out, -1, true).unwrap();
                 let neg_k = -top_k;
                 let all_inds = ops::argpartition_axis(&gates, neg_k, -1).unwrap();
@@ -9828,38 +9644,22 @@ mod tests {
                     .unwrap()
                     .sum_axes(&[-2], false)
                     .unwrap();
-                let sh_g = ops::quantized_matmul(
-                    &normed2,
-                    &m.se_gate.0,
-                    &m.se_gate.1,
-                    &m.se_gate.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
-                let sh_u = ops::quantized_matmul(
-                    &normed2, &m.se_up.0, &m.se_up.1, &m.se_up.2, true, gs, bits,
-                )
-                .unwrap();
+                let sh_g =
+                    quantized_forward(&normed2, &m.se_gate.0, &m.se_gate.1, &m.se_gate.2, gs, bits)
+                        .unwrap();
+                let sh_u =
+                    quantized_forward(&normed2, &m.se_up.0, &m.se_up.1, &m.se_up.2, gs, bits)
+                        .unwrap();
                 let sh_act = swiglu(&sh_g, &sh_u).unwrap();
-                let sh_d = ops::quantized_matmul(
-                    &sh_act,
-                    &m.se_down.0,
-                    &m.se_down.1,
-                    &m.se_down.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
+                let sh_d =
+                    quantized_forward(&sh_act, &m.se_down.0, &m.se_down.1, &m.se_down.2, gs, bits)
+                        .unwrap();
                 let sh_gate_val = nn::sigmoid(
-                    ops::quantized_matmul(
+                    quantized_forward(
                         &normed2,
                         &m.se_gate_proj.0,
                         &m.se_gate_proj.1,
                         &m.se_gate_proj.2,
-                        true,
                         gs,
                         bits,
                     )
@@ -9924,22 +9724,20 @@ mod tests {
                 let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
                 let r = if gdn_layers[i].is_some() {
                     let l = gdn_layers[i].as_ref().unwrap();
-                    let qkvz = ops::quantized_matmul(
+                    let qkvz = quantized_forward(
                         &normed,
                         &l.in_proj_qkvz.0,
                         &l.in_proj_qkvz.1,
                         &l.in_proj_qkvz.2,
-                        true,
                         gs,
                         bits,
                     )
                     .unwrap();
-                    let ba = ops::quantized_matmul(
+                    let ba = quantized_forward(
                         &normed,
                         &l.in_proj_ba.0,
                         &l.in_proj_ba.1,
                         &l.in_proj_ba.2,
-                        true,
                         gs,
                         bits,
                     )
@@ -10008,44 +9806,40 @@ mod tests {
                         .reshape(&[1, 1, hv, dv])
                         .unwrap();
                     let gated = swiglu(&z_shaped, &normed_y).unwrap();
-                    ops::quantized_matmul(
+                    quantized_forward(
                         &gated.reshape(&[1, 1, -1]).unwrap(),
                         &l.out_proj.0,
                         &l.out_proj.1,
                         &l.out_proj.2,
-                        true,
                         gs,
                         bits,
                     )
                     .unwrap()
                 } else {
                     let al = attn_layers[i].as_ref().unwrap();
-                    let q = ops::quantized_matmul(
+                    let q = quantized_forward(
                         &normed,
                         &al.q_proj.0,
                         &al.q_proj.1,
                         &al.q_proj.2,
-                        true,
                         gs,
                         bits,
                     )
                     .unwrap();
-                    let _k = ops::quantized_matmul(
+                    let _k = quantized_forward(
                         &normed,
                         &al.k_proj.0,
                         &al.k_proj.1,
                         &al.k_proj.2,
-                        true,
                         gs,
                         bits,
                     )
                     .unwrap();
-                    let v = ops::quantized_matmul(
+                    let v = quantized_forward(
                         &normed,
                         &al.v_proj.0,
                         &al.v_proj.1,
                         &al.v_proj.2,
-                        true,
                         gs,
                         bits,
                     )
@@ -10053,24 +9847,14 @@ mod tests {
                     let proxy = v
                         .multiply(nn::sigmoid(&q.sum_axes(&[-1], true).unwrap()).unwrap())
                         .unwrap();
-                    ops::quantized_matmul(
-                        &proxy,
-                        &al.o_proj.0,
-                        &al.o_proj.1,
-                        &al.o_proj.2,
-                        true,
-                        gs,
-                        bits,
-                    )
-                    .unwrap()
+                    quantized_forward(&proxy, &al.o_proj.0, &al.o_proj.1, &al.o_proj.2, gs, bits)
+                        .unwrap()
                 };
                 let h2 = h.add(r).unwrap();
                 let normed2 = fast::rms_norm(&h2, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
                 let m = &moe_layers[i];
-                let gate_out = ops::quantized_matmul(
-                    &normed2, &m.gate.0, &m.gate.1, &m.gate.2, true, gs, bits,
-                )
-                .unwrap();
+                let gate_out =
+                    quantized_forward(&normed2, &m.gate.0, &m.gate.1, &m.gate.2, gs, bits).unwrap();
                 let gates = ops::softmax_axis(&gate_out, -1, true).unwrap();
                 let neg_k = -top_k;
                 let all_inds = ops::argpartition_axis(&gates, neg_k, -1).unwrap();
@@ -10116,38 +9900,22 @@ mod tests {
                     .unwrap()
                     .sum_axes(&[-2], false)
                     .unwrap();
-                let sh_g = ops::quantized_matmul(
-                    &normed2,
-                    &m.se_gate.0,
-                    &m.se_gate.1,
-                    &m.se_gate.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
-                let sh_u = ops::quantized_matmul(
-                    &normed2, &m.se_up.0, &m.se_up.1, &m.se_up.2, true, gs, bits,
-                )
-                .unwrap();
+                let sh_g =
+                    quantized_forward(&normed2, &m.se_gate.0, &m.se_gate.1, &m.se_gate.2, gs, bits)
+                        .unwrap();
+                let sh_u =
+                    quantized_forward(&normed2, &m.se_up.0, &m.se_up.1, &m.se_up.2, gs, bits)
+                        .unwrap();
                 let sh_act = swiglu(&sh_g, &sh_u).unwrap();
-                let sh_d = ops::quantized_matmul(
-                    &sh_act,
-                    &m.se_down.0,
-                    &m.se_down.1,
-                    &m.se_down.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
+                let sh_d =
+                    quantized_forward(&sh_act, &m.se_down.0, &m.se_down.1, &m.se_down.2, gs, bits)
+                        .unwrap();
                 let sh_gate_val = nn::sigmoid(
-                    ops::quantized_matmul(
+                    quantized_forward(
                         &normed2,
                         &m.se_gate_proj.0,
                         &m.se_gate_proj.1,
                         &m.se_gate_proj.2,
-                        true,
                         gs,
                         bits,
                     )
@@ -10195,22 +9963,20 @@ mod tests {
                 let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
                 let r = if gdn_layers[i].is_some() {
                     let l = gdn_layers[i].as_ref().unwrap();
-                    let qkvz = ops::quantized_matmul(
+                    let qkvz = quantized_forward(
                         &normed,
                         &l.in_proj_qkvz.0,
                         &l.in_proj_qkvz.1,
                         &l.in_proj_qkvz.2,
-                        true,
                         gs,
                         bits,
                     )
                     .unwrap();
-                    let ba = ops::quantized_matmul(
+                    let ba = quantized_forward(
                         &normed,
                         &l.in_proj_ba.0,
                         &l.in_proj_ba.1,
                         &l.in_proj_ba.2,
-                        true,
                         gs,
                         bits,
                     )
@@ -10292,44 +10058,40 @@ mod tests {
                         .reshape(&[1, 1, hv, dv])
                         .unwrap();
                     let gated = swiglu(&z_shaped, &normed_y).unwrap();
-                    ops::quantized_matmul(
+                    quantized_forward(
                         &gated.reshape(&[1, 1, -1]).unwrap(),
                         &l.out_proj.0,
                         &l.out_proj.1,
                         &l.out_proj.2,
-                        true,
                         gs,
                         bits,
                     )
                     .unwrap()
                 } else {
                     let al = attn_layers[i].as_ref().unwrap();
-                    let q = ops::quantized_matmul(
+                    let q = quantized_forward(
                         &normed,
                         &al.q_proj.0,
                         &al.q_proj.1,
                         &al.q_proj.2,
-                        true,
                         gs,
                         bits,
                     )
                     .unwrap();
-                    let _k = ops::quantized_matmul(
+                    let _k = quantized_forward(
                         &normed,
                         &al.k_proj.0,
                         &al.k_proj.1,
                         &al.k_proj.2,
-                        true,
                         gs,
                         bits,
                     )
                     .unwrap();
-                    let v = ops::quantized_matmul(
+                    let v = quantized_forward(
                         &normed,
                         &al.v_proj.0,
                         &al.v_proj.1,
                         &al.v_proj.2,
-                        true,
                         gs,
                         bits,
                     )
@@ -10337,24 +10099,14 @@ mod tests {
                     let proxy = v
                         .multiply(nn::sigmoid(&q.sum_axes(&[-1], true).unwrap()).unwrap())
                         .unwrap();
-                    ops::quantized_matmul(
-                        &proxy,
-                        &al.o_proj.0,
-                        &al.o_proj.1,
-                        &al.o_proj.2,
-                        true,
-                        gs,
-                        bits,
-                    )
-                    .unwrap()
+                    quantized_forward(&proxy, &al.o_proj.0, &al.o_proj.1, &al.o_proj.2, gs, bits)
+                        .unwrap()
                 };
                 let h2 = h.add(r).unwrap();
                 let normed2 = fast::rms_norm(&h2, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
                 let m = &moe_layers[i];
-                let gate_out = ops::quantized_matmul(
-                    &normed2, &m.gate.0, &m.gate.1, &m.gate.2, true, gs, bits,
-                )
-                .unwrap();
+                let gate_out =
+                    quantized_forward(&normed2, &m.gate.0, &m.gate.1, &m.gate.2, gs, bits).unwrap();
                 let gates = ops::softmax_axis(&gate_out, -1, true).unwrap();
                 let neg_k = -top_k;
                 let all_inds = ops::argpartition_axis(&gates, neg_k, -1).unwrap();
@@ -10400,38 +10152,22 @@ mod tests {
                     .unwrap()
                     .sum_axes(&[-2], false)
                     .unwrap();
-                let sh_g = ops::quantized_matmul(
-                    &normed2,
-                    &m.se_gate.0,
-                    &m.se_gate.1,
-                    &m.se_gate.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
-                let sh_u = ops::quantized_matmul(
-                    &normed2, &m.se_up.0, &m.se_up.1, &m.se_up.2, true, gs, bits,
-                )
-                .unwrap();
+                let sh_g =
+                    quantized_forward(&normed2, &m.se_gate.0, &m.se_gate.1, &m.se_gate.2, gs, bits)
+                        .unwrap();
+                let sh_u =
+                    quantized_forward(&normed2, &m.se_up.0, &m.se_up.1, &m.se_up.2, gs, bits)
+                        .unwrap();
                 let sh_act = swiglu(&sh_g, &sh_u).unwrap();
-                let sh_d = ops::quantized_matmul(
-                    &sh_act,
-                    &m.se_down.0,
-                    &m.se_down.1,
-                    &m.se_down.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
+                let sh_d =
+                    quantized_forward(&sh_act, &m.se_down.0, &m.se_down.1, &m.se_down.2, gs, bits)
+                        .unwrap();
                 let sh_gate_val = nn::sigmoid(
-                    ops::quantized_matmul(
+                    quantized_forward(
                         &normed2,
                         &m.se_gate_proj.0,
                         &m.se_gate_proj.1,
                         &m.se_gate_proj.2,
-                        true,
                         gs,
                         bits,
                     )
@@ -10471,305 +10207,30 @@ mod tests {
         );
 
         // Variant: Metal kernel with per-layer eval barriers
-        let forward_eval_barrier =
-            |h_in: &Array, ss: &mut Vec<Array>, cs: &mut Vec<Array>| -> Array {
-                let mut h = h_in.clone();
-                let mut gdn_idx = 0usize;
-                for i in 0..n_layers as usize {
-                    let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
-                    let r = if gdn_layers[i].is_some() {
-                        let l = gdn_layers[i].as_ref().unwrap();
-                        let qkvz = ops::quantized_matmul(
-                            &normed,
-                            &l.in_proj_qkvz.0,
-                            &l.in_proj_qkvz.1,
-                            &l.in_proj_qkvz.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap();
-                        let ba = ops::quantized_matmul(
-                            &normed,
-                            &l.in_proj_ba.0,
-                            &l.in_proj_ba.1,
-                            &l.in_proj_ba.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap();
-                        let q = qkvz
-                            .index((.., .., ..key_dim))
-                            .reshape(&[1, 1, hk, dk])
-                            .unwrap();
-                        let k = qkvz
-                            .index((.., .., key_dim..2 * key_dim))
-                            .reshape(&[1, 1, hk, dk])
-                            .unwrap();
-                        let v = qkvz
-                            .index((.., .., 2 * key_dim..2 * key_dim + value_dim))
-                            .reshape(&[1, 1, hv, dv])
-                            .unwrap();
-                        let z = qkvz.index((.., .., 2 * key_dim + value_dim..));
-                        let b = ba.index((.., .., ..hv)).reshape(&[1, 1, hv]).unwrap();
-                        let a = ba.index((.., .., hv..)).reshape(&[1, 1, hv]).unwrap();
-                        let q_flat = q.reshape(&[1, 1, -1]).unwrap();
-                        let k_flat = k.reshape(&[1, 1, -1]).unwrap();
-                        let v_flat = v.reshape(&[1, 1, -1]).unwrap();
-                        let mixed = ops::concatenate(&[&q_flat, &k_flat, &v_flat], -1).unwrap();
-                        let conv_in = ops::concatenate(&[&cs[gdn_idx], &mixed], 1).unwrap();
-                        cs[gdn_idx] = conv_in.index((.., -3.., ..));
-                        let conv_out =
-                            nn::silu(ops::conv1d(&conv_in, &l.conv_w, 1, 0, 1, conv_dim).unwrap())
-                                .unwrap();
-                        let conv_q = conv_out
-                            .index((.., .., ..key_dim))
-                            .reshape(&[1, 1, hk, dk])
-                            .unwrap();
-                        let conv_k = conv_out
-                            .index((.., .., key_dim..2 * key_dim))
-                            .reshape(&[1, 1, hk, dk])
-                            .unwrap();
-                        let conv_v = conv_out
-                            .index((.., .., 2 * key_dim..))
-                            .reshape(&[1, 1, hv, dv])
-                            .unwrap();
-                        let norm_q = fast::rms_norm(&conv_q, Some(&qk_norm_w), 1e-6)
-                            .unwrap()
-                            .multiply(&inv_scale_sq)
-                            .unwrap();
-                        let norm_k = fast::rms_norm(&conv_k, Some(&qk_norm_w), 1e-6)
-                            .unwrap()
-                            .multiply(&inv_scale)
-                            .unwrap();
-                        let (y, new_state) = gated_delta_kernel_ffi(
-                            &norm_q,
-                            &norm_k,
-                            &conv_v,
-                            &l.a_log,
-                            &a,
-                            &l.dt_bias,
-                            &b,
-                            &ss[gdn_idx],
-                            1,
-                            1,
-                            hk,
-                            dk,
-                            hv,
-                            dv,
-                        )
-                        .unwrap();
-                        ss[gdn_idx] = new_state;
-                        gdn_idx += 1;
-                        let normed_y = fast::rms_norm(&y, Some(&l.norm_w), 1e-6).unwrap();
-                        let z_shaped = z
-                            .index((.., .., ..value_dim))
-                            .reshape(&[1, 1, hv, dv])
-                            .unwrap();
-                        let gated = swiglu(&z_shaped, &normed_y).unwrap();
-                        ops::quantized_matmul(
-                            &gated.reshape(&[1, 1, -1]).unwrap(),
-                            &l.out_proj.0,
-                            &l.out_proj.1,
-                            &l.out_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap()
-                    } else {
-                        let al = attn_layers[i].as_ref().unwrap();
-                        let q = ops::quantized_matmul(
-                            &normed,
-                            &al.q_proj.0,
-                            &al.q_proj.1,
-                            &al.q_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap();
-                        let _k = ops::quantized_matmul(
-                            &normed,
-                            &al.k_proj.0,
-                            &al.k_proj.1,
-                            &al.k_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap();
-                        let v = ops::quantized_matmul(
-                            &normed,
-                            &al.v_proj.0,
-                            &al.v_proj.1,
-                            &al.v_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap();
-                        let proxy = v
-                            .multiply(nn::sigmoid(&q.sum_axes(&[-1], true).unwrap()).unwrap())
-                            .unwrap();
-                        ops::quantized_matmul(
-                            &proxy,
-                            &al.o_proj.0,
-                            &al.o_proj.1,
-                            &al.o_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap()
-                    };
-                    let h2 = h.add(r).unwrap();
-                    let normed2 = fast::rms_norm(&h2, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
-                    let m = &moe_layers[i];
-                    let gate_out = ops::quantized_matmul(
-                        &normed2, &m.gate.0, &m.gate.1, &m.gate.2, true, gs, bits,
-                    )
-                    .unwrap();
-                    let gates = ops::softmax_axis(&gate_out, -1, true).unwrap();
-                    let neg_k = -top_k;
-                    let all_inds = ops::argpartition_axis(&gates, neg_k, -1).unwrap();
-                    let top_inds = all_inds.index((.., .., (n_experts + neg_k)..));
-                    let raw_scores = gates.take_along_axis(&top_inds, -1).unwrap();
-                    let scores = raw_scores
-                        .divide(raw_scores.sum_axes(&[-1], true).unwrap())
-                        .unwrap();
-                    let x_exp = normed2.expand_dims(-2).unwrap().expand_dims(-2).unwrap();
-                    let g_out = gather_qmm(
-                        &x_exp,
-                        &m.sw_gate.0,
-                        &m.sw_gate.1,
-                        &m.sw_gate.2,
-                        &top_inds,
-                        true,
-                        gs,
-                        bits,
-                        false,
-                    )
-                    .unwrap();
-                    let u_out = gather_qmm(
-                        &x_exp, &m.sw_up.0, &m.sw_up.1, &m.sw_up.2, &top_inds, true, gs, bits,
-                        false,
-                    )
-                    .unwrap();
-                    let activated = swiglu(&g_out, &u_out).unwrap();
-                    let d_out = gather_qmm(
-                        &activated,
-                        &m.sw_down.0,
-                        &m.sw_down.1,
-                        &m.sw_down.2,
-                        &top_inds,
-                        true,
-                        gs,
-                        bits,
-                        false,
-                    )
-                    .unwrap();
-                    let expert_sum = d_out
-                        .squeeze_axes(&[-2])
-                        .unwrap()
-                        .multiply(scores.expand_dims(-1).unwrap())
-                        .unwrap()
-                        .sum_axes(&[-2], false)
-                        .unwrap();
-                    let sh_g = ops::quantized_matmul(
-                        &normed2,
-                        &m.se_gate.0,
-                        &m.se_gate.1,
-                        &m.se_gate.2,
-                        true,
-                        gs,
-                        bits,
-                    )
-                    .unwrap();
-                    let sh_u = ops::quantized_matmul(
-                        &normed2, &m.se_up.0, &m.se_up.1, &m.se_up.2, true, gs, bits,
-                    )
-                    .unwrap();
-                    let sh_act = swiglu(&sh_g, &sh_u).unwrap();
-                    let sh_d = ops::quantized_matmul(
-                        &sh_act,
-                        &m.se_down.0,
-                        &m.se_down.1,
-                        &m.se_down.2,
-                        true,
-                        gs,
-                        bits,
-                    )
-                    .unwrap();
-                    let sh_gate_val = nn::sigmoid(
-                        ops::quantized_matmul(
-                            &normed2,
-                            &m.se_gate_proj.0,
-                            &m.se_gate_proj.1,
-                            &m.se_gate_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap(),
-                    )
-                    .unwrap();
-                    let shared_out = sh_d.multiply(sh_gate_val).unwrap();
-                    h = h2.add(expert_sum).unwrap().add(shared_out).unwrap();
-
-                    // Eval barrier: force layer-by-layer evaluation
-                    h.eval().unwrap();
-                    ss.iter().for_each(|s| s.eval().unwrap());
-                    cs.iter().for_each(|c| c.eval().unwrap());
-                }
-                h
-            };
-
-        for _ in 0..3 {
-            let mut ss = states.clone();
-            let mut cs = conv_states.clone();
-            let r = forward_eval_barrier(&x, &mut ss, &mut cs);
-            r.eval().unwrap();
-        }
-        let mut total_eb = 0u128;
-        for _ in 0..n {
-            let mut ss = states.clone();
-            let mut cs = conv_states.clone();
-            let t0 = std::time::Instant::now();
-            let r = forward_eval_barrier(&x, &mut ss, &mut cs);
-            r.eval().unwrap();
-            total_eb += t0.elapsed().as_nanos();
-        }
-        println!(
-            "Rust combined EVAL BARRIER (per-layer eval): {:.2}ms",
-            total_eb as f64 / n as f64 / 1e6
-        );
-
-        // Variant: async_eval after each layer (non-blocking pipeline hint)
-        let forward_async = |h_in: &Array, ss: &mut Vec<Array>, cs: &mut Vec<Array>| -> Array {
+        let forward_eval_barrier = |h_in: &Array,
+                                    ss: &mut Vec<Array>,
+                                    cs: &mut Vec<Array>|
+         -> Array {
             let mut h = h_in.clone();
             let mut gdn_idx = 0usize;
             for i in 0..n_layers as usize {
                 let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
                 let r = if gdn_layers[i].is_some() {
                     let l = gdn_layers[i].as_ref().unwrap();
-                    let qkvz = ops::quantized_matmul(
+                    let qkvz = quantized_forward(
                         &normed,
                         &l.in_proj_qkvz.0,
                         &l.in_proj_qkvz.1,
                         &l.in_proj_qkvz.2,
-                        true,
                         gs,
                         bits,
                     )
                     .unwrap();
-                    let ba = ops::quantized_matmul(
+                    let ba = quantized_forward(
                         &normed,
                         &l.in_proj_ba.0,
                         &l.in_proj_ba.1,
                         &l.in_proj_ba.2,
-                        true,
                         gs,
                         bits,
                     )
@@ -10843,44 +10304,40 @@ mod tests {
                         .reshape(&[1, 1, hv, dv])
                         .unwrap();
                     let gated = swiglu(&z_shaped, &normed_y).unwrap();
-                    ops::quantized_matmul(
+                    quantized_forward(
                         &gated.reshape(&[1, 1, -1]).unwrap(),
                         &l.out_proj.0,
                         &l.out_proj.1,
                         &l.out_proj.2,
-                        true,
                         gs,
                         bits,
                     )
                     .unwrap()
                 } else {
                     let al = attn_layers[i].as_ref().unwrap();
-                    let q = ops::quantized_matmul(
+                    let q = quantized_forward(
                         &normed,
                         &al.q_proj.0,
                         &al.q_proj.1,
                         &al.q_proj.2,
-                        true,
                         gs,
                         bits,
                     )
                     .unwrap();
-                    let _k = ops::quantized_matmul(
+                    let _k = quantized_forward(
                         &normed,
                         &al.k_proj.0,
                         &al.k_proj.1,
                         &al.k_proj.2,
-                        true,
                         gs,
                         bits,
                     )
                     .unwrap();
-                    let v = ops::quantized_matmul(
+                    let v = quantized_forward(
                         &normed,
                         &al.v_proj.0,
                         &al.v_proj.1,
                         &al.v_proj.2,
-                        true,
                         gs,
                         bits,
                     )
@@ -10888,28 +10345,14 @@ mod tests {
                     let proxy = v
                         .multiply(nn::sigmoid(&q.sum_axes(&[-1], true).unwrap()).unwrap())
                         .unwrap();
-                    ops::quantized_matmul(
-                        &proxy,
-                        &al.o_proj.0,
-                        &al.o_proj.1,
-                        &al.o_proj.2,
-                        true,
-                        gs,
-                        bits,
-                    )
-                    .unwrap()
+                    quantized_forward(&proxy, &al.o_proj.0, &al.o_proj.1, &al.o_proj.2, gs, bits)
+                        .unwrap()
                 };
                 let h2 = h.add(r).unwrap();
-
-                // Async eval hint: start processing GDN computation while building MoE graph
-                mlx_rs::transforms::async_eval([&h2]).unwrap();
-
                 let normed2 = fast::rms_norm(&h2, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
                 let m = &moe_layers[i];
-                let gate_out = ops::quantized_matmul(
-                    &normed2, &m.gate.0, &m.gate.1, &m.gate.2, true, gs, bits,
-                )
-                .unwrap();
+                let gate_out =
+                    quantized_forward(&normed2, &m.gate.0, &m.gate.1, &m.gate.2, gs, bits).unwrap();
                 let gates = ops::softmax_axis(&gate_out, -1, true).unwrap();
                 let neg_k = -top_k;
                 let all_inds = ops::argpartition_axis(&gates, neg_k, -1).unwrap();
@@ -10955,38 +10398,268 @@ mod tests {
                     .unwrap()
                     .sum_axes(&[-2], false)
                     .unwrap();
-                let sh_g = ops::quantized_matmul(
-                    &normed2,
-                    &m.se_gate.0,
-                    &m.se_gate.1,
-                    &m.se_gate.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
-                let sh_u = ops::quantized_matmul(
-                    &normed2, &m.se_up.0, &m.se_up.1, &m.se_up.2, true, gs, bits,
-                )
-                .unwrap();
+                let sh_g =
+                    quantized_forward(&normed2, &m.se_gate.0, &m.se_gate.1, &m.se_gate.2, gs, bits)
+                        .unwrap();
+                let sh_u =
+                    quantized_forward(&normed2, &m.se_up.0, &m.se_up.1, &m.se_up.2, gs, bits)
+                        .unwrap();
                 let sh_act = swiglu(&sh_g, &sh_u).unwrap();
-                let sh_d = ops::quantized_matmul(
-                    &sh_act,
-                    &m.se_down.0,
-                    &m.se_down.1,
-                    &m.se_down.2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
+                let sh_d =
+                    quantized_forward(&sh_act, &m.se_down.0, &m.se_down.1, &m.se_down.2, gs, bits)
+                        .unwrap();
                 let sh_gate_val = nn::sigmoid(
-                    ops::quantized_matmul(
+                    quantized_forward(
                         &normed2,
                         &m.se_gate_proj.0,
                         &m.se_gate_proj.1,
                         &m.se_gate_proj.2,
-                        true,
+                        gs,
+                        bits,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                let shared_out = sh_d.multiply(sh_gate_val).unwrap();
+                h = h2.add(expert_sum).unwrap().add(shared_out).unwrap();
+
+                // Eval barrier: force layer-by-layer evaluation
+                h.eval().unwrap();
+                ss.iter().for_each(|s| s.eval().unwrap());
+                cs.iter().for_each(|c| c.eval().unwrap());
+            }
+            h
+        };
+
+        for _ in 0..3 {
+            let mut ss = states.clone();
+            let mut cs = conv_states.clone();
+            let r = forward_eval_barrier(&x, &mut ss, &mut cs);
+            r.eval().unwrap();
+        }
+        let mut total_eb = 0u128;
+        for _ in 0..n {
+            let mut ss = states.clone();
+            let mut cs = conv_states.clone();
+            let t0 = std::time::Instant::now();
+            let r = forward_eval_barrier(&x, &mut ss, &mut cs);
+            r.eval().unwrap();
+            total_eb += t0.elapsed().as_nanos();
+        }
+        println!(
+            "Rust combined EVAL BARRIER (per-layer eval): {:.2}ms",
+            total_eb as f64 / n as f64 / 1e6
+        );
+
+        // Variant: async_eval after each layer (non-blocking pipeline hint)
+        let forward_async = |h_in: &Array, ss: &mut Vec<Array>, cs: &mut Vec<Array>| -> Array {
+            let mut h = h_in.clone();
+            let mut gdn_idx = 0usize;
+            for i in 0..n_layers as usize {
+                let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                let r = if gdn_layers[i].is_some() {
+                    let l = gdn_layers[i].as_ref().unwrap();
+                    let qkvz = quantized_forward(
+                        &normed,
+                        &l.in_proj_qkvz.0,
+                        &l.in_proj_qkvz.1,
+                        &l.in_proj_qkvz.2,
+                        gs,
+                        bits,
+                    )
+                    .unwrap();
+                    let ba = quantized_forward(
+                        &normed,
+                        &l.in_proj_ba.0,
+                        &l.in_proj_ba.1,
+                        &l.in_proj_ba.2,
+                        gs,
+                        bits,
+                    )
+                    .unwrap();
+                    let q = qkvz
+                        .index((.., .., ..key_dim))
+                        .reshape(&[1, 1, hk, dk])
+                        .unwrap();
+                    let k = qkvz
+                        .index((.., .., key_dim..2 * key_dim))
+                        .reshape(&[1, 1, hk, dk])
+                        .unwrap();
+                    let v = qkvz
+                        .index((.., .., 2 * key_dim..2 * key_dim + value_dim))
+                        .reshape(&[1, 1, hv, dv])
+                        .unwrap();
+                    let z = qkvz.index((.., .., 2 * key_dim + value_dim..));
+                    let b = ba.index((.., .., ..hv)).reshape(&[1, 1, hv]).unwrap();
+                    let a = ba.index((.., .., hv..)).reshape(&[1, 1, hv]).unwrap();
+                    let q_flat = q.reshape(&[1, 1, -1]).unwrap();
+                    let k_flat = k.reshape(&[1, 1, -1]).unwrap();
+                    let v_flat = v.reshape(&[1, 1, -1]).unwrap();
+                    let mixed = ops::concatenate(&[&q_flat, &k_flat, &v_flat], -1).unwrap();
+                    let conv_in = ops::concatenate(&[&cs[gdn_idx], &mixed], 1).unwrap();
+                    cs[gdn_idx] = conv_in.index((.., -3.., ..));
+                    let conv_out =
+                        nn::silu(ops::conv1d(&conv_in, &l.conv_w, 1, 0, 1, conv_dim).unwrap())
+                            .unwrap();
+                    let conv_q = conv_out
+                        .index((.., .., ..key_dim))
+                        .reshape(&[1, 1, hk, dk])
+                        .unwrap();
+                    let conv_k = conv_out
+                        .index((.., .., key_dim..2 * key_dim))
+                        .reshape(&[1, 1, hk, dk])
+                        .unwrap();
+                    let conv_v = conv_out
+                        .index((.., .., 2 * key_dim..))
+                        .reshape(&[1, 1, hv, dv])
+                        .unwrap();
+                    let norm_q = fast::rms_norm(&conv_q, Some(&qk_norm_w), 1e-6)
+                        .unwrap()
+                        .multiply(&inv_scale_sq)
+                        .unwrap();
+                    let norm_k = fast::rms_norm(&conv_k, Some(&qk_norm_w), 1e-6)
+                        .unwrap()
+                        .multiply(&inv_scale)
+                        .unwrap();
+                    let (y, new_state) = gated_delta_kernel_ffi(
+                        &norm_q,
+                        &norm_k,
+                        &conv_v,
+                        &l.a_log,
+                        &a,
+                        &l.dt_bias,
+                        &b,
+                        &ss[gdn_idx],
+                        1,
+                        1,
+                        hk,
+                        dk,
+                        hv,
+                        dv,
+                    )
+                    .unwrap();
+                    ss[gdn_idx] = new_state;
+                    gdn_idx += 1;
+                    let normed_y = fast::rms_norm(&y, Some(&l.norm_w), 1e-6).unwrap();
+                    let z_shaped = z
+                        .index((.., .., ..value_dim))
+                        .reshape(&[1, 1, hv, dv])
+                        .unwrap();
+                    let gated = swiglu(&z_shaped, &normed_y).unwrap();
+                    quantized_forward(
+                        &gated.reshape(&[1, 1, -1]).unwrap(),
+                        &l.out_proj.0,
+                        &l.out_proj.1,
+                        &l.out_proj.2,
+                        gs,
+                        bits,
+                    )
+                    .unwrap()
+                } else {
+                    let al = attn_layers[i].as_ref().unwrap();
+                    let q = quantized_forward(
+                        &normed,
+                        &al.q_proj.0,
+                        &al.q_proj.1,
+                        &al.q_proj.2,
+                        gs,
+                        bits,
+                    )
+                    .unwrap();
+                    let _k = quantized_forward(
+                        &normed,
+                        &al.k_proj.0,
+                        &al.k_proj.1,
+                        &al.k_proj.2,
+                        gs,
+                        bits,
+                    )
+                    .unwrap();
+                    let v = quantized_forward(
+                        &normed,
+                        &al.v_proj.0,
+                        &al.v_proj.1,
+                        &al.v_proj.2,
+                        gs,
+                        bits,
+                    )
+                    .unwrap();
+                    let proxy = v
+                        .multiply(nn::sigmoid(&q.sum_axes(&[-1], true).unwrap()).unwrap())
+                        .unwrap();
+                    quantized_forward(&proxy, &al.o_proj.0, &al.o_proj.1, &al.o_proj.2, gs, bits)
+                        .unwrap()
+                };
+                let h2 = h.add(r).unwrap();
+
+                // Async eval hint: start processing GDN computation while building MoE graph
+                mlx_rs::transforms::async_eval([&h2]).unwrap();
+
+                let normed2 = fast::rms_norm(&h2, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                let m = &moe_layers[i];
+                let gate_out =
+                    quantized_forward(&normed2, &m.gate.0, &m.gate.1, &m.gate.2, gs, bits).unwrap();
+                let gates = ops::softmax_axis(&gate_out, -1, true).unwrap();
+                let neg_k = -top_k;
+                let all_inds = ops::argpartition_axis(&gates, neg_k, -1).unwrap();
+                let top_inds = all_inds.index((.., .., (n_experts + neg_k)..));
+                let raw_scores = gates.take_along_axis(&top_inds, -1).unwrap();
+                let scores = raw_scores
+                    .divide(raw_scores.sum_axes(&[-1], true).unwrap())
+                    .unwrap();
+                let x_exp = normed2.expand_dims(-2).unwrap().expand_dims(-2).unwrap();
+                let g_out = gather_qmm(
+                    &x_exp,
+                    &m.sw_gate.0,
+                    &m.sw_gate.1,
+                    &m.sw_gate.2,
+                    &top_inds,
+                    true,
+                    gs,
+                    bits,
+                    false,
+                )
+                .unwrap();
+                let u_out = gather_qmm(
+                    &x_exp, &m.sw_up.0, &m.sw_up.1, &m.sw_up.2, &top_inds, true, gs, bits, false,
+                )
+                .unwrap();
+                let activated = swiglu(&g_out, &u_out).unwrap();
+                let d_out = gather_qmm(
+                    &activated,
+                    &m.sw_down.0,
+                    &m.sw_down.1,
+                    &m.sw_down.2,
+                    &top_inds,
+                    true,
+                    gs,
+                    bits,
+                    false,
+                )
+                .unwrap();
+                let expert_sum = d_out
+                    .squeeze_axes(&[-2])
+                    .unwrap()
+                    .multiply(scores.expand_dims(-1).unwrap())
+                    .unwrap()
+                    .sum_axes(&[-2], false)
+                    .unwrap();
+                let sh_g =
+                    quantized_forward(&normed2, &m.se_gate.0, &m.se_gate.1, &m.se_gate.2, gs, bits)
+                        .unwrap();
+                let sh_u =
+                    quantized_forward(&normed2, &m.se_up.0, &m.se_up.1, &m.se_up.2, gs, bits)
+                        .unwrap();
+                let sh_act = swiglu(&sh_g, &sh_u).unwrap();
+                let sh_d =
+                    quantized_forward(&sh_act, &m.se_down.0, &m.se_down.1, &m.se_down.2, gs, bits)
+                        .unwrap();
+                let sh_gate_val = nn::sigmoid(
+                    quantized_forward(
+                        &normed2,
+                        &m.se_gate_proj.0,
+                        &m.se_gate_proj.1,
+                        &m.se_gate_proj.2,
                         gs,
                         bits,
                     )
@@ -11026,259 +10699,228 @@ mod tests {
         );
 
         // Variant: eval kernel outputs (y + state) immediately after each GDN layer
-        let forward_eval_kernel =
-            |h_in: &Array, ss: &mut Vec<Array>, cs: &mut Vec<Array>| -> Array {
-                let mut h = h_in.clone();
-                let mut gdn_idx = 0usize;
-                for i in 0..n_layers as usize {
-                    let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
-                    let r = if gdn_layers[i].is_some() {
-                        let l = gdn_layers[i].as_ref().unwrap();
-                        let qkvz = ops::quantized_matmul(
-                            &normed,
-                            &l.in_proj_qkvz.0,
-                            &l.in_proj_qkvz.1,
-                            &l.in_proj_qkvz.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap();
-                        let ba = ops::quantized_matmul(
-                            &normed,
-                            &l.in_proj_ba.0,
-                            &l.in_proj_ba.1,
-                            &l.in_proj_ba.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap();
-                        let q = qkvz
-                            .index((.., .., ..key_dim))
-                            .reshape(&[1, 1, hk, dk])
-                            .unwrap();
-                        let k = qkvz
-                            .index((.., .., key_dim..2 * key_dim))
-                            .reshape(&[1, 1, hk, dk])
-                            .unwrap();
-                        let v = qkvz
-                            .index((.., .., 2 * key_dim..2 * key_dim + value_dim))
-                            .reshape(&[1, 1, hv, dv])
-                            .unwrap();
-                        let z = qkvz.index((.., .., 2 * key_dim + value_dim..));
-                        let b = ba.index((.., .., ..hv)).reshape(&[1, 1, hv]).unwrap();
-                        let a = ba.index((.., .., hv..)).reshape(&[1, 1, hv]).unwrap();
-                        let q_flat = q.reshape(&[1, 1, -1]).unwrap();
-                        let k_flat = k.reshape(&[1, 1, -1]).unwrap();
-                        let v_flat = v.reshape(&[1, 1, -1]).unwrap();
-                        let mixed = ops::concatenate(&[&q_flat, &k_flat, &v_flat], -1).unwrap();
-                        let conv_in = ops::concatenate(&[&cs[gdn_idx], &mixed], 1).unwrap();
-                        cs[gdn_idx] = conv_in.index((.., -3.., ..));
-                        let conv_out =
-                            nn::silu(ops::conv1d(&conv_in, &l.conv_w, 1, 0, 1, conv_dim).unwrap())
-                                .unwrap();
-                        let conv_q = conv_out
-                            .index((.., .., ..key_dim))
-                            .reshape(&[1, 1, hk, dk])
-                            .unwrap();
-                        let conv_k = conv_out
-                            .index((.., .., key_dim..2 * key_dim))
-                            .reshape(&[1, 1, hk, dk])
-                            .unwrap();
-                        let conv_v = conv_out
-                            .index((.., .., 2 * key_dim..))
-                            .reshape(&[1, 1, hv, dv])
-                            .unwrap();
-                        let norm_q = fast::rms_norm(&conv_q, Some(&qk_norm_w), 1e-6)
-                            .unwrap()
-                            .multiply(&inv_scale_sq)
-                            .unwrap();
-                        let norm_k = fast::rms_norm(&conv_k, Some(&qk_norm_w), 1e-6)
-                            .unwrap()
-                            .multiply(&inv_scale)
-                            .unwrap();
-                        let (y, new_state) = gated_delta_kernel_ffi(
-                            &norm_q,
-                            &norm_k,
-                            &conv_v,
-                            &l.a_log,
-                            &a,
-                            &l.dt_bias,
-                            &b,
-                            &ss[gdn_idx],
-                            1,
-                            1,
-                            hk,
-                            dk,
-                            hv,
-                            dv,
-                        )
-                        .unwrap();
-
-                        // Targeted eval: resolve kernel outputs to break graph
-                        mlx_rs::transforms::eval([&y, &new_state, &cs[gdn_idx]]).unwrap();
-
-                        ss[gdn_idx] = new_state;
-                        gdn_idx += 1;
-                        let normed_y = fast::rms_norm(&y, Some(&l.norm_w), 1e-6).unwrap();
-                        let z_shaped = z
-                            .index((.., .., ..value_dim))
-                            .reshape(&[1, 1, hv, dv])
-                            .unwrap();
-                        let gated = swiglu(&z_shaped, &normed_y).unwrap();
-                        ops::quantized_matmul(
-                            &gated.reshape(&[1, 1, -1]).unwrap(),
-                            &l.out_proj.0,
-                            &l.out_proj.1,
-                            &l.out_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap()
-                    } else {
-                        let al = attn_layers[i].as_ref().unwrap();
-                        let q = ops::quantized_matmul(
-                            &normed,
-                            &al.q_proj.0,
-                            &al.q_proj.1,
-                            &al.q_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap();
-                        let _k = ops::quantized_matmul(
-                            &normed,
-                            &al.k_proj.0,
-                            &al.k_proj.1,
-                            &al.k_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap();
-                        let v = ops::quantized_matmul(
-                            &normed,
-                            &al.v_proj.0,
-                            &al.v_proj.1,
-                            &al.v_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap();
-                        let proxy = v
-                            .multiply(nn::sigmoid(&q.sum_axes(&[-1], true).unwrap()).unwrap())
-                            .unwrap();
-                        ops::quantized_matmul(
-                            &proxy,
-                            &al.o_proj.0,
-                            &al.o_proj.1,
-                            &al.o_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap()
-                    };
-                    let h2 = h.add(r).unwrap();
-                    let normed2 = fast::rms_norm(&h2, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
-                    let m = &moe_layers[i];
-                    let gate_out = ops::quantized_matmul(
-                        &normed2, &m.gate.0, &m.gate.1, &m.gate.2, true, gs, bits,
-                    )
-                    .unwrap();
-                    let gates = ops::softmax_axis(&gate_out, -1, true).unwrap();
-                    let neg_k = -top_k;
-                    let all_inds = ops::argpartition_axis(&gates, neg_k, -1).unwrap();
-                    let top_inds = all_inds.index((.., .., (n_experts + neg_k)..));
-                    let raw_scores = gates.take_along_axis(&top_inds, -1).unwrap();
-                    let scores = raw_scores
-                        .divide(raw_scores.sum_axes(&[-1], true).unwrap())
-                        .unwrap();
-                    let x_exp = normed2.expand_dims(-2).unwrap().expand_dims(-2).unwrap();
-                    let g_out = gather_qmm(
-                        &x_exp,
-                        &m.sw_gate.0,
-                        &m.sw_gate.1,
-                        &m.sw_gate.2,
-                        &top_inds,
-                        true,
+        let forward_eval_kernel = |h_in: &Array,
+                                   ss: &mut Vec<Array>,
+                                   cs: &mut Vec<Array>|
+         -> Array {
+            let mut h = h_in.clone();
+            let mut gdn_idx = 0usize;
+            for i in 0..n_layers as usize {
+                let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                let r = if gdn_layers[i].is_some() {
+                    let l = gdn_layers[i].as_ref().unwrap();
+                    let qkvz = quantized_forward(
+                        &normed,
+                        &l.in_proj_qkvz.0,
+                        &l.in_proj_qkvz.1,
+                        &l.in_proj_qkvz.2,
                         gs,
                         bits,
-                        false,
                     )
                     .unwrap();
-                    let u_out = gather_qmm(
-                        &x_exp, &m.sw_up.0, &m.sw_up.1, &m.sw_up.2, &top_inds, true, gs, bits,
-                        false,
-                    )
-                    .unwrap();
-                    let activated = swiglu(&g_out, &u_out).unwrap();
-                    let d_out = gather_qmm(
-                        &activated,
-                        &m.sw_down.0,
-                        &m.sw_down.1,
-                        &m.sw_down.2,
-                        &top_inds,
-                        true,
+                    let ba = quantized_forward(
+                        &normed,
+                        &l.in_proj_ba.0,
+                        &l.in_proj_ba.1,
+                        &l.in_proj_ba.2,
                         gs,
                         bits,
-                        false,
                     )
                     .unwrap();
-                    let expert_sum = d_out
-                        .squeeze_axes(&[-2])
-                        .unwrap()
-                        .multiply(scores.expand_dims(-1).unwrap())
-                        .unwrap()
-                        .sum_axes(&[-2], false)
+                    let q = qkvz
+                        .index((.., .., ..key_dim))
+                        .reshape(&[1, 1, hk, dk])
                         .unwrap();
-                    let sh_g = ops::quantized_matmul(
+                    let k = qkvz
+                        .index((.., .., key_dim..2 * key_dim))
+                        .reshape(&[1, 1, hk, dk])
+                        .unwrap();
+                    let v = qkvz
+                        .index((.., .., 2 * key_dim..2 * key_dim + value_dim))
+                        .reshape(&[1, 1, hv, dv])
+                        .unwrap();
+                    let z = qkvz.index((.., .., 2 * key_dim + value_dim..));
+                    let b = ba.index((.., .., ..hv)).reshape(&[1, 1, hv]).unwrap();
+                    let a = ba.index((.., .., hv..)).reshape(&[1, 1, hv]).unwrap();
+                    let q_flat = q.reshape(&[1, 1, -1]).unwrap();
+                    let k_flat = k.reshape(&[1, 1, -1]).unwrap();
+                    let v_flat = v.reshape(&[1, 1, -1]).unwrap();
+                    let mixed = ops::concatenate(&[&q_flat, &k_flat, &v_flat], -1).unwrap();
+                    let conv_in = ops::concatenate(&[&cs[gdn_idx], &mixed], 1).unwrap();
+                    cs[gdn_idx] = conv_in.index((.., -3.., ..));
+                    let conv_out =
+                        nn::silu(ops::conv1d(&conv_in, &l.conv_w, 1, 0, 1, conv_dim).unwrap())
+                            .unwrap();
+                    let conv_q = conv_out
+                        .index((.., .., ..key_dim))
+                        .reshape(&[1, 1, hk, dk])
+                        .unwrap();
+                    let conv_k = conv_out
+                        .index((.., .., key_dim..2 * key_dim))
+                        .reshape(&[1, 1, hk, dk])
+                        .unwrap();
+                    let conv_v = conv_out
+                        .index((.., .., 2 * key_dim..))
+                        .reshape(&[1, 1, hv, dv])
+                        .unwrap();
+                    let norm_q = fast::rms_norm(&conv_q, Some(&qk_norm_w), 1e-6)
+                        .unwrap()
+                        .multiply(&inv_scale_sq)
+                        .unwrap();
+                    let norm_k = fast::rms_norm(&conv_k, Some(&qk_norm_w), 1e-6)
+                        .unwrap()
+                        .multiply(&inv_scale)
+                        .unwrap();
+                    let (y, new_state) = gated_delta_kernel_ffi(
+                        &norm_q,
+                        &norm_k,
+                        &conv_v,
+                        &l.a_log,
+                        &a,
+                        &l.dt_bias,
+                        &b,
+                        &ss[gdn_idx],
+                        1,
+                        1,
+                        hk,
+                        dk,
+                        hv,
+                        dv,
+                    )
+                    .unwrap();
+
+                    // Targeted eval: resolve kernel outputs to break graph
+                    mlx_rs::transforms::eval([&y, &new_state, &cs[gdn_idx]]).unwrap();
+
+                    ss[gdn_idx] = new_state;
+                    gdn_idx += 1;
+                    let normed_y = fast::rms_norm(&y, Some(&l.norm_w), 1e-6).unwrap();
+                    let z_shaped = z
+                        .index((.., .., ..value_dim))
+                        .reshape(&[1, 1, hv, dv])
+                        .unwrap();
+                    let gated = swiglu(&z_shaped, &normed_y).unwrap();
+                    quantized_forward(
+                        &gated.reshape(&[1, 1, -1]).unwrap(),
+                        &l.out_proj.0,
+                        &l.out_proj.1,
+                        &l.out_proj.2,
+                        gs,
+                        bits,
+                    )
+                    .unwrap()
+                } else {
+                    let al = attn_layers[i].as_ref().unwrap();
+                    let q = quantized_forward(
+                        &normed,
+                        &al.q_proj.0,
+                        &al.q_proj.1,
+                        &al.q_proj.2,
+                        gs,
+                        bits,
+                    )
+                    .unwrap();
+                    let _k = quantized_forward(
+                        &normed,
+                        &al.k_proj.0,
+                        &al.k_proj.1,
+                        &al.k_proj.2,
+                        gs,
+                        bits,
+                    )
+                    .unwrap();
+                    let v = quantized_forward(
+                        &normed,
+                        &al.v_proj.0,
+                        &al.v_proj.1,
+                        &al.v_proj.2,
+                        gs,
+                        bits,
+                    )
+                    .unwrap();
+                    let proxy = v
+                        .multiply(nn::sigmoid(&q.sum_axes(&[-1], true).unwrap()).unwrap())
+                        .unwrap();
+                    quantized_forward(&proxy, &al.o_proj.0, &al.o_proj.1, &al.o_proj.2, gs, bits)
+                        .unwrap()
+                };
+                let h2 = h.add(r).unwrap();
+                let normed2 = fast::rms_norm(&h2, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                let m = &moe_layers[i];
+                let gate_out =
+                    quantized_forward(&normed2, &m.gate.0, &m.gate.1, &m.gate.2, gs, bits).unwrap();
+                let gates = ops::softmax_axis(&gate_out, -1, true).unwrap();
+                let neg_k = -top_k;
+                let all_inds = ops::argpartition_axis(&gates, neg_k, -1).unwrap();
+                let top_inds = all_inds.index((.., .., (n_experts + neg_k)..));
+                let raw_scores = gates.take_along_axis(&top_inds, -1).unwrap();
+                let scores = raw_scores
+                    .divide(raw_scores.sum_axes(&[-1], true).unwrap())
+                    .unwrap();
+                let x_exp = normed2.expand_dims(-2).unwrap().expand_dims(-2).unwrap();
+                let g_out = gather_qmm(
+                    &x_exp,
+                    &m.sw_gate.0,
+                    &m.sw_gate.1,
+                    &m.sw_gate.2,
+                    &top_inds,
+                    true,
+                    gs,
+                    bits,
+                    false,
+                )
+                .unwrap();
+                let u_out = gather_qmm(
+                    &x_exp, &m.sw_up.0, &m.sw_up.1, &m.sw_up.2, &top_inds, true, gs, bits, false,
+                )
+                .unwrap();
+                let activated = swiglu(&g_out, &u_out).unwrap();
+                let d_out = gather_qmm(
+                    &activated,
+                    &m.sw_down.0,
+                    &m.sw_down.1,
+                    &m.sw_down.2,
+                    &top_inds,
+                    true,
+                    gs,
+                    bits,
+                    false,
+                )
+                .unwrap();
+                let expert_sum = d_out
+                    .squeeze_axes(&[-2])
+                    .unwrap()
+                    .multiply(scores.expand_dims(-1).unwrap())
+                    .unwrap()
+                    .sum_axes(&[-2], false)
+                    .unwrap();
+                let sh_g =
+                    quantized_forward(&normed2, &m.se_gate.0, &m.se_gate.1, &m.se_gate.2, gs, bits)
+                        .unwrap();
+                let sh_u =
+                    quantized_forward(&normed2, &m.se_up.0, &m.se_up.1, &m.se_up.2, gs, bits)
+                        .unwrap();
+                let sh_act = swiglu(&sh_g, &sh_u).unwrap();
+                let sh_d =
+                    quantized_forward(&sh_act, &m.se_down.0, &m.se_down.1, &m.se_down.2, gs, bits)
+                        .unwrap();
+                let sh_gate_val = nn::sigmoid(
+                    quantized_forward(
                         &normed2,
-                        &m.se_gate.0,
-                        &m.se_gate.1,
-                        &m.se_gate.2,
-                        true,
+                        &m.se_gate_proj.0,
+                        &m.se_gate_proj.1,
+                        &m.se_gate_proj.2,
                         gs,
                         bits,
                     )
-                    .unwrap();
-                    let sh_u = ops::quantized_matmul(
-                        &normed2, &m.se_up.0, &m.se_up.1, &m.se_up.2, true, gs, bits,
-                    )
-                    .unwrap();
-                    let sh_act = swiglu(&sh_g, &sh_u).unwrap();
-                    let sh_d = ops::quantized_matmul(
-                        &sh_act,
-                        &m.se_down.0,
-                        &m.se_down.1,
-                        &m.se_down.2,
-                        true,
-                        gs,
-                        bits,
-                    )
-                    .unwrap();
-                    let sh_gate_val = nn::sigmoid(
-                        ops::quantized_matmul(
-                            &normed2,
-                            &m.se_gate_proj.0,
-                            &m.se_gate_proj.1,
-                            &m.se_gate_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap(),
-                    )
-                    .unwrap();
-                    let shared_out = sh_d.multiply(sh_gate_val).unwrap();
-                    h = h2.add(expert_sum).unwrap().add(shared_out).unwrap();
-                }
-                h
-            };
+                    .unwrap(),
+                )
+                .unwrap();
+                let shared_out = sh_d.multiply(sh_gate_val).unwrap();
+                h = h2.add(expert_sum).unwrap().add(shared_out).unwrap();
+            }
+            h
+        };
 
         for _ in 0..3 {
             let mut ss = states.clone();
@@ -11320,250 +10962,219 @@ mod tests {
             s.eval().unwrap();
         }
 
-        let forward_tiny_state =
-            |h_in: &Array, ss: &mut Vec<Array>, cs: &mut Vec<Array>| -> Array {
-                let mut h = h_in.clone();
-                let mut gdn_idx = 0usize;
-                for i in 0..n_layers as usize {
-                    let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
-                    let r = if gdn_layers[i].is_some() {
-                        let l = gdn_layers[i].as_ref().unwrap();
-                        let qkvz = ops::quantized_matmul(
-                            &normed,
-                            &l.in_proj_qkvz.0,
-                            &l.in_proj_qkvz.1,
-                            &l.in_proj_qkvz.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap();
-                        let ba = ops::quantized_matmul(
-                            &normed,
-                            &l.in_proj_ba.0,
-                            &l.in_proj_ba.1,
-                            &l.in_proj_ba.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap();
-                        let q = qkvz
-                            .index((.., .., ..key_dim))
-                            .reshape(&[1, 1, hk, dk])
-                            .unwrap();
-                        let k = qkvz
-                            .index((.., .., key_dim..2 * key_dim))
-                            .reshape(&[1, 1, hk, dk])
-                            .unwrap();
-                        let v = qkvz
-                            .index((.., .., 2 * key_dim..2 * key_dim + value_dim))
-                            .reshape(&[1, 1, hv, dv])
-                            .unwrap();
-                        let z = qkvz.index((.., .., 2 * key_dim + value_dim..));
-                        let b = ba.index((.., .., ..hv)).reshape(&[1, 1, hv]).unwrap();
-                        let a = ba.index((.., .., hv..)).reshape(&[1, 1, hv]).unwrap();
-                        let q_flat = q.reshape(&[1, 1, -1]).unwrap();
-                        let k_flat = k.reshape(&[1, 1, -1]).unwrap();
-                        let v_flat = v.reshape(&[1, 1, -1]).unwrap();
-                        let mixed = ops::concatenate(&[&q_flat, &k_flat, &v_flat], -1).unwrap();
-                        let conv_in = ops::concatenate(&[&cs[gdn_idx], &mixed], 1).unwrap();
-                        cs[gdn_idx] = conv_in.index((.., -3.., ..));
-                        let conv_out =
-                            nn::silu(ops::conv1d(&conv_in, &l.conv_w, 1, 0, 1, conv_dim).unwrap())
-                                .unwrap();
-                        let conv_q = conv_out
-                            .index((.., .., ..key_dim))
-                            .reshape(&[1, 1, hk, dk])
-                            .unwrap();
-                        let conv_k = conv_out
-                            .index((.., .., key_dim..2 * key_dim))
-                            .reshape(&[1, 1, hk, dk])
-                            .unwrap();
-                        let conv_v = conv_out
-                            .index((.., .., 2 * key_dim..))
-                            .reshape(&[1, 1, hv, dv])
-                            .unwrap();
-                        let _norm_q = fast::rms_norm(&conv_q, Some(&qk_norm_w), 1e-6)
-                            .unwrap()
-                            .multiply(&inv_scale_sq)
-                            .unwrap();
-                        let _norm_k = fast::rms_norm(&conv_k, Some(&qk_norm_w), 1e-6)
-                            .unwrap()
-                            .multiply(&inv_scale)
-                            .unwrap();
-                        let g = compute_g_compiled((&l.a_log, &a, &l.dt_bias)).unwrap();
-                        let beta = nn::sigmoid(&b).unwrap();
-
-                        // Tiny state: just multiply by a scalar instead of full state ops
-                        let g_scalar = g.sum_axes(&[-1], true).unwrap();
-                        let tiny_decayed = ss[gdn_idx].multiply(g_scalar).unwrap();
-                        ss[gdn_idx] = tiny_decayed.add(Array::from_f32(0.1)).unwrap();
-
-                        // Use conv_v directly as y (same shape [1,1,Hv,Dv])
-                        let y = conv_v
-                            .multiply(beta.reshape(&[1, 1, hv, 1]).unwrap())
-                            .unwrap();
-
-                        gdn_idx += 1;
-                        let normed_y = fast::rms_norm(&y, Some(&l.norm_w), 1e-6).unwrap();
-                        let z_shaped = z
-                            .index((.., .., ..value_dim))
-                            .reshape(&[1, 1, hv, dv])
-                            .unwrap();
-                        let gated = swiglu(&z_shaped, &normed_y).unwrap();
-                        ops::quantized_matmul(
-                            &gated.reshape(&[1, 1, -1]).unwrap(),
-                            &l.out_proj.0,
-                            &l.out_proj.1,
-                            &l.out_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap()
-                    } else {
-                        let al = attn_layers[i].as_ref().unwrap();
-                        let q = ops::quantized_matmul(
-                            &normed,
-                            &al.q_proj.0,
-                            &al.q_proj.1,
-                            &al.q_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap();
-                        let _k = ops::quantized_matmul(
-                            &normed,
-                            &al.k_proj.0,
-                            &al.k_proj.1,
-                            &al.k_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap();
-                        let v = ops::quantized_matmul(
-                            &normed,
-                            &al.v_proj.0,
-                            &al.v_proj.1,
-                            &al.v_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap();
-                        let proxy = v
-                            .multiply(nn::sigmoid(&q.sum_axes(&[-1], true).unwrap()).unwrap())
-                            .unwrap();
-                        ops::quantized_matmul(
-                            &proxy,
-                            &al.o_proj.0,
-                            &al.o_proj.1,
-                            &al.o_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap()
-                    };
-                    let h2 = h.add(r).unwrap();
-                    let normed2 = fast::rms_norm(&h2, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
-                    let m = &moe_layers[i];
-                    let gate_out = ops::quantized_matmul(
-                        &normed2, &m.gate.0, &m.gate.1, &m.gate.2, true, gs, bits,
-                    )
-                    .unwrap();
-                    let gates = ops::softmax_axis(&gate_out, -1, true).unwrap();
-                    let neg_k = -top_k;
-                    let all_inds = ops::argpartition_axis(&gates, neg_k, -1).unwrap();
-                    let top_inds = all_inds.index((.., .., (n_experts + neg_k)..));
-                    let raw_scores = gates.take_along_axis(&top_inds, -1).unwrap();
-                    let scores = raw_scores
-                        .divide(raw_scores.sum_axes(&[-1], true).unwrap())
-                        .unwrap();
-                    let x_exp = normed2.expand_dims(-2).unwrap().expand_dims(-2).unwrap();
-                    let g_out = gather_qmm(
-                        &x_exp,
-                        &m.sw_gate.0,
-                        &m.sw_gate.1,
-                        &m.sw_gate.2,
-                        &top_inds,
-                        true,
+        let forward_tiny_state = |h_in: &Array,
+                                  ss: &mut Vec<Array>,
+                                  cs: &mut Vec<Array>|
+         -> Array {
+            let mut h = h_in.clone();
+            let mut gdn_idx = 0usize;
+            for i in 0..n_layers as usize {
+                let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                let r = if gdn_layers[i].is_some() {
+                    let l = gdn_layers[i].as_ref().unwrap();
+                    let qkvz = quantized_forward(
+                        &normed,
+                        &l.in_proj_qkvz.0,
+                        &l.in_proj_qkvz.1,
+                        &l.in_proj_qkvz.2,
                         gs,
                         bits,
-                        false,
                     )
                     .unwrap();
-                    let u_out = gather_qmm(
-                        &x_exp, &m.sw_up.0, &m.sw_up.1, &m.sw_up.2, &top_inds, true, gs, bits,
-                        false,
-                    )
-                    .unwrap();
-                    let activated = swiglu(&g_out, &u_out).unwrap();
-                    let d_out = gather_qmm(
-                        &activated,
-                        &m.sw_down.0,
-                        &m.sw_down.1,
-                        &m.sw_down.2,
-                        &top_inds,
-                        true,
+                    let ba = quantized_forward(
+                        &normed,
+                        &l.in_proj_ba.0,
+                        &l.in_proj_ba.1,
+                        &l.in_proj_ba.2,
                         gs,
                         bits,
-                        false,
                     )
                     .unwrap();
-                    let expert_sum = d_out
-                        .squeeze_axes(&[-2])
-                        .unwrap()
-                        .multiply(scores.expand_dims(-1).unwrap())
-                        .unwrap()
-                        .sum_axes(&[-2], false)
+                    let q = qkvz
+                        .index((.., .., ..key_dim))
+                        .reshape(&[1, 1, hk, dk])
                         .unwrap();
-                    let sh_g = ops::quantized_matmul(
+                    let k = qkvz
+                        .index((.., .., key_dim..2 * key_dim))
+                        .reshape(&[1, 1, hk, dk])
+                        .unwrap();
+                    let v = qkvz
+                        .index((.., .., 2 * key_dim..2 * key_dim + value_dim))
+                        .reshape(&[1, 1, hv, dv])
+                        .unwrap();
+                    let z = qkvz.index((.., .., 2 * key_dim + value_dim..));
+                    let b = ba.index((.., .., ..hv)).reshape(&[1, 1, hv]).unwrap();
+                    let a = ba.index((.., .., hv..)).reshape(&[1, 1, hv]).unwrap();
+                    let q_flat = q.reshape(&[1, 1, -1]).unwrap();
+                    let k_flat = k.reshape(&[1, 1, -1]).unwrap();
+                    let v_flat = v.reshape(&[1, 1, -1]).unwrap();
+                    let mixed = ops::concatenate(&[&q_flat, &k_flat, &v_flat], -1).unwrap();
+                    let conv_in = ops::concatenate(&[&cs[gdn_idx], &mixed], 1).unwrap();
+                    cs[gdn_idx] = conv_in.index((.., -3.., ..));
+                    let conv_out =
+                        nn::silu(ops::conv1d(&conv_in, &l.conv_w, 1, 0, 1, conv_dim).unwrap())
+                            .unwrap();
+                    let conv_q = conv_out
+                        .index((.., .., ..key_dim))
+                        .reshape(&[1, 1, hk, dk])
+                        .unwrap();
+                    let conv_k = conv_out
+                        .index((.., .., key_dim..2 * key_dim))
+                        .reshape(&[1, 1, hk, dk])
+                        .unwrap();
+                    let conv_v = conv_out
+                        .index((.., .., 2 * key_dim..))
+                        .reshape(&[1, 1, hv, dv])
+                        .unwrap();
+                    let _norm_q = fast::rms_norm(&conv_q, Some(&qk_norm_w), 1e-6)
+                        .unwrap()
+                        .multiply(&inv_scale_sq)
+                        .unwrap();
+                    let _norm_k = fast::rms_norm(&conv_k, Some(&qk_norm_w), 1e-6)
+                        .unwrap()
+                        .multiply(&inv_scale)
+                        .unwrap();
+                    let g = compute_g_compiled((&l.a_log, &a, &l.dt_bias)).unwrap();
+                    let beta = nn::sigmoid(&b).unwrap();
+
+                    // Tiny state: just multiply by a scalar instead of full state ops
+                    let g_scalar = g.sum_axes(&[-1], true).unwrap();
+                    let tiny_decayed = ss[gdn_idx].multiply(g_scalar).unwrap();
+                    ss[gdn_idx] = tiny_decayed.add(Array::from_f32(0.1)).unwrap();
+
+                    // Use conv_v directly as y (same shape [1,1,Hv,Dv])
+                    let y = conv_v
+                        .multiply(beta.reshape(&[1, 1, hv, 1]).unwrap())
+                        .unwrap();
+
+                    gdn_idx += 1;
+                    let normed_y = fast::rms_norm(&y, Some(&l.norm_w), 1e-6).unwrap();
+                    let z_shaped = z
+                        .index((.., .., ..value_dim))
+                        .reshape(&[1, 1, hv, dv])
+                        .unwrap();
+                    let gated = swiglu(&z_shaped, &normed_y).unwrap();
+                    quantized_forward(
+                        &gated.reshape(&[1, 1, -1]).unwrap(),
+                        &l.out_proj.0,
+                        &l.out_proj.1,
+                        &l.out_proj.2,
+                        gs,
+                        bits,
+                    )
+                    .unwrap()
+                } else {
+                    let al = attn_layers[i].as_ref().unwrap();
+                    let q = quantized_forward(
+                        &normed,
+                        &al.q_proj.0,
+                        &al.q_proj.1,
+                        &al.q_proj.2,
+                        gs,
+                        bits,
+                    )
+                    .unwrap();
+                    let _k = quantized_forward(
+                        &normed,
+                        &al.k_proj.0,
+                        &al.k_proj.1,
+                        &al.k_proj.2,
+                        gs,
+                        bits,
+                    )
+                    .unwrap();
+                    let v = quantized_forward(
+                        &normed,
+                        &al.v_proj.0,
+                        &al.v_proj.1,
+                        &al.v_proj.2,
+                        gs,
+                        bits,
+                    )
+                    .unwrap();
+                    let proxy = v
+                        .multiply(nn::sigmoid(&q.sum_axes(&[-1], true).unwrap()).unwrap())
+                        .unwrap();
+                    quantized_forward(&proxy, &al.o_proj.0, &al.o_proj.1, &al.o_proj.2, gs, bits)
+                        .unwrap()
+                };
+                let h2 = h.add(r).unwrap();
+                let normed2 = fast::rms_norm(&h2, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                let m = &moe_layers[i];
+                let gate_out =
+                    quantized_forward(&normed2, &m.gate.0, &m.gate.1, &m.gate.2, gs, bits).unwrap();
+                let gates = ops::softmax_axis(&gate_out, -1, true).unwrap();
+                let neg_k = -top_k;
+                let all_inds = ops::argpartition_axis(&gates, neg_k, -1).unwrap();
+                let top_inds = all_inds.index((.., .., (n_experts + neg_k)..));
+                let raw_scores = gates.take_along_axis(&top_inds, -1).unwrap();
+                let scores = raw_scores
+                    .divide(raw_scores.sum_axes(&[-1], true).unwrap())
+                    .unwrap();
+                let x_exp = normed2.expand_dims(-2).unwrap().expand_dims(-2).unwrap();
+                let g_out = gather_qmm(
+                    &x_exp,
+                    &m.sw_gate.0,
+                    &m.sw_gate.1,
+                    &m.sw_gate.2,
+                    &top_inds,
+                    true,
+                    gs,
+                    bits,
+                    false,
+                )
+                .unwrap();
+                let u_out = gather_qmm(
+                    &x_exp, &m.sw_up.0, &m.sw_up.1, &m.sw_up.2, &top_inds, true, gs, bits, false,
+                )
+                .unwrap();
+                let activated = swiglu(&g_out, &u_out).unwrap();
+                let d_out = gather_qmm(
+                    &activated,
+                    &m.sw_down.0,
+                    &m.sw_down.1,
+                    &m.sw_down.2,
+                    &top_inds,
+                    true,
+                    gs,
+                    bits,
+                    false,
+                )
+                .unwrap();
+                let expert_sum = d_out
+                    .squeeze_axes(&[-2])
+                    .unwrap()
+                    .multiply(scores.expand_dims(-1).unwrap())
+                    .unwrap()
+                    .sum_axes(&[-2], false)
+                    .unwrap();
+                let sh_g =
+                    quantized_forward(&normed2, &m.se_gate.0, &m.se_gate.1, &m.se_gate.2, gs, bits)
+                        .unwrap();
+                let sh_u =
+                    quantized_forward(&normed2, &m.se_up.0, &m.se_up.1, &m.se_up.2, gs, bits)
+                        .unwrap();
+                let sh_act = swiglu(&sh_g, &sh_u).unwrap();
+                let sh_d =
+                    quantized_forward(&sh_act, &m.se_down.0, &m.se_down.1, &m.se_down.2, gs, bits)
+                        .unwrap();
+                let sh_gate_val = nn::sigmoid(
+                    quantized_forward(
                         &normed2,
-                        &m.se_gate.0,
-                        &m.se_gate.1,
-                        &m.se_gate.2,
-                        true,
+                        &m.se_gate_proj.0,
+                        &m.se_gate_proj.1,
+                        &m.se_gate_proj.2,
                         gs,
                         bits,
                     )
-                    .unwrap();
-                    let sh_u = ops::quantized_matmul(
-                        &normed2, &m.se_up.0, &m.se_up.1, &m.se_up.2, true, gs, bits,
-                    )
-                    .unwrap();
-                    let sh_act = swiglu(&sh_g, &sh_u).unwrap();
-                    let sh_d = ops::quantized_matmul(
-                        &sh_act,
-                        &m.se_down.0,
-                        &m.se_down.1,
-                        &m.se_down.2,
-                        true,
-                        gs,
-                        bits,
-                    )
-                    .unwrap();
-                    let sh_gate_val = nn::sigmoid(
-                        ops::quantized_matmul(
-                            &normed2,
-                            &m.se_gate_proj.0,
-                            &m.se_gate_proj.1,
-                            &m.se_gate_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap(),
-                    )
-                    .unwrap();
-                    let shared_out = sh_d.multiply(sh_gate_val).unwrap();
-                    h = h2.add(expert_sum).unwrap().add(shared_out).unwrap();
-                }
-                h
-            };
+                    .unwrap(),
+                )
+                .unwrap();
+                let shared_out = sh_d.multiply(sh_gate_val).unwrap();
+                h = h2.add(expert_sum).unwrap().add(shared_out).unwrap();
+            }
+            h
+        };
 
         for _ in 0..5 {
             let mut ss = tiny_states.clone();
@@ -11603,22 +11214,20 @@ mod tests {
                     let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
                     let r = if gdn_layers[i].is_some() {
                         let l = gdn_layers[i].as_ref().unwrap();
-                        let qkvz = ops::quantized_matmul(
+                        let qkvz = quantized_forward(
                             &normed,
                             &l.in_proj_qkvz.0,
                             &l.in_proj_qkvz.1,
                             &l.in_proj_qkvz.2,
-                            true,
                             gs,
                             bits,
                         )
                         .unwrap();
-                        let ba = ops::quantized_matmul(
+                        let ba = quantized_forward(
                             &normed,
                             &l.in_proj_ba.0,
                             &l.in_proj_ba.1,
                             &l.in_proj_ba.2,
-                            true,
                             gs,
                             bits,
                         )
@@ -11692,44 +11301,40 @@ mod tests {
                             .reshape(&[1, 1, hv, dv])
                             .unwrap();
                         let gated = swiglu(&z_shaped, &normed_y).unwrap();
-                        ops::quantized_matmul(
+                        quantized_forward(
                             &gated.reshape(&[1, 1, -1]).unwrap(),
                             &l.out_proj.0,
                             &l.out_proj.1,
                             &l.out_proj.2,
-                            true,
                             gs,
                             bits,
                         )
                         .unwrap()
                     } else {
                         let al = attn_layers[i].as_ref().unwrap();
-                        let q = ops::quantized_matmul(
+                        let q = quantized_forward(
                             &normed,
                             &al.q_proj.0,
                             &al.q_proj.1,
                             &al.q_proj.2,
-                            true,
                             gs,
                             bits,
                         )
                         .unwrap();
-                        let _k = ops::quantized_matmul(
+                        let _k = quantized_forward(
                             &normed,
                             &al.k_proj.0,
                             &al.k_proj.1,
                             &al.k_proj.2,
-                            true,
                             gs,
                             bits,
                         )
                         .unwrap();
-                        let v = ops::quantized_matmul(
+                        let v = quantized_forward(
                             &normed,
                             &al.v_proj.0,
                             &al.v_proj.1,
                             &al.v_proj.2,
-                            true,
                             gs,
                             bits,
                         )
@@ -11737,12 +11342,11 @@ mod tests {
                         let proxy = v
                             .multiply(nn::sigmoid(&q.sum_axes(&[-1], true).unwrap()).unwrap())
                             .unwrap();
-                        ops::quantized_matmul(
+                        quantized_forward(
                             &proxy,
                             &al.o_proj.0,
                             &al.o_proj.1,
                             &al.o_proj.2,
-                            true,
                             gs,
                             bits,
                         )
@@ -11751,10 +11355,9 @@ mod tests {
                     let h2 = h.add(r).unwrap();
                     let normed2 = fast::rms_norm(&h2, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
                     let m = &moe_layers[i];
-                    let gate_out = ops::quantized_matmul(
-                        &normed2, &m.gate.0, &m.gate.1, &m.gate.2, true, gs, bits,
-                    )
-                    .unwrap();
+                    let gate_out =
+                        quantized_forward(&normed2, &m.gate.0, &m.gate.1, &m.gate.2, gs, bits)
+                            .unwrap();
                     let gates = ops::softmax_axis(&gate_out, -1, true).unwrap();
                     let neg_k = -top_k;
                     let all_inds = ops::argpartition_axis(&gates, neg_k, -1).unwrap();
@@ -11801,38 +11404,34 @@ mod tests {
                         .unwrap()
                         .sum_axes(&[-2], false)
                         .unwrap();
-                    let sh_g = ops::quantized_matmul(
+                    let sh_g = quantized_forward(
                         &normed2,
                         &m.se_gate.0,
                         &m.se_gate.1,
                         &m.se_gate.2,
-                        true,
                         gs,
                         bits,
                     )
                     .unwrap();
-                    let sh_u = ops::quantized_matmul(
-                        &normed2, &m.se_up.0, &m.se_up.1, &m.se_up.2, true, gs, bits,
-                    )
-                    .unwrap();
+                    let sh_u =
+                        quantized_forward(&normed2, &m.se_up.0, &m.se_up.1, &m.se_up.2, gs, bits)
+                            .unwrap();
                     let sh_act = swiglu(&sh_g, &sh_u).unwrap();
-                    let sh_d = ops::quantized_matmul(
+                    let sh_d = quantized_forward(
                         &sh_act,
                         &m.se_down.0,
                         &m.se_down.1,
                         &m.se_down.2,
-                        true,
                         gs,
                         bits,
                     )
                     .unwrap();
                     let sh_gate_val = nn::sigmoid(
-                        ops::quantized_matmul(
+                        quantized_forward(
                             &normed2,
                             &m.se_gate_proj.0,
                             &m.se_gate_proj.1,
                             &m.se_gate_proj.2,
-                            true,
                             gs,
                             bits,
                         )
@@ -11873,251 +11472,220 @@ mod tests {
         }
 
         // Variant: replace recurrence with a single matmul (same data flow, fewer ops)
-        let forward_matmul_gdn =
-            |h_in: &Array, ss: &mut Vec<Array>, cs: &mut Vec<Array>| -> Array {
-                let mut h = h_in.clone();
-                let mut gdn_idx = 0usize;
-                for i in 0..n_layers as usize {
-                    let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
-                    let r = if gdn_layers[i].is_some() {
-                        let l = gdn_layers[i].as_ref().unwrap();
-                        let qkvz = ops::quantized_matmul(
-                            &normed,
-                            &l.in_proj_qkvz.0,
-                            &l.in_proj_qkvz.1,
-                            &l.in_proj_qkvz.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap();
-                        let ba = ops::quantized_matmul(
-                            &normed,
-                            &l.in_proj_ba.0,
-                            &l.in_proj_ba.1,
-                            &l.in_proj_ba.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap();
-                        let q = qkvz
-                            .index((.., .., ..key_dim))
-                            .reshape(&[1, 1, hk, dk])
-                            .unwrap();
-                        let k = qkvz
-                            .index((.., .., key_dim..2 * key_dim))
-                            .reshape(&[1, 1, hk, dk])
-                            .unwrap();
-                        let v = qkvz
-                            .index((.., .., 2 * key_dim..2 * key_dim + value_dim))
-                            .reshape(&[1, 1, hv, dv])
-                            .unwrap();
-                        let z = qkvz.index((.., .., 2 * key_dim + value_dim..));
-                        let b = ba.index((.., .., ..hv)).reshape(&[1, 1, hv]).unwrap();
-                        let a = ba.index((.., .., hv..)).reshape(&[1, 1, hv]).unwrap();
-                        let q_flat = q.reshape(&[1, 1, -1]).unwrap();
-                        let k_flat = k.reshape(&[1, 1, -1]).unwrap();
-                        let v_flat = v.reshape(&[1, 1, -1]).unwrap();
-                        let mixed = ops::concatenate(&[&q_flat, &k_flat, &v_flat], -1).unwrap();
-                        let conv_in = ops::concatenate(&[&cs[gdn_idx], &mixed], 1).unwrap();
-                        cs[gdn_idx] = conv_in.index((.., -3.., ..));
-                        let conv_out =
-                            nn::silu(ops::conv1d(&conv_in, &l.conv_w, 1, 0, 1, conv_dim).unwrap())
-                                .unwrap();
-                        let conv_q = conv_out
-                            .index((.., .., ..key_dim))
-                            .reshape(&[1, 1, hk, dk])
-                            .unwrap();
-                        let conv_k = conv_out
-                            .index((.., .., key_dim..2 * key_dim))
-                            .reshape(&[1, 1, hk, dk])
-                            .unwrap();
-                        let conv_v = conv_out
-                            .index((.., .., 2 * key_dim..))
-                            .reshape(&[1, 1, hv, dv])
-                            .unwrap();
-                        let _norm_q = fast::rms_norm(&conv_q, Some(&qk_norm_w), 1e-6)
-                            .unwrap()
-                            .multiply(&inv_scale_sq)
-                            .unwrap();
-                        let _norm_k = fast::rms_norm(&conv_k, Some(&qk_norm_w), 1e-6)
-                            .unwrap()
-                            .multiply(&inv_scale)
-                            .unwrap();
-                        let g = compute_g_compiled((&l.a_log, &a, &l.dt_bias)).unwrap();
-                        let _beta = nn::sigmoid(&b).unwrap();
-
-                        // Variant A: no reduction, just multiply + add on state
-                        let g_exp = g.reshape(&[1, hv, 1, 1]).unwrap();
-                        let decayed = ss[gdn_idx].multiply(g_exp).unwrap();
-                        let v_exp = conv_v.reshape(&[1, hv, dv, 1]).unwrap();
-                        ss[gdn_idx] = decayed.add(v_exp).unwrap();
-                        // y = just take a slice of state (no reduction)
-                        let y_proxy = ss[gdn_idx]
-                            .index((.., .., .., 0..1))
-                            .reshape(&[1, 1, hv, dv])
-                            .unwrap();
-                        gdn_idx += 1;
-
-                        let normed_y = fast::rms_norm(&y_proxy, Some(&l.norm_w), 1e-6).unwrap();
-                        let z_shaped = z
-                            .index((.., .., ..value_dim))
-                            .reshape(&[1, 1, hv, dv])
-                            .unwrap();
-                        let gated = swiglu(&z_shaped, &normed_y).unwrap();
-                        ops::quantized_matmul(
-                            &gated.reshape(&[1, 1, -1]).unwrap(),
-                            &l.out_proj.0,
-                            &l.out_proj.1,
-                            &l.out_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap()
-                    } else {
-                        let al = attn_layers[i].as_ref().unwrap();
-                        let q = ops::quantized_matmul(
-                            &normed,
-                            &al.q_proj.0,
-                            &al.q_proj.1,
-                            &al.q_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap();
-                        let _k = ops::quantized_matmul(
-                            &normed,
-                            &al.k_proj.0,
-                            &al.k_proj.1,
-                            &al.k_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap();
-                        let v = ops::quantized_matmul(
-                            &normed,
-                            &al.v_proj.0,
-                            &al.v_proj.1,
-                            &al.v_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap();
-                        let proxy = v
-                            .multiply(nn::sigmoid(&q.sum_axes(&[-1], true).unwrap()).unwrap())
-                            .unwrap();
-                        ops::quantized_matmul(
-                            &proxy,
-                            &al.o_proj.0,
-                            &al.o_proj.1,
-                            &al.o_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap()
-                    };
-                    let h2 = h.add(r).unwrap();
-                    let normed2 = fast::rms_norm(&h2, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
-                    let m = &moe_layers[i];
-                    let gate_out = ops::quantized_matmul(
-                        &normed2, &m.gate.0, &m.gate.1, &m.gate.2, true, gs, bits,
-                    )
-                    .unwrap();
-                    let gates = ops::softmax_axis(&gate_out, -1, true).unwrap();
-                    let neg_k = -top_k;
-                    let all_inds = ops::argpartition_axis(&gates, neg_k, -1).unwrap();
-                    let top_inds = all_inds.index((.., .., (n_experts + neg_k)..));
-                    let raw_scores = gates.take_along_axis(&top_inds, -1).unwrap();
-                    let scores = raw_scores
-                        .divide(raw_scores.sum_axes(&[-1], true).unwrap())
-                        .unwrap();
-                    let x_exp = normed2.expand_dims(-2).unwrap().expand_dims(-2).unwrap();
-                    let g_out = gather_qmm(
-                        &x_exp,
-                        &m.sw_gate.0,
-                        &m.sw_gate.1,
-                        &m.sw_gate.2,
-                        &top_inds,
-                        true,
+        let forward_matmul_gdn = |h_in: &Array,
+                                  ss: &mut Vec<Array>,
+                                  cs: &mut Vec<Array>|
+         -> Array {
+            let mut h = h_in.clone();
+            let mut gdn_idx = 0usize;
+            for i in 0..n_layers as usize {
+                let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                let r = if gdn_layers[i].is_some() {
+                    let l = gdn_layers[i].as_ref().unwrap();
+                    let qkvz = quantized_forward(
+                        &normed,
+                        &l.in_proj_qkvz.0,
+                        &l.in_proj_qkvz.1,
+                        &l.in_proj_qkvz.2,
                         gs,
                         bits,
-                        false,
                     )
                     .unwrap();
-                    let u_out = gather_qmm(
-                        &x_exp, &m.sw_up.0, &m.sw_up.1, &m.sw_up.2, &top_inds, true, gs, bits,
-                        false,
-                    )
-                    .unwrap();
-                    let activated = swiglu(&g_out, &u_out).unwrap();
-                    let d_out = gather_qmm(
-                        &activated,
-                        &m.sw_down.0,
-                        &m.sw_down.1,
-                        &m.sw_down.2,
-                        &top_inds,
-                        true,
+                    let ba = quantized_forward(
+                        &normed,
+                        &l.in_proj_ba.0,
+                        &l.in_proj_ba.1,
+                        &l.in_proj_ba.2,
                         gs,
                         bits,
-                        false,
                     )
                     .unwrap();
-                    let expert_sum = d_out
-                        .squeeze_axes(&[-2])
-                        .unwrap()
-                        .multiply(scores.expand_dims(-1).unwrap())
-                        .unwrap()
-                        .sum_axes(&[-2], false)
+                    let q = qkvz
+                        .index((.., .., ..key_dim))
+                        .reshape(&[1, 1, hk, dk])
                         .unwrap();
-                    let sh_g = ops::quantized_matmul(
+                    let k = qkvz
+                        .index((.., .., key_dim..2 * key_dim))
+                        .reshape(&[1, 1, hk, dk])
+                        .unwrap();
+                    let v = qkvz
+                        .index((.., .., 2 * key_dim..2 * key_dim + value_dim))
+                        .reshape(&[1, 1, hv, dv])
+                        .unwrap();
+                    let z = qkvz.index((.., .., 2 * key_dim + value_dim..));
+                    let b = ba.index((.., .., ..hv)).reshape(&[1, 1, hv]).unwrap();
+                    let a = ba.index((.., .., hv..)).reshape(&[1, 1, hv]).unwrap();
+                    let q_flat = q.reshape(&[1, 1, -1]).unwrap();
+                    let k_flat = k.reshape(&[1, 1, -1]).unwrap();
+                    let v_flat = v.reshape(&[1, 1, -1]).unwrap();
+                    let mixed = ops::concatenate(&[&q_flat, &k_flat, &v_flat], -1).unwrap();
+                    let conv_in = ops::concatenate(&[&cs[gdn_idx], &mixed], 1).unwrap();
+                    cs[gdn_idx] = conv_in.index((.., -3.., ..));
+                    let conv_out =
+                        nn::silu(ops::conv1d(&conv_in, &l.conv_w, 1, 0, 1, conv_dim).unwrap())
+                            .unwrap();
+                    let conv_q = conv_out
+                        .index((.., .., ..key_dim))
+                        .reshape(&[1, 1, hk, dk])
+                        .unwrap();
+                    let conv_k = conv_out
+                        .index((.., .., key_dim..2 * key_dim))
+                        .reshape(&[1, 1, hk, dk])
+                        .unwrap();
+                    let conv_v = conv_out
+                        .index((.., .., 2 * key_dim..))
+                        .reshape(&[1, 1, hv, dv])
+                        .unwrap();
+                    let _norm_q = fast::rms_norm(&conv_q, Some(&qk_norm_w), 1e-6)
+                        .unwrap()
+                        .multiply(&inv_scale_sq)
+                        .unwrap();
+                    let _norm_k = fast::rms_norm(&conv_k, Some(&qk_norm_w), 1e-6)
+                        .unwrap()
+                        .multiply(&inv_scale)
+                        .unwrap();
+                    let g = compute_g_compiled((&l.a_log, &a, &l.dt_bias)).unwrap();
+                    let _beta = nn::sigmoid(&b).unwrap();
+
+                    // Variant A: no reduction, just multiply + add on state
+                    let g_exp = g.reshape(&[1, hv, 1, 1]).unwrap();
+                    let decayed = ss[gdn_idx].multiply(g_exp).unwrap();
+                    let v_exp = conv_v.reshape(&[1, hv, dv, 1]).unwrap();
+                    ss[gdn_idx] = decayed.add(v_exp).unwrap();
+                    // y = just take a slice of state (no reduction)
+                    let y_proxy = ss[gdn_idx]
+                        .index((.., .., .., 0..1))
+                        .reshape(&[1, 1, hv, dv])
+                        .unwrap();
+                    gdn_idx += 1;
+
+                    let normed_y = fast::rms_norm(&y_proxy, Some(&l.norm_w), 1e-6).unwrap();
+                    let z_shaped = z
+                        .index((.., .., ..value_dim))
+                        .reshape(&[1, 1, hv, dv])
+                        .unwrap();
+                    let gated = swiglu(&z_shaped, &normed_y).unwrap();
+                    quantized_forward(
+                        &gated.reshape(&[1, 1, -1]).unwrap(),
+                        &l.out_proj.0,
+                        &l.out_proj.1,
+                        &l.out_proj.2,
+                        gs,
+                        bits,
+                    )
+                    .unwrap()
+                } else {
+                    let al = attn_layers[i].as_ref().unwrap();
+                    let q = quantized_forward(
+                        &normed,
+                        &al.q_proj.0,
+                        &al.q_proj.1,
+                        &al.q_proj.2,
+                        gs,
+                        bits,
+                    )
+                    .unwrap();
+                    let _k = quantized_forward(
+                        &normed,
+                        &al.k_proj.0,
+                        &al.k_proj.1,
+                        &al.k_proj.2,
+                        gs,
+                        bits,
+                    )
+                    .unwrap();
+                    let v = quantized_forward(
+                        &normed,
+                        &al.v_proj.0,
+                        &al.v_proj.1,
+                        &al.v_proj.2,
+                        gs,
+                        bits,
+                    )
+                    .unwrap();
+                    let proxy = v
+                        .multiply(nn::sigmoid(&q.sum_axes(&[-1], true).unwrap()).unwrap())
+                        .unwrap();
+                    quantized_forward(&proxy, &al.o_proj.0, &al.o_proj.1, &al.o_proj.2, gs, bits)
+                        .unwrap()
+                };
+                let h2 = h.add(r).unwrap();
+                let normed2 = fast::rms_norm(&h2, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                let m = &moe_layers[i];
+                let gate_out =
+                    quantized_forward(&normed2, &m.gate.0, &m.gate.1, &m.gate.2, gs, bits).unwrap();
+                let gates = ops::softmax_axis(&gate_out, -1, true).unwrap();
+                let neg_k = -top_k;
+                let all_inds = ops::argpartition_axis(&gates, neg_k, -1).unwrap();
+                let top_inds = all_inds.index((.., .., (n_experts + neg_k)..));
+                let raw_scores = gates.take_along_axis(&top_inds, -1).unwrap();
+                let scores = raw_scores
+                    .divide(raw_scores.sum_axes(&[-1], true).unwrap())
+                    .unwrap();
+                let x_exp = normed2.expand_dims(-2).unwrap().expand_dims(-2).unwrap();
+                let g_out = gather_qmm(
+                    &x_exp,
+                    &m.sw_gate.0,
+                    &m.sw_gate.1,
+                    &m.sw_gate.2,
+                    &top_inds,
+                    true,
+                    gs,
+                    bits,
+                    false,
+                )
+                .unwrap();
+                let u_out = gather_qmm(
+                    &x_exp, &m.sw_up.0, &m.sw_up.1, &m.sw_up.2, &top_inds, true, gs, bits, false,
+                )
+                .unwrap();
+                let activated = swiglu(&g_out, &u_out).unwrap();
+                let d_out = gather_qmm(
+                    &activated,
+                    &m.sw_down.0,
+                    &m.sw_down.1,
+                    &m.sw_down.2,
+                    &top_inds,
+                    true,
+                    gs,
+                    bits,
+                    false,
+                )
+                .unwrap();
+                let expert_sum = d_out
+                    .squeeze_axes(&[-2])
+                    .unwrap()
+                    .multiply(scores.expand_dims(-1).unwrap())
+                    .unwrap()
+                    .sum_axes(&[-2], false)
+                    .unwrap();
+                let sh_g =
+                    quantized_forward(&normed2, &m.se_gate.0, &m.se_gate.1, &m.se_gate.2, gs, bits)
+                        .unwrap();
+                let sh_u =
+                    quantized_forward(&normed2, &m.se_up.0, &m.se_up.1, &m.se_up.2, gs, bits)
+                        .unwrap();
+                let sh_act = swiglu(&sh_g, &sh_u).unwrap();
+                let sh_d =
+                    quantized_forward(&sh_act, &m.se_down.0, &m.se_down.1, &m.se_down.2, gs, bits)
+                        .unwrap();
+                let sh_gate_val = nn::sigmoid(
+                    quantized_forward(
                         &normed2,
-                        &m.se_gate.0,
-                        &m.se_gate.1,
-                        &m.se_gate.2,
-                        true,
+                        &m.se_gate_proj.0,
+                        &m.se_gate_proj.1,
+                        &m.se_gate_proj.2,
                         gs,
                         bits,
                     )
-                    .unwrap();
-                    let sh_u = ops::quantized_matmul(
-                        &normed2, &m.se_up.0, &m.se_up.1, &m.se_up.2, true, gs, bits,
-                    )
-                    .unwrap();
-                    let sh_act = swiglu(&sh_g, &sh_u).unwrap();
-                    let sh_d = ops::quantized_matmul(
-                        &sh_act,
-                        &m.se_down.0,
-                        &m.se_down.1,
-                        &m.se_down.2,
-                        true,
-                        gs,
-                        bits,
-                    )
-                    .unwrap();
-                    let sh_gate_val = nn::sigmoid(
-                        ops::quantized_matmul(
-                            &normed2,
-                            &m.se_gate_proj.0,
-                            &m.se_gate_proj.1,
-                            &m.se_gate_proj.2,
-                            true,
-                            gs,
-                            bits,
-                        )
-                        .unwrap(),
-                    )
-                    .unwrap();
-                    let shared_out = sh_d.multiply(sh_gate_val).unwrap();
-                    h = h2.add(expert_sum).unwrap().add(shared_out).unwrap();
-                }
-                h
-            };
+                    .unwrap(),
+                )
+                .unwrap();
+                let shared_out = sh_d.multiply(sh_gate_val).unwrap();
+                h = h2.add(expert_sum).unwrap().add(shared_out).unwrap();
+            }
+            h
+        };
 
         for _ in 0..5 {
             let mut ss = states.clone();
@@ -12169,14 +11737,14 @@ mod tests {
                 .unwrap()
                 .as_dtype(Dtype::Float16)
                 .unwrap();
-            ops::quantize(&raw, gs, bits).unwrap()
+            crate::test_support::quantize_affine(&raw, gs, bits).unwrap()
         };
         let make_qw = |d_in: i32, d_out: i32| -> (Array, Array, Array) {
             let raw = mlx_rs::random::normal::<f32>(&[d_out, d_in], None, None, None)
                 .unwrap()
                 .as_dtype(Dtype::Float16)
                 .unwrap();
-            ops::quantize(&raw, gs, bits).unwrap()
+            crate::test_support::quantize_affine(&raw, gs, bits).unwrap()
         };
 
         let sw_gate: Vec<_> = (0..n_layers).map(|_| make_sw(d, d_inter)).collect();
@@ -12272,12 +11840,11 @@ mod tests {
         let forward_moe_only = |h_in: &Array| -> Array {
             let mut h = h_in.clone();
             for i in 0..n_layers {
-                let gate_out = ops::quantized_matmul(
+                let gate_out = quantized_forward(
                     &h,
                     &gate_proj[i].0,
                     &gate_proj[i].1,
                     &gate_proj[i].2,
-                    true,
                     gs,
                     bits,
                 )
@@ -12381,12 +11948,11 @@ mod tests {
                 }
 
                 // MoE ops
-                let gate_out = ops::quantized_matmul(
+                let gate_out = quantized_forward(
                     &h,
                     &gate_proj[i].0,
                     &gate_proj[i].1,
                     &gate_proj[i].2,
-                    true,
                     gs,
                     bits,
                 )
@@ -12498,12 +12064,11 @@ mod tests {
                     gdn_idx += 1;
                 }
 
-                let gate_out = ops::quantized_matmul(
+                let gate_out = quantized_forward(
                     &h,
                     &gate_proj[i].0,
                     &gate_proj[i].1,
                     &gate_proj[i].2,
-                    true,
                     gs,
                     bits,
                 )
@@ -12655,16 +12220,9 @@ mod tests {
                     gdn_idx += 1;
                 }
                 // Simple quantized_matmul chain (no gather_qmm FFI)
-                let out = ops::quantized_matmul(
-                    &h,
-                    &simple_w[i].0,
-                    &simple_w[i].1,
-                    &simple_w[i].2,
-                    true,
-                    gs,
-                    bits,
-                )
-                .unwrap();
+                let out =
+                    quantized_forward(&h, &simple_w[i].0, &simple_w[i].1, &simple_w[i].2, gs, bits)
+                        .unwrap();
                 h = h.add(out).unwrap();
             }
             h
@@ -12716,12 +12274,11 @@ mod tests {
                     gdn_idx += 1;
                 }
 
-                let gate_out = ops::quantized_matmul(
+                let gate_out = quantized_forward(
                     &h,
                     &gate_proj[i].0,
                     &gate_proj[i].1,
                     &gate_proj[i].2,
-                    true,
                     gs,
                     bits,
                 )
@@ -12858,7 +12415,7 @@ mod tests {
                 .unwrap()
                 .as_dtype(Dtype::Float16)
                 .unwrap();
-            let (w, s, b) = ops::quantize(&raw, gs, bits).unwrap();
+            let (w, s, b) = crate::test_support::quantize_affine(&raw, gs, bits).unwrap();
             mlx_rs::transforms::eval(vec![&w, &s, &b]).unwrap();
             // raw, w, s, b will be dropped here
         }
@@ -12878,14 +12435,14 @@ mod tests {
                 .unwrap()
                 .as_dtype(Dtype::Float16)
                 .unwrap();
-            ops::quantize(&raw, gs, bits).unwrap()
+            crate::test_support::quantize_affine(&raw, gs, bits).unwrap()
         };
         let make_qw = |d_in: i32, d_out: i32| -> (Array, Array, Array) {
             let raw = mlx_rs::random::normal::<f32>(&[d_out, d_in], None, None, None)
                 .unwrap()
                 .as_dtype(Dtype::Float16)
                 .unwrap();
-            ops::quantize(&raw, gs, bits).unwrap()
+            crate::test_support::quantize_affine(&raw, gs, bits).unwrap()
         };
 
         let sw_gate: Vec<_> = (0..n_layers).map(|_| make_sw(d, d_inter)).collect();
@@ -13149,12 +12706,11 @@ mod tests {
                     h = h.add(y).unwrap();
                     gdn_idx += 1;
                 }
-                let gate_out = ops::quantized_matmul(
+                let gate_out = quantized_forward(
                     &h,
                     &gate_proj[i].0,
                     &gate_proj[i].1,
                     &gate_proj[i].2,
-                    true,
                     gs,
                     bits,
                 )
@@ -14005,7 +13561,7 @@ mod tests {
                 &vec![0.01f32; (n * out_d * in_d) as usize],
                 &[n, out_d, in_d],
             );
-            let (w, s, b_arr) = ops::quantize(&raw, gs, bits).unwrap();
+            let (w, s, b_arr) = crate::test_support::quantize_affine(&raw, gs, bits).unwrap();
             mlx_rs::transforms::eval([&w, &s, &b_arr]).unwrap();
             (w, s, b_arr)
         }
@@ -14216,7 +13772,7 @@ mod tests {
 
         fn make_qw2d(rows: i32, cols: i32, gs: i32, bits: i32) -> (Array, Array, Array) {
             let raw = Array::from_slice(&vec![0.01f32; (rows * cols) as usize], &[rows, cols]);
-            let (w, s, b_arr) = ops::quantize(&raw, gs, bits).unwrap();
+            let (w, s, b_arr) = crate::test_support::quantize_affine(&raw, gs, bits).unwrap();
             mlx_rs::transforms::eval([&w, &s, &b_arr]).unwrap();
             (w, s, b_arr)
         }
@@ -14235,24 +13791,22 @@ mod tests {
             let build = |h_in: &Array| -> Array {
                 let mut h = h_in.clone();
                 for i in 0..n_layers as usize {
-                    h = ops::quantized_matmul(
+                    h = quantized_forward(
                         &h,
                         &weights[i].0,
                         &weights[i].1,
                         &weights[i].2,
-                        true,
                         gs,
                         bits,
                     )
                     .unwrap();
                     for j in 0..*n_extras as usize {
                         let idx = (i + j + 1) % n_layers as usize;
-                        let extra = ops::quantized_matmul(
+                        let extra = quantized_forward(
                             &h,
                             &weights[idx].0,
                             &weights[idx].1,
                             &weights[idx].2,
-                            true,
                             gs,
                             bits,
                         )
@@ -14866,14 +14420,16 @@ mod tests {
         let float_weight =
             mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[vocab, hidden], None).unwrap();
         eval([&float_weight].into_iter()).unwrap();
-        let (qw, qs, qb) = ops::quantize(&float_weight, group_size, bits).unwrap();
+        let (qw, qs, qb) =
+            crate::test_support::quantize_affine(&float_weight, group_size, bits).unwrap();
         eval([&qw, &qs, &qb].into_iter()).unwrap();
 
         let indices = Array::from_slice(&[0i32, 5, 42, 255, 5], &[5]);
         eval([&indices].into_iter()).unwrap();
 
         // Path A: dequantize full vocab, then gather (current QEmbedding::forward)
-        let full_deq = ops::dequantize(&qw, &qs, &qb, group_size, bits).unwrap();
+        let full_deq =
+            crate::test_support::dequantize_affine(&qw, &qs, &qb, group_size, bits).unwrap();
         let path_a = full_deq.take_axis(&indices, 0).unwrap();
         eval([&path_a].into_iter()).unwrap();
 
@@ -14881,7 +14437,9 @@ mod tests {
         let sel_w = qw.take_axis(&indices, 0).unwrap();
         let sel_s = qs.take_axis(&indices, 0).unwrap();
         let sel_b = qb.take_axis(&indices, 0).unwrap();
-        let path_b = ops::dequantize(&sel_w, &sel_s, &sel_b, group_size, bits).unwrap();
+        let path_b =
+            crate::test_support::dequantize_affine(&sel_w, &sel_s, &sel_b, group_size, bits)
+                .unwrap();
         eval([&path_b].into_iter()).unwrap();
 
         // They should be identical (both round-trip through the same quantized repr)
@@ -15423,7 +14981,8 @@ mod tests {
             mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[n, k], None)
         })
         .unwrap();
-        let (w_q, scales, biases) = mlx_rs::ops::quantize(&w_dense, group_size, 4).unwrap();
+        let (w_q, scales, biases) =
+            crate::test_support::quantize_affine(&w_dense, group_size, 4).unwrap();
         mlx_rs::transforms::eval([&w_q, &scales, &biases, &x]).unwrap();
 
         // Reference: MLX quantized_matmul
@@ -15504,7 +15063,8 @@ mod tests {
             mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[n, k], None)
         })
         .unwrap();
-        let (w_q, scales, biases) = mlx_rs::ops::quantize(&w_dense, group_size, 4).unwrap();
+        let (w_q, scales, biases) =
+            crate::test_support::quantize_affine(&w_dense, group_size, 4).unwrap();
         mlx_rs::transforms::eval([&w_q, &scales, &biases, &x]).unwrap();
 
         // Warmup
@@ -15625,7 +15185,7 @@ mod tests {
                 .unwrap()
                 .as_dtype(Dtype::Float16)
                 .unwrap();
-            let (w, s, b) = ops::quantize(&raw, 32, 4).unwrap();
+            let (w, s, b) = crate::test_support::quantize_affine(&raw, 32, 4).unwrap();
             layer.weight = Param::new(w);
             layer.scales = Param::new(s);
             layer.biases = Param::new(b);

@@ -2,5 +2,15 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "packageRules": [
+    {
+      "description": "mlx-rs and mlx-sys are built from the same repository; bumping one alone links two mlx-sys builds and fails to compile.",
+      "matchPackageNames": [
+        "mlx-rs",
+        "mlx-sys"
+      ],
+      "groupName": "mlx-rs"
+    }
   ]
 }
