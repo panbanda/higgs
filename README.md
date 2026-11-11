@@ -140,6 +140,8 @@ never count as traffic in metrics.
 - `higgs stop`: stop a running daemon, or use `higgs stop --force`
 - `higgs attach`: open the daemon metrics dashboard
 - `higgs ui`: open the desktop app if it is installed (macOS)
+- `higgs mesh capabilities`: report the opt-in native image-to-mesh runtime's provenance and readiness
+- `higgs mesh generate --input STAGED.png --output-dir JOB_UUID --seed 0`: generate a mesh through that fixed runtime
 - `higgs init`: create `~/.config/higgs/config.toml`
 - `higgs doctor`: validate config, model paths, and providers
 - `higgs shellenv`: print `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` after verifying the server is reachable
@@ -228,6 +230,11 @@ cd apps/desktop && pnpm install && pnpm typecheck && pnpm build
 
 Contributor workflow, project structure, release validation, and doc expectations live in [CONTRIBUTING.md](CONTRIBUTING.md). Migration notes for older `higgs start` flags are in [docs/configuration.md](docs/configuration.md).
 
+## Optional native image-to-mesh runtime
+
+The `mesh` command invokes a separately installed fixed `~/.local/share/higgs/mesh-runtime/mesh` executable. It does not use chat completions, remote LLM providers, or model routing settings, and never accepts a user-provided command or model. Runtime installation is explicit: `higgs init` does not download checkpoints. `capabilities` returns JSON provenance/readiness; `generate` returns mesh metadata with a job-relative artifact name. The runtime owns staged PNG and UUID job directories, validates inputs, and must enforce its download, disk, memory, deadline and output bounds. Hosted deployments additionally require admission/concurrency controls.
+
+The initial adapter uses the Python MLX shape route from `ZimengXiong/Hunyuan3D-Swift`, pinned to `292331f4d26ddb80b9dcea6bcb5629ff82f12b82`, and the bundled Hunyuan3D-2mini checkpoint. This is a distinct model from Hi3D. The port source is MIT; model weights retain Tencent's Hunyuan 3D 2.0 Community License, including geographic restrictions. Mesh generation is not a commercial rights or print-manufacturing acceptance check. Validate and scale geometry independently before STL export or fulfillment.
 ## License
 
 MIT
