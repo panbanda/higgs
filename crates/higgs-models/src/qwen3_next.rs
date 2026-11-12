@@ -2994,7 +2994,8 @@ impl GatedDeltaNet {
         let norm_q = fast::rms_norm(&conv_q, Some(&self.qk_norm_weight_q), 1e-6)?;
         let norm_k = fast::rms_norm(&conv_k, Some(&self.qk_norm_weight_k), 1e-6)?;
 
-        let use_compiled_decode = compiled_gdn_decode_enabled() && S == 1;
+        // The compiled step is traced for a single sequence.
+        let use_compiled_decode = compiled_gdn_decode_enabled() && S == 1 && B == 1;
         if use_compiled_decode {
             if cache.ssm_state.is_none() {
                 cache.ssm_state = Some(ops::zeros_dtype(
@@ -3343,7 +3344,8 @@ impl FfnBlock {
                 .ok_or_else(|| Exception::custom("dense gate_proj missing"))?;
 
             let seq_len = *x.shape().get(1).unwrap_or(&0);
-            let use_decode_gemv = seq_len == 1 && gp.bits == 4;
+            // `qgemv_4bit` handles exactly one row.
+            let use_decode_gemv = matches!(x.shape(), [1, 1, _]) && gp.bits == 4;
             let gemv_mode = if std::env::var_os("HIGGS_QGEMV_FFN_MODE").is_none()
                 && should_force_dense_decode_safe_defaults_for_brand(apple_cpu_brand())
             {
@@ -6976,6 +6978,60 @@ mod tests {
         );
     }
 
+    /// The dense FFN has a single-row decode kernel; a batch must fall back
+    /// to the general path and produce what each row gets alone.
+    #[test]
+    fn dense_ffn_batched_decode_matches_per_row() {
+        use mlx_rs::Dtype;
+
+        fn assign_qlinear(layer: &mut QLinear, out_dim: i32, in_dim: i32) {
+            let raw = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[out_dim, in_dim], None)
+                .unwrap()
+                .as_dtype(Dtype::Float16)
+                .unwrap();
+            let (w, s, b) = crate::test_support::quantize_affine(&raw, 32, 4).unwrap();
+            layer.weight = Param::new(w);
+            layer.scales = Param::new(s);
+            layer.biases = Param::new(b);
+            layer.group_size = 32;
+            layer.bits = 4;
+        }
+
+        let mut block = FfnBlock::new_dense(64, 4).unwrap();
+        assign_qlinear(block.gate_proj.as_mut().unwrap(), 96, 64);
+        assign_qlinear(block.up_proj.as_mut().unwrap(), 96, 64);
+        assign_qlinear(block.down_proj.as_mut().unwrap(), 64, 96);
+
+        let x = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[3, 1, 64], None)
+            .unwrap()
+            .as_dtype(Dtype::Float16)
+            .unwrap();
+        let batched = block.forward(&x).unwrap();
+        assert_eq!(batched.shape(), &[3, 1, 64]);
+        for row in 0..3 {
+            let alone = block.forward(&x.index((row..=row, .., ..))).unwrap();
+            let diff = batched
+                .index((row..=row, .., ..))
+                .subtract(&alone)
+                .unwrap()
+                .abs()
+                .unwrap();
+            let max_diff: f32 = diff.max(None).unwrap().item_cast();
+            let largest: f32 = alone
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap()
+                .as_dtype(Dtype::Float32)
+                .unwrap()
+                .item_cast();
+            assert!(
+                max_diff < 1e-2 * largest,
+                "row {row}: batched FFN differs by {max_diff} of {largest}"
+            );
+        }
+    }
+
     #[test]
     fn test_gated_delta_kernel_state_passthrough() {
         // Verify that running kernel with T=1 twice produces different state
@@ -7067,6 +7123,14 @@ mod tests {
     fn test_gated_delta_kernel_matches_ops_model_dims() {
         // Actual Qwen3-Next dims: Hk=16, Hv=32, Dk=128, Dv=128
         assert_kernel_matches_ops(1, 1, 16, 32, 128, 128, 1e-4, "model dims");
+    }
+
+    #[test]
+    fn test_gated_delta_kernel_matches_ops_batched() {
+        // Batched decode runs the kernel with one sequence per batch row.
+        assert_kernel_matches_ops(3, 1, 2, 4, 32, 32, 1e-4, "B=3 GQA");
+        assert_kernel_matches_ops(2, 3, 2, 4, 32, 32, 1e-4, "B=2 T=3 GQA");
+        assert_kernel_matches_ops(4, 1, 16, 32, 128, 128, 1e-4, "B=4 model dims");
     }
 
     #[test]
