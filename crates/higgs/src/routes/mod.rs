@@ -8,3 +8,6 @@ pub mod models;
 pub mod responses;
 pub mod system;
 pub mod tokenize;
+
+#[cfg(test)]
+mod tool_choice_tests;

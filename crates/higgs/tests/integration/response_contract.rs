@@ -14,7 +14,7 @@ use higgs::types::anthropic::{
     AnthropicUsage, ContentBlockDeltaEvent, ContentBlockResponse, ContentBlockStartEvent,
     ContentBlockStartPayload, ContentBlockStopEvent, CountTokensResponse, CreateMessageResponse,
     MessageDelta, MessageDeltaEvent, MessageStartEvent, MessageStartPayload, MessageStopEvent,
-    TextDelta,
+    ResponseContentBlock, TextDelta,
 };
 use higgs::types::openai::{
     ChatCompletionChoice, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionDelta,
@@ -325,10 +325,10 @@ fn anthropic_response_has_type_field() {
         id: "msg_abc123".to_owned(),
         message_type: "message",
         role: "assistant",
-        content: vec![ContentBlockResponse {
+        content: vec![ResponseContentBlock::Text(ContentBlockResponse {
             block_type: "text",
             text: "Hello!".to_owned(),
-        }],
+        })],
         model: "claude-3".to_owned(),
         stop_reason: Some("end_turn".to_owned()),
         usage: make_anthropic_usage(10, 5),
