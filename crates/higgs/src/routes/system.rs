@@ -122,6 +122,11 @@ static PHYSICAL_MEMORY: LazyLock<Option<u64>> = LazyLock::new(|| {
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 });
 
+/// Unified memory installed on the machine.
+pub fn physical_memory_bytes() -> Option<u64> {
+    *PHYSICAL_MEMORY
+}
+
 fn process_rss_bytes() -> Option<u64> {
     let output = Command::new("ps")
         .args(["-o", "rss=", "-p", &std::process::id().to_string()])
