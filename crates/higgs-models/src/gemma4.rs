@@ -1674,8 +1674,7 @@ fn load_gemma4_moe_expert_weights(
     let mut remapped = 0usize;
 
     for file_path in &files {
-        let loaded = Array::load_safetensors(file_path)
-            .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+        let loaded = crate::load_safetensors_shard(file_path)?;
 
         for (key, value) in loaded {
             if let Some(prefix) = key.strip_suffix(".experts.gate_up_proj") {

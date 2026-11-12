@@ -5210,8 +5210,7 @@ fn load_qwen3_next_weights<M: mlx_rs::module::ModuleParametersExt>(
     let mut params = model.parameters_mut().flatten();
 
     for file_path in &safetensors_files {
-        let loaded = Array::load_safetensors(file_path)
-            .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
+        let loaded = crate::load_safetensors_shard(file_path)?;
         crate::validate_quantized_tensor_widths(&loaded, quantization)?;
 
         for (key, value) in loaded {
@@ -5249,8 +5248,7 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
     let mut unmatched = Vec::new();
 
     for file_path in &safetensors_files {
-        let loaded = Array::load_safetensors(file_path)
-            .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
+        let loaded = crate::load_safetensors_shard(file_path)?;
         crate::validate_quantized_tensor_widths(&loaded, quantization)?;
 
         for (key, value) in loaded {
@@ -5338,8 +5336,7 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     ];
 
     for file_path in &safetensors_files {
-        let loaded = Array::load_safetensors(file_path)
-            .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
+        let loaded = crate::load_safetensors_shard(file_path)?;
         crate::validate_quantized_tensor_widths(&loaded, quantization)?;
 
         for (key, value) in loaded {

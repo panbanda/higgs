@@ -1323,6 +1323,24 @@ pub fn load_tokenizer<P: AsRef<Path>>(model_dir: P) -> Result<tokenizers::Tokeni
         .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))
 }
 
+/// Load one safetensors shard and read its tensors into memory right away.
+///
+/// MLX loads lazily: the file is only read when an array is first evaluated.
+/// Left lazy, the reads happen inside the first GPU evaluation that touches
+/// the weights, and on slow storage a Metal command buffer can then sit open
+/// long enough to hit the GPU watchdog
+/// (`kIOGPUCommandBufferCallbackErrorTimeout`), failing the load. Evaluating
+/// here keeps disk I/O out of GPU work.
+pub(crate) fn load_safetensors_shard(
+    file_path: &Path,
+) -> Result<HashMap<String, Array>, ModelError> {
+    let loaded = Array::load_safetensors(file_path)
+        .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+    mlx_rs::transforms::eval(loaded.values())
+        .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+    Ok(loaded)
+}
+
 /// Load safetensors weights into any model that implements `ModuleParametersExt`.
 pub fn load_safetensors_weights<M: ModuleParametersExt>(
     model: &mut M,
@@ -1363,8 +1381,7 @@ pub(crate) fn load_quantized_safetensors_weights_with_settings<M: ModuleParamete
 
     for file_path in &safetensors_files {
         tracing::debug!(file = %file_path.display(), "Loading weights");
-        let loaded = Array::load_safetensors(file_path)
-            .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+        let loaded = load_safetensors_shard(file_path)?;
         validate_quantized_tensor_widths(&loaded, quantization)?;
 
         for (key, value) in loaded {
@@ -1433,8 +1450,7 @@ pub(crate) fn load_quantized_safetensors_weights_with_prefix_and_settings<
 
     for file_path in &safetensors_files {
         tracing::debug!(file = %file_path.display(), prefix, "Loading weights with prefix");
-        let loaded = Array::load_safetensors(file_path)
-            .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+        let loaded = load_safetensors_shard(file_path)?;
         validate_quantized_tensor_widths(&loaded, quantization)?;
 
         let mut matched = 0usize;
@@ -1530,8 +1546,7 @@ pub(crate) fn load_quantized_safetensors_weights_optional_prefix_with_settings<
     let mut total_unmatched_warns = 0usize;
 
     for file_path in &safetensors_files {
-        let loaded = Array::load_safetensors(file_path)
-            .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+        let loaded = load_safetensors_shard(file_path)?;
         validate_quantized_tensor_widths(&loaded, quantization)?;
 
         for (key, value) in loaded {
