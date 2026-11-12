@@ -952,7 +952,7 @@ fn oversized_unfinished_call_is_released_as_text() {
 #[test]
 fn detection_prefers_the_template_over_the_model_type() {
     let llama_template = "<|start_header_id|>system<|end_header_id|> Respond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}.";
-    let cases: [(Option<&str>, Option<&str>, ToolCallFormat); 16] = [
+    let cases: [(Option<&str>, Option<&str>, ToolCallFormat); 20] = [
         (
             Some("qwen3"),
             Some("{{ '<tool_call>' }}"),
@@ -965,7 +965,15 @@ fn detection_prefers_the_template_over_the_model_type() {
         ),
         (Some("llama"), Some(llama_template), ToolCallFormat::Llama),
         (Some("llama"), Some("<|python_tag|>"), ToolCallFormat::Llama),
-        (Some("llama"), Some("{{ messages }}"), ToolCallFormat::Llama),
+        (Some("llama"), Some("{{ messages }}"), ToolCallFormat::Auto),
+        (Some("llama"), None, ToolCallFormat::Llama),
+        (Some("mistral"), None, ToolCallFormat::MistralJsonArray),
+        (
+            Some("mistral"),
+            Some("{{ messages }}"),
+            ToolCallFormat::Auto,
+        ),
+        (Some("qwen2"), Some("{{ messages }}"), ToolCallFormat::Qwen),
         (
             Some("mistral"),
             Some("[TOOL_CALLS] [{{ x }}]"),

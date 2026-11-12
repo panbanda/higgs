@@ -62,11 +62,16 @@ impl ToolCallFormat {
     /// Pick the format from the model's chat template and `model_type`.
     ///
     /// The template wins because it is what the model was taught to answer
-    /// in; `model_type` only decides when the template says nothing.
+    /// in. `model_type` decides when the template says nothing, but only for
+    /// families whose output is unmistakable; Mistral, Llama and Gemma 3 write
+    /// calls only when their template teaches them to, so a template that
+    /// never mentions tools leaves them on [`Self::Auto`].
     pub fn detect(model_type: Option<&str>, chat_template: Option<&str>) -> Self {
+        let from_model_type =
+            |family_name: &str| Self::from_model_type(family_name, chat_template.is_none());
         chat_template
             .and_then(Self::from_template)
-            .or_else(|| model_type.and_then(Self::from_model_type))
+            .or_else(|| model_type.and_then(from_model_type))
             .unwrap_or(Self::Auto)
     }
 
@@ -99,7 +104,7 @@ impl ToolCallFormat {
         }
     }
 
-    fn from_model_type(model_type: &str) -> Option<Self> {
+    fn from_model_type(model_type: &str, template_absent: bool) -> Option<Self> {
         let family = |prefix: &str| model_type.starts_with(prefix);
         if family("qwen") || family("minicpm") {
             Some(Self::Qwen)
@@ -109,6 +114,8 @@ impl ToolCallFormat {
             Some(Self::MiniMax)
         } else if family("gemma4") {
             Some(Self::Gemma4)
+        } else if !template_absent {
+            None
         } else if family("gemma3") {
             Some(Self::GemmaPythonic)
         } else if family("mistral") || family("mixtral") || family("ministral") {

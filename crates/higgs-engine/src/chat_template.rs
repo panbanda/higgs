@@ -933,10 +933,10 @@ TOOLS:{{ tools | length }}
     #[test]
     fn tool_call_format_falls_back_to_the_model_type() {
         let format = format_for_model_dir(
-            r#"{"text_config": {"model_type": "llama"}}"#,
+            r#"{"text_config": {"model_type": "qwen3_5"}}"#,
             r#"{"chat_template": "{{ messages }}"}"#,
         );
-        assert_eq!(format, ToolCallFormat::Llama);
+        assert_eq!(format, ToolCallFormat::Qwen);
     }
 
     #[test]

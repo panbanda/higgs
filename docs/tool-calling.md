@@ -24,9 +24,11 @@ the model was taught to answer in.
 | `` ```tool_code `` | Gemma (pythonic) |
 
 When the template says nothing, `model_type` decides: `qwen*` and `minicpm*`
-use Qwen, `glm*` GLM, `minimax*` MiniMax, `gemma4*` Gemma 4, `gemma3*` Gemma
-(pythonic), `mistral*`/`mixtral*`/`ministral*` Mistral (JSON array), `llama*`
-Llama. Anything else is **auto**: calls are recognized from the output text
+use Qwen, `glm*` GLM, `minimax*` MiniMax, `gemma4*` Gemma 4. Mistral, Llama and
+Gemma 3 follow their `model_type` (`mistral*`/`mixtral*`/`ministral*`,
+`llama*`, `gemma3*`) only when the model has no chat template at all, because
+their output is only a call when the template taught it. Anything else is
+**auto**: calls are recognized from the output text
 when they start with a marker that belongs to one format only (`<tool_call>`,
 `[TOOL_CALLS]`, `<|python_tag|>`, `<function=`, `<function `, a `tool_code`
 fence, `<|tool_call>`, `<start_function_call>`, `<minimax:tool_call>`). Auto
@@ -38,12 +40,12 @@ knowing the model that would misread ordinary answers.
 | Model family | Format the model writes | Streaming | Forced `tool_choice` |
 | --- | --- | --- | --- |
 | Qwen 2.5 / Qwen3 / Hermes-style | `<tool_call>{"name": ..., "arguments": {...}}</tool_call>` | yes | yes |
-| Qwen3.5 / Qwen3.6, Qwen3-Coder | `<tool_call><function=name><parameter=key>value</parameter></function></tool_call>` | yes | yes (see below) |
-| MiniCPM5 | `<function name="..."><param name="...">...</param></function>` | yes | no |
+| Qwen3.5 / Qwen3.6, Qwen3-Coder | `<tool_call><function=name><parameter=key>value</parameter></function></tool_call>` | yes | yes (JSON envelope, see below) |
+| MiniCPM5 | `<function name="..."><param name="...">...</param></function>` | yes | yes (JSON envelope, as for Qwen3.5) |
 | Mistral, Mixtral, Ministral | `[TOOL_CALLS] [{"name": ..., "arguments": {...}}, ...]` | yes | yes |
 | Mistral (newer templates) | `[TOOL_CALLS]name[ARGS]{...}` or `[TOOL_CALLS]name{...}` | yes | yes |
 | Llama 3.1 / 3.2 | `{"name": ..., "parameters": {...}}`, optionally after `<\|python_tag\|>`, calls separated by `;` | yes | yes (one call) |
-| Llama 3.1 | `<function=name>{...}</function>` | yes | no |
+| Llama 3.1 | `<function=name>{...}</function>` | yes | yes (as the JSON form above) |
 | Gemma 3 (prompted) | a ```` ```tool_code ```` fence, or a bare `[name(arg=value), ...]` list | yes | no |
 | FunctionGemma | `<start_function_call>call:name{key:<escape>value<escape>}<end_function_call>` | yes | no |
 | Gemma 4 | `<\|tool_call>call:name{key:<\|"\|>value<\|"\|>}<tool_call\|>` | yes | no |
@@ -88,11 +90,13 @@ exactly what the parser extracts and the response finishes with `tool_calls`
 (`tool_use` on Anthropic). A forced call replaces the model's reasoning, so
 thinking is turned off for that request.
 
-Forcing needs a format whose arguments are JSON: Qwen/Hermes JSON, Mistral and
-Llama JSON. For the others Higgs returns a 400 naming the format rather than
-guessing. A Qwen3.5/3.6 model, which is prompted for the XML form, is forced
-into the JSON `<tool_call>` envelope, which the parser accepts but is not what
-the model was trained to write. Forcing cannot be combined with
+Forcing needs a format whose arguments are JSON: the Qwen format (any model
+detected as Qwen, MiniCPM included), Mistral and Llama. For the others Higgs
+returns a 400 naming the format rather than guessing. The forced text is always
+the JSON form of the format: a Qwen3.5/3.6 or MiniCPM model, which is prompted
+for an XML form, is forced into the `<tool_call>{"name": ..., "arguments":
+...}</tool_call>` envelope, which the parser accepts but is not what the model
+was trained to write; a Llama model is forced into the bare JSON object. Forcing cannot be combined with
 `response_format`, `guided_regex` or `guided_json`; a request that tries gets a
 400, as does naming a function that is not in `tools` or forcing a call with no
 tools.
