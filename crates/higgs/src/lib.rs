@@ -7,6 +7,7 @@ pub mod constraint;
 pub mod daemon;
 pub mod doctor;
 pub mod engine_loader;
+pub mod engine_selection;
 pub mod error;
 pub mod metrics;
 pub mod metrics_log;

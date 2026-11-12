@@ -286,7 +286,20 @@ export function ConfigForm({ draft, onChange, section }: ConfigFormProps) {
                   ))}
                 </select>
               </div>
-              <Checkbox label="Batch" checked={model.batch ?? false} onChange={(v) => updateModel(index, { batch: v || undefined })} />
+              <div className="field" style={{ flex: 1 }}>
+                <label>Batch engine</label>
+                <select
+                  value={model.batch === undefined || model.batch === "auto" ? "" : String(model.batch)}
+                  onChange={(event) => {
+                    const choice = event.target.value;
+                    updateModel(index, { batch: choice === "" ? undefined : choice === "true" });
+                  }}
+                >
+                  <option value="">auto (default)</option>
+                  <option value="true">always</option>
+                  <option value="false">never</option>
+                </select>
+              </div>
               <ReorderButtons index={index} count={models.length} onMove={(delta) => moveModel(index, delta)} onRemove={() => removeModel(index)} />
             </div>
             <details className="config-disclosure">

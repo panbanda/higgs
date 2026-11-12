@@ -20,7 +20,7 @@ export interface ModelEntry {
   path: string;
   name?: string;
   mlx_profile?: string;
-  batch?: boolean;
+  batch?: boolean | "auto";
   prefill_yield_tokens?: number;
   kv_cache?: string;
   kv_bits?: number;

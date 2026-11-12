@@ -217,7 +217,8 @@ traffic in metrics. The read-only ones never load a model.
 - Source builds also require `mlx.metallib` next to the executable. Higgs now restores it automatically from Cargo build output when possible, then fails loudly if it still cannot be found.
 - `[local].raise_wired_limit` defaults to `false`. Enable it only when you explicitly want MLX to raise the process wired-memory limit.
 - With several large models, `load = "on_demand"` plus `max_loaded_models`, `memory_guard`, or `idle_ttl_seconds` keeps unified memory from filling up; unloading shuts the engine down and clears the MLX buffer cache.
-- `batch=true` is only supported for transformer families with true batched decode support.
+- `batch` is `true`, `false`, or `"auto"` (the default). `auto` uses the continuous-batching engine whenever the model supports it and nothing configured needs a simple-engine-only feature (TurboQuant KV, `kv_disk_dir`, vision, MTP speculative decode); `higgs serve --batch` / `--no-batch` force it either way. See [docs/configuration.md](docs/configuration.md#engine-selection).
+- `batch = true` is only supported for transformer families with true batched decode support.
 - For batch models, `prefill_yield_tokens` can interleave long prompt prefills with decode; use `0` or omit it for the synchronous default.
 
 
