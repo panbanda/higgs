@@ -80,10 +80,7 @@ pub fn load_engine(
     let choice = match model.batch {
         BatchMode::On => {
             if !config::resolved_model_supports_batch(resolved)? {
-                return Err(format!(
-                    "batch=true is only supported for models with batched decode (llama, mistral, qwen2, qwen3, qwen3_moe, qwen3_5, qwen3_5_moe, phi3, starcoder2); {} is not supported",
-                    model.path
-                ));
+                return Err(config::batch_unsupported_message(&model.path));
             }
             EngineChoice::Batch
         }

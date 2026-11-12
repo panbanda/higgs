@@ -1163,10 +1163,7 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
             && let Some(supported) = batch_support_for_model_path(&model.path)?
             && !supported
         {
-            return Err(format!(
-                "batch=true is only supported for models with batched decode (llama, mistral, qwen2, qwen3, qwen3_moe, qwen3_5, qwen3_5_moe, phi3, starcoder2); {} is not supported",
-                model.path
-            ));
+            return Err(batch_unsupported_message(&model.path));
         }
     }
 
@@ -1224,6 +1221,12 @@ fn batch_support_check_can_be_deferred(model_path: &str, err: &str) -> bool {
             )
             || (err.starts_with(&format!("could not read HF cache ref for '{model_path}':"))
                 && err.contains("No such file or directory")))
+}
+
+pub fn batch_unsupported_message(model_path: &str) -> String {
+    format!(
+        "batch=true is only supported for models with batched decode (llama, mistral, qwen2, qwen3, qwen3_moe, qwen3_5, qwen3_5_moe, phi3, starcoder2); {model_path} is not supported"
+    )
 }
 
 pub fn resolved_model_supports_batch(model_dir: &Path) -> Result<bool, String> {
