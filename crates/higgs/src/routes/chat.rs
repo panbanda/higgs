@@ -20,7 +20,7 @@ use crate::{
     error::ServerError,
     metrics::{MetricsStore, RequestMetricsContext, RequestRecord, RequestTiming},
     router::ResolvedRoute,
-    state::{Engine, SharedState},
+    state::{EngineLease, SharedState},
     tool_choice::ToolChoice,
     types::openai::{
         ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessage, ChatCompletionRequest,
@@ -62,8 +62,7 @@ pub async fn chat_completions(
     let resolved = state
         .router
         .resolve(&req.model, messages_json.as_deref())
-        .await
-        .map_err(ServerError::ModelNotFound)?;
+        .await?;
 
     match resolved {
         ResolvedRoute::Higgs {
@@ -287,10 +286,10 @@ pub async fn chat_completions(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn chat_completions_non_streaming(
+pub(crate) async fn chat_completions_non_streaming(
     state: SharedState,
     req: ChatCompletionRequest,
-    engine: Arc<Engine>,
+    engine: EngineLease,
     constraint_spec: Option<ConstraintSpec>,
     received_at: Instant,
 ) -> Result<ChatCompletionResponse, ServerError> {
@@ -463,16 +462,41 @@ async fn chat_completions_non_streaming(
     })
 }
 
-#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 fn chat_completions_stream(
     state: SharedState,
     req: ChatCompletionRequest,
-    engine: Arc<Engine>,
+    engine: EngineLease,
     constraint_spec: Option<ConstraintSpec>,
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,
     received_at: Instant,
 ) -> Result<impl Stream<Item = Result<Event, Infallible>>, ServerError> {
+    let chunks = chat_completions_chunk_stream(
+        state,
+        req,
+        engine,
+        constraint_spec,
+        metrics,
+        routing_method,
+        received_at,
+    )?;
+    Ok(tokio_stream::StreamExt::map(chunks, |data| {
+        Ok(Event::default().data(data))
+    }))
+}
+
+/// Streaming generation as raw SSE `data` payloads (JSON chunks, ending with
+/// the `[DONE]` sentinel), shared by every route that re-frames chat chunks.
+#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
+pub(crate) fn chat_completions_chunk_stream(
+    state: SharedState,
+    req: ChatCompletionRequest,
+    engine: EngineLease,
+    constraint_spec: Option<ConstraintSpec>,
+    metrics: Option<Arc<MetricsStore>>,
+    routing_method: crate::router::RoutingMethod,
+    received_at: Instant,
+) -> Result<impl Stream<Item = String>, ServerError> {
     let stream_includes_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
     // Built here (before the `async_stream::stream!` block, which captures by
     // move) so the tracker can coerce XML-format tool-call values to their
@@ -596,7 +620,7 @@ fn chat_completions_stream(
         macro_rules! emit_delta {
             ($delta:expr, $finish:expr, $logprobs:expr) => {
                 match writer.write_delta($delta, $finish, $logprobs) {
-                    Ok(json) => yield Ok(Event::default().data(json)),
+                    Ok(json) => yield json.to_owned(),
                     Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
                 }
             };
@@ -656,7 +680,7 @@ fn chat_completions_stream(
                 if return_progress {
                     let time_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
                     let json = writer.write_prompt_progress(p.total, p.cached, p.processed, time_ms);
-                    yield Ok(Event::default().data(json));
+                    yield json.to_owned();
                 }
                 continue;
             }
@@ -806,7 +830,7 @@ fn chat_completions_stream(
                 received_at,
             );
             match writer.write_usage(&usage) {
-                Ok(json) => yield Ok(Event::default().data(json)),
+                Ok(json) => yield json.to_owned(),
                 Err(e) => tracing::error!(error = %e, "Failed to serialize usage chunk"),
             }
         }
@@ -818,7 +842,7 @@ fn chat_completions_stream(
         }
 
         // Send [DONE] sentinel
-        yield Ok(Event::default().data("[DONE]"));
+        yield "[DONE]".to_owned();
     };
 
     Ok(stream)
@@ -934,7 +958,7 @@ fn build_sampling_params(req: &ChatCompletionRequest) -> SamplingParams {
 /// server error.
 fn build_constraint(
     requested: Option<&ConstraintSpec>,
-    engine: &std::sync::Arc<crate::state::Engine>,
+    engine: &crate::state::Engine,
 ) -> Result<Option<higgs_engine::constrained::ConstrainedGenerator>, ServerError> {
     use higgs_engine::constrained::ConstrainedGenerator;
 

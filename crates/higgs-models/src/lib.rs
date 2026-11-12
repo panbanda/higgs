@@ -493,59 +493,112 @@ impl AnyModel {
         Ok(logits)
     }
 
-    /// Batched decode forward pass for N requests each with 1 token.
-    ///
-    /// Only supported for the `Transformer` variant (Llama/Qwen/Mistral).
+    /// Batched decode: one forward pass appending one token to each of the
+    /// `B` sequences held in `cache`. `inputs` is `[B, 1]`; returns
+    /// `[B, 1, vocab]` logits. See [`Self::supports_batched_decode`].
     pub fn forward_batched(
         &mut self,
         inputs: &Array,
-        cache: &mut batched_cache::BatchedKvCache,
+        batch: &mut batched_cache::AnyBatchedCache,
     ) -> Result<Array, Exception> {
-        match self {
-            Self::Transformer(m) => m.forward_batched(inputs, cache),
-            Self::Qwen3Moe(_)
-            | Self::Qwen3Next(_)
-            | Self::Gemma2(_)
-            | Self::Gemma3(_)
-            | Self::Gemma4(_)
-            | Self::Phi3(_)
-            | Self::Starcoder2(_)
-            | Self::LlavaQwen2(_)
-            | Self::DeepSeekV2(_)
-            | Self::BonsaiQ1(_) => Err(Exception::custom(
-                "Batched forward only supported for Transformer models",
+        match (self, batch) {
+            (Self::Qwen3Next(m), batched_cache::AnyBatchedCache::Hybrid(hybrid)) => {
+                let mask = hybrid.attention_mask(1)?;
+                m.forward_batched(inputs, mask.as_ref(), hybrid.layers_mut())
+            }
+            (model, batched_cache::AnyBatchedCache::Kv(kv)) => {
+                let mask = kv.attention_mask(1)?;
+                model.forward_with_batched_cache(inputs, mask.as_ref(), kv)
+            }
+            _ => Err(Exception::custom(
+                "batched cache does not match the model architecture",
             )),
         }
     }
 
-    /// Prefill several left-padded prompts in one pass (see
-    /// [`transformer::Model::prefill_batched`]). Same model support as
-    /// [`Self::forward_batched`].
+    /// Prefill several prompts in one forward pass.
+    ///
+    /// `inputs` is `[B, T]` with each prompt **left-padded** to the longest
+    /// (`T`), and `lengths` holds the true token counts. Returns last-position
+    /// logits `[B, 1, vocab]` and the filled cache. Real tokens are rotated at
+    /// their true positions, so the rows are interchangeable with caches
+    /// built by an unbatched prefill. See [`Self::supports_batched_prefill`].
     pub fn prefill_batched(
         &mut self,
         inputs: &Array,
         lengths: &[i32],
-    ) -> Result<(Array, batched_cache::BatchedKvCache), Exception> {
+    ) -> Result<(Array, batched_cache::AnyBatchedCache), Exception> {
+        let steps = batched_cache::validate_prefill_shape(inputs, lengths)?;
+        let mut cache =
+            batched_cache::BatchedKvCache::for_prefill(self.num_layers()?, lengths, steps);
+        let mask = batched_cache::BatchedKvCache::prefill_mask(lengths, steps)?;
+        let logits = self.forward_with_batched_cache(inputs, Some(&mask), &mut cache)?;
+        Ok((logits, batched_cache::AnyBatchedCache::Kv(cache)))
+    }
+
+    /// The model's ordinary forward pass, run over a batched cache.
+    fn forward_with_batched_cache(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut batched_cache::BatchedKvCache,
+    ) -> Result<Array, Exception> {
+        let layers = cache.layers_mut();
         match self {
-            Self::Transformer(m) => m.prefill_batched(inputs, lengths),
-            Self::Qwen3Moe(_)
-            | Self::Qwen3Next(_)
+            Self::Transformer(m) => m.forward(inputs, mask, layers),
+            Self::Qwen3Moe(m) => m.forward_with_cache(inputs, mask, layers),
+            Self::Phi3(m) => m.forward(inputs, mask, layers),
+            Self::Starcoder2(m) => m.forward(inputs, mask, layers),
+            // Gemma 2 attends over grouped `[B, kv_heads, groups, T, S]`
+            // scores, which the 4D padding mask does not broadcast against.
+            // The hybrid architecture batches through its own cache type.
+            Self::Qwen3Next(_)
             | Self::Gemma2(_)
             | Self::Gemma3(_)
             | Self::Gemma4(_)
-            | Self::Phi3(_)
-            | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => Err(Exception::custom(
-                "Batched prefill only supported for Transformer models",
+                "Batched decode is not supported for this model architecture",
             )),
         }
     }
 
-    /// Whether this model supports batched decode.
+    fn num_layers(&self) -> Result<usize, Exception> {
+        match self.make_cache()? {
+            AnyCache::KV(layers) => Ok(layers.len()),
+            AnyCache::Hybrid(layers) => Ok(layers.len()),
+        }
+    }
+
+    /// Whether this model supports batched decode: its attention must take
+    /// per-row positions and a padding mask from the cache (see
+    /// [`batched_cache::BatchedKvCache`]), verified against unbatched decode
+    /// on real weights for each architecture listed here.
+    ///
+    /// A hybrid model with an MTP head stays unbatched: speculative decode
+    /// drafts and rolls back one sequence at a time.
     pub const fn supports_batched_decode(&self) -> bool {
-        matches!(self, Self::Transformer(_))
+        match self {
+            Self::Transformer(_) | Self::Qwen3Moe(_) | Self::Phi3(_) | Self::Starcoder2(_) => true,
+            Self::Qwen3Next(m) => !m.has_mtp(),
+            Self::Gemma2(_)
+            | Self::Gemma3(_)
+            | Self::Gemma4(_)
+            | Self::LlavaQwen2(_)
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => false,
+        }
+    }
+
+    /// Whether several prompts can be prefilled in one left-padded pass
+    /// ([`Self::prefill_batched`]). Recurrent layers have no way to skip
+    /// padding tokens, so the hybrid architecture prefills one at a time.
+    pub const fn supports_batched_prefill(&self) -> bool {
+        matches!(
+            self,
+            Self::Transformer(_) | Self::Qwen3Moe(_) | Self::Phi3(_) | Self::Starcoder2(_)
+        )
     }
 
     /// Whether this model has a loaded MTP head for speculative decode.
@@ -1323,6 +1376,24 @@ pub fn load_tokenizer<P: AsRef<Path>>(model_dir: P) -> Result<tokenizers::Tokeni
         .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))
 }
 
+/// Load one safetensors shard and read its tensors into memory right away.
+///
+/// MLX loads lazily: the file is only read when an array is first evaluated.
+/// Left lazy, the reads happen inside the first GPU evaluation that touches
+/// the weights, and on slow storage a Metal command buffer can then sit open
+/// long enough to hit the GPU watchdog
+/// (`kIOGPUCommandBufferCallbackErrorTimeout`), failing the load. Evaluating
+/// here keeps disk I/O out of GPU work.
+pub(crate) fn load_safetensors_shard(
+    file_path: &Path,
+) -> Result<HashMap<String, Array>, ModelError> {
+    let loaded = Array::load_safetensors(file_path)
+        .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+    mlx_rs::transforms::eval(loaded.values())
+        .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+    Ok(loaded)
+}
+
 /// Load safetensors weights into any model that implements `ModuleParametersExt`.
 pub fn load_safetensors_weights<M: ModuleParametersExt>(
     model: &mut M,
@@ -1363,8 +1434,7 @@ pub(crate) fn load_quantized_safetensors_weights_with_settings<M: ModuleParamete
 
     for file_path in &safetensors_files {
         tracing::debug!(file = %file_path.display(), "Loading weights");
-        let loaded = Array::load_safetensors(file_path)
-            .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+        let loaded = load_safetensors_shard(file_path)?;
         validate_quantized_tensor_widths(&loaded, quantization)?;
 
         for (key, value) in loaded {
@@ -1433,8 +1503,7 @@ pub(crate) fn load_quantized_safetensors_weights_with_prefix_and_settings<
 
     for file_path in &safetensors_files {
         tracing::debug!(file = %file_path.display(), prefix, "Loading weights with prefix");
-        let loaded = Array::load_safetensors(file_path)
-            .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+        let loaded = load_safetensors_shard(file_path)?;
         validate_quantized_tensor_widths(&loaded, quantization)?;
 
         let mut matched = 0usize;
@@ -1530,8 +1599,7 @@ pub(crate) fn load_quantized_safetensors_weights_optional_prefix_with_settings<
     let mut total_unmatched_warns = 0usize;
 
     for file_path in &safetensors_files {
-        let loaded = Array::load_safetensors(file_path)
-            .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+        let loaded = load_safetensors_shard(file_path)?;
         validate_quantized_tensor_widths(&loaded, quantization)?;
 
         for (key, value) in loaded {

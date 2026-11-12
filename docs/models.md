@@ -42,6 +42,11 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 - `mistral`
 - `qwen2`
 - `qwen3`
+- `qwen3_5` (dense) and `qwen3_5_moe`
+- `phi3`
+- `starcoder2`
+
+Qwen3.5 hybrid models (`qwen3_5`, `qwen3_5_moe`) batch decode only: each prompt is prefilled on its own and then joins the decode batch, because left padding would corrupt the recurrent layers. A checkpoint that ships an MTP head decodes its requests one at a time under `batch=true`. `qwen3_next` is not verified for batched decode and is rejected.
 
 Other supported architectures still serve normally in simple mode, but Higgs now rejects `batch=true` during config load, `doctor`, and server startup.
 

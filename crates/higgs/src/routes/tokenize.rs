@@ -14,7 +14,7 @@ use crate::{
     metrics::RequestMetricsContext,
     router::ResolvedRoute,
     routes::chat::convert_messages,
-    state::{Engine, SharedState},
+    state::{EngineLease, SharedState},
     types::openai::{ChatCompletionMessage, ReasoningConfig},
 };
 
@@ -150,12 +150,8 @@ async fn local_engine(
     state: &SharedState,
     model: &str,
     messages: Option<&[serde_json::Value]>,
-) -> Result<(std::sync::Arc<Engine>, String), ServerError> {
-    let resolved = state
-        .router
-        .resolve(model, messages)
-        .await
-        .map_err(ServerError::ModelNotFound)?;
+) -> Result<(EngineLease, String), ServerError> {
+    let resolved = state.router.resolve(model, messages).await?;
     match resolved {
         ResolvedRoute::Higgs {
             engine, model_name, ..

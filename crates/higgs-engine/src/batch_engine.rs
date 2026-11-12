@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use higgs_models::{
     AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties,
-    batched_cache::BatchedKvCache, sample, turboquant::KvCacheConfig,
+    batched_cache::AnyBatchedCache, sample, turboquant::KvCacheConfig,
 };
 use mlx_rs::{
     Array, Stream,
@@ -89,7 +89,7 @@ struct ActiveRequest {
 /// was formed; `ids` detects when that list has changed since.
 struct DecodeBatch {
     ids: Vec<u64>,
-    cache: BatchedKvCache,
+    cache: AnyBatchedCache,
     /// `[B]` most recent token of each row, fed to the next step.
     tokens: Array,
     /// `tokens` came from a step whose results clients have not received yet.
@@ -137,6 +137,7 @@ fn prefill_chunk_ranges(token_count: usize, quantum: usize) -> Vec<std::ops::Ran
 /// token level instead of being fully serialized.
 pub struct BatchEngine {
     request_tx: tokio::sync::mpsc::Sender<BatchRequest>,
+    worker: std::thread::JoinHandle<()>,
     tokenizer: Tokenizer,
     template: ChatTemplateRenderer,
     model_name: String,
@@ -174,7 +175,7 @@ impl BatchEngine {
         // the worker loads the model itself and reports back only plain data.
         let (loaded_tx, loaded_rx) = std::sync::mpsc::sync_channel::<Result<i32, EngineError>>(1);
 
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("batch-engine".into())
             .spawn(move || {
                 let model = match model_loader::load_model(&worker_model_dir) {
@@ -211,12 +212,24 @@ impl BatchEngine {
 
         Ok(Self {
             request_tx,
+            worker,
             tokenizer,
             template,
             model_name,
             eos_token_ids,
             hidden_size: AtomicI32::new(hidden_size),
         })
+    }
+
+    /// Free the model, returning only once the worker has dropped its MLX state.
+    ///
+    /// The worker finishes requests it already accepted, then exits when the queue closes.
+    pub fn shutdown(self) {
+        let Self {
+            request_tx, worker, ..
+        } = self;
+        drop(request_tx);
+        let _ = worker.join();
     }
 
     pub fn model_name(&self) -> &str {
@@ -499,6 +512,9 @@ fn worker_loop(
     mut request_rx: tokio::sync::mpsc::Receiver<BatchRequest>,
     prefill_yield_tokens: u32,
 ) {
+    if !model.supports_batched_decode() {
+        tracing::warn!("This model cannot batch decode; requests will decode one at a time");
+    }
     let mut prefix_cache = PrefixCache::new(DEFAULT_PREFIX_CACHE_SIZE);
     let mut active: Vec<ActiveRequest> = Vec::new();
     let mut pending_prefill: Option<PendingPrefill> = None;
@@ -525,7 +541,7 @@ fn worker_loop(
         //    group of short prompts in a single pass), so long prefills are
         //    interleaved with decode steps for requests already in flight.
         if prefill_yield_tokens == 0 {
-            let group = if model.supports_batched_decode() {
+            let group = if model.supports_batched_prefill() {
                 take_prefill_group(&mut waiting, &mut prefix_cache)
             } else {
                 Vec::new()
@@ -798,14 +814,7 @@ fn form_decode_batch(active: &mut [ActiveRequest]) -> Result<DecodeBatch, Engine
     let mut rows = Vec::with_capacity(active.len());
     let mut last_tokens = Vec::with_capacity(active.len());
     for ar in active.iter_mut() {
-        match std::mem::replace(&mut ar.cache, AnyCache::KV(Vec::new())) {
-            AnyCache::KV(row) => rows.push(row),
-            AnyCache::Hybrid(_) => {
-                return Err(EngineError::Generation(
-                    "Batched decode requires a KV cache".to_owned(),
-                ));
-            }
-        }
+        rows.push(std::mem::replace(&mut ar.cache, AnyCache::KV(Vec::new())));
         last_tokens.push(ar.generated_tokens.last().copied().ok_or_else(|| {
             EngineError::Generation("Active request has no generated token".to_owned())
         })?);
@@ -814,7 +823,7 @@ fn form_decode_batch(active: &mut [ActiveRequest]) -> Result<DecodeBatch, Engine
         .map_err(|_| EngineError::Generation("Too many batched requests".to_owned()))?;
     Ok(DecodeBatch {
         ids: active.iter().map(|ar| ar.id).collect(),
-        cache: BatchedKvCache::from_rows(rows).map_err(EngineError::Mlx)?,
+        cache: AnyBatchedCache::from_rows(rows).map_err(EngineError::Mlx)?,
         tokens: Array::from_slice(&last_tokens, &[rows_len]),
         undelivered: false,
     })
@@ -873,7 +882,7 @@ fn disband_decode_batch(
         let Some(ar) = active.iter_mut().find(|ar| ar.id == *request_id) else {
             continue;
         };
-        ar.cache = AnyCache::KV(row);
+        ar.cache = row;
         if let Some(&last_token) = ar.generated_tokens.last() {
             ar.current_token = Array::from_slice(&[last_token], &[1]);
         }
@@ -998,7 +1007,7 @@ fn prefill_group(
                 eos_token_ids,
                 req,
                 prompt_len,
-                AnyCache::KV(row),
+                row,
                 row_logits,
             )
         });

@@ -259,7 +259,7 @@ static QWEN35_DENSE: BuiltinAdapter = BuiltinAdapter {
     id: "qwen3.5-dense",
     family: qwen,
     version_range: "Qwen 3.5+ dense",
-    capabilities: caps(false, true, false, false, false),
+    capabilities: caps(false, true, false, false, true),
     notes: "Qwen3.5 text backbone, including structurally compatible newer revisions",
     kind: LoadKind::Qwen35Dense,
 };
@@ -267,7 +267,7 @@ static QWEN35_MOE: BuiltinAdapter = BuiltinAdapter {
     id: "qwen3.5-moe",
     family: qwen,
     version_range: "Qwen 3.5+ MoE",
-    capabilities: caps(false, true, true, false, false),
+    capabilities: caps(false, true, true, false, true),
     notes: "Qwen3.5 MoE text backbone, including structurally compatible newer revisions",
     kind: LoadKind::Qwen35Moe,
 };
@@ -307,7 +307,7 @@ static PHI3: BuiltinAdapter = BuiltinAdapter {
     id: "phi3",
     family: phi,
     version_range: "Phi 3.x",
-    capabilities: caps(false, false, false, false, false),
+    capabilities: caps(false, false, false, false, true),
     notes: "Phi-3",
     kind: LoadKind::Phi3,
 };
@@ -315,7 +315,7 @@ static STARCODER2: BuiltinAdapter = BuiltinAdapter {
     id: "starcoder2",
     family: starcoder,
     version_range: "Starcoder 2.x",
-    capabilities: caps(false, false, false, false, false),
+    capabilities: caps(false, false, false, false, true),
     notes: "Starcoder2",
     kind: LoadKind::Starcoder2,
 };

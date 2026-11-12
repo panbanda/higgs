@@ -1,11 +1,23 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use regex::Regex;
 use tracing::warn;
 
-use crate::config::{ApiFormat, HiggsConfig};
-use crate::state::Engine;
+use crate::config::{ApiFormat, HiggsConfig, LoadMode};
+use crate::model_pool::{ModelError, ModelPool, ModelSpec};
+use crate::state::{Engine, EngineLease};
+
+/// Why a model name could not be resolved to a servable route.
+#[derive(Debug, thiserror::Error)]
+pub enum RouteError {
+    /// Nothing is configured to serve the requested model.
+    #[error("{0}")]
+    NotFound(String),
+    /// The model is configured but could not be made ready.
+    #[error(transparent)]
+    Model(#[from] ModelError),
+}
 
 /// How a model name was resolved to its target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,7 +36,7 @@ pub enum RoutingMethod {
 pub enum ResolvedRoute {
     /// Serve locally via a loaded MLX engine.
     Higgs {
-        engine: Arc<Engine>,
+        engine: EngineLease,
         model_name: String,
         routing_method: RoutingMethod,
     },
@@ -84,22 +96,19 @@ struct AutoRouteEntry {
 /// 3. Pattern matching (first match wins)
 /// 4. Default provider fallback
 pub struct Router {
-    local_engines: HashMap<String, Arc<Engine>>,
+    pool: Arc<ModelPool<Engine>>,
     compiled_routes: Vec<CompiledRoute>,
     auto_routes: Vec<AutoRouteEntry>,
     auto_candidates: Vec<RouteCandidate>,
-    auto_router_engine: Option<Arc<Engine>>,
+    auto_router_model: Option<String>,
     auto_router_force: bool,
     auto_router_timeout_ms: u64,
     default_target: RouteTarget,
 }
 
 impl Router {
-    /// Build a router from the unified config and loaded local engines.
-    pub fn from_config(
-        config: &HiggsConfig,
-        engines: HashMap<String, Arc<Engine>>,
-    ) -> Result<Self, String> {
+    /// Build a router from the unified config and the pool that serves its local models.
+    pub fn new(config: &HiggsConfig, pool: Arc<ModelPool<Engine>>) -> Result<Self, String> {
         let mut compiled_routes = Vec::new();
         let mut auto_routes = Vec::new();
         let mut auto_candidates = Vec::new();
@@ -146,7 +155,7 @@ impl Router {
             }
         }
 
-        let auto_router_engine = if config.auto_router.enabled {
+        let auto_router_model = if config.auto_router.enabled {
             if config.auto_router.model.is_empty() {
                 return Err("auto_router.enabled is true but model is empty".to_owned());
             }
@@ -154,10 +163,12 @@ impl Router {
                 warn!("auto_router is enabled but no routes have descriptions");
             }
             let auto_model = &config.auto_router.model;
-            let engine = engines.get(auto_model).cloned().ok_or_else(|| {
-                format!("auto_router model '{auto_model}' not found among loaded models")
-            })?;
-            Some(engine)
+            if !pool.contains(auto_model) {
+                return Err(format!(
+                    "auto_router model '{auto_model}' not found among loaded models"
+                ));
+            }
+            Some(auto_model.clone())
         } else {
             None
         };
@@ -165,11 +176,11 @@ impl Router {
         let default_target = build_route_target(&config.default.provider, None, config)?;
 
         Ok(Self {
-            local_engines: engines,
+            pool,
             compiled_routes,
             auto_routes,
             auto_candidates,
-            auto_router_engine,
+            auto_router_model,
             auto_router_force: config.auto_router.force,
             auto_router_timeout_ms: config.auto_router.timeout_ms,
             default_target,
@@ -184,21 +195,23 @@ impl Router {
         &self,
         model: &str,
         messages: Option<&[serde_json::Value]>,
-    ) -> Result<ResolvedRoute, String> {
+    ) -> Result<ResolvedRoute, RouteError> {
         if self.auto_router_force || model == "auto" {
             if let Some(resolved) = self.try_auto_route(messages).await {
                 return Ok(resolved);
             }
             if model == "auto" {
-                return self.resolve_target(&self.default_target, model, RoutingMethod::Default);
+                return self
+                    .resolve_target(&self.default_target, model, RoutingMethod::Default)
+                    .await;
             }
             // force mode: auto-routing returned nothing, fall through to normal resolution
         }
 
         // Direct engine lookup
-        if let Some(engine) = self.local_engines.get(model) {
+        if self.pool.contains(model) {
             return Ok(ResolvedRoute::Higgs {
-                engine: Arc::clone(engine),
+                engine: self.pool.acquire(model).await?,
                 model_name: model.to_owned(),
                 routing_method: RoutingMethod::Direct,
             });
@@ -207,17 +220,44 @@ impl Router {
         // Pattern matching (first match wins)
         for route in &self.compiled_routes {
             if route.pattern.is_match(model) {
-                return self.resolve_target(&route.target, model, RoutingMethod::Pattern);
+                return self
+                    .resolve_target(&route.target, model, RoutingMethod::Pattern)
+                    .await;
             }
         }
 
         // Default fallback
         self.resolve_target(&self.default_target, model, RoutingMethod::Default)
+            .await
     }
 
-    /// Returns all loaded local engines.
-    pub const fn local_engines(&self) -> &HashMap<String, Arc<Engine>> {
-        &self.local_engines
+    /// Build a router over engines the caller already loaded.
+    ///
+    /// Such engines are pinned: the pool has no way to rebuild one once it is unloaded.
+    pub fn from_config(
+        config: &HiggsConfig,
+        engines: std::collections::HashMap<String, Arc<Engine>>,
+    ) -> Result<Self, String> {
+        let mut resident: Vec<(ModelSpec, Arc<Engine>)> = engines
+            .into_iter()
+            .map(|(name, engine)| {
+                let spec = ModelSpec {
+                    name,
+                    engine_kind: engine.kind(),
+                    load: LoadMode::Startup,
+                    pinned: true,
+                    idle_ttl: None,
+                };
+                (spec, engine)
+            })
+            .collect();
+        resident.sort_by(|(left, _), (right, _)| left.name.cmp(&right.name));
+        Self::new(config, ModelPool::from_resident(resident))
+    }
+
+    /// The pool that loads, tracks and unloads the configured local models.
+    pub const fn pool(&self) -> &Arc<ModelPool<Engine>> {
+        &self.pool
     }
 
     // -- Private helpers ---------------------------------------------------
@@ -226,13 +266,19 @@ impl Router {
         &self,
         messages: Option<&[serde_json::Value]>,
     ) -> Option<ResolvedRoute> {
-        let auto_engine = self.auto_router_engine.as_ref()?;
+        let classifier_model = self.auto_router_model.as_ref()?;
         let msg_slice = messages?;
         if self.auto_candidates.is_empty() || msg_slice.is_empty() {
             return None;
         }
 
-        let engine_clone = Arc::clone(auto_engine);
+        let classifier = match self.pool.acquire(classifier_model).await {
+            Ok(lease) => lease,
+            Err(error) => {
+                warn!(%error, "auto-router classifier unavailable; using normal routing");
+                return None;
+            }
+        };
         let candidates = self.auto_candidates.clone();
         let messages_owned = msg_slice.to_vec();
 
@@ -240,7 +286,7 @@ impl Router {
         let timeout_result = tokio::time::timeout(
             timeout,
             tokio::task::spawn_blocking(move || {
-                crate::auto_router::classify_local(&engine_clone, &candidates, &messages_owned)
+                crate::auto_router::classify_local(&classifier, &candidates, &messages_owned)
             }),
         )
         .await;
@@ -253,36 +299,36 @@ impl Router {
 
         let entry = self.auto_routes.iter().find(|r| r.name == name)?;
         self.resolve_target(&entry.target, "auto", RoutingMethod::Auto)
+            .await
             .ok()
     }
 
-    fn resolve_target(
+    async fn resolve_target(
         &self,
         target: &RouteTarget,
         model: &str,
         method: RoutingMethod,
-    ) -> Result<ResolvedRoute, String> {
+    ) -> Result<ResolvedRoute, RouteError> {
         match target {
             RouteTarget::Higgs { model_rewrite } => {
                 let lookup_name = model_rewrite.as_deref().unwrap_or(model);
-                let (engine, resolved_name) =
-                    if let Some(engine) = self.local_engines.get(lookup_name) {
-                        (Arc::clone(engine), lookup_name.to_owned())
-                    } else if model == "auto" {
-                        // "auto" is a virtual model name; pick any loaded engine
-                        let (name, engine) =
-                            self.local_engines.iter().next().ok_or_else(|| {
-                                "no local models loaded for default route".to_owned()
-                            })?;
-                        (Arc::clone(engine), name.clone())
-                    } else {
-                        return Err(format!(
-                            "model '{lookup_name}' not found among loaded local models"
-                        ));
-                    };
+                let resolved_name = if self.pool.contains(lookup_name) {
+                    lookup_name
+                } else if model == "auto" {
+                    // "auto" is a virtual model name; prefer a model that is already loaded
+                    self.pool.preferred_name().ok_or_else(|| {
+                        RouteError::NotFound(
+                            "no local models configured for default route".to_owned(),
+                        )
+                    })?
+                } else {
+                    return Err(RouteError::NotFound(format!(
+                        "model '{lookup_name}' not found among loaded local models"
+                    )));
+                };
                 Ok(ResolvedRoute::Higgs {
-                    engine,
-                    model_name: resolved_name,
+                    engine: self.pool.acquire(resolved_name).await?,
+                    model_name: resolved_name.to_owned(),
                     routing_method: method,
                 })
             }
@@ -296,11 +342,11 @@ impl Router {
                 stub_count_tokens,
             } => {
                 if model == "auto" && model_rewrite.is_none() {
-                    return Err(
+                    return Err(RouteError::NotFound(
                         "cannot forward virtual model name \"auto\" to remote provider; \
                          configure a model rewrite on the default route or add auto-router routes"
                             .to_owned(),
-                    );
+                    ));
                 }
                 Ok(ResolvedRoute::Remote {
                     provider_name: provider_name.clone(),
@@ -349,6 +395,8 @@ fn build_route_target(
 )]
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::config::load_config_file;
 
@@ -696,7 +744,8 @@ mod tests {
         let result = router.resolve("Llama-3.2-1B", None).await;
         match result {
             Err(e) => assert!(
-                e.contains("not found among loaded local models"),
+                e.to_string()
+                    .contains("not found among loaded local models"),
                 "got: {e}"
             ),
             Ok(_) => panic!("expected error for missing local model"),
@@ -801,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn local_engines_accessor_returns_engines() {
+    fn pool_accessor_lists_no_models_when_none_are_supplied() {
         let config = config_from_toml(
             r#"
             [[models]]
@@ -809,7 +858,7 @@ mod tests {
             "#,
         );
         let router = Router::from_config(&config, HashMap::new()).unwrap();
-        assert!(router.local_engines().is_empty());
+        assert!(router.pool().statuses().is_empty());
     }
 
     #[tokio::test]
@@ -918,7 +967,10 @@ mod tests {
         let router = router_from_toml(production_toml());
         let result = router.resolve("auto", None).await;
         match result {
-            Err(e) => assert!(e.contains("cannot forward virtual model name"), "got: {e}"),
+            Err(e) => assert!(
+                e.to_string().contains("cannot forward virtual model name"),
+                "got: {e}"
+            ),
             Ok(_) => panic!("expected error for auto with remote default"),
         }
     }
@@ -990,5 +1042,128 @@ mod tests {
             }
             ResolvedRoute::Higgs { .. } => panic!("expected Remote route"),
         }
+    }
+
+    // -- Lazy loading through the pool --
+
+    use crate::model_pool::{ModelState, PoolLimits};
+    use crate::state::test_support::{stub_pool_with, stub_spec};
+
+    #[tokio::test]
+    async fn direct_route_loads_an_on_demand_model_on_first_use_and_tracks_the_request() {
+        let (pool, loader) = stub_pool_with(vec![stub_spec("lazy")], PoolLimits::default());
+        let router = Router::new(&HiggsConfig::default(), pool).unwrap();
+        assert_eq!(
+            router.pool().status("lazy").unwrap().state,
+            ModelState::Unloaded
+        );
+
+        let route = router.resolve("lazy", None).await.unwrap();
+
+        let ResolvedRoute::Higgs { engine, .. } = route else {
+            panic!("expected a local route");
+        };
+        assert_eq!(engine.model_name(), "lazy");
+        assert_eq!(router.pool().status("lazy").unwrap().in_flight, 1);
+        assert_eq!(*loader.events.lock().unwrap(), ["load:lazy"]);
+        drop(engine);
+        assert_eq!(router.pool().status("lazy").unwrap().in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn pattern_route_to_higgs_loads_the_target_model() {
+        let config = config_from_toml(
+            r#"
+            [[models]]
+            path = "some/model"
+            name = "lazy"
+
+            [[routes]]
+            pattern = "^gpt-"
+            provider = "higgs"
+            model = "lazy"
+            "#,
+        );
+        let (pool, loader) = stub_pool_with(vec![stub_spec("lazy")], PoolLimits::default());
+        let router = Router::new(&config, pool).unwrap();
+
+        let route = router.resolve("gpt-4", None).await.unwrap();
+
+        let ResolvedRoute::Higgs {
+            model_name,
+            routing_method,
+            ..
+        } = route
+        else {
+            panic!("expected a local route");
+        };
+        assert_eq!(model_name, "lazy");
+        assert_eq!(routing_method, RoutingMethod::Pattern);
+        assert_eq!(*loader.events.lock().unwrap(), ["load:lazy"]);
+    }
+
+    #[tokio::test]
+    async fn load_failure_is_a_model_error_not_a_missing_model() {
+        let (pool, loader) = stub_pool_with(vec![stub_spec("lazy")], PoolLimits::default());
+        *loader.fail_with.lock().unwrap() = Some("out of memory".to_owned());
+        let router = Router::new(&HiggsConfig::default(), pool).unwrap();
+
+        let Err(error) = router.resolve("lazy", None).await else {
+            panic!("expected the load to fail");
+        };
+
+        assert!(matches!(
+            error,
+            RouteError::Model(ModelError::LoadFailed { .. })
+        ));
+        assert!(error.to_string().contains("out of memory"));
+    }
+
+    #[tokio::test]
+    async fn unknown_model_is_not_found_and_loads_nothing() {
+        let (pool, loader) = stub_pool_with(vec![stub_spec("lazy")], PoolLimits::default());
+        let router = Router::new(&HiggsConfig::default(), pool).unwrap();
+
+        let result = router.resolve("other", None).await;
+
+        assert!(matches!(result, Err(RouteError::NotFound(_))));
+        assert!(loader.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_model_prefers_a_model_that_is_already_loaded() {
+        let (pool, _loader) = stub_pool_with(
+            vec![stub_spec("first"), stub_spec("second")],
+            PoolLimits::default(),
+        );
+        pool.load("second").await.unwrap();
+        let router = Router::new(&HiggsConfig::default(), pool).unwrap();
+
+        let route = router.resolve("auto", None).await.unwrap();
+
+        let ResolvedRoute::Higgs { model_name, .. } = route else {
+            panic!("expected a local route");
+        };
+        assert_eq!(model_name, "second");
+    }
+
+    #[test]
+    fn auto_router_classifier_must_be_a_configured_model() {
+        let config = config_from_toml(
+            r#"
+            [[models]]
+            path = "some/model"
+            name = "chat"
+
+            [auto_router]
+            enabled = true
+            model = "router"
+            "#,
+        );
+        let (pool, _loader) = stub_pool_with(vec![stub_spec("chat")], PoolLimits::default());
+
+        let error = Router::new(&config, pool).err().unwrap();
+
+        assert!(error.contains("'router' not found"), "{error}");
     }
 }

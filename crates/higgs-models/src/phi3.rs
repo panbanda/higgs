@@ -22,8 +22,8 @@ use crate::{
     cache::KeyValueCache,
     error::ModelError,
     utils::{
-        AttentionMask, apply_rope, cached_scaled_dot_product_attention, create_attention_mask,
-        scaled_dot_product_attention,
+        AttentionMask, apply_rope, apply_rope_at_cache, cached_scaled_dot_product_attention,
+        create_attention_mask, scaled_dot_product_attention,
     },
 };
 
@@ -193,8 +193,8 @@ where
             .transpose_axes(&[0, 2, 1, 3])?;
 
         if let Some(ref mut kv_cache) = cache {
-            queries = apply_rope(&queries, &self.rope, kv_cache.offset())?;
-            keys = apply_rope(&keys, &self.rope, kv_cache.offset())?;
+            queries = apply_rope_at_cache(&queries, &self.rope, kv_cache)?;
+            keys = apply_rope_at_cache(&keys, &self.rope, kv_cache)?;
 
             let output = cached_scaled_dot_product_attention(
                 queries, kv_cache, keys, values, self.scale, mask,

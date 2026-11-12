@@ -5,5 +5,6 @@ pub mod embeddings;
 pub mod health;
 pub mod metrics;
 pub mod models;
+pub mod responses;
 pub mod system;
 pub mod tokenize;

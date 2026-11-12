@@ -130,8 +130,7 @@ pub fn cmd_stop(profile: Option<&str>, force: bool) -> i32 {
     0
 }
 
-#[allow(clippy::print_stderr)]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::print_stderr, clippy::too_many_lines)]
 pub fn cmd_init(profile: Option<&str>) {
     let dir = config::config_dir();
     let filename = profile.map_or_else(
@@ -179,6 +178,12 @@ port = 8000
 # [local]
 # mlx_profile = "auto"
 # thinking_budget = 256
+# Model lifecycle. By default every model loads at startup and stays loaded.
+# load = "on_demand"          # load a model on the first request that uses it
+# idle_ttl_seconds = 900      # unload a model after this long with no requests (0 = never)
+# max_loaded_models = 2       # keep at most N loaded; least recently used idle model is evicted
+# memory_guard = "balanced"   # off | safe (reserve 20%) | balanced (8%) | aggressive (2%) of RAM
+# memory_limit_gb = 48        # explicit ceiling on MLX active memory; wins over memory_guard
 
 # --- Local models ---
 # Each [[models]] entry loads an MLX model into GPU memory.
@@ -188,6 +193,9 @@ port = 8000
 # path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
 # name = "llama"
 # mlx_profile = "throughput"
+# load = "startup"           # per-model override of [local].load
+# idle_ttl_seconds = 600     # per-model override of [local].idle_ttl_seconds
+# pinned = true              # never evicted or unloaded on idle
 # batch = false
 # kv_disk_dir = "/var/lib/higgs/prefix-kv" # optional durable prefix cache
 # kv_disk_space_mb = 4096                # LRU budget; minimum 64 MiB

@@ -6,13 +6,16 @@ pub mod config;
 pub mod constraint;
 pub mod daemon;
 pub mod doctor;
+pub mod engine_loader;
 pub mod error;
 pub mod metrics;
 pub mod metrics_log;
 pub mod model_download;
+pub mod model_pool;
 pub mod model_resolver;
 pub mod proxy;
 pub(crate) mod reasoning;
+pub mod responses;
 pub mod router;
 pub mod routes;
 #[doc(hidden)]
@@ -35,7 +38,7 @@ use std::time::Instant;
 use axum::{
     Router,
     extract::DefaultBodyLimit,
-    extract::{ConnectInfo, Request},
+    extract::{ConnectInfo, Extension, Request},
     http::{HeaderValue, StatusCode},
     middleware::{self, Next},
     response::Response,
@@ -56,7 +59,18 @@ type SharedRateLimiter = Arc<RateLimiter<String, DefaultKeyedStateStore<String>,
 
 // Observability/control-plane routes must never perturb API traffic metrics.
 /// Requests that dashboards poll; they never count as traffic in metrics.
-const INFRASTRUCTURE_PATHS: &[&str] = &["/health", "/metrics", "/v1/models", "/v1/system"];
+const INFRASTRUCTURE_PATHS: &[&str] = &[
+    "/health",
+    "/metrics",
+    "/v1/models",
+    "/v1/models/status",
+    "/v1/system",
+];
+
+/// Model load/unload controls live under `/v1/models/` and are not API traffic either.
+fn is_infrastructure_path(path: &str) -> bool {
+    INFRASTRUCTURE_PATHS.contains(&path) || path.starts_with("/v1/models/")
+}
 
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
@@ -81,6 +95,8 @@ pub fn build_router(
         .route("/metrics", get(routes::metrics::metrics))
         .route("/v1/system", get(routes::system::system))
         .route("/v1/models", get(routes::models::list_models))
+        .route("/v1/models/status", get(routes::models::models_status))
+        .route("/v1/models/{*target}", post(routes::models::model_action))
         .route("/v1/chat/completions", post(routes::chat::chat_completions))
         .route("/v1/completions", post(routes::completions::completions))
         .route("/v1/embeddings", post(routes::embeddings::embeddings))
@@ -92,7 +108,8 @@ pub fn build_router(
         .route("/v1/tokenize", post(routes::tokenize::tokenize))
         .route("/tokenize", post(routes::tokenize::tokenize))
         .route("/v1/detokenize", post(routes::tokenize::detokenize))
-        .route("/detokenize", post(routes::tokenize::detokenize));
+        .route("/detokenize", post(routes::tokenize::detokenize))
+        .merge(responses_routes());
 
     if let Some(rpm) = NonZeroU32::new(rate_limit) {
         let limiter: SharedRateLimiter = Arc::new(RateLimiter::keyed(Quota::per_minute(rpm)));
@@ -134,6 +151,18 @@ pub fn build_router(
     router.with_state(state)
 }
 
+fn responses_routes() -> Router<SharedState> {
+    Router::new()
+        .route("/v1/responses", post(routes::responses::create_response))
+        .route(
+            "/v1/responses/{id}",
+            get(routes::responses::get_response).delete(routes::responses::delete_response),
+        )
+        .layer(Extension(Arc::new(
+            responses::store::ResponseStore::default(),
+        )))
+}
+
 async fn record_http_response(
     metrics: Option<Arc<MetricsStore>>,
     mut request: Request,
@@ -146,7 +175,7 @@ async fn record_http_response(
     let wallclock = chrono::Utc::now();
     let response = next.run(request).await;
 
-    if !INFRASTRUCTURE_PATHS.contains(&path.as_str())
+    if !is_infrastructure_path(&path)
         && !context.was_recorded()
         && let Some(store) = metrics
     {

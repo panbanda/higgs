@@ -230,6 +230,39 @@ pub struct ServeArgs {
     /// Seed used to generate `TurboQuant` rotation/QJL matrices.
     #[arg(long)]
     pub kv_seed: Option<u64>,
+
+    /// When to load models: at startup, or on the first request that uses them.
+    #[arg(long, value_enum)]
+    pub load: Option<LoadMode>,
+
+    /// Unload a model after this many idle seconds (0 never unloads).
+    #[arg(long, value_name = "SECONDS")]
+    pub idle_ttl: Option<u64>,
+
+    /// Derive a memory ceiling from total memory by reserving a share for the system.
+    #[arg(long, value_enum, value_name = "TIER")]
+    pub memory_guard: Option<MemoryGuard>,
+
+    /// Keep at most this many models loaded, evicting the least recently used.
+    #[arg(long, value_name = "N")]
+    pub max_loaded_models: Option<usize>,
+}
+
+impl ServeArgs {
+    const fn apply_lifecycle_to(&self, local: &mut LocalConfig) {
+        if let Some(load) = self.load {
+            local.load = load;
+        }
+        if let Some(seconds) = self.idle_ttl {
+            local.idle_ttl_seconds = Some(seconds);
+        }
+        if let Some(guard) = self.memory_guard {
+            local.memory_guard = guard;
+        }
+        if let Some(count) = self.max_loaded_models {
+            local.max_loaded_models = Some(count);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +407,22 @@ pub struct LocalConfig {
     /// Internal requested profile after resolving precedence (`model` > `--mlx-profile` > `HIGGS_MLX_PROFILE` > local default).
     #[serde(skip, default)]
     pub requested_mlx_profile: RequestedMlxProfile,
+    /// When models are loaded. A model's own `load` overrides this.
+    #[serde(default)]
+    pub load: LoadMode,
+    /// Unload a model after this many seconds without an in-flight request.
+    /// `0` or unset never unloads on idle. A model's own `idle_ttl_seconds` overrides this.
+    #[serde(default)]
+    pub idle_ttl_seconds: Option<u64>,
+    /// Keep at most this many models loaded; the least recently used idle model is evicted first.
+    #[serde(default)]
+    pub max_loaded_models: Option<usize>,
+    /// Ceiling on MLX active memory in GiB. Wins over `memory_guard`.
+    #[serde(default)]
+    pub memory_limit_gb: Option<f64>,
+    /// Derive the memory ceiling from total unified memory.
+    #[serde(default)]
+    pub memory_guard: MemoryGuard,
 }
 
 impl Default for LocalConfig {
@@ -383,8 +432,106 @@ impl Default for LocalConfig {
             raise_wired_limit: false,
             thinking_budget: None,
             requested_mlx_profile: RequestedMlxProfile::Auto,
+            load: LoadMode::Startup,
+            idle_ttl_seconds: None,
+            max_loaded_models: None,
+            memory_limit_gb: None,
+            memory_guard: MemoryGuard::Off,
         }
     }
+}
+
+/// When a local model is loaded into memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadMode {
+    /// Load when the server starts and keep resident until unloaded.
+    #[default]
+    Startup,
+    /// Load on the first request that routes to the model.
+    OnDemand,
+}
+
+impl LoadMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::OnDemand => "on_demand",
+        }
+    }
+}
+
+/// Memory ceiling tier: how much unified memory is left to the rest of the system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryGuard {
+    /// No derived ceiling.
+    #[default]
+    Off,
+    /// Reserve 20% of unified memory.
+    Safe,
+    /// Reserve 8% of unified memory.
+    Balanced,
+    /// Reserve 2% of unified memory.
+    Aggressive,
+}
+
+impl MemoryGuard {
+    const fn reserved_percent(self) -> u64 {
+        match self {
+            Self::Off => 0,
+            Self::Safe => 20,
+            Self::Balanced => 8,
+            Self::Aggressive => 2,
+        }
+    }
+}
+
+impl LocalConfig {
+    /// Ceiling on MLX active memory in bytes, if any is configured.
+    ///
+    /// An explicit `memory_limit_gb` wins; otherwise `memory_guard` reserves a share of
+    /// `physical_memory_bytes`. Returns `None` when neither applies or the machine's memory is
+    /// unknown.
+    pub fn memory_ceiling_bytes(&self, physical_memory_bytes: Option<u64>) -> Option<u64> {
+        if let Some(limit_gb) = self.memory_limit_gb {
+            return gib_to_bytes(limit_gb);
+        }
+        if self.memory_guard == MemoryGuard::Off {
+            return None;
+        }
+        let total = physical_memory_bytes?;
+        Some(total.saturating_sub(total / 100 * self.memory_guard.reserved_percent()))
+    }
+
+    /// Check the lifecycle fields for values the server cannot honor.
+    pub fn validate_lifecycle(&self) -> Result<(), String> {
+        if let Some(limit_gb) = self.memory_limit_gb
+            && (!limit_gb.is_finite() || limit_gb <= 0.0)
+        {
+            return Err(format!(
+                "local.memory_limit_gb must be a positive, finite number of GiB (got {limit_gb})"
+            ));
+        }
+        if self.max_loaded_models == Some(0) {
+            return Err("local.max_loaded_models must be at least 1".to_owned());
+        }
+        Ok(())
+    }
+}
+
+fn gib_to_bytes(gib: f64) -> Option<u64> {
+    let bytes = gib * 1024.0 * 1024.0 * 1024.0;
+    if !bytes.is_finite() || bytes < 0.0 {
+        return None;
+    }
+    // Saturates at u64::MAX for absurdly large limits, which then never bind.
+    #[allow(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    Some(bytes as u64)
 }
 
 // -- Model config -----------------------------------------------------------
@@ -445,6 +592,16 @@ pub struct ModelConfig {
     /// architectures. Mutually exclusive with `kv_cache = "turboquant"`.
     #[serde(default)]
     pub mla_latent_cache: Option<bool>,
+    /// When to load this model; overrides `[local].load`.
+    #[serde(default)]
+    pub load: Option<LoadMode>,
+    /// Unload after this many idle seconds; overrides `[local].idle_ttl_seconds`.
+    /// `0` never unloads this model on idle.
+    #[serde(default)]
+    pub idle_ttl_seconds: Option<u64>,
+    /// Never evict this model or unload it on idle. Explicit `/unload` still works.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 const fn default_norm_correction() -> bool {
@@ -465,6 +622,19 @@ impl ModelConfig {
         self.thinking_budget
             .or(local.thinking_budget)
             .unwrap_or(higgs_engine::engine::DEFAULT_THINKING_BUDGET)
+    }
+
+    /// When this model is loaded, after applying the `[local]` default.
+    pub fn effective_load(&self, local: &LocalConfig) -> LoadMode {
+        self.load.unwrap_or(local.load)
+    }
+
+    /// Idle time after which this model is unloaded, if any.
+    pub fn effective_idle_ttl(&self, local: &LocalConfig) -> Option<std::time::Duration> {
+        self.idle_ttl_seconds
+            .or(local.idle_ttl_seconds)
+            .filter(|seconds| *seconds > 0)
+            .map(std::time::Duration::from_secs)
     }
 
     /// Validate disk-prefix-store settings independently of engine startup.
@@ -733,6 +903,9 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             kv_disk_dir: None,
             kv_disk_space_mb: default_kv_disk_space_mb(),
             mla_latent_cache: None,
+            load: None,
+            idle_ttl_seconds: None,
+            pinned: false,
         })
         .collect();
 
@@ -767,6 +940,7 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
         server.timeout = timeout;
     }
     config.server = server;
+    args.apply_lifecycle_to(&mut config.local);
     apply_requested_mlx_profile(&mut config, args.mlx_profile)?;
 
     validate_config(&config, true)?;
@@ -848,6 +1022,9 @@ fn extract_config(
                     kv_disk_dir: None,
                     kv_disk_space_mb: default_kv_disk_space_mb(),
                     mla_latent_cache: None,
+                    load: None,
+                    idle_ttl_seconds: None,
+                    pinned: false,
                 })
                 .collect();
             let mut existing = figment
@@ -862,6 +1039,9 @@ fn extract_config(
     let mut config: HiggsConfig = figment
         .extract()
         .map_err(|e| format!("failed to load config from {source}: {e}"))?;
+    if let Some(serve_args) = args {
+        serve_args.apply_lifecycle_to(&mut config.local);
+    }
     apply_requested_mlx_profile(
         &mut config,
         args.and_then(|serve_args| serve_args.mlx_profile),
@@ -878,6 +1058,8 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
     } else if config.models.is_empty() && config.providers.is_empty() {
         return Err("config must define at least one [[models]] entry or [provider.*]".to_owned());
     }
+
+    config.local.validate_lifecycle()?;
 
     for model in &config.models {
         if model.path.trim().is_empty() {
@@ -903,7 +1085,7 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
             && !supported
         {
             return Err(format!(
-                "batch=true is only supported for transformer models (llama, mistral, qwen2, qwen3); {} is not supported",
+                "batch=true is only supported for models with batched decode (llama, mistral, qwen2, qwen3, qwen3_5, qwen3_5_moe, phi3, starcoder2); {} is not supported",
                 model.path
             ));
         }
@@ -1018,6 +1200,9 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         kv_disk_dir: None,
         kv_disk_space_mb: default_kv_disk_space_mb(),
         mla_latent_cache: None,
+        load: None,
+        idle_ttl_seconds: None,
+        pinned: false,
     });
     config.auto_router.model = name;
 }
@@ -1220,6 +1405,10 @@ mod tests {
             kv_value_bits: None,
             kv_no_norm_correction: false,
             kv_adaptive_dense_layers: None,
+            load: None,
+            idle_ttl: None,
+            memory_guard: None,
+            max_loaded_models: None,
         };
         let config = build_simple_config(&args).unwrap();
         assert_eq!(config.models.len(), 2);
@@ -1249,6 +1438,10 @@ mod tests {
             kv_value_bits: None,
             kv_no_norm_correction: false,
             kv_adaptive_dense_layers: None,
+            load: None,
+            idle_ttl: None,
+            memory_guard: None,
+            max_loaded_models: None,
         };
         let config = build_simple_config(&args).unwrap();
         assert_eq!(config.server.host, "127.0.0.1");
@@ -1278,6 +1471,10 @@ mod tests {
             kv_value_bits: None,
             kv_no_norm_correction: false,
             kv_adaptive_dense_layers: None,
+            load: None,
+            idle_ttl: None,
+            memory_guard: None,
+            max_loaded_models: None,
         };
         let config = build_simple_config(&args).unwrap();
         let model = config.models.first().unwrap();
@@ -1305,6 +1502,10 @@ mod tests {
             kv_value_bits: None,
             kv_no_norm_correction: false,
             kv_adaptive_dense_layers: None,
+            load: None,
+            idle_ttl: None,
+            memory_guard: None,
+            max_loaded_models: None,
         };
         assert!(build_simple_config(&args).is_err());
     }
@@ -1328,6 +1529,10 @@ mod tests {
             kv_value_bits: None,
             kv_no_norm_correction: false,
             kv_adaptive_dense_layers: None,
+            load: None,
+            idle_ttl: None,
+            memory_guard: None,
+            max_loaded_models: None,
         };
         assert!(build_simple_config(&args).is_err());
     }
@@ -1351,6 +1556,10 @@ mod tests {
             kv_value_bits: None,
             kv_no_norm_correction: false,
             kv_adaptive_dense_layers: None,
+            load: None,
+            idle_ttl: None,
+            memory_guard: None,
+            max_loaded_models: None,
         };
         assert!(build_simple_config(&args).is_err());
     }
@@ -1374,6 +1583,10 @@ mod tests {
             kv_value_bits: None,
             kv_no_norm_correction: false,
             kv_adaptive_dense_layers: None,
+            load: None,
+            idle_ttl: None,
+            memory_guard: None,
+            max_loaded_models: None,
         };
         let error = build_simple_config(&args).unwrap_err();
         assert!(error.contains("TurboQuant"));
@@ -1685,6 +1898,10 @@ mod tests {
             kv_value_bits: None,
             kv_no_norm_correction: false,
             kv_adaptive_dense_layers: None,
+            load: None,
+            idle_ttl: None,
+            memory_guard: None,
+            max_loaded_models: None,
         };
         assert!(build_simple_config(&args).is_err());
     }
@@ -1723,6 +1940,10 @@ mod tests {
             kv_value_bits: None,
             kv_no_norm_correction: false,
             kv_adaptive_dense_layers: None,
+            load: None,
+            idle_ttl: None,
+            memory_guard: None,
+            max_loaded_models: None,
         };
 
         let config = load_config_file(&path, Some(&args)).unwrap();
@@ -2214,5 +2435,211 @@ mod tests {
             .map(|model| model.effective_thinking_budget(&config.local))
             .collect();
         assert_eq!(budgets, vec![512, 64]);
+    }
+
+    // -- Model lifecycle ------------------------------------------------------
+
+    fn load_toml(contents: &str) -> Result<HiggsConfig, String> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, contents).unwrap();
+        load_config_file(&path, None)
+    }
+
+    #[test]
+    fn test_lifecycle_defaults_preserve_startup_behavior() {
+        let config = load_toml("[[models]]\npath = \"some/model\"\n").unwrap();
+        let model = config.models.first().unwrap();
+
+        assert_eq!(config.local.load, LoadMode::Startup);
+        assert_eq!(model.effective_load(&config.local), LoadMode::Startup);
+        assert_eq!(model.effective_idle_ttl(&config.local), None);
+        assert!(!model.pinned);
+        assert_eq!(config.local.max_loaded_models, None);
+        assert_eq!(config.local.memory_ceiling_bytes(Some(64 << 30)), None);
+    }
+
+    #[test]
+    fn test_lifecycle_fields_parse() {
+        let config = load_toml(
+            r#"
+            [local]
+            load = "on_demand"
+            idle_ttl_seconds = 600
+            max_loaded_models = 2
+            memory_limit_gb = 48.5
+            memory_guard = "balanced"
+
+            [[models]]
+            path = "a/model"
+
+            [[models]]
+            path = "b/model"
+            load = "startup"
+            idle_ttl_seconds = 0
+            pinned = true
+            "#,
+        )
+        .unwrap();
+        let first = config.models.first().unwrap();
+        let second = config.models.get(1).unwrap();
+
+        assert_eq!(first.effective_load(&config.local), LoadMode::OnDemand);
+        assert_eq!(
+            first.effective_idle_ttl(&config.local),
+            Some(std::time::Duration::from_secs(600))
+        );
+        assert_eq!(second.effective_load(&config.local), LoadMode::Startup);
+        assert_eq!(second.effective_idle_ttl(&config.local), None);
+        assert!(second.pinned);
+        assert_eq!(config.local.max_loaded_models, Some(2));
+        assert_eq!(config.local.memory_guard, MemoryGuard::Balanced);
+    }
+
+    #[test]
+    fn test_unknown_load_value_is_rejected_naming_the_choices() {
+        let err = load_toml("[local]\nload = \"lazy\"\n[[models]]\npath = \"m/m\"\n").unwrap_err();
+        assert!(
+            err.contains("startup") && err.contains("on_demand"),
+            "{err}"
+        );
+
+        let model_err = load_toml("[[models]]\npath = \"m/m\"\nload = \"eager\"\n").unwrap_err();
+        assert!(model_err.contains("on_demand"), "{model_err}");
+    }
+
+    #[test]
+    fn test_unknown_memory_guard_is_rejected_naming_the_choices() {
+        let err = load_toml("[local]\nmemory_guard = \"yolo\"\n[[models]]\npath = \"m/m\"\n")
+            .unwrap_err();
+        assert!(err.contains("aggressive") && err.contains("safe"), "{err}");
+    }
+
+    #[test]
+    fn test_non_positive_memory_limit_is_rejected() {
+        for bad in ["0", "-4", "nan", "inf"] {
+            let err = load_toml(&format!(
+                "[local]\nmemory_limit_gb = {bad}\n[[models]]\npath = \"m/m\"\n"
+            ))
+            .unwrap_err();
+            assert!(err.contains("memory_limit_gb"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_zero_max_loaded_models_is_rejected() {
+        let err =
+            load_toml("[local]\nmax_loaded_models = 0\n[[models]]\npath = \"m/m\"\n").unwrap_err();
+        assert!(err.contains("max_loaded_models"), "{err}");
+    }
+
+    #[test]
+    fn test_negative_idle_ttl_is_rejected() {
+        assert!(load_toml("[local]\nidle_ttl_seconds = -1\n[[models]]\npath = \"m/m\"\n").is_err());
+    }
+
+    #[test]
+    fn test_memory_guard_tiers_reserve_a_share_of_physical_memory() {
+        let total = 100 * (1_u64 << 30);
+        let ceiling = |guard| {
+            LocalConfig {
+                memory_guard: guard,
+                ..LocalConfig::default()
+            }
+            .memory_ceiling_bytes(Some(total))
+        };
+
+        assert_eq!(ceiling(MemoryGuard::Off), None);
+        assert_eq!(ceiling(MemoryGuard::Safe), Some(80 * (1 << 30)));
+        assert_eq!(ceiling(MemoryGuard::Balanced), Some(92 * (1 << 30)));
+        assert_eq!(ceiling(MemoryGuard::Aggressive), Some(98 * (1 << 30)));
+    }
+
+    #[test]
+    fn test_memory_guard_without_known_physical_memory_has_no_ceiling() {
+        let local = LocalConfig {
+            memory_guard: MemoryGuard::Safe,
+            ..LocalConfig::default()
+        };
+        assert_eq!(local.memory_ceiling_bytes(None), None);
+    }
+
+    #[test]
+    fn test_explicit_memory_limit_wins_over_guard() {
+        let local = LocalConfig {
+            memory_guard: MemoryGuard::Safe,
+            memory_limit_gb: Some(10.0),
+            ..LocalConfig::default()
+        };
+        assert_eq!(
+            local.memory_ceiling_bytes(Some(100 * (1 << 30))),
+            Some(10 * (1 << 30))
+        );
+    }
+
+    #[test]
+    fn test_serve_flags_set_local_lifecycle_in_simple_mode() {
+        let args = ServeArgs {
+            models: vec!["some/model".to_owned()],
+            load: Some(LoadMode::OnDemand),
+            idle_ttl: Some(90),
+            memory_guard: Some(MemoryGuard::Safe),
+            max_loaded_models: Some(3),
+            ..ServeArgs::default()
+        };
+        let config = build_simple_config(&args).unwrap();
+
+        assert_eq!(config.local.load, LoadMode::OnDemand);
+        assert_eq!(config.local.idle_ttl_seconds, Some(90));
+        assert_eq!(config.local.memory_guard, MemoryGuard::Safe);
+        assert_eq!(config.local.max_loaded_models, Some(3));
+    }
+
+    #[test]
+    fn test_serve_flags_override_config_file_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[local]\nload = \"startup\"\nmax_loaded_models = 5\n[[models]]\npath = \"m/m\"\n",
+        )
+        .unwrap();
+        let args = ServeArgs {
+            load: Some(LoadMode::OnDemand),
+            max_loaded_models: Some(1),
+            ..ServeArgs::default()
+        };
+
+        let config = load_config_file(&path, Some(&args)).unwrap();
+
+        assert_eq!(config.local.load, LoadMode::OnDemand);
+        assert_eq!(config.local.max_loaded_models, Some(1));
+    }
+
+    #[test]
+    fn test_serve_load_flag_parses_kebab_case() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "higgs",
+            "serve",
+            "--model",
+            "m/m",
+            "--load",
+            "on-demand",
+            "--idle-ttl",
+            "30",
+            "--memory-guard",
+            "aggressive",
+            "--max-loaded-models",
+            "2",
+        ])
+        .unwrap();
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve");
+        };
+        assert_eq!(args.load, Some(LoadMode::OnDemand));
+        assert_eq!(args.idle_ttl, Some(30));
+        assert_eq!(args.memory_guard, Some(MemoryGuard::Aggressive));
+        assert_eq!(args.max_loaded_models, Some(2));
     }
 }
