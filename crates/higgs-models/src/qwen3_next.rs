@@ -1171,6 +1171,10 @@ fn dense_ffn_fuse_gate_up() -> bool {
     })
 }
 
+/// Expert lookups (`tokens * top_k`) at which sorting by expert starts to pay
+/// for itself. Same threshold as mlx-lm's `SwitchGLU`.
+const MOE_SORT_MIN_LOOKUPS: usize = 64;
+
 fn moe_ffn_fuse_gate_up() -> bool {
     *MOE_FFN_FUSE_GATE_UP.get_or_init(|| truthy_env_var("HIGGS_MOE_FFN_GATE_UP"))
 }
@@ -2192,7 +2196,6 @@ impl SwitchMlpWeights {
     /// `x`: `[..., D]` input
     /// `indices`: `[..., top_k]` expert indices
     /// Returns: `[..., top_k, D]`
-    #[allow(dead_code)]
     pub(crate) fn forward_gather(
         &self,
         x: &Array,
@@ -3314,7 +3317,17 @@ impl FfnBlock {
                 .last()
                 .ok_or_else(|| Exception::custom("gates must have last dim"))?;
             let top_k_start = num_experts - self.top_k;
-            let inds = ops::sort_axis(all_inds.index((.., .., top_k_start..)), -1)?;
+            let top_inds = all_inds.index((.., .., top_k_start..));
+            // Sorting lookups by expert makes weight access coalesced, which
+            // pays off across many tokens. For a handful of lookups (one
+            // decode token) the argsorts and gathers cost more than they
+            // save, so those go to `gather_qmm` as selected.
+            let sort_lookups = moe_ffn_fuse_gate_up() || top_inds.size() >= MOE_SORT_MIN_LOOKUPS;
+            let inds = if sort_lookups {
+                ops::sort_axis(&top_inds, -1)?
+            } else {
+                top_inds
+            };
             let raw_scores = gates.take_along_axis(&inds, -1)?;
             let scores = if self.norm_topk_prob {
                 let sum = raw_scores.sum_axes(&[-1], true)?;
@@ -3329,8 +3342,10 @@ impl FfnBlock {
                 .ok_or_else(|| Exception::custom("MoE switch_mlp missing"))?;
             let y = if moe_ffn_fuse_gate_up() {
                 switch_ref.forward_gather_fused(x, &inds)?
-            } else {
+            } else if sort_lookups {
                 switch_ref.forward_gather_global_sort(x, &inds)?
+            } else {
+                switch_ref.forward_gather(x, &inds, false)?
             };
 
             let expert_sum = y
