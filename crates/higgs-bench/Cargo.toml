@@ -35,6 +35,10 @@ built = { version = "0.8", features = ["git2"] }
 tempfile = "3"
 
 [[bin]]
+name = "bench_compare"
+path = "src/bin/bench_compare.rs"
+
+[[bin]]
 name = "bench_decode"
 path = "src/bin/bench_decode.rs"
 

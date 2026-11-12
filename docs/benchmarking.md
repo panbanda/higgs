@@ -209,6 +209,57 @@ SSE chunk count for backends that don't emit usage. The bench also sends
 `reasoning: { effort: "none" }` so decode timing reflects time-to-generate,
 not time-to-visible-answer for thinking-mode models.
 
+### `bench_compare`
+
+Server-agnostic comparison bench. It measures any OpenAI-compatible
+`/v1/chat/completions` endpoint purely from the client side, so the identical
+code path scores higgs, oMLX, or any other server. Every request streams with
+`stream_options.include_usage = true`. Time to first token is the first SSE
+delta carrying `content`, `reasoning_content`, `reasoning`, or a `tool_calls`
+entry. Token counts come from the server's terminal `usage`; if it is missing
+the trial falls back to counting deltas and is flagged `usage_missing: true`.
+Decode tok/s is `(completion_tokens - 1) / (first token to stream end)`.
+Non-2xx responses, mid-stream errors, and zero-token streams fail the run
+rather than recording zeros.
+
+Scenarios (`--scenarios`, default all four):
+
+- `decode`: fixed long-output prompt, `--max-tokens` tokens. Reports TTFT,
+  decode tok/s, and end-to-end tok/s (mean/median/p95/stdev), plus how many
+  trials ended below `--max-tokens`.
+- `prefill`: for each size in `--prefill-tokens`, a deterministic prompt of
+  roughly that many tokens with a random nonce at the very start so every
+  trial is cache-cold, `max_tokens = 8`. Reports TTFT and prefill tok/s
+  (`prompt_tokens / TTFT`, using the server-reported `prompt_tokens`).
+- `prefix_cache`: agent/chat loop. A ~4096-token nonce-prefixed first message
+  (turn 1), then the same history plus the assistant reply and a short new
+  user message (turn 2). Reports turn-1 and turn-2 TTFT, their ratio, and
+  `cached_tokens` when the server reports it.
+- `concurrency`: for each level in `--concurrency`, N simultaneous
+  nonce-prefixed long-output requests, 2 rounds, median reported. Reports
+  aggregate tok/s (`sum(completion_tokens) / batch wall time`) and mean
+  per-request TTFT.
+
+`--extra-body '{"...": ...}'` merges server-specific knobs (for example
+disabling thinking) into every request and overrides defaults. `--pid` samples
+the server's RSS and reports `rss_mb_peak`. Results persist under the key
+`<label>__<model-key>`, so runs against different servers never overwrite each
+other. `--api-key` values are redacted from recorded argv.
+
+```bash
+# higgs
+cargo run --release -p higgs-bench --bin bench_compare -- \
+  --base-url http://127.0.0.1:8899 --model mlx-community/Qwen3-1.7B-4bit \
+  --model-key qwen3-1.7B-4bit --label higgs --pid "$(pgrep -x higgs)" \
+  --extra-body '{"reasoning":{"effort":"none"}}'
+
+# oMLX
+cargo run --release -p higgs-bench --bin bench_compare -- \
+  --base-url http://127.0.0.1:8000 --model Qwen3-1.7B-4bit \
+  --model-key qwen3-1.7B-4bit --label omlx --api-key "$OMLX_API_KEY" \
+  --extra-body '{"chat_template_kwargs":{"enable_thinking":false}}'
+```
+
 ### `bench_speculative`
 
 Starts a fresh Higgs server per speculative mode and compares baseline greedy
