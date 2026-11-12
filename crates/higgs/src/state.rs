@@ -399,6 +399,8 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     /// Request metrics (present in config mode, absent in simple mode).
     pub metrics: Option<Arc<MetricsStore>>,
+    /// Tools the server can run for a model (MCP servers).
+    pub tools: Arc<crate::tools::ToolHub>,
 }
 
 /// Type alias for the shared state used by Axum handlers.
@@ -490,6 +492,7 @@ pub(crate) mod test_support {
             config,
             http_client: reqwest::Client::new(),
             metrics,
+            tools: Arc::new(crate::tools::ToolHub::disabled()),
         });
         (state, loader)
     }

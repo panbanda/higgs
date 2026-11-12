@@ -3,6 +3,7 @@ pub mod chat;
 pub mod completions;
 pub mod embeddings;
 pub mod health;
+pub mod mcp;
 pub mod metrics;
 pub mod models;
 pub mod responses;

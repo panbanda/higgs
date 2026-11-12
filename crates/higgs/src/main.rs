@@ -223,11 +223,13 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
 
     // Create shared state
     let http_client = reqwest::Client::new();
+    let tools = Arc::new(higgs::tools::ToolHub::start(&higgs_config)?);
     let shared_state = Arc::new(AppState {
         router,
         config: higgs_config,
         http_client,
         metrics,
+        tools: Arc::clone(&tools),
     });
 
     // Build router with middleware
@@ -253,6 +255,8 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
     )
     .with_graceful_shutdown(higgs::daemon::await_shutdown_signal())
     .await?;
+
+    tools.shutdown().await;
 
     higgs::daemon::remove_pid_file(profile);
     Ok(())

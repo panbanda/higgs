@@ -8,6 +8,7 @@ pub mod daemon;
 pub mod doctor;
 pub mod engine_loader;
 pub mod error;
+pub mod mcp;
 pub mod metrics;
 pub mod metrics_log;
 pub mod model_download;
@@ -24,6 +25,7 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tool_choice;
+pub mod tools;
 pub mod translate;
 pub mod tui;
 pub mod types;
@@ -67,9 +69,16 @@ const INFRASTRUCTURE_PATHS: &[&str] = &[
     "/v1/system",
 ];
 
+/// MCP tool endpoints are tool plumbing, not inference traffic.
+const TOOL_PATH_PREFIXES: &[&str] = &["/v1/mcp/"];
+
 /// Model load/unload controls live under `/v1/models/` and are not API traffic either.
 fn is_infrastructure_path(path: &str) -> bool {
-    INFRASTRUCTURE_PATHS.contains(&path) || path.starts_with("/v1/models/")
+    INFRASTRUCTURE_PATHS.contains(&path)
+        || path.starts_with("/v1/models/")
+        || TOOL_PATH_PREFIXES
+            .iter()
+            .any(|prefix| path.starts_with(prefix))
 }
 
 #[cfg(test)]
@@ -105,6 +114,9 @@ pub fn build_router(
             "/v1/messages/count_tokens",
             post(routes::anthropic::count_tokens),
         )
+        .route("/v1/mcp/servers", get(routes::mcp::list_servers))
+        .route("/v1/mcp/tools", get(routes::mcp::list_tools))
+        .route("/v1/mcp/execute", post(routes::mcp::execute))
         .route("/v1/tokenize", post(routes::tokenize::tokenize))
         .route("/tokenize", post(routes::tokenize::tokenize))
         .route("/v1/detokenize", post(routes::tokenize::detokenize))

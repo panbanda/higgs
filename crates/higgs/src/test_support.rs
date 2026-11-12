@@ -166,11 +166,95 @@ pub fn app_with_stub_and_config(
         config,
         http_client: reqwest::Client::new(),
         metrics: None,
+        tools: Arc::new(crate::tools::ToolHub::disabled()),
     });
     (
         crate::build_router(state, 30.0, None, 0, 1024 * 1024, None),
         engine,
     )
+}
+
+/// Router over a stub model with the given tool hub, optional API key and
+/// metrics store, for exercising tool endpoints.
+pub fn app_with_tools(
+    tools: crate::tools::ToolHub,
+    api_key: Option<&str>,
+    metrics: Option<std::sync::Arc<crate::metrics::MetricsStore>>,
+) -> axum::Router {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap_or_else(|error| unreachable!("tempdir: {error}"));
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "[[models]]\npath = \"test/stub\"\nname = \"stub\"\n",
+    )
+    .unwrap_or_else(|error| unreachable!("write config: {error}"));
+    let config = crate::config::load_config_file(&config_path, None)
+        .unwrap_or_else(|error| unreachable!("load config: {error}"));
+    let mut engines = HashMap::new();
+    engines.insert(
+        "stub".to_owned(),
+        Arc::new(crate::state::Engine::test_stub("stub")),
+    );
+    let router = crate::router::Router::from_config(&config, engines)
+        .unwrap_or_else(|error| unreachable!("build router: {error}"));
+    let state = Arc::new(crate::state::AppState {
+        router,
+        config,
+        http_client: reqwest::Client::new(),
+        metrics,
+        tools: Arc::new(tools),
+    });
+    crate::build_router(
+        state,
+        30.0,
+        api_key.map(str::to_owned),
+        0,
+        1024 * 1024,
+        None,
+    )
+}
+
+/// Send a request with an optional JSON body and bearer token.
+pub async fn send_request(
+    app: &axum::Router,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+    bearer: Option<&str>,
+) -> (http::StatusCode, serde_json::Value) {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let mut builder = http::Request::builder().method(method).uri(path);
+    if let Some(token) = bearer {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    let request = match body {
+        Some(value) => builder
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(value.to_string())),
+        None => builder.body(axum::body::Body::empty()),
+    }
+    .unwrap_or_else(|error| unreachable!("request: {error}"));
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .unwrap_or_else(|error| unreachable!("oneshot: {error}"));
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .map(http_body_util::Collected::to_bytes)
+        .unwrap_or_default();
+    let parsed = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+        serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned())
+    });
+    (status, parsed)
 }
 
 /// POST a JSON body and return the status with the raw response text.

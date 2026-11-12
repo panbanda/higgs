@@ -405,6 +405,7 @@ mod tests {
             config,
             http_client: reqwest::Client::new(),
             metrics,
+            tools: Arc::new(crate::tools::ToolHub::disabled()),
         })
     }
 

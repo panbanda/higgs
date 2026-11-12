@@ -1,0 +1,158 @@
+# MCP tools
+
+Higgs can act as a [Model Context Protocol](https://modelcontextprotocol.io) client. It connects to the servers you configure, lists their tools, and runs them on request, so a local model can use tools without every client implementing MCP itself.
+
+Nothing happens unless you configure it: with no `[mcp.servers.*]` tables there are no child processes, no outbound connections, and the endpoints report empty lists.
+
+## Configuring servers
+
+Servers live under `[mcp.servers.<name>]` in the config file:
+
+```toml
+[mcp]
+max_result_bytes = 262144          # larger tool results are truncated (default 256 KiB)
+
+[mcp.servers.filesystem]           # stdio: Higgs starts the process
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/Documents"]
+env = { API_TOKEN = "${API_TOKEN}" }
+cwd = "/Users/me"
+timeout_seconds = 30
+enabled = true
+
+[mcp.servers.remote]               # Streamable HTTP: Higgs connects to a URL
+url = "https://mcp.example.com/mcp"
+headers = { Authorization = "Bearer ${MCP_TOKEN}" }
+```
+
+| Field | Applies to | Meaning |
+|---|---|---|
+| `transport` | both | `"stdio"` or `"http"` (Streamable HTTP). Inferred from `command` or `url` when omitted. `"sse"` (the legacy HTTP+SSE transport) is rejected. |
+| `command`, `args` | stdio | Executable and arguments. Run directly, never through a shell. |
+| `env` | stdio | Extra environment for the child, on top of the Higgs environment. |
+| `cwd` | stdio | Working directory of the child. |
+| `url` | http | Streamable HTTP endpoint (`http` or `https`). |
+| `headers` | http | Extra request headers. |
+| `timeout_seconds` | both | Bound on connecting, on listing tools, and on each tool call. Default 30. |
+| `enabled` | both | `false` keeps the entry but never starts it. Default `true`. |
+
+Server names may contain letters, digits, `-` and `_`, but not `__` (the tool namespace separator), and `higgs` is reserved for built-in tools.
+
+### Environment variables
+
+`${VAR}` in an `env` or `headers` value is replaced with the Higgs process environment. A reference to an unset variable is an error at startup (and a failure in `higgs doctor`), never an empty string, so a typo cannot silently drop a credential. Write `$${` for a literal `${`. Disabled servers are not checked.
+
+### Reusing a desktop-client config
+
+`higgs serve --mcp-config mcp.json` loads servers from the common JSON format and merges them with the config file:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/Documents"],
+      "env": {"API_TOKEN": "${API_TOKEN}"}
+    },
+    "remote": {"type": "http", "url": "https://mcp.example.com/mcp"}
+  }
+}
+```
+
+`type` is accepted as an alias for `transport`, `disabled: true` and `enabled: false` both turn a server off, and keys other clients add (`autoApprove`, ...) are ignored. A server name defined in both the file and the config is an error. The flag also works with `higgs doctor`.
+
+## Lifecycle
+
+- Servers connect in the background at startup. A slow or failing server never delays Higgs from serving; its state is `connecting`, then `ready` or `failed`.
+- The handshake negotiates the protocol version (2025-06-18, 2025-03-26 and 2024-11-05 are supported) and `tools/list` follows pagination.
+- `notifications/tools/list_changed` refreshes the tool list without reconnecting.
+- A failed server is retried with exponential backoff (1 s doubling to 60 s). A tool call against a failed or crashed server cuts the wait short and reconnects immediately, so a crashed stdio server is restarted on its next use.
+- On shutdown Higgs closes every server's stdin, waits briefly, then kills the process group, so launchers like `npx` leave no orphaned children.
+
+## Endpoints
+
+They use the same authentication as the other API endpoints (`api_key`) and never count as traffic in `/metrics`.
+
+### `GET /v1/mcp/servers`
+
+```json
+{"servers": [
+  {"name": "filesystem", "transport": "stdio", "state": "ready", "error": null,
+   "tool_count": 14, "protocol_version": "2025-06-18",
+   "server_info": {"name": "secure-filesystem-server", "version": "0.2.0"}},
+  {"name": "remote", "transport": "http", "state": "failed",
+   "error": "handshake failed: HTTP 401 Unauthorized: ...", "tool_count": 0,
+   "protocol_version": null, "server_info": null}
+]}
+```
+
+`state` is `connecting`, `ready`, `failed`, or `disabled`.
+
+### `GET /v1/mcp/tools`
+
+Tools of every ready server, namespaced `server__tool`, in the OpenAI function-tool shape plus the originating `server`:
+
+```json
+{"count": 1, "tools": [
+  {"type": "function", "server": "filesystem",
+   "function": {"name": "filesystem__read_file", "description": "...", "parameters": {"type": "object", "...": "..."}}}
+]}
+```
+
+The list can be passed as `tools` of a chat request. Strict clients that reject unknown keys should drop `server` first.
+
+### `POST /v1/mcp/execute`
+
+```json
+{"name": "filesystem__read_file", "arguments": {"path": "/Users/me/Documents/notes.txt"}}
+```
+
+(`tool_name` and `tool` are accepted for `name`.) The response:
+
+```json
+{"name": "filesystem__read_file", "server": "filesystem", "is_error": false,
+ "text": "file contents", "content": [{"type": "text", "text": "file contents"}],
+ "truncated": false}
+```
+
+`text` joins the text blocks; `content` carries every block as the server sent it, so images and resources come back structurally; `structured_content` is present when the server returned it. A tool that reports failure answers HTTP 200 with `"is_error": true`.
+
+| Status | Meaning |
+|---|---|
+| 400 | Malformed body, or `arguments` is not an object (or the server rejected them as invalid) |
+| 404 | Unknown tool |
+| 502 | The server failed or answered with a protocol error |
+| 503 | The server is `failed` or still `connecting` (the message carries its last error) |
+| 504 | The tool call exceeded `timeout_seconds` |
+
+## Security notes
+
+- Stdio servers run local commands taken from your own config. That is by design; treat the config file (and `--mcp-config` files) as code.
+- Request data never reaches a command line or the environment: tool names and arguments travel only as JSON-RPC parameters. The executable and arguments are fixed by the config and started without a shell.
+- Anyone who can call `/v1/mcp/execute` can run every enabled tool. Set `api_key` before binding to anything but loopback, and give MCP servers only the access they need (for example, point the filesystem server at one directory).
+- Results are capped at `max_result_bytes`; text is cut on a character boundary and `truncated` is set. Messages from a server are capped at 16 MiB.
+- `timeout_seconds` bounds every call. A timed-out call is cancelled with `notifications/cancelled`.
+- Credentials in `headers` and `env` come from `${VAR}`; they are not logged, and `higgs doctor` prints URLs without credentials or query strings.
+- HTTP servers are contacted at the configured URL only; redirects are not followed.
+
+## `higgs doctor`
+
+`higgs doctor` validates every server without starting it: unknown transport, missing `command` or `url`, a malformed URL, `timeout_seconds <= 0`, unresolved `${VAR}` references (failures), and a `command` that is not on `PATH` or a `cwd` that is missing (warnings). Each valid server is reported with its transport.
+
+## Verifying against a real server
+
+```bash
+mkdir -p /tmp/mcp-demo && echo "hello from mcp" > /tmp/mcp-demo/hello.txt
+cat > /tmp/mcp.json <<'JSON'
+{"mcpServers": {"fs": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/mcp-demo"]}}}
+JSON
+higgs doctor --mcp-config /tmp/mcp.json -c ~/.config/higgs/config.toml
+higgs serve --config ~/.config/higgs/config.toml --mcp-config /tmp/mcp.json
+
+curl -s localhost:8000/v1/mcp/servers | jq
+curl -s localhost:8000/v1/mcp/tools | jq '.tools[].function.name'
+curl -s localhost:8000/v1/mcp/execute -H 'content-type: application/json' \
+  -d '{"name": "fs__read_text_file", "arguments": {"path": "/tmp/mcp-demo/hello.txt"}}' | jq
+```
+
+Kill the `node` process while Higgs runs and call `execute` again to watch it restart.
