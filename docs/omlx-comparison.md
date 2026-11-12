@@ -96,7 +96,16 @@ Dense models: both servers land within 3% of each other because single-stream de
 
 Qwen3.5-family MoE: stock mlx-lm decodes this model at 135 tok/s; Higgs was at 117 and is now at 134 after it stopped sorting expert lookups for single-token decode. oMLX reaches about 184 tok/s on most requests because it ships model-specific fused Metal kernels for this architecture's one-token MoE block (router top-k, gate/up with SwiGLU, down with combine). Its speed is bimodal in our runs: 183 to 185 tok/s on most requests, 86 to 130 on others, apparently when cache writes from the previous request overlap. Closing this gap needs equivalent fused kernels in Higgs and is open work.
 
-What has been tried on the Higgs side: a fused single-launch router kernel (top-k selection plus score softmax, one GPU thread per expert) was correct but only worth 1.5% (134 to 136 tok/s), so it was not kept; the routing chain is not where the time goes. Feeding every token the same eight experts raises decode to 150 tok/s, which suggests the cost is in reading and multiplying the selected experts' weights (`gather_qmm` for gate, up and down, plus the shared expert), the part oMLX's kernels fuse. That is the next thing to build.
+What has been tried on the Higgs side, each measured on Qwen3.6-35B-A3B-4bit and none kept because the gain was within noise:
+
+| Experiment | Decode tok/s | Finding |
+|---|---|---|
+| Baseline | 134 | 7.6 ms per token |
+| Fused router kernel (top-k and score softmax in one launch) | 136 | routing is not where the time goes |
+| Gathered 4-bit matrix-vector kernel replacing the three `gather_qmm` calls | 133 | same speed as MLX's kernel, launch for launch |
+| Gate, up and SwiGLU fused into one launch (five launches to one) | 136 | fewer launches alone does not explain oMLX's lead |
+
+Ablations show where the 7.6 ms goes: 4.0 ms outside the MoE block (GDN and attention layers, norms, head), 2.6 ms in the routed experts (three gathered products per layer), 0.7 ms in the shared expert, 0.2 ms combining them. oMLX's whole step is about 5.4 ms, so matching it needs the routed-expert cost roughly halved or savings found outside the MoE block as well. The custom kernels above matched MLX's speed rather than beating it, so the next step is profiling the GPU side directly (thread layout and occupancy of the gathered products) rather than more fusion.
 
 ### Cold prefill
 
