@@ -21,6 +21,7 @@ Higgs is a Rust binary (plus its Metal shader library) built on [MLX](https://gi
 - **Fast on Apple Silicon.** Native MLX inference with prefix caching, continuous batching for transformer families, quantized KV cache, and MoE prefill tuning. See [Performance](#performance).
 - **One endpoint for everything.** Local models and remote providers behind one URL, with regex routes, aliases, and an optional auto-router that picks a model per prompt.
 - **Memory you can manage.** Load models on first use, unload them after an idle timeout, cap how many stay resident or how much memory they use, and pin the ones that must stay. Least-recently-used eviction and load, unload, and status endpoints included.
+- **Tool calling across model families.** Qwen, Mistral, Llama 3.x, Gemma, GLM and MiniMax tool calls are parsed into structured `tool_calls` (streaming included), and `tool_choice: "required"` or a named function forces a valid call through constrained decoding. See [Tool calling](docs/tool-calling.md).
 - **Drop-in for your tools.** `higgs shellenv` exports `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL`; Claude Code, Aider, and any OpenAI or Anthropic client just work.
 - **You can see what is happening.** Time to first token, decode tokens per second, and prefix-cache hits for local streaming requests, plus latency, throughput, and memory, in the `/metrics` API and the desktop app.
 
@@ -157,9 +158,15 @@ Requests for `qwen` run locally; anything matching `claude-.*` is proxied to Ant
     Anthropic `thinking.budget_tokens` does the same on `/v1/messages`.
     Defaults come from `[[models]].thinking_budget`, then `[local].thinking_budget`,
     then 256. See [Thinking budget](docs/configuration.md#thinking-budget).
-  - `tool_choice`: `"auto"` (default) and `"none"` (tools are not shown to the
-    model and tool calls are not parsed) are supported; `"required"` and a
-    named function return 400 until they are implemented.
+  - `tool_choice`: `"auto"` (default), `"none"` (tools are not shown to the
+    model and tool calls are not parsed), `"required"`, and
+    `{"type": "function", "function": {"name": "..."}}`. The last two force a
+    call with constrained decoding for models whose tool-call format allows
+    it, and return 400 for the others. `parallel_tool_calls: false` limits a
+    response to one call. The same fields work on `/v1/responses` and, as
+    `tool_choice` `any`/`tool`/`none` and `disable_parallel_tool_use`, on
+    `/v1/messages`. See [Tool calling](docs/tool-calling.md) for the format
+    each model family uses and which ones support forcing.
   - `seed` is accepted for client compatibility but does not make sampling
     reproducible yet.
   - Unrecognized request fields are ignored.
