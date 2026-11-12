@@ -11,7 +11,7 @@ use mlx_rs::{
     error::Exception,
     macros::{ModuleParameters, Quantizable},
     module::Module,
-    nn, ops,
+    nn,
     ops::indexing::IndexOp,
     quantization::MaybeQuantized,
 };
@@ -19,11 +19,12 @@ use serde::Deserialize;
 
 use crate::qwen3_next::{QEmbedding, QLinear};
 use crate::{
-    cache::{KeyValueCache, SteppingKeyValueCache},
+    batched_cache::BatchedKvCache,
+    cache::KeyValueCache,
     error::ModelError,
     utils::{
         AttentionMask, apply_rope, cached_scaled_dot_product_attention, create_attention_mask,
-        create_batched_decode_mask, scaled_dot_product_attention,
+        scaled_dot_product_attention,
     },
 };
 
@@ -689,176 +690,190 @@ impl Model {
         self.apply_lm_head(&out)
     }
 
-    /// Batched decode: one forward pass for N requests each with 1 token.
+    /// Batched decode: one forward pass appending one token to each of the
+    /// `B` sequences held in `cache`. `inputs` is `[B, 1]`.
     ///
-    /// Heavy ops (projections, MLP, LM head) run batched. Per-request ops
-    /// (`RoPE`, KV cache update) loop over individual requests since each has
-    /// a different position offset and cache state.
-    #[allow(clippy::too_many_lines, clippy::indexing_slicing)]
+    /// Each row is rotated at its own position (rows differ in length), while
+    /// the cache append and attention run once for the whole batch.
     pub fn forward_batched(
         &mut self,
         inputs: &Array,
-        kv_caches: &mut [&mut Vec<Option<SteppingKeyValueCache>>],
+        cache: &mut BatchedKvCache,
     ) -> Result<Array, Exception> {
-        let n = *inputs
+        let batch = *inputs
             .shape()
             .first()
             .ok_or_else(|| Exception::custom("inputs must have batch dimension"))?;
-        let num_layers = self.model.layers.len();
-        let n_usize = usize::try_from(n).map_err(|_| Exception::custom("batch size overflow"))?;
-        if kv_caches.len() != n_usize {
-            return Err(Exception::custom("kv_caches length must match batch size"));
+        if usize::try_from(batch).ok() != Some(cache.batch_size()) {
+            return Err(Exception::custom("cache batch size must match inputs"));
         }
-        for (i, cache) in kv_caches.iter().enumerate() {
-            if cache.len() != num_layers {
-                return Err(Exception::custom(format!(
-                    "kv_cache[{i}] length ({}) must match num layers ({num_layers})",
-                    cache.len()
-                )));
-            }
+        if cache.num_layers() != self.model.layers.len() {
+            return Err(Exception::custom(
+                "cache layer count must match model layers",
+            ));
         }
-        let head_dim = self.args.head_dim();
 
-        // Per-request offsets (from layer 0's cache, all layers have the same offset)
-        let offsets: Vec<i32> = kv_caches
-            .iter()
-            .map(|req| {
-                req.first()
-                    .and_then(Option::as_ref)
-                    .map_or(0, KeyValueCache::offset)
-            })
-            .collect();
-        let max_kv_len = offsets.iter().map(|&o| o + 1).max().unwrap_or(1);
-        let kv_lengths: Vec<i32> = offsets.iter().map(|&o| o + 1).collect();
+        let positions = Array::from_slice(cache.lengths(), &[batch]);
+        let mask = cache.attention_mask(1)?;
 
         let mut h = self.model.embed_tokens.forward(inputs)?;
 
-        for (layer_idx, layer) in self.model.layers.iter_mut().enumerate() {
-            let n_heads = layer.self_attn.n_heads;
-            let n_kv_heads = layer.self_attn.n_kv_heads;
-            let scale = layer.self_attn.scale;
-
-            // Extract RoPE params as scalars (avoids borrow conflict with mutable layer)
-            let rope_dims = layer.self_attn.rope.dimensions;
-            let rope_traditional = layer.self_attn.rope.traditional;
-            let rope_base = layer.self_attn.rope.base;
-            let rope_scale = layer.self_attn.rope.scale;
-
-            // --- Batched: layernorm + Q/K/V projections ---
+        for (layer_index, layer) in self.model.layers.iter_mut().enumerate() {
+            let attention = &mut layer.self_attn;
             let normed = layer.input_layernorm.forward(&h)?;
-            let q_raw = layer.self_attn.q_proj.forward(&normed)?;
-            let k_raw = layer.self_attn.k_proj.forward(&normed)?;
-            let v_raw = layer.self_attn.v_proj.forward(&normed)?;
 
-            // [N, 1, proj_dim] -> [N, heads, 1, head_dim]
-            let mut queries = q_raw
-                .reshape(&[n, 1, n_heads, -1])?
-                .transpose_axes(&[0, 2, 1, 3])?;
-            let mut keys = k_raw
-                .reshape(&[n, 1, n_kv_heads, -1])?
-                .transpose_axes(&[0, 2, 1, 3])?;
-            let values = v_raw
-                .reshape(&[n, 1, n_kv_heads, -1])?
-                .transpose_axes(&[0, 2, 1, 3])?;
+            // [B, 1, proj_dim] -> [B, heads, 1, head_dim]
+            let split_heads = |projected: Array, heads: i32| {
+                projected
+                    .reshape(&[batch, 1, heads, -1])?
+                    .transpose_axes(&[0, 2, 1, 3])
+            };
+            let mut queries = split_heads(attention.q_proj.forward(&normed)?, attention.n_heads)?;
+            let mut keys = split_heads(attention.k_proj.forward(&normed)?, attention.n_kv_heads)?;
+            let values = split_heads(attention.v_proj.forward(&normed)?, attention.n_kv_heads)?;
 
-            // --- Batched: QK norm (Qwen3) ---
-            if let Some(ref mut qn) = layer.self_attn.q_norm {
-                queries = qn.forward(&queries)?;
+            if let Some(ref mut q_norm) = attention.q_norm {
+                queries = q_norm.forward(&queries)?;
             }
-            if let Some(ref mut kn) = layer.self_attn.k_norm {
-                keys = kn.forward(&keys)?;
+            if let Some(ref mut k_norm) = attention.k_norm {
+                keys = k_norm.forward(&keys)?;
             }
 
-            // --- Per-request: RoPE + KV cache update + pad ---
-            // Flatten to 2D for reliable per-request slicing
-            let q_flat = queries.reshape(&[n, n_heads * head_dim])?;
-            let k_flat = keys.reshape(&[n, n_kv_heads * head_dim])?;
-            let v_flat = values.reshape(&[n, n_kv_heads * head_dim])?;
-
-            let mut all_queries = Vec::with_capacity(n_usize);
-            let mut all_keys = Vec::with_capacity(n_usize);
-            let mut all_values = Vec::with_capacity(n_usize);
-
-            for (req_idx, &offset) in offsets.iter().enumerate() {
-                let i = i32::try_from(req_idx)
-                    .map_err(|_| Exception::custom("request index overflow"))?;
-
-                let q_i = q_flat
-                    .index((i..i + 1, ..))
-                    .reshape(&[1, n_heads, 1, head_dim])?;
-                let k_i = k_flat
-                    .index((i..i + 1, ..))
-                    .reshape(&[1, n_kv_heads, 1, head_dim])?;
-                let v_i = v_flat
-                    .index((i..i + 1, ..))
-                    .reshape(&[1, n_kv_heads, 1, head_dim])?;
-
-                // RoPE with this request's offset
-                let q_rope = mlx_rs::fast::rope(
-                    &q_i,
-                    rope_dims,
-                    rope_traditional,
-                    rope_base,
-                    rope_scale,
-                    offset,
+            let rotate = |array: &Array| {
+                mlx_rs::fast::rope_dynamic(
+                    array,
+                    attention.rope.dimensions,
+                    attention.rope.traditional,
+                    attention.rope.base,
+                    attention.rope.scale,
+                    &positions,
                     None,
-                )?;
-                let k_rope = mlx_rs::fast::rope(
-                    &k_i,
-                    rope_dims,
-                    rope_traditional,
-                    rope_base,
-                    rope_scale,
-                    offset,
-                    None,
-                )?;
+                )
+            };
+            let rotated_queries = rotate(&queries)?;
+            let rotated_keys = rotate(&keys)?;
 
-                // Update this request's KV cache
-                let cache = kv_caches[req_idx][layer_idx]
-                    .as_mut()
-                    .ok_or_else(|| Exception::custom("Cache not initialized"))?;
-                let (full_k, full_v) = cache.update_and_fetch(k_rope, v_i)?;
+            let (all_keys, all_values) = cache
+                .layer_mut(layer_index)?
+                .update_and_fetch(rotated_keys, values)?;
+            let attended = scaled_dot_product_attention(
+                rotated_queries,
+                all_keys,
+                all_values,
+                attention.scale,
+                mask.as_ref(),
+            )?;
 
-                // Right-pad shorter caches to max_kv_len
-                let seq_len = full_k.shape()[2];
-                if seq_len < max_kv_len {
-                    let pad_len = max_kv_len - seq_len;
-                    let pad_k =
-                        ops::zeros_dtype(&[1, n_kv_heads, pad_len, head_dim], full_k.dtype())?;
-                    let pad_v =
-                        ops::zeros_dtype(&[1, n_kv_heads, pad_len, head_dim], full_v.dtype())?;
-                    all_keys.push(ops::concatenate(&[&full_k, &pad_k], 2)?);
-                    all_values.push(ops::concatenate(&[&full_v, &pad_v], 2)?);
-                } else {
-                    all_keys.push(full_k);
-                    all_values.push(full_v);
-                }
-                all_queries.push(q_rope);
-            }
-
-            // --- Batched: stack + SDPA + output proj + MLP ---
-            let stacked_q = ops::concatenate(&all_queries.iter().collect::<Vec<_>>(), 0)?;
-            let stacked_k = ops::concatenate(&all_keys.iter().collect::<Vec<_>>(), 0)?;
-            let stacked_v = ops::concatenate(&all_values.iter().collect::<Vec<_>>(), 0)?;
-
-            let mask = create_batched_decode_mask(&kv_lengths, max_kv_len)?;
-
-            let attn_out =
-                scaled_dot_product_attention(stacked_q, stacked_k, stacked_v, scale, Some(&mask))?;
-
-            let attn_flat = attn_out
+            let merged = attended
                 .transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[n, 1, -1])?;
-            let residual = layer.self_attn.o_proj.forward(&attn_flat)?;
-            h = h.add(residual)?;
+                .reshape(&[batch, 1, -1])?;
+            h = h.add(attention.o_proj.forward(&merged)?)?;
 
             let normed_post = layer.post_attention_layernorm.forward(&h)?;
-            let mlp_out = layer.mlp.forward(&normed_post)?;
-            h = h.add(mlp_out)?;
+            h = h.add(layer.mlp.forward(&normed_post)?)?;
         }
+        cache.advance(1);
 
         let out = self.model.norm.forward(&h)?;
         self.apply_lm_head(&out)
+    }
+
+    /// Prefill several prompts in one forward pass.
+    ///
+    /// `inputs` is `[B, T]` with each prompt **left-padded** to the longest
+    /// (`T`), and `lengths` holds the true token counts. Returns last-position
+    /// logits `[B, 1, vocab]` and the filled cache. Real tokens are rotated at
+    /// their true positions, so the rows are interchangeable with caches
+    /// built by an unbatched prefill.
+    pub fn prefill_batched(
+        &mut self,
+        inputs: &Array,
+        lengths: &[i32],
+    ) -> Result<(Array, BatchedKvCache), Exception> {
+        let &[batch, steps] = inputs.shape() else {
+            return Err(Exception::custom("prefill inputs must be [B, T]"));
+        };
+        if usize::try_from(batch).ok() != Some(lengths.len())
+            || lengths.iter().copied().max() != Some(steps)
+            || lengths.iter().any(|&length| length < 1)
+        {
+            return Err(Exception::custom(
+                "prefill lengths must be positive, one per row, with the longest equal to T",
+            ));
+        }
+
+        let mut cache = BatchedKvCache::for_prefill(self.model.layers.len(), lengths.to_vec());
+        let mask = BatchedKvCache::prefill_mask(lengths, steps)?;
+        // Negative for padded rows, so the first real token lands on position 0.
+        let row_first_positions: Vec<i32> = lengths.iter().map(|&length| length - steps).collect();
+        let first_positions = Array::from_slice(&row_first_positions, &[batch]);
+
+        let mut h = self.model.embed_tokens.forward(inputs)?;
+
+        for (layer_index, layer) in self.model.layers.iter_mut().enumerate() {
+            let attention = &mut layer.self_attn;
+            let normed = layer.input_layernorm.forward(&h)?;
+
+            let mut queries = attention.q_proj.forward(&normed)?.reshape(&[
+                batch,
+                steps,
+                attention.n_heads,
+                -1,
+            ])?;
+            let mut keys = attention.k_proj.forward(&normed)?.reshape(&[
+                batch,
+                steps,
+                attention.n_kv_heads,
+                -1,
+            ])?;
+            let values = attention
+                .v_proj
+                .forward(&normed)?
+                .reshape(&[batch, steps, attention.n_kv_heads, -1])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            if let Some(ref mut q_norm) = attention.q_norm {
+                queries = q_norm.forward(&queries)?;
+            }
+            if let Some(ref mut k_norm) = attention.k_norm {
+                keys = k_norm.forward(&keys)?;
+            }
+
+            let rotate = |array: Array| {
+                mlx_rs::fast::rope_dynamic(
+                    array.transpose_axes(&[0, 2, 1, 3])?,
+                    attention.rope.dimensions,
+                    attention.rope.traditional,
+                    attention.rope.base,
+                    attention.rope.scale,
+                    &first_positions,
+                    None,
+                )
+            };
+            let rotated_queries = rotate(queries)?;
+            let rotated_keys = rotate(keys)?;
+
+            let (all_keys, all_values) = cache
+                .layer_mut(layer_index)?
+                .update_and_fetch(rotated_keys, values)?;
+            let attended = scaled_dot_product_attention(
+                rotated_queries,
+                all_keys,
+                all_values,
+                attention.scale,
+                Some(&mask),
+            )?;
+
+            let merged = attended
+                .transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[batch, steps, -1])?;
+            h = h.add(attention.o_proj.forward(&merged)?)?;
+
+            let normed_post = layer.post_attention_layernorm.forward(&h)?;
+            h = h.add(layer.mlp.forward(&normed_post)?)?;
+        }
+
+        let out = self.model.norm.forward(&h)?;
+        Ok((self.apply_lm_head(&out)?, cache))
     }
 
     /// Apply the LM head to hidden states (last position only during prefill).
@@ -1044,10 +1059,21 @@ pub(crate) fn load_model_with_args(
     Ok(model)
 }
 
-#[allow(clippy::panic, clippy::unwrap_used)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::print_stdout,
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::indexing_slicing,
+    clippy::items_after_statements,
+    clippy::shadow_reuse,
+    clippy::shadow_unrelated
+)]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::SteppingKeyValueCache;
     use mlx_rs::module::ModuleParameters as _;
 
     /// Create a `ModelArgs` with sensible defaults. Only fields that vary
@@ -1386,6 +1412,258 @@ mod tests {
         let model = Model::new(args).unwrap();
         assert_eq!(model.model_type(), "qwen2");
         assert!(model.lm_head.is_some());
+    }
+
+    /// Largest absolute difference between two same-shaped f32 arrays.
+    fn max_abs_difference(left: &Array, right: &Array) -> f32 {
+        let left = left.contiguous().unwrap();
+        let right = right.contiguous().unwrap();
+        left.as_slice::<f32>()
+            .iter()
+            .zip(right.as_slice::<f32>())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max)
+    }
+
+    /// Batched decode must reproduce one-at-a-time decode. `Model::new` only
+    /// creates placeholder embedding weights, so this needs a real checkpoint:
+    /// `HIGGS_MODEL_PATH=<llama/qwen/mistral dir> cargo test -p higgs-models -- --ignored forward_batched`
+    #[test]
+    #[ignore = "requires real model weights (set HIGGS_MODEL_PATH)"]
+    fn forward_batched_matches_per_sequence_forward() {
+        let Ok(model_path) = std::env::var("HIGGS_MODEL_PATH") else {
+            println!("HIGGS_MODEL_PATH not set, skipping");
+            return;
+        };
+        let mut model = load_model(&model_path).unwrap();
+        let layers = model.model.layers.len();
+        // Different prompt lengths exercise left padding, masking, and
+        // per-row rotary positions.
+        let prompts: [&[u32]; 3] = [
+            &[101, 2002, 3003, 404, 505, 6006, 707],
+            &[909, 808, 7007],
+            &[1100, 1200, 130, 1400, 150],
+        ];
+        let steps: [[u32; 3]; 3] = [[210, 2200, 230], [3100, 320, 3300], [41, 4200, 430]];
+
+        let prefill = |model: &mut Model, prompt: &[u32]| {
+            let mut cache: Vec<Option<SteppingKeyValueCache>> = (0..layers)
+                .map(|_| Some(SteppingKeyValueCache::new()))
+                .collect();
+            let length = i32::try_from(prompt.len()).unwrap();
+            let logits = model
+                .forward(&Array::from_slice(prompt, &[1, length]), None, &mut cache)
+                .unwrap();
+            logits.eval().unwrap();
+            cache
+        };
+
+        let mut reference_caches: Vec<_> = prompts.iter().map(|p| prefill(&mut model, p)).collect();
+        let rows: Vec<_> = prompts.iter().map(|p| prefill(&mut model, p)).collect();
+        let mut batch = BatchedKvCache::from_rows(rows).unwrap();
+
+        let mut worst_relative = 0.0_f32;
+        for step_tokens in steps {
+            let batched = model
+                .forward_batched(&Array::from_slice(&step_tokens, &[3, 1]), &mut batch)
+                .unwrap()
+                .as_dtype(mlx_rs::Dtype::Float32)
+                .unwrap();
+            for ((cache, &token), row) in reference_caches.iter_mut().zip(&step_tokens).zip(0_i32..)
+            {
+                let expected = model
+                    .forward(&Array::from_slice(&[token], &[1, 1]), None, cache)
+                    .unwrap()
+                    .as_dtype(mlx_rs::Dtype::Float32)
+                    .unwrap();
+                let actual = batched.index((row..row + 1, .., ..));
+                let largest_logit = expected
+                    .as_slice::<f32>()
+                    .iter()
+                    .fold(0.0_f32, |max, logit| max.max(logit.abs()));
+                worst_relative =
+                    worst_relative.max(max_abs_difference(&expected, &actual) / largest_logit);
+            }
+        }
+        println!("largest logit difference relative to the largest logit: {worst_relative}");
+        // Half-precision kernels round differently at batch 3 than at batch 1:
+        // the standard forward shows ~1.5% on Qwen3-1.7B-4bit and ~0.4% on
+        // Llama-3.2-1B-4bit. A positional or masking bug is an order of
+        // magnitude larger.
+        assert!(
+            worst_relative < 0.03,
+            "batched logits differ from unbatched by {worst_relative} of the largest logit"
+        );
+        assert_eq!(batch.lengths(), &[10, 6, 8]);
+    }
+
+    /// Batched prefill must leave the same logits and the same decode
+    /// behavior as prefilling each prompt alone.
+    /// `HIGGS_MODEL_PATH=<llama/qwen/mistral dir> cargo test -p higgs-models -- --ignored prefill_batched`
+    #[test]
+    #[ignore = "requires real model weights (set HIGGS_MODEL_PATH)"]
+    fn prefill_batched_matches_per_sequence_prefill() {
+        let Ok(model_path) = std::env::var("HIGGS_MODEL_PATH") else {
+            println!("HIGGS_MODEL_PATH not set, skipping");
+            return;
+        };
+        let mut model = load_model(&model_path).unwrap();
+        let layers = model.model.layers.len();
+        let prompts: [&[u32]; 3] = [
+            &[101, 2002, 3003, 404, 505, 6006, 707],
+            &[909, 808, 7007],
+            &[1100, 1200, 130, 1400, 150],
+        ];
+        let next_tokens = [210_u32, 2200, 230];
+        const LONGEST: usize = 7;
+        const PAD_TOKEN: u32 = 0;
+
+        let mut padded = Vec::new();
+        for prompt in prompts {
+            padded.extend(std::iter::repeat_n(PAD_TOKEN, LONGEST - prompt.len()));
+            padded.extend_from_slice(prompt);
+        }
+        let lengths: Vec<i32> = prompts
+            .iter()
+            .map(|p| i32::try_from(p.len()).unwrap())
+            .collect();
+        let (batched_logits, mut batch) = model
+            .prefill_batched(&Array::from_slice(&padded, &[3, 7]), &lengths)
+            .unwrap();
+        let batched_logits = batched_logits.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        let batched_step = model
+            .forward_batched(&Array::from_slice(&next_tokens, &[3, 1]), &mut batch)
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .unwrap();
+
+        let relative_difference = |expected: &Array, actual: &Array| {
+            let largest_logit = expected
+                .as_slice::<f32>()
+                .iter()
+                .fold(0.0_f32, |max, logit| max.max(logit.abs()));
+            max_abs_difference(expected, actual) / largest_logit
+        };
+        let mut worst_relative = 0.0_f32;
+        for ((prompt, &next_token), row) in prompts.iter().zip(&next_tokens).zip(0_i32..) {
+            let mut cache: Vec<Option<SteppingKeyValueCache>> = (0..layers)
+                .map(|_| Some(SteppingKeyValueCache::new()))
+                .collect();
+            let length = i32::try_from(prompt.len()).unwrap();
+            let expected_prefill = model
+                .forward(&Array::from_slice(prompt, &[1, length]), None, &mut cache)
+                .unwrap()
+                .as_dtype(mlx_rs::Dtype::Float32)
+                .unwrap();
+            let expected_step = model
+                .forward(&Array::from_slice(&[next_token], &[1, 1]), None, &mut cache)
+                .unwrap()
+                .as_dtype(mlx_rs::Dtype::Float32)
+                .unwrap();
+            let row_range = row..row + 1;
+            worst_relative = worst_relative
+                .max(relative_difference(
+                    &expected_prefill,
+                    &batched_logits.index((row_range.clone(), .., ..)),
+                ))
+                .max(relative_difference(
+                    &expected_step,
+                    &batched_step.index((row_range, .., ..)),
+                ));
+        }
+        println!("largest logit difference relative to the largest logit: {worst_relative}");
+        assert!(
+            worst_relative < 0.03,
+            "batched prefill differs from unbatched by {worst_relative} of the largest logit"
+        );
+        assert!(
+            batch.eval_targets().iter().all(|array| !array
+                .as_dtype(mlx_rs::Dtype::Float32)
+                .unwrap()
+                .sum(None)
+                .unwrap()
+                .item_cast::<f32>()
+                .is_nan()),
+            "padding must not leave NaN in the cache"
+        );
+    }
+
+    /// Steady-state decode step time by batch size, for the batched path and
+    /// the standard forward at the same batch size.
+    /// `HIGGS_MODEL_PATH=<dir> cargo test --release -p higgs-models -- --ignored bench_batched_decode_step --nocapture`
+    #[test]
+    #[ignore = "benchmark, requires real model weights (set HIGGS_MODEL_PATH)"]
+    fn bench_batched_decode_step() {
+        let Ok(model_path) = std::env::var("HIGGS_MODEL_PATH") else {
+            println!("HIGGS_MODEL_PATH not set, skipping");
+            return;
+        };
+        let mut model = load_model(&model_path).unwrap();
+        let layers = model.model.layers.len();
+        const PROMPT_TOKENS: i32 = 64;
+        const STEPS: usize = 200;
+
+        for batch_size in [1_i32, 2, 4, 8] {
+            let prompt: Vec<u32> = (0..batch_size * PROMPT_TOKENS)
+                .map(|i| 100 + u32::try_from(i % 5000).unwrap())
+                .collect();
+            let fresh = || -> Vec<Option<SteppingKeyValueCache>> {
+                (0..layers)
+                    .map(|_| Some(SteppingKeyValueCache::new()))
+                    .collect()
+            };
+
+            let mut standard_cache = fresh();
+            let prefill = Array::from_slice(&prompt, &[batch_size, PROMPT_TOKENS]);
+            let mut tokens =
+                argmax_last(&model.forward(&prefill, None, &mut standard_cache).unwrap());
+            tokens.eval().unwrap();
+            let started = std::time::Instant::now();
+            for _ in 0..STEPS {
+                let logits = model.forward(&tokens, None, &mut standard_cache).unwrap();
+                tokens = argmax_last(&logits);
+                tokens.eval().unwrap();
+            }
+            let standard_ms = started.elapsed().as_secs_f64() * 1000.0 / STEPS as f64;
+
+            let rows: Vec<_> = (0..batch_size)
+                .map(|row| {
+                    let mut cache = fresh();
+                    let start = usize::try_from(row * PROMPT_TOKENS).unwrap();
+                    let end = start + usize::try_from(PROMPT_TOKENS).unwrap();
+                    model
+                        .forward(
+                            &Array::from_slice(&prompt[start..end], &[1, PROMPT_TOKENS]),
+                            None,
+                            &mut cache,
+                        )
+                        .unwrap()
+                        .eval()
+                        .unwrap();
+                    cache
+                })
+                .collect();
+            let mut batch = BatchedKvCache::from_rows(rows).unwrap();
+            let mut tokens = Array::from_slice(
+                &vec![7_u32; usize::try_from(batch_size).unwrap()],
+                &[batch_size, 1],
+            );
+            let started = std::time::Instant::now();
+            for _ in 0..STEPS {
+                let logits = model.forward_batched(&tokens, &mut batch).unwrap();
+                tokens = argmax_last(&logits);
+                tokens.eval().unwrap();
+            }
+            let batched_ms = started.elapsed().as_secs_f64() * 1000.0 / STEPS as f64;
+            println!(
+                "batch {batch_size}: standard forward {standard_ms:.3} ms/step, forward_batched {batched_ms:.3} ms/step"
+            );
+        }
+    }
+
+    /// Greedy next tokens as `[B, 1]` from `[B, T, vocab]` logits.
+    fn argmax_last(logits: &Array) -> Array {
+        mlx_rs::ops::indexing::argmax_axis(logits.index((.., -1, ..)), -1, true).unwrap()
     }
 
     /// Write a minimal config.json to a tempdir and return the directory.

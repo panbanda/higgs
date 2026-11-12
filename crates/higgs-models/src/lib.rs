@@ -1,4 +1,5 @@
 pub mod adapter;
+pub mod batched_cache;
 pub mod bonsai_q1;
 pub mod cache;
 pub mod deepseek_v2;
@@ -498,23 +499,10 @@ impl AnyModel {
     pub fn forward_batched(
         &mut self,
         inputs: &Array,
-        caches: &mut [&mut AnyCache],
+        cache: &mut batched_cache::BatchedKvCache,
     ) -> Result<Array, Exception> {
-        let mut kv_refs: Vec<&mut Vec<Option<cache::SteppingKeyValueCache>>> =
-            Vec::with_capacity(caches.len());
-        for cache in caches.iter_mut() {
-            match cache {
-                AnyCache::KV(kv) => kv_refs.push(kv),
-                AnyCache::Hybrid(_) => {
-                    return Err(Exception::custom(
-                        "Batched forward not supported for Hybrid cache",
-                    ));
-                }
-            }
-        }
-
         match self {
-            Self::Transformer(m) => m.forward_batched(inputs, &mut kv_refs),
+            Self::Transformer(m) => m.forward_batched(inputs, cache),
             Self::Qwen3Moe(_)
             | Self::Qwen3Next(_)
             | Self::Gemma2(_)
@@ -526,6 +514,31 @@ impl AnyModel {
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => Err(Exception::custom(
                 "Batched forward only supported for Transformer models",
+            )),
+        }
+    }
+
+    /// Prefill several left-padded prompts in one pass (see
+    /// [`transformer::Model::prefill_batched`]). Same model support as
+    /// [`Self::forward_batched`].
+    pub fn prefill_batched(
+        &mut self,
+        inputs: &Array,
+        lengths: &[i32],
+    ) -> Result<(Array, batched_cache::BatchedKvCache), Exception> {
+        match self {
+            Self::Transformer(m) => m.prefill_batched(inputs, lengths),
+            Self::Qwen3Moe(_)
+            | Self::Qwen3Next(_)
+            | Self::Gemma2(_)
+            | Self::Gemma3(_)
+            | Self::Gemma4(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::LlavaQwen2(_)
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom(
+                "Batched prefill only supported for Transformer models",
             )),
         }
     }
