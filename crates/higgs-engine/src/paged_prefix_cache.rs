@@ -151,50 +151,67 @@ impl RadixNode {
         }
     }
 
-    fn find_deepest_match(
+    /// Walk the trie along `tokens` and return the usable entry covering the
+    /// most leading tokens, with that covered length.
+    ///
+    /// An entry whose whole key is a prefix of `tokens` covers its full key.
+    /// Where the walk ends partway along an edge, or at a node whose prompt
+    /// has run out, every entry below shares the leading `shared_len` tokens
+    /// with `tokens`; a dense entry among them can serve a block-aligned part
+    /// of that shared run (see [`is_truncatable`]).
+    fn find_best_match(
         &self,
         tokens: &[u32],
-        depth: usize,
         min_prefix: usize,
+        block_size: usize,
     ) -> Option<(usize, &CachedState)> {
-        let mut best = self
-            .cached
-            .as_ref()
-            .filter(|cs| {
+        let mut node = self;
+        let mut depth = 0;
+        let mut best = None;
+        loop {
+            let usable = node.cached.as_ref().filter(|cs| match &cs.data {
                 // Cloned entries are valid at any depth > 0 (no block alignment needed).
                 // Paged entries require at least min_prefix tokens for block alignment.
-                match &cs.data {
-                    CachedData::Cloned(_) => depth > 0,
-                    CachedData::Paged { .. } | CachedData::TurboQuantPaged { .. } => {
-                        depth >= min_prefix
-                    }
+                CachedData::Cloned(_) => depth > 0,
+                CachedData::Paged { .. } | CachedData::TurboQuantPaged { .. } => {
+                    depth >= min_prefix
                 }
-            })
-            .map(|cs| (depth, cs));
-
-        let Some(&next_token) = tokens.get(depth) else {
-            return best;
-        };
-
-        let Some(child) = self.children.get(&next_token) else {
-            return best;
-        };
-
-        let remaining = tokens.get(depth..).unwrap_or_default();
-        let common = child
-            .edge
-            .iter()
-            .zip(remaining.iter())
-            .take_while(|(a, b)| a == b)
-            .count();
-
-        if common == child.edge.len() {
-            if let Some(deeper) = child.find_deepest_match(tokens, depth + common, min_prefix) {
-                best = Some(deeper);
+            });
+            if let Some(cs) = usable {
+                best = Some((depth, cs));
             }
-        }
 
-        best
+            let next_child = tokens
+                .get(depth)
+                .and_then(|next_token| node.children.get(next_token));
+            let Some(child) = next_child else {
+                // The prompt ended, or continues differently than every
+                // child: all entries below share the first `depth` tokens.
+                return better_truncated(best, node.children.values(), depth, block_size);
+            };
+            let remaining = tokens.get(depth..).unwrap_or_default();
+            let common = child
+                .edge
+                .iter()
+                .zip(remaining.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            if common < child.edge.len() {
+                return better_truncated(best, std::iter::once(child), depth + common, block_size);
+            }
+            node = child;
+            depth += common;
+        }
+    }
+
+    /// The most recently used entry in this subtree that [`is_truncatable`] allows
+    /// cutting down.
+    fn truncatable_entry(&self) -> Option<&CachedState> {
+        let own = self.cached.as_ref().filter(|cs| is_truncatable(&cs.data));
+        let below = self.children.values().filter_map(Self::truncatable_entry);
+        own.into_iter()
+            .chain(below)
+            .max_by_key(|cs| cs.last_accessed.get())
     }
 
     fn oldest_cached_time(&self) -> Option<Instant> {
@@ -249,6 +266,49 @@ impl RadixNode {
     }
 }
 
+/// Whether an entry's stored tokens can be cut to any block-aligned length.
+///
+/// True only for dense attention KV, where the keys and values of a token
+/// depend on earlier tokens alone, so the first `n` tokens of a longer entry
+/// are exactly the entry a shorter prompt would have produced. Recurrent
+/// (hybrid) snapshots are valid only at the position they were taken, and
+/// `TurboQuant`, MLA latent and cloned entries are left whole.
+fn is_truncatable(data: &CachedData) -> bool {
+    match data {
+        CachedData::Paged {
+            layers,
+            is_hybrid: false,
+            ..
+        } => layers
+            .iter()
+            .all(|layer| matches!(layer, CachedLayerData::Kv(_) | CachedLayerData::Empty)),
+        CachedData::Paged { .. } | CachedData::TurboQuantPaged { .. } | CachedData::Cloned(_) => {
+            false
+        }
+    }
+}
+
+/// Prefer a truncated descendant entry over `best` when it covers more tokens.
+///
+/// `subtrees` are the nodes whose entries all share the first `shared_len`
+/// tokens with the prompt.
+fn better_truncated<'a>(
+    best: Option<(usize, &'a CachedState)>,
+    subtrees: impl Iterator<Item = &'a RadixNode>,
+    shared_len: usize,
+    block_size: usize,
+) -> Option<(usize, &'a CachedState)> {
+    let truncated_len = shared_len / block_size * block_size;
+    let best_len = best.map_or(0, |(len, _)| len);
+    if truncated_len == 0 || truncated_len <= best_len {
+        return best;
+    }
+    subtrees
+        .filter_map(RadixNode::truncatable_entry)
+        .max_by_key(|cs| cs.last_accessed.get())
+        .map_or(best, |cs| Some((truncated_len, cs)))
+}
+
 // ---------------------------------------------------------------------------
 // PagedPrefixCache impl
 // ---------------------------------------------------------------------------
@@ -268,20 +328,35 @@ impl PagedPrefixCache {
     ///
     /// Returns `None` if no prefix matches or if the match is shorter than one
     /// block. On hit, blocks are gathered into a contiguous `AnyCache`.
+    ///
+    /// A dense entry that shares only the start of its key with `tokens` (the
+    /// same system prompt followed by a different question) serves the
+    /// block-aligned part of that shared run, so the first such request hits.
     pub fn find_longest_prefix(&mut self, tokens: &[u32]) -> Option<PagedPrefixMatch> {
+        let block_size = self.block_size;
         self.root
-            .find_deepest_match(tokens, 0, self.block_size)
-            .and_then(|(prefix_len, cs)| match materialize(&cs.data) {
-                Ok(cache) => {
-                    tracing::debug!(prefix_len, "Prefix cache hit");
-                    cs.last_accessed.set(Instant::now());
-                    Some(PagedPrefixMatch { prefix_len, cache })
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Prefix cache materialize failed");
-                    None
+            .find_best_match(tokens, block_size, block_size)
+            .and_then(|(prefix_len, cs)| {
+                match materialize_prefix(&cs.data, prefix_len, block_size) {
+                    Ok(cache) => {
+                        tracing::debug!(prefix_len, "Prefix cache hit");
+                        cs.last_accessed.set(Instant::now());
+                        Some(PagedPrefixMatch { prefix_len, cache })
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Prefix cache materialize failed");
+                        None
+                    }
                 }
             })
+    }
+
+    /// Tokens at the start of `tokens` that [`Self::find_longest_prefix`] would
+    /// serve, without materializing the cache or refreshing the entry.
+    pub fn longest_prefix_len(&self, tokens: &[u32]) -> usize {
+        self.root
+            .find_best_match(tokens, self.block_size, self.block_size)
+            .map_or(0, |(prefix_len, _)| prefix_len)
     }
 
     /// Store a prefix and its cache state as paged blocks.
@@ -303,19 +378,24 @@ impl PagedPrefixCache {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to page cache, using clone fallback");
-                match kv_offset(cache).and_then(|offset| usize::try_from(offset).ok()) {
-                    Some(offset) if offset > prefix_tokens.len() => {
-                        tracing::warn!(
-                            cache_tokens = offset,
-                            key_tokens = prefix_tokens.len(),
-                            "Skipping prefix cache store: cache longer than key"
-                        );
-                        return;
-                    }
-                    _ => CachedData::Cloned(cache.clone()),
-                }
+                CachedData::Cloned(cache.clone())
             }
         };
+        // A cloned entry is reused as-is, so it must hold exactly the tokens
+        // its key names. A cache that also ran the chat template's generation
+        // suffix would replay those tokens on the next hit.
+        if matches!(data, CachedData::Cloned(_)) {
+            if let Some(offset) = cache_offset(cache).and_then(|o| usize::try_from(o).ok()) {
+                if offset != prefix_tokens.len() {
+                    tracing::debug!(
+                        cache_tokens = offset,
+                        key_tokens = prefix_tokens.len(),
+                        "Skipping prefix cache store: cache does not end at the key"
+                    );
+                    return;
+                }
+            }
+        }
 
         let stored_len = match &data {
             CachedData::Paged { total_tokens, .. }
@@ -478,6 +558,17 @@ fn kv_offset(cache: &AnyCache) -> Option<i32> {
     }
 }
 
+/// Number of tokens a cache holds, from its first KV layer or recurrent state.
+fn cache_offset(cache: &AnyCache) -> Option<i32> {
+    kv_offset(cache).or_else(|| match cache {
+        AnyCache::Hybrid(layers) => layers.iter().find_map(|layer| match layer {
+            Some(LayerCache::Arrays(state)) => Some(state.offset),
+            _ => None,
+        }),
+        AnyCache::KV(_) => None,
+    })
+}
+
 /// Slice a cache into block-aligned paged data.
 fn slice_into_blocks(
     cache: &AnyCache,
@@ -625,6 +716,42 @@ fn slice_kv_layer(
     }
 
     Ok(CachedLayerData::Kv(blocks))
+}
+
+/// Materialize the first `prefix_len` tokens of an entry.
+///
+/// `prefix_len` is the entry's full length except for the truncated hits
+/// [`is_truncatable`] allows, which keep only the leading blocks.
+fn materialize_prefix(
+    data: &CachedData,
+    prefix_len: usize,
+    block_size: usize,
+) -> Result<AnyCache, Exception> {
+    match data {
+        CachedData::Paged {
+            layers,
+            total_tokens,
+            is_hybrid: false,
+        } if prefix_len < *total_tokens => {
+            let kept_blocks = prefix_len / block_size;
+            let kept: Vec<CachedLayerData> = layers
+                .iter()
+                .map(|layer| match layer {
+                    CachedLayerData::Kv(blocks) => {
+                        CachedLayerData::Kv(blocks.iter().take(kept_blocks).cloned().collect())
+                    }
+                    other @ (CachedLayerData::TurboQuantKv(_)
+                    | CachedLayerData::MlaLatent(..)
+                    | CachedLayerData::Gdn(_)
+                    | CachedLayerData::Empty) => other.clone(),
+                })
+                .collect();
+            materialize_kv(&kept)
+        }
+        CachedData::Paged { .. } | CachedData::TurboQuantPaged { .. } | CachedData::Cloned(_) => {
+            materialize(data)
+        }
+    }
 }
 
 /// Materialize block references into a contiguous `AnyCache`.
@@ -1152,5 +1279,245 @@ mod tests {
             .unwrap();
         assert_eq!(offset, 5);
         assert_eq!(history.shape(), &[1, 1, 5, 6]);
+    }
+
+    /// KV cache whose entries differ per position, layer and head, so
+    /// truncation bugs show up as wrong values rather than wrong shapes.
+    fn make_ramp_kv_cache(num_layers: usize, seq_len: i32) -> AnyCache {
+        let layers: Vec<Option<SteppingKeyValueCache>> = (0..num_layers)
+            .map(|layer| {
+                let count = 2 * seq_len * 8;
+                let base = mlx_rs::ops::arange::<_, f32>(0, count, None)
+                    .unwrap()
+                    .reshape(&[1, 2, seq_len, 8])
+                    .unwrap();
+                let shift = Array::from_f32(f32::from(u16::try_from(layer).unwrap()) * 1000.0);
+                let keys = base.add(&shift).unwrap();
+                let values = keys.negative().unwrap();
+                Some(SteppingKeyValueCache::from_arrays(keys, values).unwrap())
+            })
+            .collect();
+        AnyCache::KV(layers)
+    }
+
+    fn layer_contents(cache: &AnyCache, layer: usize) -> (Vec<f32>, Vec<f32>) {
+        let AnyCache::KV(layers) = cache else {
+            panic!("expected KV cache")
+        };
+        let kv = layers.get(layer).unwrap().as_ref().unwrap();
+        let to_vec = |array: &Array| array.as_slice::<f32>().to_vec();
+        (to_vec(kv.keys().unwrap()), to_vec(kv.values().unwrap()))
+    }
+
+    #[test]
+    fn test_divergent_prompt_hits_truncated_entry() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        let stored: Vec<u32> = (0..96).collect();
+        let original = make_ramp_kv_cache(3, 96);
+        cache.store(&stored, &original);
+
+        let mut query: Vec<u32> = (0..70).collect();
+        query.extend(500..540);
+        let matched = cache.find_longest_prefix(&query).unwrap();
+
+        assert_eq!(matched.prefix_len, 64);
+        assert_eq!(kv_cache_offset(&matched.cache), 64);
+        for layer in 0..3 {
+            let (keys, values) = layer_contents(&matched.cache, layer);
+            let (full_keys, full_values) = layer_contents(&original, layer);
+            assert_eq!(keys.len(), 2 * 64 * 8);
+            assert_eq!(values.len(), 2 * 64 * 8);
+            let head_stride_full = 96 * 8;
+            let head_stride_cut = 64 * 8;
+            for head in 0..2 {
+                assert_eq!(
+                    keys[head * head_stride_cut..(head + 1) * head_stride_cut],
+                    full_keys[head * head_stride_full..head * head_stride_full + head_stride_cut]
+                );
+                assert_eq!(
+                    values[head * head_stride_cut..(head + 1) * head_stride_cut],
+                    full_values[head * head_stride_full..head * head_stride_full + head_stride_cut]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_truncated_hit_continues_decoding() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        let stored: Vec<u32> = (0..96).collect();
+        cache.store(&stored, &make_ramp_kv_cache(2, 96));
+
+        let mut query: Vec<u32> = (0..40).collect();
+        query.push(999);
+        let matched = cache.find_longest_prefix(&query).unwrap();
+        assert_eq!(matched.prefix_len, 32);
+
+        let AnyCache::KV(layers) = matched.cache else {
+            panic!("expected KV cache")
+        };
+        let mut restored = layers.into_iter().next().flatten().unwrap();
+        let (keys, _) = restored
+            .update_and_fetch(
+                Array::zeros::<f32>(&[1, 2, 1, 8]).unwrap(),
+                Array::zeros::<f32>(&[1, 2, 1, 8]).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(keys.shape(), &[1, 2, 33, 8]);
+    }
+
+    #[test]
+    fn test_divergence_inside_first_block_misses() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        let stored: Vec<u32> = (0..96).collect();
+        cache.store(&stored, &make_kv_cache(2, 96));
+
+        let mut query: Vec<u32> = (0..20).collect();
+        query.extend(500..520);
+        assert!(cache.find_longest_prefix(&query).is_none());
+    }
+
+    #[test]
+    fn test_prompt_ending_inside_entry_hits_truncated() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        let stored: Vec<u32> = (0..96).collect();
+        cache.store(&stored, &make_kv_cache(2, 96));
+
+        let query: Vec<u32> = (0..80).collect();
+        let matched = cache.find_longest_prefix(&query).unwrap();
+        assert_eq!(matched.prefix_len, 64);
+        assert_eq!(kv_cache_offset(&matched.cache), 64);
+    }
+
+    #[test]
+    fn test_truncation_below_a_branch_without_entry() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        let mut first: Vec<u32> = (0..40).collect();
+        first.extend(100..156);
+        let mut second: Vec<u32> = (0..40).collect();
+        second.extend(200..256);
+        cache.store(&first, &make_kv_cache(2, 96));
+        cache.store(&second, &make_kv_cache(2, 96));
+
+        let mut query: Vec<u32> = (0..40).collect();
+        query.extend(300..340);
+        let matched = cache.find_longest_prefix(&query).unwrap();
+        assert_eq!(matched.prefix_len, 32);
+        assert_eq!(kv_cache_offset(&matched.cache), 32);
+    }
+
+    #[test]
+    fn test_exact_prefix_beats_shorter_truncation() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        let short: Vec<u32> = (0..64).collect();
+        cache.store(&short, &make_kv_cache(2, 64));
+        let mut long = short.clone();
+        long.extend(100..164);
+        cache.store(&long, &make_kv_cache(2, 128));
+
+        let mut query = short;
+        query.extend(100..140);
+        query.extend(900..920);
+        let matched = cache.find_longest_prefix(&query).unwrap();
+        assert_eq!(matched.prefix_len, 96);
+        assert_eq!(kv_cache_offset(&matched.cache), 96);
+
+        let mut exact_query: Vec<u32> = (0..64).collect();
+        exact_query.push(999);
+        assert_eq!(
+            cache.find_longest_prefix(&exact_query).unwrap().prefix_len,
+            64
+        );
+
+        let mut barely_past: Vec<u32> = (0..64).collect();
+        barely_past.extend(100..110);
+        barely_past.extend(900..920);
+        assert_eq!(
+            cache.find_longest_prefix(&barely_past).unwrap().prefix_len,
+            64
+        );
+    }
+
+    #[test]
+    fn test_hybrid_entries_are_never_truncated() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        let stored: Vec<u32> = (0..96).collect();
+        cache.store(&stored, &make_hybrid_cache(8, 96));
+
+        let mut query: Vec<u32> = (0..70).collect();
+        query.extend(500..540);
+        assert!(cache.find_longest_prefix(&query).is_none());
+    }
+
+    #[test]
+    fn test_mla_entries_are_never_truncated() {
+        let mut cache = PagedPrefixCache::new(4, 2);
+        let rows = Array::ones::<f32>(&[1, 1, 8, 6]).unwrap();
+        let layer = SteppingKeyValueCache::from_latent_array(rows, 4, 2).unwrap();
+        cache.store(&[1, 2, 3, 4, 5, 6, 7, 8], &AnyCache::KV(vec![Some(layer)]));
+
+        assert!(
+            cache
+                .find_longest_prefix(&[1, 2, 3, 4, 90, 91, 92])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_cloned_entries_are_never_truncated() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        let stored: Vec<u32> = (0..20).collect();
+        cache.store(&stored, &make_kv_cache(2, 20));
+
+        let mut query: Vec<u32> = (0..10).collect();
+        query.extend(500..520);
+        assert!(cache.find_longest_prefix(&query).is_none());
+    }
+
+    #[test]
+    fn test_truncated_hit_refreshes_the_source_entry() {
+        let mut cache = PagedPrefixCache::new(2, DEFAULT_BLOCK_SIZE);
+        let kept: Vec<u32> = (0..64).collect();
+        let other: Vec<u32> = (100..164).collect();
+        cache.store(&kept, &make_kv_cache(2, 64));
+        cache.store(&other, &make_kv_cache(2, 64));
+
+        let mut divergent: Vec<u32> = (0..40).collect();
+        divergent.extend(900..910);
+        assert!(cache.find_longest_prefix(&divergent).is_some());
+
+        cache.store(&(200..264).collect::<Vec<u32>>(), &make_kv_cache(2, 64));
+        let mut kept_query = kept;
+        kept_query.push(999);
+        assert!(cache.find_longest_prefix(&kept_query).is_some());
+        let mut other_query = other;
+        other_query.push(999);
+        assert!(cache.find_longest_prefix(&other_query).is_none());
+    }
+
+    #[test]
+    fn test_longest_prefix_len_matches_lookup_without_side_effects() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        cache.store(&(0..96).collect::<Vec<u32>>(), &make_kv_cache(2, 96));
+
+        let mut divergent: Vec<u32> = (0..70).collect();
+        divergent.extend(500..520);
+        assert_eq!(cache.longest_prefix_len(&divergent), 64);
+        assert_eq!(cache.longest_prefix_len(&[7, 8, 9]), 0);
+        assert_eq!(
+            cache.longest_prefix_len(&divergent),
+            cache.find_longest_prefix(&divergent).unwrap().prefix_len
+        );
+    }
+
+    #[test]
+    fn test_cloned_entry_longer_than_its_key_is_not_stored() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        let key: Vec<u32> = (0..64).collect();
+        cache.store(&key, &make_hybrid_cache(8, 68));
+        assert!(cache.is_empty());
+
+        cache.store(&key, &make_hybrid_cache(8, 64));
+        assert_eq!(cache.len(), 1);
     }
 }
