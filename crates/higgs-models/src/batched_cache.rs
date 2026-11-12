@@ -17,7 +17,11 @@ use mlx_rs::{
     ops::{self, indexing::IndexOp},
 };
 
-use crate::cache::{KeyValueCache, KvCacheView, SteppingKeyValueCache};
+use crate::{
+    AnyCache,
+    cache::{KeyValueCache, KvCacheView, SteppingKeyValueCache},
+    qwen3_next::{ArraysCache, LayerCache, chronological_conv_history},
+};
 
 /// Per-layer caches for one sequence, as used by non-batched decode.
 pub type KvRow = Vec<Option<SteppingKeyValueCache>>;
@@ -48,6 +52,10 @@ impl KeyValueCache for BatchedLayerCache {
             .collect();
         let batch = i32::try_from(positions.len()).ok()?;
         Some(Array::from_slice(&positions, &[batch]))
+    }
+
+    fn eval_targets(&self) -> Vec<&Array> {
+        self.storage.eval_targets()
     }
 
     fn max_size(&self) -> Option<i32> {
@@ -91,24 +99,15 @@ impl BatchedKvCache {
 
         let mut layers = Vec::with_capacity(num_layers);
         for layer_index in 0..num_layers {
-            let mut row_keys = Vec::with_capacity(rows.len());
-            let mut row_values = Vec::with_capacity(rows.len());
-            for ((row, &length), &row_padding) in rows.iter().zip(&lengths).zip(&padding) {
-                let cache = row
-                    .get(layer_index)
-                    .and_then(Option::as_ref)
-                    .ok_or_else(|| Exception::custom("batched cache row has an empty layer"))?;
-                let (keys, values) = dense_prefix(cache, length)?;
-                row_keys.push(left_pad(&keys, row_padding)?);
-                row_values.push(left_pad(&values, row_padding)?);
+            let mut caches = Vec::with_capacity(rows.len());
+            for row in &rows {
+                caches.push(
+                    row.get(layer_index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| Exception::custom("batched cache row has an empty layer"))?,
+                );
             }
-            layers.push(Some(BatchedLayerCache {
-                storage: SteppingKeyValueCache::from_arrays(
-                    stack_rows(&row_keys)?,
-                    stack_rows(&row_values)?,
-                )?,
-                padding: padding.clone(),
-            }));
+            layers.push(Some(merge_kv_layer(&caches, &lengths, &padding)?));
         }
         Ok(Self { layers, padding })
     }
@@ -138,25 +137,15 @@ impl BatchedKvCache {
             .iter()
             .map(|_| Vec::with_capacity(self.layers.len()))
             .collect();
-        for layer in &self.layers {
-            let storage = &layer
+        for slot in &self.layers {
+            let layer = slot
                 .as_ref()
-                .ok_or_else(|| Exception::custom("batched cache has an empty layer"))?
-                .storage;
-            let keys = storage
-                .keys()
-                .ok_or_else(|| Exception::custom("batched cache layer has no keys"))?;
-            let values = storage
-                .values()
-                .ok_or_else(|| Exception::custom("batched cache layer has no values"))?;
-            for ((row, &row_padding), row_index) in rows.iter_mut().zip(&self.padding).zip(0_i32..)
+                .ok_or_else(|| Exception::custom("batched cache has an empty layer"))?;
+            for (row, split) in
+                rows.iter_mut()
+                    .zip(split_kv_layer(layer, &self.padding, padded_len)?)
             {
-                let valid = row_padding..padded_len;
-                let row_range = row_index..row_index + 1;
-                row.push(Some(SteppingKeyValueCache::from_arrays(
-                    keys.index((row_range.clone(), .., valid.clone(), ..)),
-                    values.index((row_range, .., valid, ..)),
-                )?));
+                row.push(Some(split));
             }
         }
         Ok(rows)
@@ -196,16 +185,7 @@ impl BatchedKvCache {
     /// cache contents plus `new_tokens` about to be appended. `None` when no
     /// row has padding, so equal-length batches skip masking entirely.
     pub fn attention_mask(&self, new_tokens: i32) -> Result<Option<Array>, Exception> {
-        if self.padding.iter().all(|&row_padding| row_padding == 0) {
-            return Ok(None);
-        }
-        let batch = i32::try_from(self.padding.len())
-            .map_err(|_| Exception::custom("batch size overflow"))?;
-        let total = self.padded_len() + new_tokens;
-        let padding_array = Array::from_slice(&self.padding, &[batch, 1]);
-        let positions = ops::arange::<_, i32>(None, total, None)?.reshape(&[1, total])?;
-        let mask = positions.ge(padding_array)?;
-        mask.reshape(&[batch, 1, 1, total]).map(Some)
+        padding_attention_mask(&self.padding, self.padded_len(), new_tokens)
     }
 
     /// Boolean `[B, 1, T, T]` mask (true = attend) for prefilling prompts
@@ -235,6 +215,367 @@ impl BatchedKvCache {
             .flat_map(|layer| layer.storage.eval_targets())
             .collect()
     }
+}
+
+/// One layer of a [`HybridBatchedCache`].
+#[derive(Debug)]
+pub enum HybridLayer {
+    /// A full-attention layer: left-padded batched keys and values.
+    Attention(BatchedLayerCache),
+    /// A recurrent layer: convolution and state arrays stacked on the batch axis.
+    Recurrent(RecurrentBatch),
+}
+
+/// Recurrent (`GatedDeltaNet`) state of every row of a batch.
+///
+/// The stacked [`ArraysCache`] carries a single `conv_pos` and `offset` for
+/// the whole batch, so rows are normalized to one convolution layout when
+/// they join (see [`HybridBatchedCache::from_rows`]).
+#[derive(Debug)]
+pub struct RecurrentBatch {
+    state: ArraysCache,
+    /// Tokens each row had processed when the batch was formed.
+    row_offsets: Vec<i32>,
+    /// `state.offset` when the batch was formed; later growth is the number of
+    /// steps taken, which every row has taken together.
+    formed_offset: i32,
+}
+
+impl RecurrentBatch {
+    pub const fn state_mut(&mut self) -> &mut ArraysCache {
+        &mut self.state
+    }
+
+    fn merge(caches: &[&ArraysCache]) -> Result<Self, Exception> {
+        let mut conv_rows = Vec::with_capacity(caches.len());
+        let mut ssm_rows = Vec::with_capacity(caches.len());
+        let mut conv_history_len = None;
+        for cache in caches {
+            let ssm_state = cache
+                .ssm_state
+                .as_ref()
+                .ok_or_else(|| Exception::custom("batched cache row has no recurrent state"))?;
+            ssm_rows.push(ssm_state.clone());
+            match cache.conv_state.as_ref() {
+                Some(conv_state) => {
+                    conv_history_len = conv_state.shape().get(1).copied();
+                    conv_rows.push(chronological_conv_history(
+                        conv_state,
+                        cache.conv_pos,
+                        cache.offset,
+                    )?);
+                }
+                None => {
+                    return Err(Exception::custom(
+                        "batched cache row has no convolution state",
+                    ));
+                }
+            }
+        }
+        // After normalization every row's newest entry is the last slot, and
+        // slots a row never filled are zero. Reading all `history_len` slots
+        // is therefore equivalent to each row's own `min(offset, history_len)`.
+        let history_len = conv_history_len.unwrap_or(0);
+        Ok(Self {
+            state: ArraysCache {
+                conv_state: Some(stack_rows(&conv_rows)?),
+                ssm_state: Some(stack_rows(&ssm_rows)?),
+                conv_pos: history_len - 1,
+                offset: history_len,
+            },
+            row_offsets: caches.iter().map(|cache| cache.offset).collect(),
+            formed_offset: history_len,
+        })
+    }
+
+    fn split(&self) -> Result<Vec<ArraysCache>, Exception> {
+        let steps = self.state.offset - self.formed_offset;
+        let conv_state =
+            self.state.conv_state.as_ref().ok_or_else(|| {
+                Exception::custom("batched recurrent layer has no convolution state")
+            })?;
+        let ssm_state = self
+            .state
+            .ssm_state
+            .as_ref()
+            .ok_or_else(|| Exception::custom("batched recurrent layer has no state"))?;
+        self.row_offsets
+            .iter()
+            .zip(0_i32..)
+            .map(|(&row_offset, row_index)| {
+                let row_range = row_index..row_index + 1;
+                Ok(ArraysCache {
+                    conv_state: Some(conv_state.index((row_range.clone(), .., ..))),
+                    ssm_state: Some(ssm_state.index((row_range, .., .., ..))),
+                    conv_pos: self.state.conv_pos,
+                    offset: row_offset + steps,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Several hybrid (attention plus recurrent) sequences decoding together.
+///
+/// Attention layers are batched exactly like [`BatchedKvCache`]. Recurrent
+/// layers stack each row's state on the batch axis; they need no padding
+/// because a recurrence has no positions to align.
+#[derive(Debug)]
+pub struct HybridBatchedCache {
+    layers: Vec<HybridLayer>,
+    /// Left padding of each row in the attention layers.
+    padding: Vec<i32>,
+}
+
+impl HybridBatchedCache {
+    /// Merge per-sequence hybrid caches into one batch. Attention layers must
+    /// be dense, and every recurrent layer must hold state (the row must have
+    /// been prefilled).
+    // Callers hand over ownership of their per-sequence caches on purpose.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn from_rows(rows: Vec<Vec<Option<LayerCache>>>) -> Result<Self, Exception> {
+        let num_layers = rows.first().map_or(0, Vec::len);
+        if rows.iter().any(|row| row.len() != num_layers) {
+            return Err(Exception::custom(
+                "batched cache rows must have the same layer count",
+            ));
+        }
+        let first_attention = rows.first().and_then(|row| {
+            row.iter()
+                .position(|layer| matches!(layer, Some(LayerCache::KV(_))))
+        });
+        let lengths: Vec<i32> = match first_attention {
+            Some(index) => rows
+                .iter()
+                .map(|row| match row.get(index) {
+                    Some(Some(LayerCache::KV(cache))) => Ok(cache.offset()),
+                    _ => Err(Exception::custom(
+                        "batched cache rows must agree on which layers are attention layers",
+                    )),
+                })
+                .collect::<Result<_, _>>()?,
+            None => vec![0; rows.len()],
+        };
+        let padded_len = lengths.iter().copied().max().unwrap_or(0);
+        let padding: Vec<i32> = lengths.iter().map(|&length| padded_len - length).collect();
+
+        let mut layers = Vec::with_capacity(num_layers);
+        for layer_index in 0..num_layers {
+            let mut attention = Vec::new();
+            let mut recurrent = Vec::new();
+            for row in &rows {
+                match row.get(layer_index) {
+                    Some(Some(LayerCache::KV(cache))) => attention.push(cache),
+                    Some(Some(LayerCache::Arrays(cache))) => recurrent.push(cache),
+                    _ => return Err(Exception::custom("batched cache row has an empty layer")),
+                }
+            }
+            layers.push(match (attention.is_empty(), recurrent.is_empty()) {
+                (false, true) => {
+                    HybridLayer::Attention(merge_kv_layer(&attention, &lengths, &padding)?)
+                }
+                (true, false) => HybridLayer::Recurrent(RecurrentBatch::merge(&recurrent)?),
+                _ => {
+                    return Err(Exception::custom(
+                        "batched cache rows must agree on each layer's kind",
+                    ));
+                }
+            });
+        }
+        Ok(Self { layers, padding })
+    }
+
+    /// Split back into per-sequence caches. Attention rows drop their
+    /// padding; recurrent rows continue on the unbatched path from the
+    /// batch's convolution layout.
+    pub fn into_rows(self) -> Result<Vec<Vec<Option<LayerCache>>>, Exception> {
+        let padded_len = self.padded_len();
+        let mut rows: Vec<Vec<Option<LayerCache>>> = self
+            .padding
+            .iter()
+            .map(|_| Vec::with_capacity(self.layers.len()))
+            .collect();
+        for layer in &self.layers {
+            match layer {
+                HybridLayer::Attention(attention) => {
+                    for (row, split) in
+                        rows.iter_mut()
+                            .zip(split_kv_layer(attention, &self.padding, padded_len)?)
+                    {
+                        row.push(Some(LayerCache::KV(split)));
+                    }
+                }
+                HybridLayer::Recurrent(recurrent) => {
+                    for (row, split) in rows.iter_mut().zip(recurrent.split()?) {
+                        row.push(Some(LayerCache::Arrays(split)));
+                    }
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    pub const fn batch_size(&self) -> usize {
+        self.padding.len()
+    }
+
+    /// Tokens held per attention row including padding.
+    fn padded_len(&self) -> i32 {
+        self.layers
+            .iter()
+            .find_map(|layer| match layer {
+                HybridLayer::Attention(attention) => Some(attention.offset()),
+                HybridLayer::Recurrent(_) => None,
+            })
+            .unwrap_or(0)
+    }
+
+    pub fn layers_mut(&mut self) -> &mut [HybridLayer] {
+        &mut self.layers
+    }
+
+    /// See [`BatchedKvCache::attention_mask`]; applies to the attention layers.
+    pub fn attention_mask(&self, new_tokens: i32) -> Result<Option<Array>, Exception> {
+        padding_attention_mask(&self.padding, self.padded_len(), new_tokens)
+    }
+
+    pub fn eval_targets(&self) -> Vec<&Array> {
+        let mut targets = Vec::new();
+        for layer in &self.layers {
+            match layer {
+                HybridLayer::Attention(attention) => targets.extend(attention.eval_targets()),
+                HybridLayer::Recurrent(recurrent) => {
+                    targets.extend(&recurrent.state.conv_state);
+                    targets.extend(&recurrent.state.ssm_state);
+                }
+            }
+        }
+        targets
+    }
+}
+
+/// A batched cache of whichever kind the loaded architecture uses.
+#[derive(Debug)]
+pub enum AnyBatchedCache {
+    Kv(BatchedKvCache),
+    Hybrid(HybridBatchedCache),
+}
+
+impl AnyBatchedCache {
+    /// Merge per-sequence caches. All rows must be the same kind.
+    pub fn from_rows(rows: Vec<AnyCache>) -> Result<Self, Exception> {
+        let mut kv_rows = Vec::new();
+        let mut hybrid_rows = Vec::new();
+        for any_row in rows {
+            match any_row {
+                AnyCache::KV(row) => kv_rows.push(row),
+                AnyCache::Hybrid(row) => hybrid_rows.push(row),
+            }
+        }
+        match (kv_rows.is_empty(), hybrid_rows.is_empty()) {
+            (false, true) => BatchedKvCache::from_rows(kv_rows).map(Self::Kv),
+            (true, false) => HybridBatchedCache::from_rows(hybrid_rows).map(Self::Hybrid),
+            _ => Err(Exception::custom(
+                "batched cache rows must all use the same cache kind",
+            )),
+        }
+    }
+
+    /// Split back into per-sequence caches, in row order.
+    pub fn into_rows(self) -> Result<Vec<AnyCache>, Exception> {
+        match self {
+            Self::Kv(cache) => Ok(cache.into_rows()?.into_iter().map(AnyCache::KV).collect()),
+            Self::Hybrid(cache) => Ok(cache
+                .into_rows()?
+                .into_iter()
+                .map(AnyCache::Hybrid)
+                .collect()),
+        }
+    }
+
+    pub const fn batch_size(&self) -> usize {
+        match self {
+            Self::Kv(cache) => cache.batch_size(),
+            Self::Hybrid(cache) => cache.batch_size(),
+        }
+    }
+
+    pub fn eval_targets(&self) -> Vec<&Array> {
+        match self {
+            Self::Kv(cache) => cache.eval_targets(),
+            Self::Hybrid(cache) => cache.eval_targets(),
+        }
+    }
+}
+
+/// Boolean `[B, 1, 1, padded_len + new_tokens]` mask (true = attend) that
+/// hides each row's left padding. `None` when no row has padding.
+fn padding_attention_mask(
+    padding: &[i32],
+    padded_len: i32,
+    new_tokens: i32,
+) -> Result<Option<Array>, Exception> {
+    if padding.iter().all(|&row_padding| row_padding == 0) {
+        return Ok(None);
+    }
+    let batch =
+        i32::try_from(padding.len()).map_err(|_| Exception::custom("batch size overflow"))?;
+    let total = padded_len + new_tokens;
+    let padding_array = Array::from_slice(padding, &[batch, 1]);
+    let positions = ops::arange::<_, i32>(None, total, None)?.reshape(&[1, total])?;
+    let mask = positions.ge(padding_array)?;
+    mask.reshape(&[batch, 1, 1, total]).map(Some)
+}
+
+/// Merge one layer's per-row caches into a left-padded batched layer.
+/// `lengths` are the rows' true token counts and `padding` their left padding.
+fn merge_kv_layer(
+    caches: &[&SteppingKeyValueCache],
+    lengths: &[i32],
+    padding: &[i32],
+) -> Result<BatchedLayerCache, Exception> {
+    let mut row_keys = Vec::with_capacity(caches.len());
+    let mut row_values = Vec::with_capacity(caches.len());
+    for ((cache, &length), &row_padding) in caches.iter().zip(lengths).zip(padding) {
+        let (keys, values) = dense_prefix(cache, length)?;
+        row_keys.push(left_pad(&keys, row_padding)?);
+        row_values.push(left_pad(&values, row_padding)?);
+    }
+    Ok(BatchedLayerCache {
+        storage: SteppingKeyValueCache::from_arrays(
+            stack_rows(&row_keys)?,
+            stack_rows(&row_values)?,
+        )?,
+        padding: padding.to_vec(),
+    })
+}
+
+/// Split a batched layer back into one unpadded cache per row.
+fn split_kv_layer(
+    layer: &BatchedLayerCache,
+    padding: &[i32],
+    padded_len: i32,
+) -> Result<Vec<SteppingKeyValueCache>, Exception> {
+    let keys = layer
+        .storage
+        .keys()
+        .ok_or_else(|| Exception::custom("batched cache layer has no keys"))?;
+    let values = layer
+        .storage
+        .values()
+        .ok_or_else(|| Exception::custom("batched cache layer has no values"))?;
+    padding
+        .iter()
+        .zip(0_i32..)
+        .map(|(&row_padding, row_index)| {
+            let valid = row_padding..padded_len;
+            let row_range = row_index..row_index + 1;
+            SteppingKeyValueCache::from_arrays(
+                keys.index((row_range.clone(), .., valid.clone(), ..)),
+                values.index((row_range, .., valid, ..)),
+            )
+        })
+        .collect()
 }
 
 /// Check `[B, T]` prefill inputs against per-row `lengths` and return `T`.
@@ -289,7 +630,12 @@ fn stack_rows(rows: &[Array]) -> Result<Array, Exception> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::float_cmp)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::float_cmp,
+    clippy::panic
+)]
 mod tests {
     use super::*;
 
@@ -394,5 +740,141 @@ mod tests {
         let mut two_layers = row(2, 1.0);
         two_layers.extend(row(2, 1.0));
         assert!(BatchedKvCache::from_rows(vec![row(2, 1.0), two_layers]).is_err());
+    }
+
+    const HISTORY: i32 = 3;
+    const CONV_DIM: i32 = 2;
+    const CONV_WIDTH: usize = 2;
+
+    /// A recurrent row whose ring slots hold `slots` (one value per slot,
+    /// replicated across channels), newest entry at `conv_pos`.
+    fn recurrent_row(slots: [f32; 3], conv_pos: i32, offset: i32) -> Vec<Option<LayerCache>> {
+        let conv_state = Array::from_slice(
+            &slots
+                .iter()
+                .flat_map(|&value| [value; CONV_WIDTH])
+                .collect::<Vec<_>>(),
+            &[1, HISTORY, CONV_DIM],
+        );
+        vec![Some(LayerCache::Arrays(ArraysCache {
+            conv_state: Some(conv_state),
+            ssm_state: Some(
+                Array::full::<f32>(
+                    &[1, 1, 1, 1],
+                    Array::from_f32(f32::from(i16::try_from(offset).unwrap())),
+                )
+                .unwrap(),
+            ),
+            conv_pos,
+            offset,
+        }))]
+    }
+
+    fn slot_values(conv_state: &Array) -> Vec<f32> {
+        let flat = conv_state.contiguous().unwrap();
+        flat.as_slice::<f32>()
+            .iter()
+            .step_by(CONV_WIDTH)
+            .copied()
+            .collect()
+    }
+
+    fn recurrent_state_mut(batch: &mut HybridBatchedCache) -> &mut ArraysCache {
+        let Some(HybridLayer::Recurrent(recurrent)) = batch.layers_mut().first_mut() else {
+            panic!("expected a recurrent layer");
+        };
+        recurrent.state_mut()
+    }
+
+    #[test]
+    fn recurrent_rows_are_normalized_to_one_ring_layout() {
+        // Chronological (oldest first) contents the rows must end up with:
+        // row 0 has wrapped (offset 5), row 1 has one token, row 2 two.
+        let rows = vec![
+            recurrent_row([30.0, 10.0, 20.0], 1, 5),
+            recurrent_row([7.0, 0.0, 0.0], 0, 1),
+            recurrent_row([1.0, 2.0, 0.0], 1, 2),
+        ];
+        let mut batch = HybridBatchedCache::from_rows(rows).unwrap();
+        let state = recurrent_state_mut(&mut batch);
+        assert_eq!(state.conv_pos, HISTORY - 1);
+        assert!(state.offset >= HISTORY);
+        let stacked = slot_values(state.conv_state.as_ref().unwrap());
+        assert_eq!(
+            stacked,
+            vec![20.0, 30.0, 10.0, 0.0, 0.0, 7.0, 0.0, 1.0, 2.0]
+        );
+    }
+
+    #[test]
+    fn recurrent_rows_keep_their_own_offsets_after_steps() {
+        let rows = vec![
+            recurrent_row([30.0, 10.0, 20.0], 1, 5),
+            recurrent_row([7.0, 0.0, 0.0], 0, 1),
+        ];
+        let mut batch = HybridBatchedCache::from_rows(rows).unwrap();
+        recurrent_state_mut(&mut batch).offset += 2;
+        let mut split = batch.into_rows().unwrap();
+        let offsets: Vec<i32> = split
+            .iter_mut()
+            .map(|row| match row.first() {
+                Some(Some(LayerCache::Arrays(cache))) => cache.offset,
+                _ => panic!("expected a recurrent layer"),
+            })
+            .collect();
+        assert_eq!(offsets, vec![7, 3]);
+        for (row, expected_ssm) in split.iter().zip([5.0_f32, 1.0]) {
+            let Some(Some(LayerCache::Arrays(cache))) = row.first() else {
+                panic!("expected a recurrent layer");
+            };
+            let ssm = cache.ssm_state.as_ref().unwrap().contiguous().unwrap();
+            assert_eq!(ssm.as_slice::<f32>(), &[expected_ssm]);
+            assert_eq!(cache.conv_pos, HISTORY - 1);
+        }
+    }
+
+    #[test]
+    fn hybrid_batch_pads_attention_layers_and_stacks_recurrent_ones() {
+        let attention_row = |length: i32, fill: f32| {
+            let keys = ops::full::<f32>(&[1, HEADS, length, DIM], Array::from_f32(fill)).unwrap();
+            LayerCache::KV(SteppingKeyValueCache::from_arrays(keys.clone(), keys).unwrap())
+        };
+        let hybrid_row = |length: i32, fill: f32, slots: [f32; 3]| {
+            let mut layers = recurrent_row(slots, 2, length);
+            layers.push(Some(attention_row(length, fill)));
+            layers
+        };
+        let mut batch = HybridBatchedCache::from_rows(vec![
+            hybrid_row(2, 1.0, [1.0, 2.0, 3.0]),
+            hybrid_row(4, 2.0, [4.0, 5.0, 6.0]),
+        ])
+        .unwrap();
+        assert_eq!(batch.batch_size(), 2);
+        let mask = batch.attention_mask(1).unwrap().unwrap();
+        assert_eq!(mask.shape(), &[2, 1, 1, 5]);
+        let positions = match batch.layers_mut().get(1) {
+            Some(HybridLayer::Attention(layer)) => layer.rope_positions().unwrap(),
+            _ => panic!("expected an attention layer"),
+        };
+        assert_eq!(positions.as_slice::<i32>(), &[2, 4]);
+
+        let rows = batch.into_rows().unwrap();
+        let lengths: Vec<i32> = rows
+            .iter()
+            .map(|row| match row.get(1) {
+                Some(Some(LayerCache::KV(cache))) => cache.offset(),
+                _ => panic!("expected an attention layer"),
+            })
+            .collect();
+        assert_eq!(lengths, vec![2, 4]);
+    }
+
+    #[test]
+    fn rows_without_recurrent_state_are_rejected() {
+        let mut row = recurrent_row([1.0, 2.0, 3.0], 2, 3);
+        if let Some(Some(LayerCache::Arrays(cache))) = row.first_mut() {
+            cache.ssm_state = None;
+        }
+        assert!(HybridBatchedCache::from_rows(vec![row]).is_err());
     }
 }

@@ -499,10 +499,21 @@ impl AnyModel {
     pub fn forward_batched(
         &mut self,
         inputs: &Array,
-        cache: &mut batched_cache::BatchedKvCache,
+        batch: &mut batched_cache::AnyBatchedCache,
     ) -> Result<Array, Exception> {
-        let mask = cache.attention_mask(1)?;
-        self.forward_with_batched_cache(inputs, mask.as_ref(), cache)
+        match (self, batch) {
+            (Self::Qwen3Next(m), batched_cache::AnyBatchedCache::Hybrid(hybrid)) => {
+                let mask = hybrid.attention_mask(1)?;
+                m.forward_batched(inputs, mask.as_ref(), hybrid.layers_mut())
+            }
+            (model, batched_cache::AnyBatchedCache::Kv(kv)) => {
+                let mask = kv.attention_mask(1)?;
+                model.forward_with_batched_cache(inputs, mask.as_ref(), kv)
+            }
+            _ => Err(Exception::custom(
+                "batched cache does not match the model architecture",
+            )),
+        }
     }
 
     /// Prefill several prompts in one forward pass.
@@ -511,18 +522,18 @@ impl AnyModel {
     /// (`T`), and `lengths` holds the true token counts. Returns last-position
     /// logits `[B, 1, vocab]` and the filled cache. Real tokens are rotated at
     /// their true positions, so the rows are interchangeable with caches
-    /// built by an unbatched prefill.
+    /// built by an unbatched prefill. See [`Self::supports_batched_prefill`].
     pub fn prefill_batched(
         &mut self,
         inputs: &Array,
         lengths: &[i32],
-    ) -> Result<(Array, batched_cache::BatchedKvCache), Exception> {
+    ) -> Result<(Array, batched_cache::AnyBatchedCache), Exception> {
         let steps = batched_cache::validate_prefill_shape(inputs, lengths)?;
         let mut cache =
             batched_cache::BatchedKvCache::for_prefill(self.num_layers()?, lengths, steps);
         let mask = batched_cache::BatchedKvCache::prefill_mask(lengths, steps)?;
         let logits = self.forward_with_batched_cache(inputs, Some(&mask), &mut cache)?;
-        Ok((logits, cache))
+        Ok((logits, batched_cache::AnyBatchedCache::Kv(cache)))
     }
 
     /// The model's ordinary forward pass, run over a batched cache.
@@ -540,6 +551,7 @@ impl AnyModel {
             Self::Starcoder2(m) => m.forward(inputs, mask, layers),
             // Gemma 2 attends over grouped `[B, kv_heads, groups, T, S]`
             // scores, which the 4D padding mask does not broadcast against.
+            // The hybrid architecture batches through its own cache type.
             Self::Qwen3Next(_)
             | Self::Gemma2(_)
             | Self::Gemma3(_)
@@ -563,7 +575,26 @@ impl AnyModel {
     /// per-row positions and a padding mask from the cache (see
     /// [`batched_cache::BatchedKvCache`]), verified against unbatched decode
     /// on real weights for each architecture listed here.
+    ///
+    /// A hybrid model with an MTP head stays unbatched: speculative decode
+    /// drafts and rolls back one sequence at a time.
     pub const fn supports_batched_decode(&self) -> bool {
+        match self {
+            Self::Transformer(_) | Self::Qwen3Moe(_) | Self::Phi3(_) | Self::Starcoder2(_) => true,
+            Self::Qwen3Next(m) => !m.has_mtp(),
+            Self::Gemma2(_)
+            | Self::Gemma3(_)
+            | Self::Gemma4(_)
+            | Self::LlavaQwen2(_)
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => false,
+        }
+    }
+
+    /// Whether several prompts can be prefilled in one left-padded pass
+    /// ([`Self::prefill_batched`]). Recurrent layers have no way to skip
+    /// padding tokens, so the hybrid architecture prefills one at a time.
+    pub const fn supports_batched_prefill(&self) -> bool {
         matches!(
             self,
             Self::Transformer(_) | Self::Qwen3Moe(_) | Self::Phi3(_) | Self::Starcoder2(_)

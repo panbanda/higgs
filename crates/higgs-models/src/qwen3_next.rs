@@ -86,9 +86,10 @@ impl Drop for CachedMetalKernel {
 static GATED_DELTA_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 
 use crate::{
+    batched_cache::HybridLayer,
     cache::{KeyValueCache, SteppingKeyValueCache},
     error::ModelError,
-    utils::{AttentionMask, apply_rope, create_causal_mask},
+    utils::{AttentionMask, apply_rope, apply_rope_at_cache, create_causal_mask},
 };
 
 // ---------------------------------------------------------------------------
@@ -1490,11 +1491,11 @@ impl Qwen3NextAttention {
     }
 
     #[allow(non_snake_case)]
-    fn forward(
+    fn forward<C: KeyValueCache>(
         &mut self,
         x: &Array,
         mask: Option<&AttentionMask>,
-        cache: &mut SteppingKeyValueCache,
+        cache: &mut C,
     ) -> Result<Array, Exception> {
         let shape = x.shape();
         let B = *shape
@@ -1532,10 +1533,8 @@ impl Qwen3NextAttention {
             .reshape(&[B, L, self.num_key_value_heads, -1])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        // RoPE with cache offset
-        let offset = cache.offset();
-        queries = apply_rope(&queries, &self.rope, offset)?;
-        keys = apply_rope(&keys, &self.rope, offset)?;
+        queries = apply_rope_at_cache(&queries, &self.rope, cache)?;
+        keys = apply_rope_at_cache(&keys, &self.rope, cache)?;
         let view = cache.update_and_view(keys, values)?;
         let try_tq_decode = mask.is_none() && L == 1;
         let output = match view {
@@ -2544,6 +2543,47 @@ impl SparseMoeBlock {
 // GatedDeltaNet (SSM-like linear attention)
 // ---------------------------------------------------------------------------
 
+/// Rotate a convolution ring buffer `[B, K - 1, C]` into chronological order
+/// (oldest first), zero-filling the front when fewer than `K - 1` tokens have
+/// been seen. `conv_pos` is the slot holding the newest entry and `offset` the
+/// number of tokens processed.
+pub(crate) fn chronological_conv_history(
+    state: &Array,
+    conv_pos: i32,
+    offset: i32,
+) -> Result<Array, Exception> {
+    let &[batch, n_keep, conv_dim] = state.shape() else {
+        return Err(Exception::custom("conv state must be [B, K - 1, C]"));
+    };
+    if n_keep <= 0 {
+        return Ok(state.clone());
+    }
+
+    let available = offset.clamp(0, n_keep);
+    if available == 0 {
+        return Ok(state.clone());
+    }
+    if available == n_keep && conv_pos == n_keep - 1 {
+        return Ok(state.clone());
+    }
+
+    let start = (conv_pos - available + 1).rem_euclid(n_keep);
+    let ordered_tail = if start + available <= n_keep {
+        state.index((.., start..start + available, ..))
+    } else {
+        let first = state.index((.., start.., ..));
+        let second = state.index((.., ..(start + available - n_keep), ..));
+        ops::concatenate(&[&first, &second], 1)?
+    };
+
+    if available == n_keep {
+        return Ok(ordered_tail);
+    }
+
+    let pad = ops::zeros_dtype(&[batch, n_keep - available, conv_dim], state.dtype())?;
+    ops::concatenate(&[&pad, &ordered_tail], 1)
+}
+
 /// Cache state for a `GatedDeltaNet` layer.
 #[derive(Debug, Clone)]
 pub struct ArraysCache {
@@ -2842,34 +2882,7 @@ impl GatedDeltaNet {
         let Some(state) = cache.conv_state.take() else {
             return ops::zeros_dtype(&[batch, n_keep, self.conv_dim], dtype);
         };
-
-        if n_keep <= 0 {
-            return Ok(state);
-        }
-
-        let available = cache.offset.clamp(0, n_keep);
-        if available == 0 {
-            return Ok(state);
-        }
-        if available == n_keep && cache.conv_pos == n_keep - 1 {
-            return Ok(state);
-        }
-
-        let start = (cache.conv_pos - available + 1).rem_euclid(n_keep);
-        let ordered_tail = if start + available <= n_keep {
-            state.index((.., start..start + available, ..))
-        } else {
-            let first = state.index((.., start.., ..));
-            let second = state.index((.., ..(start + available - n_keep), ..));
-            ops::concatenate(&[&first, &second], 1)?
-        };
-
-        if available == n_keep {
-            return Ok(ordered_tail);
-        }
-
-        let pad = ops::zeros_dtype(&[batch, n_keep - available, self.conv_dim], state.dtype())?;
-        ops::concatenate(&[&pad, &ordered_tail], 1)
+        chronological_conv_history(&state, cache.conv_pos, cache.offset)
     }
 
     #[allow(non_snake_case, clippy::too_many_lines)]
@@ -3895,6 +3908,55 @@ impl Qwen3NextCausalLM {
         }
 
         Ok(h)
+    }
+
+    /// Batched decode: one token for each of the `B` sequences in `cache`.
+    /// `inputs` is `[B, 1]`; `mask` is the batch's attention padding mask.
+    /// Returns `[B, 1, vocab]` logits.
+    pub fn forward_batched(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut [HybridLayer],
+    ) -> Result<Array, Exception> {
+        if cache.len() != self.model.layers.len() {
+            return Err(Exception::custom(format!(
+                "cache length ({}) must match num layers ({})",
+                cache.len(),
+                self.model.layers.len()
+            )));
+        }
+        if !matches!(inputs.shape(), [_, 1]) {
+            return Err(Exception::custom("batched decode inputs must be [B, 1]"));
+        }
+        let attention_mask = mask.map(|padding_mask| AttentionMask::Array(padding_mask.clone()));
+
+        let mut h = self.model.embed_tokens.forward(inputs)?;
+        for (layer, layer_cache) in self.model.layers.iter_mut().zip(cache.iter_mut()) {
+            let normed = layer.input_layernorm.forward(&h)?;
+            let r = match layer_cache {
+                HybridLayer::Recurrent(recurrent) => layer
+                    .linear_attn
+                    .as_mut()
+                    .ok_or_else(|| Exception::custom("linear_attn missing"))?
+                    .forward(&normed, None, recurrent.state_mut())?,
+                HybridLayer::Attention(attention) => layer
+                    .self_attn
+                    .as_mut()
+                    .ok_or_else(|| Exception::custom("self_attn missing"))?
+                    .forward(&normed, attention_mask.as_ref(), attention)?,
+            };
+            let h2 = h.add(r)?;
+            let normed_post = layer.post_attention_layernorm.forward(&h2)?;
+            let mlp_out = layer.mlp.forward(&normed_post)?;
+            h = h2.add(mlp_out)?;
+        }
+
+        let normed_hidden = self.model.norm.forward(&h)?;
+        match self.lm_head.as_ref() {
+            Some(head) => head.forward(&normed_hidden),
+            None => self.model.embed_tokens.as_linear(&normed_hidden),
+        }
     }
 
     /// Forward pass returning hidden states (after final `RMSNorm`, before LM head).
@@ -6976,6 +7038,114 @@ mod tests {
             max_diff < 2e-3,
             "linearized ring-buffer conv state differs from chronological state by {max_diff}"
         );
+    }
+
+    /// One decode-time convolution step on every row of a merged batch must
+    /// match the same step taken by each row alone, even though the rows'
+    /// ring buffers are at different positions and some have seen fewer than
+    /// `kernel - 1` tokens. Afterwards each row must continue correctly alone.
+    #[test]
+    fn test_batched_conv_ring_merge_and_split_match_unbatched() {
+        use crate::batched_cache::{HybridBatchedCache, HybridLayer};
+        use mlx_rs::Dtype;
+
+        let args = valid_causal_lm_args();
+        let mut gdn = GatedDeltaNet::new(&args, 64, 4).unwrap();
+        let conv_w = mlx_rs::random::uniform::<f32, f32>(
+            -0.5,
+            0.5,
+            &[gdn.conv_dim, gdn.conv_kernel_size, 1],
+            None,
+        )
+        .unwrap();
+        gdn.conv1d.weight = Param::new(conv_w);
+        gdn.conv_weight_t = None;
+        let conv_dim = gdn.conv_dim;
+        let ssm_shape = [1, gdn.num_v_heads, gdn.head_v_dim, gdn.head_k_dim];
+
+        let step_counts = [1_usize, 2, 5];
+        let inputs: Vec<Vec<Array>> = step_counts
+            .iter()
+            .map(|&count| {
+                (0..count + 6)
+                    .map(|_| {
+                        mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 1, conv_dim], None)
+                            .unwrap()
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let replay = |gdn: &mut GatedDeltaNet, row: usize| {
+            let mut cache = ArraysCache::new();
+            for input in inputs[row].iter().take(step_counts[row]) {
+                gdn.decode_conv1d_step(input, &mut cache, 1).unwrap();
+                cache.offset += 1;
+            }
+            cache.ssm_state = Some(ops::zeros_dtype(&ssm_shape, Dtype::Float32).unwrap());
+            cache
+        };
+        let positions: Vec<i32> = (0..3).map(|row| replay(&mut gdn, row).conv_pos).collect();
+        assert!(
+            positions.windows(2).any(|pair| pair[0] != pair[1]),
+            "test rows must sit at different ring positions: {positions:?}"
+        );
+
+        let mut alone: Vec<ArraysCache> = (0..3).map(|row| replay(&mut gdn, row)).collect();
+        let merged_rows = (0..3)
+            .map(|row| vec![Some(LayerCache::Arrays(replay(&mut gdn, row)))])
+            .collect();
+        let mut batch = HybridBatchedCache::from_rows(merged_rows).unwrap();
+
+        let max_difference = |expected: &Array, actual: &Array| -> f32 {
+            let diff = expected.subtract(actual).unwrap().abs().unwrap();
+            diff.max(None).unwrap().item_cast()
+        };
+
+        for step in 0..3 {
+            let stacked_input = ops::concatenate(
+                &inputs
+                    .iter()
+                    .zip(&step_counts)
+                    .map(|(row_inputs, &count)| &row_inputs[count + step])
+                    .collect::<Vec<_>>(),
+                0,
+            )
+            .unwrap();
+            let Some(HybridLayer::Recurrent(recurrent)) = batch.layers_mut().first_mut() else {
+                panic!("expected a recurrent layer");
+            };
+            let batched = gdn
+                .decode_conv1d_step(&stacked_input, recurrent.state_mut(), 3)
+                .unwrap();
+            recurrent.state_mut().offset += 1;
+            for (row, cache) in alone.iter_mut().enumerate() {
+                let expected = gdn
+                    .decode_conv1d_step(&inputs[row][step_counts[row] + step], cache, 1)
+                    .unwrap();
+                cache.offset += 1;
+                let row_index = i32::try_from(row).unwrap();
+                let diff =
+                    max_difference(&expected, &batched.index((row_index..=row_index, .., ..)));
+                assert!(
+                    diff < 1e-5,
+                    "row {row} step {step}: batched conv differs by {diff}"
+                );
+            }
+        }
+
+        let mut rows = batch.into_rows().unwrap();
+        for (row, (layers, cache)) in rows.iter_mut().zip(alone.iter_mut()).enumerate() {
+            let Some(Some(LayerCache::Arrays(split))) = layers.first_mut() else {
+                panic!("expected a recurrent layer");
+            };
+            assert_eq!(split.offset, cache.offset, "row {row} offset after split");
+            let input = &inputs[row][step_counts[row] + 3];
+            let from_split = gdn.decode_conv1d_step(input, split, 1).unwrap();
+            let expected = gdn.decode_conv1d_step(input, cache, 1).unwrap();
+            let diff = max_difference(&expected, &from_split);
+            assert!(diff < 1e-5, "row {row}: step after split differs by {diff}");
+        }
     }
 
     /// The dense FFN has a single-row decode kernel; a batch must fall back
