@@ -3296,6 +3296,47 @@ impl FfnBlock {
         silu_mul(&gate_out, &up_out)
     }
 
+    /// Pick each token's top-k experts from the router logits `[B, L, E]`.
+    ///
+    /// Returns the expert indices `[B, L, top_k]`, their mixing scores, and
+    /// whether the indices were sorted per token (callers then sort the
+    /// lookups globally before `gather_qmm`).
+    fn route_experts(&self, router_logits: &Array) -> Result<(Array, Array, bool), Exception> {
+        // With renormalized top-k scores the result equals a softmax over
+        // just the selected logits, so the softmax over every expert (and
+        // the sum and divide after it) is skipped. Softmax is monotonic, so
+        // selecting on logits picks the same experts.
+        let selection_key = if self.norm_topk_prob {
+            router_logits.clone()
+        } else {
+            ops::softmax_axis(router_logits, -1, true)?
+        };
+
+        let all_inds = ops::argpartition_axis(&selection_key, -self.top_k, -1)?;
+        let num_experts = *selection_key
+            .shape()
+            .last()
+            .ok_or_else(|| Exception::custom("gates must have last dim"))?;
+        let top_inds = all_inds.index((.., .., (num_experts - self.top_k)..));
+        // Sorting lookups by expert makes weight access coalesced, which
+        // pays off across many tokens. For a handful of lookups (one decode
+        // token) the argsorts and gathers cost more than they save, so
+        // those go to `gather_qmm` as selected.
+        let sort_lookups = moe_ffn_fuse_gate_up() || top_inds.size() >= MOE_SORT_MIN_LOOKUPS;
+        let inds = if sort_lookups {
+            ops::sort_axis(&top_inds, -1)?
+        } else {
+            top_inds
+        };
+        let selected = selection_key.take_along_axis(&inds, -1)?;
+        let scores = if self.norm_topk_prob {
+            ops::softmax_axis(&selected, -1, true)?
+        } else {
+            selected
+        };
+        Ok((inds, scores, sort_lookups))
+    }
+
     fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         if self.is_moe {
             // Delegate to SparseMoeBlock logic
@@ -3308,33 +3349,7 @@ impl FfnBlock {
                 .as_ref()
                 .ok_or_else(|| Exception::custom("MoE shared_expert_gate missing"))?;
 
-            let gates = ops::softmax_axis(&gate_ref.forward(x)?, -1, true)?;
-
-            let neg_k = -self.top_k;
-            let all_inds = ops::argpartition_axis(&gates, neg_k, -1)?;
-            let num_experts = *gates
-                .shape()
-                .last()
-                .ok_or_else(|| Exception::custom("gates must have last dim"))?;
-            let top_k_start = num_experts - self.top_k;
-            let top_inds = all_inds.index((.., .., top_k_start..));
-            // Sorting lookups by expert makes weight access coalesced, which
-            // pays off across many tokens. For a handful of lookups (one
-            // decode token) the argsorts and gathers cost more than they
-            // save, so those go to `gather_qmm` as selected.
-            let sort_lookups = moe_ffn_fuse_gate_up() || top_inds.size() >= MOE_SORT_MIN_LOOKUPS;
-            let inds = if sort_lookups {
-                ops::sort_axis(&top_inds, -1)?
-            } else {
-                top_inds
-            };
-            let raw_scores = gates.take_along_axis(&inds, -1)?;
-            let scores = if self.norm_topk_prob {
-                let sum = raw_scores.sum_axes(&[-1], true)?;
-                raw_scores.divide(&sum)?
-            } else {
-                raw_scores
-            };
+            let (inds, scores, sort_lookups) = self.route_experts(&gate_ref.forward(x)?)?;
 
             let switch_ref = self
                 .switch_mlp

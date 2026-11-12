@@ -275,7 +275,7 @@ static QWEN3_MOE: BuiltinAdapter = BuiltinAdapter {
     id: "qwen3-moe",
     family: qwen,
     version_range: "Qwen 3.0 MoE",
-    capabilities: caps(false, false, true, false, false),
+    capabilities: caps(false, false, true, false, true),
     notes: "Qwen3 sparse MoE",
     kind: LoadKind::Qwen3Moe,
 };

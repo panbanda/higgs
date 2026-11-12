@@ -42,6 +42,7 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 - `mistral`
 - `qwen2`
 - `qwen3`
+- `qwen3_moe`
 - `qwen3_5` (dense) and `qwen3_5_moe`
 - `phi3`
 - `starcoder2`

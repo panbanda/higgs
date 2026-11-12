@@ -1065,7 +1065,7 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
             && !supported
         {
             return Err(format!(
-                "batch=true is only supported for models with batched decode (llama, mistral, qwen2, qwen3, qwen3_5, qwen3_5_moe, phi3, starcoder2); {} is not supported",
+                "batch=true is only supported for models with batched decode (llama, mistral, qwen2, qwen3, qwen3_moe, qwen3_5, qwen3_5_moe, phi3, starcoder2); {} is not supported",
                 model.path
             ));
         }
