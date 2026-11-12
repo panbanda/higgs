@@ -69,6 +69,7 @@ port = 8000
 [local]
 mlx_profile = "auto"
 raise_wired_limit = false
+# thinking_budget = 256 # reasoning tokens before </think> is forced; minimum 1
 
 # --- Local models ---
 [[models]]
@@ -77,6 +78,7 @@ path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
 # mlx_profile = "throughput"
 # batch = false
 # prefill_yield_tokens = 512 # 0 or omitted keeps synchronous prefill
+# thinking_budget = 256 # overrides [local].thinking_budget for this model
 # kv_cache = "turboquant"
 # kv_bits = 3
 # kv_key_bits = 2
@@ -279,6 +281,25 @@ and backreferences are not supported. An invalid pattern returns `400` with the 
 error. `response_format: {"type": "text"}` means no constraint. The constraint is applied
 by masking token logits, so it requires the model's tokenizer to be representable by the
 grammar compiler; patterns whose automaton is very large take time and memory to compile.
+
+### Thinking budget
+
+Models that emit a `<think>` block get a cap on reasoning tokens: once the budget is spent
+the engine forces `</think>` so the model moves on to its answer. The budget resolves in this
+order, first match wins:
+
+1. Per request: `reasoning.max_tokens` on `/v1/chat/completions`, or
+   `thinking.budget_tokens` on `/v1/messages`.
+2. `thinking_budget` in the model's `[[models]]` entry.
+3. `thinking_budget` under `[local]`.
+4. The built-in default, 256.
+
+A budget must be at least 1, in config (`higgs doctor` fails on `0`) and in requests (`400`).
+To turn thinking off use reasoning effort `"none"`; a zero budget is not a way to do that.
+`higgs doctor` warns when a budget is not below `server.max_tokens`, since reasoning could
+then consume the whole response. The budget only applies to the simple engine; models with
+`batch = true` do not reason, and `thinking_budget` has no effect on them. On `/v1/messages`
+only `budget_tokens` is read from `thinking`; `type` is ignored.
 
 ### Tokenizer endpoints
 

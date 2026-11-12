@@ -137,6 +137,10 @@ Requests for `qwen` run locally; anything matching `claude-.*` is proxied to Ant
     the vLLM-style `guided_regex` (string) and `guided_json` (schema object).
     At most one may be set; more than one, an invalid regex, or a schema the
     grammar compiler rejects returns 400 with the reason.
+  - `reasoning.max_tokens` sets the reasoning-token budget for a request;
+    Anthropic `thinking.budget_tokens` does the same on `/v1/messages`.
+    Defaults come from `[[models]].thinking_budget`, then `[local].thinking_budget`,
+    then 256. See [Thinking budget](docs/configuration.md#thinking-budget).
 - Tokenizer: `POST /v1/tokenize` and `POST /v1/detokenize` (also at `/tokenize`
   and `/detokenize`), local models only.
   - `{"model": "m", "text": "hello"}` or `{"model": "m", "messages": [...]}`

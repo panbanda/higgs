@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use higgs_engine::batch_engine::BatchEngine;
 use higgs_engine::chat_template::ChatMessage;
-use higgs_engine::engine::{GenerationOutput, StreamingOutput};
+use higgs_engine::engine::{GenerationOutput, StreamingOutput, ThinkingMode};
 use higgs_engine::error::EngineError;
 use higgs_engine::mlx_tuning::MlxRuntimeTuning;
 use higgs_engine::simple::SimpleEngine;
@@ -15,6 +15,14 @@ use higgs_models::turboquant::KvCacheConfig;
 use crate::config::HiggsConfig;
 use crate::metrics::MetricsStore;
 use crate::router::Router;
+
+#[cfg(test)]
+const fn request_thinking_budget(thinking: ThinkingMode) -> Option<u32> {
+    match thinking {
+        ThinkingMode::On { budget } => budget,
+        ThinkingMode::Off => None,
+    }
+}
 
 /// Unified engine interface wrapping either the simple (serialized) or batch
 /// (interleaved) engine. Route handlers interact with this enum exclusively.
@@ -33,6 +41,7 @@ impl Engine {
         raise_wired_limit: bool,
         disk_prefix_dir: Option<&Path>,
         disk_prefix_budget: u64,
+        default_thinking_budget: u32,
     ) -> Result<Self, EngineError> {
         SimpleEngine::load(
             dir,
@@ -41,6 +50,7 @@ impl Engine {
             raise_wired_limit,
             disk_prefix_dir,
             disk_prefix_budget,
+            default_thinking_budget,
         )
         .map(|e| Self::Simple(Box::new(e)))
     }
@@ -202,7 +212,7 @@ impl Engine {
             stop_sequences,
             logprobs,
             top_logprobs,
-            self.enable_thinking(),
+            ThinkingMode::new(self.enable_thinking(), None),
             constraint,
             pixel_values,
         )
@@ -217,7 +227,7 @@ impl Engine {
         stop_sequences: &[String],
         logprobs: bool,
         top_logprobs: Option<u32>,
-        enable_thinking: bool,
+        thinking: ThinkingMode,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
         pixel_values: Option<PixelValues>,
     ) -> Result<GenerationOutput, EngineError> {
@@ -229,7 +239,7 @@ impl Engine {
                 stop_sequences,
                 logprobs,
                 top_logprobs,
-                enable_thinking,
+                thinking,
                 constraint,
                 pixel_values,
             ),
@@ -240,15 +250,16 @@ impl Engine {
                 stop_sequences,
                 logprobs,
                 top_logprobs,
-                enable_thinking,
+                thinking,
                 constraint,
                 pixel_values,
             ),
             #[cfg(test)]
             Self::Stub(stub) => stub.generate(crate::test_support::StubCall {
                 max_tokens,
-                thinking_enabled: enable_thinking,
+                thinking_enabled: thinking.is_on(),
                 has_constraint: constraint.is_some(),
+                thinking_budget: request_thinking_budget(thinking),
             }),
         }
     }
@@ -274,7 +285,7 @@ impl Engine {
             logprobs,
             top_logprobs,
             sender,
-            self.enable_thinking(),
+            ThinkingMode::new(self.enable_thinking(), None),
             // /v1/completions convenience entry never streams prefill progress.
             false,
             constraint,
@@ -292,7 +303,7 @@ impl Engine {
         logprobs: bool,
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
-        enable_thinking: bool,
+        thinking: ThinkingMode,
         return_progress: bool,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
         pixel_values: Option<PixelValues>,
@@ -306,7 +317,7 @@ impl Engine {
                 logprobs,
                 top_logprobs,
                 sender,
-                enable_thinking,
+                thinking,
                 return_progress,
                 constraint,
                 pixel_values,
@@ -319,7 +330,7 @@ impl Engine {
                 logprobs,
                 top_logprobs,
                 sender,
-                enable_thinking,
+                thinking,
                 return_progress,
                 constraint,
                 pixel_values,
@@ -328,8 +339,9 @@ impl Engine {
             Self::Stub(stub) => stub.generate_streaming(
                 crate::test_support::StubCall {
                     max_tokens,
-                    thinking_enabled: enable_thinking,
+                    thinking_enabled: thinking.is_on(),
                     has_constraint: constraint.is_some(),
+                    thinking_budget: request_thinking_budget(thinking),
                 },
                 sender,
             ),

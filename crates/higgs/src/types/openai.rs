@@ -73,6 +73,10 @@ pub struct ReasoningConfig {
     /// model's reasoning / thinking mode and preserves the original string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Reasoning-token budget for this request; overrides the configured
+    /// `thinking_budget`. Must be at least 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
 }
 
 /// Response format specification.

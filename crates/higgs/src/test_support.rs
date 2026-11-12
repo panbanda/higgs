@@ -26,6 +26,8 @@ pub struct StubCall {
     pub max_tokens: u32,
     pub thinking_enabled: bool,
     pub has_constraint: bool,
+    /// `Some` only when the request set its own budget.
+    pub thinking_budget: Option<u32>,
 }
 
 pub struct StubEngine {

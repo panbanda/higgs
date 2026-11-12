@@ -28,7 +28,17 @@ use crate::{
         MessageStartPayload, MessageStopEvent, TextDelta,
     },
 };
+use higgs_engine::engine::ThinkingMode;
 use higgs_models::SamplingParams;
+
+fn requested_thinking_budget(
+    thinking: Option<&crate::types::anthropic::ThinkingConfig>,
+) -> Result<Option<u32>, ServerError> {
+    crate::reasoning::validate_thinking_budget(
+        thinking.and_then(|config| config.budget_tokens),
+        "thinking.budget_tokens",
+    )
+}
 
 #[allow(clippy::too_many_lines)]
 pub async fn create_message(
@@ -254,6 +264,7 @@ async fn create_message_non_streaming(
 
     let engine_messages = anthropic_messages_to_engine(&req.messages, req.system.as_ref());
     let tools = req.tools.as_deref();
+    let thinking_budget = requested_thinking_budget(req.thinking.as_ref())?;
     let thinking_enabled = crate::reasoning::effective_thinking_enabled(
         engine.enable_thinking(),
         &[engine.model_name(), req.model.as_str()],
@@ -272,7 +283,7 @@ async fn create_message_non_streaming(
             &stop_sequences,
             false,
             None,
-            thinking_enabled,
+            ThinkingMode::new(thinking_enabled, thinking_budget),
             None,
             None,
         )
@@ -342,6 +353,7 @@ fn create_message_stream(
 
     let engine_messages = anthropic_messages_to_engine(&req.messages, req.system.as_ref());
     let tools = req.tools.as_deref();
+    let thinking_budget = requested_thinking_budget(req.thinking.as_ref())?;
     let thinking_enabled = crate::reasoning::effective_thinking_enabled(
         engine.enable_thinking(),
         &[engine.model_name(), req.model.as_str()],
@@ -369,7 +381,7 @@ fn create_message_stream(
             false,
             None,
             &tx,
-            thinking_enabled,
+            ThinkingMode::new(thinking_enabled, thinking_budget),
             // Progress events are consumed for metrics only; the Anthropic
             // stream never surfaces them.
             true,
@@ -687,5 +699,52 @@ mod tests {
         assert_eq!(delta["usage"]["cache_read_input_tokens"], 3);
         assert_eq!(delta["usage"]["input_tokens"], 4);
         assert_eq!(delta["usage"]["output_tokens"], 2);
+    }
+
+    fn thinking_stub() -> StubEngine {
+        let mut stub = StubEngine::named("stub");
+        stub.script.enable_thinking = true;
+        stub.script.generation = Some(generation_output("hello", 9, 2));
+        stub
+    }
+
+    #[tokio::test]
+    async fn thinking_budget_tokens_sets_the_budget() {
+        let (app, engine) = app_with_stub(thinking_stub());
+        let mut request = body(false);
+        request["thinking"] = serde_json::json!({"type": "enabled", "budget_tokens": 2048});
+
+        let (status, text) = post_json(&app, "/v1/messages", &request).await;
+
+        assert_eq!(status, http::StatusCode::OK, "{text}");
+        let calls = engine.stub_calls();
+        assert_eq!(calls[0].thinking_budget, Some(2048));
+        assert!(calls[0].thinking_enabled);
+    }
+
+    #[tokio::test]
+    async fn absent_thinking_leaves_the_budget_to_configuration() {
+        let (app, engine) = app_with_stub(thinking_stub());
+
+        let (status, _text) = post_json(&app, "/v1/messages", &body(false)).await;
+
+        assert_eq!(status, http::StatusCode::OK);
+        assert_eq!(engine.stub_calls()[0].thinking_budget, None);
+    }
+
+    #[tokio::test]
+    async fn zero_budget_tokens_is_rejected() {
+        let (app, engine) = app_with_stub(thinking_stub());
+        let mut request = body(false);
+        request["thinking"] = serde_json::json!({"type": "enabled", "budget_tokens": 0});
+
+        let (status, text) = post_json(&app, "/v1/messages", &request).await;
+
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{text}");
+        assert!(
+            text.contains("thinking.budget_tokens must be at least 1"),
+            "{text}"
+        );
+        assert!(engine.stub_calls().is_empty());
     }
 }

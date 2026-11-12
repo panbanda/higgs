@@ -37,7 +37,10 @@ fn is_settable_key(segments: &[&str]) -> bool {
                 | "max_body_size"
                 | "cors_origins"
         ),
-        ["local", field] => matches!(*field, "mlx_profile" | "raise_wired_limit"),
+        ["local", field] => matches!(
+            *field,
+            "mlx_profile" | "raise_wired_limit" | "thinking_budget"
+        ),
         ["provider", name, field] if !name.is_empty() => matches!(
             *field,
             "url" | "format" | "api_key" | "strip_auth" | "stub_count_tokens"

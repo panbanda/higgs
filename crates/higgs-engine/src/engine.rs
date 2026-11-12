@@ -2,6 +2,44 @@ use std::time::Instant;
 
 pub use higgs_models::{TokenLogprobInfo, TopLogprobEntry};
 
+/// Reasoning tokens allowed before the engine forces `</think>`, unless the
+/// model or request configures another budget.
+pub const DEFAULT_THINKING_BUDGET: u32 = 256;
+
+/// Whether a request runs with a reasoning block, and how long it may be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingMode {
+    Off,
+    On {
+        /// Per-request budget; `None` defers to the model's configured default.
+        budget: Option<u32>,
+    },
+}
+
+impl ThinkingMode {
+    pub const fn new(enabled: bool, budget: Option<u32>) -> Self {
+        if enabled {
+            Self::On { budget }
+        } else {
+            Self::Off
+        }
+    }
+
+    pub const fn is_on(self) -> bool {
+        matches!(self, Self::On { .. })
+    }
+
+    /// The request's budget, or `default` when it did not set one.
+    pub const fn budget_or(self, default: u32) -> u32 {
+        match self {
+            Self::On {
+                budget: Some(budget),
+            } => budget,
+            Self::On { budget: None } | Self::Off => default,
+        }
+    }
+}
+
 /// What the engine measured while serving one request.
 ///
 /// Every field is `None` until the engine actually observed it, so callers
@@ -273,6 +311,31 @@ mod tests {
             token_logprob: None,
             prefill_progress: None,
         }
+    }
+
+    #[test]
+    fn thinking_mode_off_ignores_budget() {
+        let mode = ThinkingMode::new(false, Some(10));
+        assert_eq!(mode, ThinkingMode::Off);
+        assert!(!mode.is_on());
+        assert_eq!(
+            mode.budget_or(DEFAULT_THINKING_BUDGET),
+            DEFAULT_THINKING_BUDGET
+        );
+    }
+
+    #[test]
+    fn thinking_mode_request_budget_beats_default() {
+        let mode = ThinkingMode::new(true, Some(32));
+        assert!(mode.is_on());
+        assert_eq!(mode.budget_or(512), 32);
+    }
+
+    #[test]
+    fn thinking_mode_without_budget_uses_default() {
+        let mode = ThinkingMode::new(true, None);
+        assert_eq!(mode.budget_or(512), 512);
+        assert_eq!(DEFAULT_THINKING_BUDGET, 256);
     }
 
     #[test]

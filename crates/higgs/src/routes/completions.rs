@@ -26,7 +26,7 @@ use crate::{
     },
     usage::{TokenCounts, build_usage},
 };
-use higgs_engine::engine::GenerationStats;
+use higgs_engine::engine::{GenerationStats, ThinkingMode};
 use higgs_models::SamplingParams;
 
 #[allow(clippy::too_many_lines)]
@@ -264,7 +264,7 @@ fn completions_stream(
             want_logprobs,
             top_logprobs,
             &tx,
-            engine.enable_thinking(),
+            ThinkingMode::new(engine.enable_thinking(), None),
             // Progress events feed the usage block and metrics; they are
             // never written to the client as completion chunks.
             true,

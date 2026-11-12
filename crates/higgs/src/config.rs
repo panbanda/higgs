@@ -365,6 +365,12 @@ pub struct LocalConfig {
     /// Raise MLX's wired memory limit to the device-recommended maximum.
     #[serde(default)]
     pub raise_wired_limit: bool,
+    /// Reasoning tokens a model may spend before `</think>` is forced, for
+    /// models that do not set their own `thinking_budget`. Must be at least 1;
+    /// defaults to 256. Requests can override it with `reasoning.max_tokens`
+    /// (OpenAI-style) or `thinking.budget_tokens` (Anthropic-style).
+    #[serde(default)]
+    pub thinking_budget: Option<u32>,
     /// Internal requested profile after resolving precedence (`model` > `--mlx-profile` > `HIGGS_MLX_PROFILE` > local default).
     #[serde(skip, default)]
     pub requested_mlx_profile: RequestedMlxProfile,
@@ -375,6 +381,7 @@ impl Default for LocalConfig {
         Self {
             mlx_profile: MlxProfile::Auto,
             raise_wired_limit: false,
+            thinking_budget: None,
             requested_mlx_profile: RequestedMlxProfile::Auto,
         }
     }
@@ -399,6 +406,10 @@ pub struct ModelConfig {
     /// `0` retain synchronous prefill behavior.
     #[serde(default)]
     pub prefill_yield_tokens: Option<u32>,
+    /// Reasoning tokens this model may spend before `</think>` is forced.
+    /// Overrides `[local].thinking_budget`; must be at least 1.
+    #[serde(default)]
+    pub thinking_budget: Option<u32>,
     /// KV-cache storage mode.
     #[serde(default)]
     pub kv_cache: KvCacheMode,
@@ -449,6 +460,13 @@ const fn default_kv_disk_space_mb() -> u64 {
 }
 
 impl ModelConfig {
+    /// Thinking budget after applying `[[models]]` > `[local]` > built-in default.
+    pub fn effective_thinking_budget(&self, local: &LocalConfig) -> u32 {
+        self.thinking_budget
+            .or(local.thinking_budget)
+            .unwrap_or(higgs_engine::engine::DEFAULT_THINKING_BUDGET)
+    }
+
     /// Validate disk-prefix-store settings independently of engine startup.
     pub fn validate_disk_prefix_store(&self) -> Result<(), String> {
         let Some(dir) = self.kv_disk_dir.as_deref() else {
@@ -704,6 +722,7 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             mlx_profile: None,
             batch: args.batch,
             prefill_yield_tokens: None,
+            thinking_budget: None,
             kv_cache,
             kv_bits: args.kv_bits.unwrap_or(default_kv_bits()),
             kv_key_bits: args.kv_key_bits,
@@ -818,6 +837,7 @@ fn extract_config(
                     mlx_profile: None,
                     batch: serve_args.batch,
                     prefill_yield_tokens: None,
+                    thinking_budget: None,
                     kv_cache,
                     kv_bits: serve_args.kv_bits.unwrap_or(default_kv_bits()),
                     kv_key_bits: serve_args.kv_key_bits,
@@ -987,6 +1007,7 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         mlx_profile: None,
         batch: false,
         prefill_yield_tokens: None,
+        thinking_budget: None,
         kv_cache: KvCacheMode::Off,
         kv_bits: default_kv_bits(),
         kv_key_bits: None,
@@ -2164,5 +2185,34 @@ mod tests {
         assert_ne!(default, profiled);
         assert!(default.to_str().unwrap().contains("higgs.log"));
         assert!(profiled.to_str().unwrap().contains("higgs.dev.log"));
+    }
+
+    fn write_and_load(toml: &str) -> HiggsConfig {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, toml).unwrap();
+        load_config_file(&path, None).unwrap()
+    }
+
+    #[test]
+    fn thinking_budget_defaults_to_engine_default() {
+        let config = write_and_load("[[models]]\npath = \"org/model\"\n");
+        let model = config.models.first().unwrap();
+        assert_eq!(model.thinking_budget, None);
+        assert_eq!(config.local.thinking_budget, None);
+        assert_eq!(model.effective_thinking_budget(&config.local), 256);
+    }
+
+    #[test]
+    fn thinking_budget_local_applies_to_models_without_their_own() {
+        let config = write_and_load(
+            "[local]\nthinking_budget = 512\n\n[[models]]\npath = \"org/a\"\n\n[[models]]\npath = \"org/b\"\nthinking_budget = 64\n",
+        );
+        let budgets: Vec<u32> = config
+            .models
+            .iter()
+            .map(|model| model.effective_thinking_budget(&config.local))
+            .collect();
+        assert_eq!(budgets, vec![512, 64]);
     }
 }

@@ -28,7 +28,7 @@ use crate::{
     },
     usage::{TokenCounts, build_usage, count_text_tokens},
 };
-use higgs_engine::engine::GenerationStats;
+use higgs_engine::engine::{GenerationStats, ThinkingMode};
 use higgs_models::SamplingParams;
 
 #[allow(clippy::too_many_lines)]
@@ -308,6 +308,7 @@ async fn chat_completions_non_streaming(
     // Treat an empty `tools: []` as absent (mirrors the streaming path) so it
     // doesn't define `tools` in the template context or trigger tool parsing.
     let tools = req.tools.as_deref().filter(|t| !t.is_empty());
+    let thinking_budget = crate::reasoning::requested_thinking_budget(req.reasoning.as_ref())?;
     let thinking_enabled = crate::reasoning::effective_thinking_enabled(
         engine.enable_thinking(),
         &[engine.model_name(), req.model.as_str()],
@@ -346,7 +347,7 @@ async fn chat_completions_non_streaming(
             &stop_sequences,
             want_logprobs,
             top_logprobs,
-            thinking_enabled,
+            ThinkingMode::new(thinking_enabled, thinking_budget),
             constraint,
             pixel_values,
         )
@@ -497,6 +498,7 @@ fn chat_completions_stream(
     };
 
     let messages = convert_messages(&effective_messages);
+    let thinking_budget = crate::reasoning::requested_thinking_budget(req.reasoning.as_ref())?;
     let thinking_enabled_stream = crate::reasoning::effective_thinking_enabled(
         engine.enable_thinking(),
         &[engine.model_name(), req.model.as_str()],
@@ -571,7 +573,7 @@ fn chat_completions_stream(
             want_logprobs,
             top_logprobs,
             &tx,
-            thinking_enabled_stream,
+            ThinkingMode::new(thinking_enabled_stream, thinking_budget),
             // Always requested so the metrics record sees prefix-cache hits;
             // progress chunks are only forwarded when the client opted in.
             true,
@@ -1410,6 +1412,60 @@ mod tests {
             let extra = serde_json::json!({"guided_json": "not a schema"});
             let (status, body, _engine) = post_chat(generating_stub(), &extra).await;
             assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        }
+
+        fn thinking_stub() -> StubEngine {
+            let mut stub = generating_stub();
+            stub.script.enable_thinking = true;
+            stub.script.stream = vec![progress_event(0, 5), token_event("hello", 1, Some("stop"))];
+            stub
+        }
+
+        #[tokio::test]
+        async fn thinking_budget_defaults_to_engine_configuration() {
+            let (status, _body, engine) = post_chat(thinking_stub(), &serde_json::json!({})).await;
+            assert_eq!(status, http::StatusCode::OK);
+            let call = &recorded_calls(&engine)[0];
+            assert!(call.thinking_enabled);
+            assert_eq!(call.thinking_budget, None);
+        }
+
+        #[tokio::test]
+        async fn request_reasoning_max_tokens_sets_the_budget() {
+            let extra = serde_json::json!({"reasoning": {"max_tokens": 64}});
+            let (status, body, engine) = post_chat(thinking_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            assert_eq!(recorded_calls(&engine)[0].thinking_budget, Some(64));
+        }
+
+        #[tokio::test]
+        async fn request_reasoning_max_tokens_applies_when_streaming() {
+            let extra = serde_json::json!({"stream": true, "reasoning": {"max_tokens": 32}});
+            let (status, body, engine) = post_chat(thinking_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            assert_eq!(recorded_calls(&engine)[0].thinking_budget, Some(32));
+        }
+
+        #[tokio::test]
+        async fn zero_reasoning_max_tokens_is_rejected() {
+            let extra = serde_json::json!({"reasoning": {"max_tokens": 0}});
+            let (status, body, engine) = post_chat(thinking_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+            assert!(
+                body.contains("reasoning.max_tokens must be at least 1"),
+                "{body}"
+            );
+            assert!(recorded_calls(&engine).is_empty());
+        }
+
+        #[tokio::test]
+        async fn budget_is_inert_when_thinking_is_off() {
+            let extra = serde_json::json!({"reasoning": {"effort": "none", "max_tokens": 64}});
+            let (status, _body, engine) = post_chat(thinking_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::OK);
+            let call = &recorded_calls(&engine)[0];
+            assert!(!call.thinking_enabled);
+            assert_eq!(call.thinking_budget, None);
         }
     }
 }

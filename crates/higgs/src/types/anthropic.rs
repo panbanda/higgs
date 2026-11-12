@@ -47,6 +47,16 @@ pub struct CreateMessageRequest {
     pub stop_sequences: Option<Vec<String>>,
     #[serde(default)]
     pub tools: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub thinking: Option<ThinkingConfig>,
+}
+
+/// Anthropic `thinking` request parameter. Only `budget_tokens` is honored;
+/// whether the model reasons at all stays a server-side decision.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ThinkingConfig {
+    #[serde(default)]
+    pub budget_tokens: Option<u32>,
 }
 
 /// A message in the Anthropic format.

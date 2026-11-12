@@ -307,6 +307,7 @@ fn load_engines(
                 config.local.raise_wired_limit,
                 model_cfg.kv_disk_dir.as_deref().map(std::path::Path::new),
                 model_cfg.kv_disk_space_mb.saturating_mul(1024 * 1024),
+                model_cfg.effective_thinking_budget(&config.local),
             )?
         };
         let name = model_cfg

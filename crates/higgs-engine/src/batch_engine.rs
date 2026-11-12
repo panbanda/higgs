@@ -23,7 +23,7 @@ use tokenizers::Tokenizer;
 
 use crate::{
     chat_template::{ChatMessage, ChatTemplateRenderer},
-    engine::{GenerationOutput, GenerationStats, PrefillProgress, StreamingOutput},
+    engine::{GenerationOutput, GenerationStats, PrefillProgress, StreamingOutput, ThinkingMode},
     error::EngineError,
     model_loader,
     prompt_cache::PrefixCache,
@@ -279,7 +279,7 @@ impl BatchEngine {
             stop_sequences,
             logprobs,
             top_logprobs,
-            false,
+            ThinkingMode::Off,
             constraint,
             pixel_values,
         )
@@ -294,7 +294,7 @@ impl BatchEngine {
         stop_sequences: &[String],
         logprobs: bool,
         top_logprobs: Option<u32>,
-        _enable_thinking: bool,
+        _thinking: ThinkingMode,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<higgs_models::siglip::PixelValues>,
     ) -> Result<GenerationOutput, EngineError> {
@@ -395,7 +395,7 @@ impl BatchEngine {
             logprobs,
             top_logprobs,
             sender,
-            false,
+            ThinkingMode::Off,
             false,
             constraint,
             pixel_values,
@@ -412,7 +412,7 @@ impl BatchEngine {
         logprobs: bool,
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
-        _enable_thinking: bool,
+        _thinking: ThinkingMode,
         return_progress: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<higgs_models::siglip::PixelValues>,
