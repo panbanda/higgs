@@ -121,6 +121,8 @@ impl ChatChunkWriter {
 /// Pre-serialized prefix + reusable buffer for `/v1/completions` SSE chunks.
 pub(crate) struct CompletionChunkWriter {
     prefix: String,
+    /// Same identity fields as `prefix`, without the open `choices` array.
+    head: String,
     buf: String,
 }
 
@@ -133,11 +135,27 @@ impl CompletionChunkWriter {
         prefix.push_str(&created.to_string());
         prefix.push_str(r#","model":"#);
         push_json_string(&mut prefix, model);
+        let head = prefix.clone();
         prefix.push_str(r#","choices":["#);
         Self {
             prefix,
+            head,
             buf: String::with_capacity(192),
         }
+    }
+
+    /// Build a terminal chunk with `choices: []` and a `usage` block.
+    pub(crate) fn write_usage(
+        &mut self,
+        usage: &CompletionUsage,
+    ) -> Result<&str, serde_json::Error> {
+        self.buf.clear();
+        self.buf.push_str(&self.head);
+        self.buf.push_str(r#","choices":[],"usage":"#);
+        let usage_json = serde_json::to_string(usage)?;
+        self.buf.push_str(&usage_json);
+        self.buf.push('}');
+        Ok(&self.buf)
     }
 
     pub(crate) fn write(
@@ -333,11 +351,7 @@ mod tests {
         let id = "chatcmpl-x";
         let model = "m";
         let mut w = ChatChunkWriter::new(id, 7, model);
-        let usage = CompletionUsage {
-            prompt_tokens: 3,
-            completion_tokens: 5,
-            total_tokens: 8,
-        };
+        let usage = CompletionUsage::new(3, 5);
         let got = w.write_usage(&usage).unwrap().to_owned();
         let expected = serde_json::to_string(&ChatCompletionChunk {
             id: id.to_owned(),
@@ -427,11 +441,7 @@ mod tests {
             tool_calls: None,
         };
         let chunks = ["Hello", ", ", "world!"];
-        let usage = CompletionUsage {
-            prompt_tokens: 7,
-            completion_tokens: 3,
-            total_tokens: 10,
-        };
+        let usage = CompletionUsage::new(7, 3);
 
         // New path.
         let mut new_path = String::new();
@@ -515,5 +525,24 @@ mod tests {
         );
 
         assert_eq!(new_path, baseline);
+    }
+
+    #[test]
+    fn completion_usage_chunk_has_empty_choices_and_usage() {
+        let mut writer = CompletionChunkWriter::new("cmpl-x", 7, "m");
+        let usage = CompletionUsage::new(3, 5);
+        let got = writer.write_usage(&usage).unwrap().to_owned();
+        let value: serde_json::Value = serde_json::from_str(&got).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "id": "cmpl-x",
+                "object": "text_completion",
+                "created": 7,
+                "model": "m",
+                "choices": [],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8},
+            })
+        );
     }
 }

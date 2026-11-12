@@ -25,7 +25,7 @@ use crate::{
     cache::PagedKvCache,
     chat_template::{ChatMessage, ChatTemplateRenderer},
     disk_prefix_store::{DiskPrefixStore, StoreIdentity},
-    engine::{GenerationOutput, StreamingOutput},
+    engine::{GenerationOutput, GenerationStats, StreamingOutput},
     engine_thread::EngineThread,
     error::EngineError,
     mlx_tuning::MlxRuntimeTuning,
@@ -293,6 +293,14 @@ struct PreparedGeneration<'a> {
     prompt_len: u32,
     pixel_values: Option<Array>,
     disk_loaded: bool,
+}
+
+impl PreparedGeneration<'_> {
+    /// Prompt tokens served from the prefix cache rather than prefilled.
+    fn cached_tokens(&self) -> u32 {
+        let prefilled = u32::try_from(self.actual_prompt_tokens.len()).unwrap_or(u32::MAX);
+        self.prompt_len.saturating_sub(prefilled)
+    }
 }
 
 impl SimpleEngine {
@@ -1274,12 +1282,17 @@ impl SimpleEngineCore {
                 prompt_tokens: Self::prompt_len(prompt_tokens)?,
                 completion_tokens: 0,
                 token_logprobs: None,
+                stats: crate::engine::GenerationStats::default(),
             });
         }
 
+        let mut stats = GenerationStats {
+            prefill_started_at: Some(std::time::Instant::now()),
+            ..GenerationStats::default()
+        };
         // Set a task-local default stream so every MLX operation reuses it
         // instead of creating a new Stream (5 FFI calls) per operation.
-        with_stream(&Stream::new(), || {
+        let mut output = with_stream(&Stream::new(), || {
             self.generate_inner(
                 prompt_tokens,
                 max_tokens,
@@ -1290,8 +1303,12 @@ impl SimpleEngineCore {
                 enable_thinking,
                 constraint,
                 pixel_values,
+                &mut stats,
             )
-        })
+        })?;
+        stats.finished_at = Some(std::time::Instant::now());
+        output.stats = stats;
+        Ok(output)
     }
 
     #[allow(
@@ -1310,11 +1327,13 @@ impl SimpleEngineCore {
         enable_thinking: bool,
         mut constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
+        stats: &mut GenerationStats,
     ) -> Result<GenerationOutput, EngineError> {
         let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
 
         let mut prepared = self.prepare_generation(prompt_tokens, pixel_values)?;
         let prompt_len = prepared.prompt_len;
+        stats.cached_tokens = Some(prepared.cached_tokens());
         #[allow(clippy::float_cmp)]
         let capture_mtp_prefill = mtp_prefill_priming_enabled()
             && self.tuning.enable_mtp()
@@ -1335,6 +1354,7 @@ impl SimpleEngineCore {
 
         // Capture T1 (already eval'd inside run_prefill).
         let first_token_id: u32 = current_token.item_cast();
+        stats.first_token_at = Some(std::time::Instant::now());
         // Advance the constraint past the first sampled token before decode.
         if let Some(ref mut cg) = constraint {
             cg.advance(first_token_id);
@@ -1354,6 +1374,7 @@ impl SimpleEngineCore {
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
                 token_logprobs: all_logprobs,
+                stats: crate::engine::GenerationStats::default(),
             });
         }
         if has_stop_sequences {
@@ -1365,6 +1386,7 @@ impl SimpleEngineCore {
                     prompt_tokens: prompt_len,
                     completion_tokens: 1,
                     token_logprobs: all_logprobs,
+                    stats: crate::engine::GenerationStats::default(),
                 });
             }
         }
@@ -1375,6 +1397,7 @@ impl SimpleEngineCore {
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
                 token_logprobs: all_logprobs,
+                stats: crate::engine::GenerationStats::default(),
             });
         }
 
@@ -1562,6 +1585,7 @@ impl SimpleEngineCore {
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: all_logprobs,
+                    stats: crate::engine::GenerationStats::default(),
                 });
             }
 
@@ -1579,6 +1603,7 @@ impl SimpleEngineCore {
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: all_logprobs,
+                    stats: crate::engine::GenerationStats::default(),
                 });
             }
 
@@ -1598,6 +1623,7 @@ impl SimpleEngineCore {
                         prompt_tokens: prompt_len,
                         completion_tokens: completion_len,
                         token_logprobs: all_logprobs,
+                        stats: crate::engine::GenerationStats::default(),
                     });
                 }
             }
@@ -1616,6 +1642,7 @@ impl SimpleEngineCore {
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: all_logprobs,
+                    stats: crate::engine::GenerationStats::default(),
                 });
             }
 
@@ -1752,6 +1779,7 @@ impl SimpleEngineCore {
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: None,
+                    stats: crate::engine::GenerationStats::default(),
                 });
             }
 
@@ -1798,6 +1826,7 @@ impl SimpleEngineCore {
                                         prompt_tokens: prompt_len,
                                         completion_tokens: Self::completion_len(tokens)?,
                                         token_logprobs: None,
+                                        stats: crate::engine::GenerationStats::default(),
                                     });
                                 }
 
@@ -1816,6 +1845,7 @@ impl SimpleEngineCore {
                                             prompt_tokens: prompt_len,
                                             completion_tokens: Self::completion_len(tokens)?,
                                             token_logprobs: None,
+                                            stats: crate::engine::GenerationStats::default(),
                                         });
                                     }
                                 }
@@ -1830,6 +1860,7 @@ impl SimpleEngineCore {
                                         prompt_tokens: prompt_len,
                                         completion_tokens: forced_completion_len,
                                         token_logprobs: None,
+                                        stats: crate::engine::GenerationStats::default(),
                                     });
                                 }
                                 break;
@@ -1849,6 +1880,7 @@ impl SimpleEngineCore {
                         prompt_tokens: prompt_len,
                         completion_tokens: Self::completion_len(tokens)?,
                         token_logprobs: None,
+                        stats: crate::engine::GenerationStats::default(),
                     });
                 }
             }
@@ -1864,6 +1896,7 @@ impl SimpleEngineCore {
                         prompt_tokens: prompt_len,
                         completion_tokens: Self::completion_len(tokens)?,
                         token_logprobs: None,
+                        stats: crate::engine::GenerationStats::default(),
                     });
                 }
             }
@@ -1878,6 +1911,7 @@ impl SimpleEngineCore {
                     prompt_tokens: prompt_len,
                     completion_tokens: final_completion_len,
                     token_logprobs: None,
+                    stats: crate::engine::GenerationStats::default(),
                 });
             }
 
@@ -2034,6 +2068,7 @@ impl SimpleEngineCore {
                                         prompt_tokens: prompt_len,
                                         completion_tokens: Self::completion_len(tokens)?,
                                         token_logprobs: None,
+                                        stats: crate::engine::GenerationStats::default(),
                                     });
                                 }
 
@@ -2050,6 +2085,7 @@ impl SimpleEngineCore {
                                             prompt_tokens: prompt_len,
                                             completion_tokens: Self::completion_len(tokens)?,
                                             token_logprobs: None,
+                                            stats: crate::engine::GenerationStats::default(),
                                         });
                                     }
                                 }
@@ -2064,6 +2100,7 @@ impl SimpleEngineCore {
                                         prompt_tokens: prompt_len,
                                         completion_tokens: completion_len,
                                         token_logprobs: None,
+                                        stats: crate::engine::GenerationStats::default(),
                                     });
                                 }
 
@@ -2085,6 +2122,7 @@ impl SimpleEngineCore {
                         prompt_tokens: prompt_len,
                         completion_tokens: Self::completion_len(tokens)?,
                         token_logprobs: None,
+                        stats: crate::engine::GenerationStats::default(),
                     });
                 }
             }
@@ -2100,6 +2138,7 @@ impl SimpleEngineCore {
                         prompt_tokens: prompt_len,
                         completion_tokens: Self::completion_len(tokens)?,
                         token_logprobs: None,
+                        stats: crate::engine::GenerationStats::default(),
                     });
                 }
             }
@@ -2114,6 +2153,7 @@ impl SimpleEngineCore {
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: None,
+                    stats: crate::engine::GenerationStats::default(),
                 });
             }
 
@@ -2494,9 +2534,7 @@ impl SimpleEngineCore {
         // consumer — dropped progress events are harmless. The returned guard is
         // held for the prefill's duration and uninstalls the sink on drop.
         let prefill_sink = return_progress.then(|| {
-            let actual_tokens =
-                u32::try_from(prepared.actual_prompt_tokens.len()).unwrap_or(u32::MAX);
-            let cached = prompt_len.saturating_sub(actual_tokens);
+            let cached = prepared.cached_tokens();
             let make_progress_output = move |suffix_done: u32| StreamingOutput {
                 new_text: String::new(),
                 finished: false,

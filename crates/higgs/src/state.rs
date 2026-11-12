@@ -22,7 +22,7 @@ pub enum Engine {
     Simple(Box<SimpleEngine>),
     Batch(Box<BatchEngine>),
     #[cfg(test)]
-    Stub(String),
+    Stub(Box<crate::test_support::StubEngine>),
 }
 
 impl Engine {
@@ -62,7 +62,12 @@ impl Engine {
 
     #[cfg(test)]
     pub fn test_stub(name: &str) -> Self {
-        Self::Stub(name.to_owned())
+        Self::Stub(Box::new(crate::test_support::StubEngine::named(name)))
+    }
+
+    #[cfg(test)]
+    pub fn scripted_stub(stub: crate::test_support::StubEngine) -> Self {
+        Self::Stub(Box::new(stub))
     }
 
     pub fn model_name(&self) -> &str {
@@ -70,7 +75,7 @@ impl Engine {
             Self::Simple(e) => e.model_name(),
             Self::Batch(e) => e.model_name(),
             #[cfg(test)]
-            Self::Stub(name) => name,
+            Self::Stub(stub) => &stub.name,
         }
     }
 
@@ -80,7 +85,10 @@ impl Engine {
             Self::Simple(e) => e.tokenizer(),
             Self::Batch(e) => e.tokenizer(),
             #[cfg(test)]
-            Self::Stub(_) => unreachable!("Engine::test_stub has no tokenizer"),
+            Self::Stub(stub) => stub
+                .tokenizer
+                .as_ref()
+                .unwrap_or_else(|| unreachable!("Engine::test_stub has no tokenizer")),
         }
     }
 
@@ -107,7 +115,7 @@ impl Engine {
             Self::Simple(e) => e.enable_thinking(),
             Self::Batch(_) => false,
             #[cfg(test)]
-            Self::Stub(_) => false,
+            Self::Stub(stub) => stub.script.enable_thinking,
         }
     }
 
@@ -163,7 +171,7 @@ impl Engine {
             }
             Self::Batch(e) => e.prepare_chat_prompt_with_thinking(messages, tools, enable_thinking),
             #[cfg(test)]
-            Self::Stub(_) => Ok(Vec::new()),
+            Self::Stub(stub) => Ok(stub.script.prompt_tokens.clone()),
         }
     }
 
@@ -229,7 +237,10 @@ impl Engine {
                 pixel_values,
             ),
             #[cfg(test)]
-            Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
+            Self::Stub(stub) => stub.generate(crate::test_support::StubCall {
+                max_tokens,
+                thinking_enabled: enable_thinking,
+            }),
         }
     }
 
@@ -305,7 +316,13 @@ impl Engine {
                 pixel_values,
             ),
             #[cfg(test)]
-            Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
+            Self::Stub(stub) => stub.generate_streaming(
+                crate::test_support::StubCall {
+                    max_tokens,
+                    thinking_enabled: enable_thinking,
+                },
+                sender,
+            ),
         }
     }
 

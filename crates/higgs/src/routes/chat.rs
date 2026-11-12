@@ -22,10 +22,12 @@ use crate::{
     state::{Engine, SharedState},
     types::openai::{
         ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessage, ChatCompletionRequest,
-        ChatCompletionResponse, ChoiceLogprobs, CompletionUsage, MessageContent, StopSequence,
-        TokenLogprob, ToolCall, ToolCallDelta, ToolCallFunction, ToolCallFunctionDelta, TopLogprob,
+        ChatCompletionResponse, ChoiceLogprobs, MessageContent, StopSequence, TokenLogprob,
+        ToolCall, ToolCallDelta, ToolCallFunction, ToolCallFunctionDelta, TopLogprob,
     },
+    usage::{TokenCounts, build_usage, count_text_tokens},
 };
+use higgs_engine::engine::GenerationStats;
 use higgs_models::SamplingParams;
 
 #[allow(clippy::too_many_lines)]
@@ -85,7 +87,8 @@ pub async fn chat_completions(
             } else {
                 let start = Instant::now();
                 let response =
-                    chat_completions_non_streaming(Arc::clone(&state), req, engine).await?;
+                    chat_completions_non_streaming(Arc::clone(&state), req, engine, received_at)
+                        .await?;
                 if let Some(ref metrics) = state.metrics {
                     metrics.record(RequestRecord {
                         id: 0,
@@ -272,6 +275,7 @@ async fn chat_completions_non_streaming(
     state: SharedState,
     req: ChatCompletionRequest,
     engine: Arc<Engine>,
+    received_at: Instant,
 ) -> Result<ChatCompletionResponse, ServerError> {
     let max_tokens = req.max_tokens.unwrap_or(state.config.server.max_tokens);
     let sampling = build_sampling_params(&req);
@@ -408,6 +412,10 @@ async fn chat_completions_non_streaming(
         )
     };
 
+    let reasoning_tokens = reasoning_content
+        .as_deref()
+        .and_then(|text| count_text_tokens(&tokenizer, text));
+
     Ok(ChatCompletionResponse {
         id: request_id,
         object: "chat.completion",
@@ -425,11 +433,15 @@ async fn chat_completions_non_streaming(
             finish_reason,
             logprobs: logprobs_response,
         }],
-        usage: CompletionUsage {
-            prompt_tokens: output.prompt_tokens,
-            completion_tokens: output.completion_tokens,
-            total_tokens: output.prompt_tokens + output.completion_tokens,
-        },
+        usage: build_usage(
+            TokenCounts {
+                prompt: output.prompt_tokens,
+                completion: output.completion_tokens,
+                reasoning: reasoning_tokens,
+            },
+            &output.stats,
+            received_at,
+        ),
     })
 }
 
@@ -611,8 +623,11 @@ fn chat_completions_stream(
         let mut pending_finish_reason: Option<String> = None;
         let mut pending_finish_logprobs: Option<ChoiceLogprobs> = None;
         let mut timing = RequestTiming::default();
+        let mut stats = GenerationStats::default();
+        let mut reasoning_text = String::new();
 
         while let Some(output) = rx.recv().await {
+            stats.observe(&output, Instant::now());
             // Prefill-progress events carry no tokens: forward as
             // `prompt_progress` chunks when the client opted in, and keep
             // them away from the delta/tool trackers either way.
@@ -637,6 +652,9 @@ fn chat_completions_stream(
             let (visible, reasoning) = reasoning_tracker.process(&output.new_text);
 
             if !reasoning.is_empty() {
+                if include_usage {
+                    reasoning_text.push_str(&reasoning);
+                }
                 let d = ChatCompletionDelta {
                     role: None,
                     content: None,
@@ -690,6 +708,9 @@ fn chat_completions_stream(
         // Flush any remaining buffered content.
         let (flush_vis, flush_reas) = reasoning_tracker.flush();
         if !flush_reas.is_empty() {
+            if include_usage {
+                reasoning_text.push_str(&flush_reas);
+            }
             let d = ChatCompletionDelta {
                 role: None,
                 content: None,
@@ -755,11 +776,15 @@ fn chat_completions_stream(
 
         // Emit final chunk with usage only when explicitly requested.
         if include_usage {
-            let usage = CompletionUsage {
-                prompt_tokens: prompt_token_count,
-                completion_tokens: output_token_count,
-                total_tokens: prompt_token_count + output_token_count,
-            };
+            let usage = build_usage(
+                TokenCounts {
+                    prompt: prompt_token_count,
+                    completion: output_token_count,
+                    reasoning: count_text_tokens(&tokenizer, &reasoning_text),
+                },
+                &stats,
+                received_at,
+            );
             match writer.write_usage(&usage) {
                 Ok(json) => yield Ok(Event::default().data(json)),
                 Err(e) => tracing::error!(error = %e, "Failed to serialize usage chunk"),
@@ -970,7 +995,7 @@ fn current_unix_timestamp() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-#[allow(clippy::panic, clippy::unwrap_used)]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1091,5 +1116,199 @@ mod tests {
     fn test_current_unix_timestamp_reasonable_value() {
         let ts = current_unix_timestamp();
         assert!(ts > 1_700_000_000, "timestamp too old: {ts}");
+    }
+
+    mod route {
+        use crate::test_support::{
+            StubEngine, app_with_stub, generation_output, post_json, progress_event,
+            sse_json_events, token_event, word_tokenizer,
+        };
+        use higgs_engine::engine::GenerationStats;
+
+        fn stub_with_tokenizer() -> StubEngine {
+            let mut stub = StubEngine::named("stub");
+            stub.tokenizer = Some(word_tokenizer());
+            stub.script.prompt_tokens = vec![1, 2, 1, 2, 1];
+            stub.script.stamp_times = true;
+            stub
+        }
+
+        fn chat_body(extra: &serde_json::Value) -> serde_json::Value {
+            let mut body = serde_json::json!({
+                "model": "stub",
+                "messages": [{"role": "user", "content": "hello"}],
+            });
+            if let (Some(target), Some(fields)) = (body.as_object_mut(), extra.as_object()) {
+                target.extend(fields.clone());
+            }
+            body
+        }
+
+        #[tokio::test]
+        async fn non_streaming_usage_reports_cache_hit_and_timings() {
+            let mut stub = stub_with_tokenizer();
+            let mut output = generation_output("hello world", 5, 4);
+            output.stats = GenerationStats {
+                cached_tokens: Some(3),
+                ..GenerationStats::default()
+            };
+            stub.script.generation = Some(output);
+            let (app, _engine) = app_with_stub(stub);
+
+            let (status, body) = post_json(
+                &app,
+                "/v1/chat/completions",
+                &chat_body(&serde_json::json!({})),
+            )
+            .await;
+
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let usage = &json["usage"];
+            assert_eq!(usage["prompt_tokens"], 5);
+            assert_eq!(usage["completion_tokens"], 4);
+            assert_eq!(usage["total_tokens"], 9);
+            assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 3);
+            for field in [
+                "time_to_first_token",
+                "prompt_eval_duration",
+                "generation_duration",
+                "total_time",
+            ] {
+                assert!(usage[field].is_f64(), "{field} missing in {usage}");
+            }
+            assert!(usage.get("completion_tokens_details").is_none());
+        }
+
+        #[tokio::test]
+        async fn non_streaming_usage_omits_unmeasured_fields() {
+            let mut stub = stub_with_tokenizer();
+            stub.script.stamp_times = false;
+            stub.script.generation = Some(generation_output("hello", 5, 2));
+            let (app, _engine) = app_with_stub(stub);
+
+            let (status, body) = post_json(
+                &app,
+                "/v1/chat/completions",
+                &chat_body(&serde_json::json!({})),
+            )
+            .await;
+
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                json["usage"],
+                serde_json::json!({"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7})
+            );
+        }
+
+        #[tokio::test]
+        async fn non_streaming_usage_counts_reasoning_tokens() {
+            let mut stub = stub_with_tokenizer();
+            stub.script.enable_thinking = true;
+            stub.script.generation = Some(generation_output(
+                "think again hello</think>hello world",
+                5,
+                8,
+            ));
+            let (app, _engine) = app_with_stub(stub);
+
+            let (status, body) = post_json(
+                &app,
+                "/v1/chat/completions",
+                &chat_body(&serde_json::json!({})),
+            )
+            .await;
+
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                json["choices"][0]["message"]["reasoning_content"],
+                "think again hello"
+            );
+            assert_eq!(
+                json["usage"]["completion_tokens_details"]["reasoning_tokens"],
+                3
+            );
+        }
+
+        #[tokio::test]
+        async fn streaming_usage_chunk_carries_details_and_timings() {
+            let mut stub = stub_with_tokenizer();
+            stub.script.stream = vec![
+                progress_event(2, 5),
+                token_event("hello", 1, None),
+                token_event(" world", 2, Some("stop")),
+            ];
+            let (app, _engine) = app_with_stub(stub);
+            let request = chat_body(&serde_json::json!({
+                "stream": true,
+                "stream_options": {"include_usage": true},
+            }));
+
+            let (status, body) = post_json(&app, "/v1/chat/completions", &request).await;
+
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            let events = sse_json_events(&body);
+            let usage_chunk = events.last().unwrap();
+            assert_eq!(usage_chunk["choices"], serde_json::json!([]));
+            let usage = &usage_chunk["usage"];
+            assert_eq!(usage["prompt_tokens"], 5);
+            assert_eq!(usage["completion_tokens"], 2);
+            assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 2);
+            for field in [
+                "time_to_first_token",
+                "prompt_eval_duration",
+                "generation_duration",
+                "total_time",
+            ] {
+                assert!(usage[field].is_f64(), "{field} missing in {usage}");
+            }
+            assert!(
+                !body.contains("prompt_progress"),
+                "progress chunks must stay opt-in"
+            );
+        }
+
+        #[tokio::test]
+        async fn streaming_without_include_usage_has_no_usage_chunk() {
+            let mut stub = stub_with_tokenizer();
+            stub.script.stream = vec![progress_event(0, 5), token_event("hello", 1, Some("stop"))];
+            let (app, _engine) = app_with_stub(stub);
+
+            let (status, body) = post_json(
+                &app,
+                "/v1/chat/completions",
+                &chat_body(&serde_json::json!({"stream": true})),
+            )
+            .await;
+
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            assert!(!body.contains("\"usage\""), "{body}");
+        }
+
+        #[tokio::test]
+        async fn streaming_usage_counts_reasoning_tokens() {
+            let mut stub = stub_with_tokenizer();
+            stub.script.enable_thinking = true;
+            stub.script.stream = vec![
+                progress_event(0, 5),
+                token_event("think again", 2, None),
+                token_event("</think>", 3, None),
+                token_event("hello", 4, Some("stop")),
+            ];
+            let (app, _engine) = app_with_stub(stub);
+            let request = chat_body(&serde_json::json!({
+                "stream": true,
+                "stream_options": {"include_usage": true},
+            }));
+
+            let (_status, body) = post_json(&app, "/v1/chat/completions", &request).await;
+
+            let events = sse_json_events(&body);
+            let usage = &events.last().unwrap()["usage"];
+            assert_eq!(usage["completion_tokens_details"]["reasoning_tokens"], 2);
+            assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 0);
+        }
     }
 }

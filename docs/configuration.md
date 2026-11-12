@@ -230,6 +230,37 @@ higgs exec -- aider --model openai/gpt-4o
 | `--profile <NAME>` | Named profile, resolves to `config.<NAME>.toml`, conflicts with `--config` |
 | `--verbose` | Enable debug logging |
 
+## API request options
+
+These apply to locally served models. Requests routed to a remote provider are
+forwarded unchanged.
+
+### Usage fields
+
+Responses from `/v1/chat/completions` and `/v1/completions` (and the terminal chunk
+requested with `stream_options.include_usage`) carry a `usage` object. Beyond the OpenAI
+token counts it includes the fields below. A field is omitted when it was not measured for
+the request; the server never fills in zeros as placeholders.
+
+| Field | Meaning |
+|---|---|
+| `prompt_tokens_details.cached_tokens` | Prompt tokens served from the prefix cache (memory or disk) instead of being prefilled. Reported as `0` when the engine measured a miss. |
+| `completion_tokens_details.reasoning_tokens` | Tokens in the reasoning block, chat only, present when the response had reasoning content. Counted by re-encoding the extracted reasoning text with the model's tokenizer, so it can differ by a token or two from the tokens actually sampled. |
+| `time_to_first_token` | Seconds from receiving the request to the first completion token. Includes queueing, template rendering and prefill. |
+| `prompt_eval_duration` | Seconds from the engine starting on the prompt to the first completion token. Excludes queueing. |
+| `generation_duration` | Seconds from the first completion token to the last. Omitted for single-token completions. |
+| `total_time` | Seconds from receiving the request to the last completion token. |
+| `prompt_tokens_per_second` | Prompt tokens that were actually prefilled (`prompt_tokens - cached_tokens`) divided by `prompt_eval_duration`. Omitted when the whole prompt was cached. |
+| `generation_tokens_per_second` | `(completion_tokens - 1) / generation_duration`; the first token is produced by prefill and is not part of the decode rate. |
+
+For streaming requests the engine events are timestamped as the server receives them, so
+the figures include the channel hop between engine and HTTP handler. The batch engine
+reports a prefix-cache hit only for requests prefilled individually; requests prefilled
+together in a group are reported with `cached_tokens: 0`.
+
+`/v1/messages` adds `usage.cache_read_input_tokens` when the cache hit is known.
+Unlike Anthropic's API, `input_tokens` still includes those cached tokens.
+
 ## Migration Notes
 
 - `higgs start` no longer accepts serve-style flags like `--model`, `--port`, or `--batch`.

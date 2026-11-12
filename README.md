@@ -121,7 +121,21 @@ Requests for `qwen` run locally; anything matching `claude-.*` is proxied to Ant
   - Streaming requests may set `"return_progress": true` to receive
     llama.cpp-compatible `prompt_progress` chunks (`{total, cache, processed,
     time_ms}`) during chunked prefill.
+  - Streaming requests on both chat and completions may set
+    `"stream_options": {"include_usage": true}` to receive a final chunk with
+    an empty `choices` array and a `usage` object.
+  - `usage` carries `prompt_tokens`, `completion_tokens`, `total_tokens`, plus
+    only the fields that were measured for that request:
+    `prompt_tokens_details.cached_tokens` (prompt tokens served from the prefix
+    cache), `completion_tokens_details.reasoning_tokens` (chat only, when the
+    response had reasoning content), and oMLX-compatible timings in seconds:
+    `time_to_first_token`, `prompt_eval_duration`, `generation_duration`,
+    `total_time`, `prompt_tokens_per_second`, `generation_tokens_per_second`.
+    See [Usage fields](docs/configuration.md#usage-fields) for exact definitions.
 - Anthropic: `/v1/messages`, `/v1/messages/count_tokens`
+  - `usage.cache_read_input_tokens` reports prompt tokens served from the
+    prefix cache when known. `usage.input_tokens` still counts the whole
+    prompt, cached tokens included.
 - Metrics: `/metrics` (window totals, latency and time-to-first-token
   percentiles, aggregate tokens/s, per-model and per-provider groups with
   TTFT, tokens/s, and prefix-cache hits). Local streaming requests record

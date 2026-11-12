@@ -17,9 +17,12 @@ pub mod routes;
 #[doc(hidden)]
 pub mod sse;
 pub mod state;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod translate;
 pub mod tui;
 pub mod types;
+pub mod usage;
 
 use std::net::SocketAddr;
 use std::num::NonZeroU32;

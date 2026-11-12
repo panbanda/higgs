@@ -24,17 +24,14 @@ use higgs::types::openai::{
 };
 
 const fn make_usage(prompt: u32, completion: u32) -> CompletionUsage {
-    CompletionUsage {
-        prompt_tokens: prompt,
-        completion_tokens: completion,
-        total_tokens: prompt + completion,
-    }
+    CompletionUsage::new(prompt, completion)
 }
 
 const fn make_anthropic_usage(input: u32, output: u32) -> AnthropicUsage {
     AnthropicUsage {
         input_tokens: input,
         output_tokens: output,
+        cache_read_input_tokens: None,
     }
 }
 

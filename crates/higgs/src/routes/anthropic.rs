@@ -318,6 +318,7 @@ async fn create_message_non_streaming(
         usage: AnthropicUsage {
             input_tokens: output.prompt_tokens,
             output_tokens: output.completion_tokens,
+            cache_read_input_tokens: output.stats.cached_tokens,
         },
     })
 }
@@ -412,6 +413,7 @@ fn create_message_stream(
                 usage: AnthropicUsage {
                     input_tokens: prompt_token_count,
                     output_tokens: 0,
+                    cache_read_input_tokens: None,
                 },
             },
         };
@@ -484,6 +486,8 @@ fn create_message_stream(
             }
         }
 
+        let cache_read_input_tokens =
+            timing.cached_tokens.and_then(|cached| u32::try_from(cached).ok());
         if let Some(ref m) = metrics {
             if let Some(id) = metrics_id {
                 m.finalize_stream(id, u64::from(total_output_tokens), start.elapsed(), timing);
@@ -509,6 +513,7 @@ fn create_message_stream(
             usage: AnthropicUsage {
                 input_tokens: prompt_token_count,
                 output_tokens: total_output_tokens,
+                cache_read_input_tokens,
             },
         };
         match serde_json::to_string(&msg_delta) {
@@ -605,5 +610,82 @@ pub async fn count_tokens(
             )
             .await
         }
+    }
+}
+
+#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+#[cfg(test)]
+mod tests {
+    use crate::test_support::{
+        StubEngine, app_with_stub, generation_output, post_json, progress_event, token_event,
+    };
+    use higgs_engine::engine::GenerationStats;
+
+    fn body(stream: bool) -> serde_json::Value {
+        serde_json::json!({
+            "model": "stub",
+            "max_tokens": 16,
+            "stream": stream,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+    }
+
+    #[tokio::test]
+    async fn non_streaming_reports_cache_read_input_tokens() {
+        let mut stub = StubEngine::named("stub");
+        let mut output = generation_output("hello", 9, 2);
+        output.stats = GenerationStats {
+            cached_tokens: Some(6),
+            ..GenerationStats::default()
+        };
+        stub.script.generation = Some(output);
+        let (app, _engine) = app_with_stub(stub);
+
+        let (status, text) = post_json(&app, "/v1/messages", &body(false)).await;
+
+        assert_eq!(status, http::StatusCode::OK, "{text}");
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["usage"]["input_tokens"], 9);
+        assert_eq!(json["usage"]["cache_read_input_tokens"], 6);
+    }
+
+    #[tokio::test]
+    async fn non_streaming_omits_cache_read_when_unknown() {
+        let mut stub = StubEngine::named("stub");
+        stub.script.generation = Some(generation_output("hello", 9, 2));
+        let (app, _engine) = app_with_stub(stub);
+
+        let (_status, text) = post_json(&app, "/v1/messages", &body(false)).await;
+
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            json["usage"].get("cache_read_input_tokens").is_none(),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_message_delta_reports_cache_read_input_tokens() {
+        let mut stub = StubEngine::named("stub");
+        stub.script.prompt_tokens = vec![1, 2, 3, 4];
+        stub.script.stream = vec![
+            progress_event(3, 4),
+            token_event("hi", 1, None),
+            token_event("!", 2, Some("stop")),
+        ];
+        let (app, _engine) = app_with_stub(stub);
+
+        let (status, text) = post_json(&app, "/v1/messages", &body(true)).await;
+
+        assert_eq!(status, http::StatusCode::OK, "{text}");
+        let delta_line = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .find(|data| data.contains("\"message_delta\""))
+            .unwrap();
+        let delta: serde_json::Value = serde_json::from_str(delta_line.trim()).unwrap();
+        assert_eq!(delta["usage"]["cache_read_input_tokens"], 3);
+        assert_eq!(delta["usage"]["input_tokens"], 4);
+        assert_eq!(delta["usage"]["output_tokens"], 2);
     }
 }

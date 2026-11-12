@@ -314,6 +314,8 @@ pub struct CompletionRequest {
     #[serde(default)]
     pub stream: Option<bool>,
     #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+    #[serde(default)]
     pub stop: Option<StopSequence>,
     #[serde(default)]
     pub logprobs: Option<bool>,
@@ -361,11 +363,80 @@ pub struct CompletionChunkChoice {
 }
 
 /// Token usage statistics.
-#[derive(Debug, Clone, Serialize)]
+///
+/// Beyond the `OpenAI` fields, timing measurements use the field names oMLX
+/// reports, flattened into the same object. A field is present only when it
+/// was measured for the request.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct CompletionUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+    #[serde(flatten)]
+    pub timings: UsageTimings,
+}
+
+impl CompletionUsage {
+    pub const fn new(prompt_tokens: u32, completion_tokens: u32) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+            timings: UsageTimings::EMPTY,
+        }
+    }
+}
+
+/// Breakdown of prompt tokens (`OpenAI` `prompt_tokens_details`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PromptTokensDetails {
+    pub cached_tokens: u32,
+}
+
+/// Breakdown of completion tokens (`OpenAI` `completion_tokens_details`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CompletionTokensDetails {
+    pub reasoning_tokens: u32,
+}
+
+/// Per-request timing measurements, in seconds and tokens per second.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct UsageTimings {
+    /// Request received until the first completion token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_to_first_token: Option<f64>,
+    /// Engine start of prompt evaluation until the first completion token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_eval_duration: Option<f64>,
+    /// First completion token until the last one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_duration: Option<f64>,
+    /// Request received until the last completion token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_time: Option<f64>,
+    /// Prompt tokens actually prefilled (cache hits excluded) per second.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_per_second: Option<f64>,
+    /// Decode rate: completion tokens after the first, per second.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_tokens_per_second: Option<f64>,
+}
+
+impl UsageTimings {
+    pub const EMPTY: Self = Self {
+        time_to_first_token: None,
+        prompt_eval_duration: None,
+        generation_duration: None,
+        total_time: None,
+        prompt_tokens_per_second: None,
+        generation_tokens_per_second: None,
+    };
 }
 
 /// GET /v1/models response.
@@ -474,11 +545,7 @@ mod tests {
     }
 
     fn make_usage(prompt: u32, completion: u32) -> CompletionUsage {
-        CompletionUsage {
-            prompt_tokens: prompt,
-            completion_tokens: completion,
-            total_tokens: prompt + completion,
-        }
+        CompletionUsage::new(prompt, completion)
     }
 
     #[test]

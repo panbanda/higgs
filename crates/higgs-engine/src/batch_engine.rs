@@ -23,7 +23,7 @@ use tokenizers::Tokenizer;
 
 use crate::{
     chat_template::{ChatMessage, ChatTemplateRenderer},
-    engine::{GenerationOutput, StreamingOutput},
+    engine::{GenerationOutput, GenerationStats, PrefillProgress, StreamingOutput},
     error::EngineError,
     model_loader,
     prompt_cache::PrefixCache,
@@ -319,6 +319,7 @@ impl BatchEngine {
                 prompt_tokens: prompt_len,
                 completion_tokens: 0,
                 token_logprobs: None,
+                stats: crate::engine::GenerationStats::default(),
             });
         }
 
@@ -342,8 +343,13 @@ impl BatchEngine {
         let mut finish_reason = "length".to_owned();
         let mut completion_tokens: u32 = 0;
         let mut all_logprobs: Option<Vec<higgs_models::TokenLogprobInfo>> = logprobs.then(Vec::new);
+        let mut stats = GenerationStats::default();
 
         while let Some(output) = internal_rx.blocking_recv() {
+            stats.observe(&output, std::time::Instant::now());
+            if output.prefill_progress.is_some() {
+                continue;
+            }
             full_text.push_str(&output.new_text);
             completion_tokens = output.completion_tokens;
             if let Some(ref reason) = output.finish_reason {
@@ -363,6 +369,7 @@ impl BatchEngine {
             prompt_tokens: prompt_len,
             completion_tokens,
             token_logprobs: all_logprobs,
+            stats,
         })
     }
 
@@ -406,9 +413,7 @@ impl BatchEngine {
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         _enable_thinking: bool,
-        // Batch engine does not emit prefill progress; accepts the flag to
-        // share the streaming interface with SimpleEngine.
-        _return_progress: bool,
+        return_progress: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<higgs_models::siglip::PixelValues>,
     ) -> Result<(), EngineError> {
@@ -457,6 +462,9 @@ impl BatchEngine {
             .map_err(|_| EngineError::Generation("Engine shut down".to_owned()))?;
 
         while let Some(output) = internal_rx.blocking_recv() {
+            if output.prefill_progress.is_some() && !return_progress {
+                continue;
+            }
             let finished = output.finished;
             if sender.blocking_send(output).is_err() {
                 break; // Client disconnected
@@ -919,6 +927,10 @@ fn prefill_group(
     active: &mut Vec<ActiveRequest>,
 ) {
     let started = std::time::Instant::now();
+    for req in &group {
+        let prompt_len = u32::try_from(req.prompt_tokens.len()).unwrap_or(u32::MAX);
+        announce_prefill(req, 0, prompt_len);
+    }
     let batched = with_stream(&Stream::new(), || {
         let longest = group
             .iter()
@@ -1002,6 +1014,25 @@ fn prefill_group(
     );
 }
 
+/// Tell the caller that prompt evaluation is starting and how much of the
+/// prompt the prefix cache already covers. Never blocks the worker: a full
+/// channel only loses this notification.
+fn announce_prefill(req: &BatchRequest, cached_tokens: u32, prompt_len: u32) {
+    let _ = req.response_tx.try_send(StreamingOutput {
+        new_text: String::new(),
+        finished: false,
+        finish_reason: None,
+        prompt_tokens: prompt_len,
+        completion_tokens: 0,
+        token_logprob: None,
+        prefill_progress: Some(PrefillProgress {
+            processed: cached_tokens,
+            cached: cached_tokens,
+            total: prompt_len,
+        }),
+    });
+}
+
 /// Set up cache reuse once, before the prompt begins advancing through chunks.
 fn start_prefill(
     model: &AnyModel,
@@ -1034,6 +1065,9 @@ fn start_prefill(
             model.make_cache().map_err(EngineError::Mlx)?,
         )
     };
+
+    let cached_tokens = prompt_len - u32::try_from(tokens.len()).unwrap_or(prompt_len);
+    announce_prefill(&req, cached_tokens, prompt_len);
 
     Ok(PendingPrefill {
         request_id: NEXT_PREFILL_ID.fetch_add(1, Ordering::Relaxed),
