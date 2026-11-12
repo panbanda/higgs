@@ -16,8 +16,10 @@ use tokio_stream::Stream;
 
 use super::chat::build_constraint;
 use crate::{
-    anthropic_adapter::{anthropic_messages_to_engine, openai_finish_to_anthropic_stop},
-    anthropic_tools::{ToolPlan, openai_tools, tool_use_block, tool_use_stream_events},
+    anthropic_adapter::openai_finish_to_anthropic_stop,
+    anthropic_tools::{
+        ToolPlan, messages_with_tool_history, openai_tools, tool_use_block, tool_use_stream_events,
+    },
     config::ApiFormat,
     error::ServerError,
     metrics::{MetricsStore, RequestMetricsContext, RequestTiming},
@@ -264,7 +266,7 @@ async fn create_message_non_streaming(
     };
     let stop_sequences = req.stop_sequences.unwrap_or_default();
 
-    let engine_messages = anthropic_messages_to_engine(&req.messages, req.system.as_ref());
+    let engine_messages = messages_with_tool_history(&req.messages, req.system.as_ref());
     let plan = ToolPlan::for_request(
         req.tools.as_deref(),
         req.tool_choice.as_ref(),
@@ -390,7 +392,7 @@ fn create_message_stream(
     };
     let stop_sequences = req.stop_sequences.unwrap_or_default();
 
-    let engine_messages = anthropic_messages_to_engine(&req.messages, req.system.as_ref());
+    let engine_messages = messages_with_tool_history(&req.messages, req.system.as_ref());
     let plan = ToolPlan::for_request(
         req.tools.as_deref(),
         req.tool_choice.as_ref(),
@@ -641,7 +643,7 @@ pub async fn count_tokens(
         ResolvedRoute::Higgs {
             engine, model_name, ..
         } => {
-            let engine_messages = anthropic_messages_to_engine(&req.messages, req.system.as_ref());
+            let engine_messages = messages_with_tool_history(&req.messages, req.system.as_ref());
             let converted_tools = req.tools.as_deref().map(openai_tools);
             let tools = converted_tools.as_deref();
             let thinking_enabled = crate::reasoning::effective_thinking_enabled(

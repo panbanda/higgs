@@ -735,3 +735,82 @@ async fn anthropic_without_a_call_keeps_the_original_text_response() {
     assert_eq!(json["content"][0]["text"], "plain answer");
     assert_eq!(json["stop_reason"], "end_turn");
 }
+
+#[tokio::test]
+async fn anthropic_stream_orders_text_then_tool_use_blocks_then_stop() {
+    let text = format!("Let me check. {QWEN_WEATHER}");
+    let (status, body, _) = send(
+        stub(ToolCallFormat::Qwen, &text),
+        Route::Anthropic,
+        &Route::Anthropic.request(None, true),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::OK, "{body}");
+    let events = sse_json_events(&body);
+    let sequence: Vec<(String, Option<u64>, Option<String>)> = events
+        .iter()
+        .map(|event| {
+            let detail = event["content_block"]["type"]
+                .as_str()
+                .or_else(|| event["delta"]["type"].as_str())
+                .or_else(|| event["delta"]["stop_reason"].as_str())
+                .map(ToOwned::to_owned);
+            (
+                event["type"].as_str().unwrap().to_owned(),
+                event["index"].as_u64(),
+                detail,
+            )
+        })
+        .collect();
+    let expected = [
+        ("message_start", None, None),
+        ("content_block_start", Some(0), Some("text")),
+        ("content_block_delta", Some(0), Some("text_delta")),
+        ("content_block_stop", Some(0), None),
+        ("content_block_start", Some(1), Some("tool_use")),
+        ("content_block_delta", Some(1), Some("input_json_delta")),
+        ("content_block_stop", Some(1), None),
+        ("message_delta", None, Some("tool_use")),
+        ("message_stop", None, None),
+    ];
+    let compact: Vec<(&str, Option<u64>, Option<&str>)> = sequence
+        .iter()
+        .map(|(kind, index, detail)| (kind.as_str(), *index, detail.as_deref()))
+        .collect();
+    assert_eq!(compact, expected);
+    let start = events
+        .iter()
+        .find(|e| e["content_block"]["type"] == "tool_use")
+        .unwrap();
+    assert!(
+        start["content_block"]["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("toolu_")
+    );
+    assert_eq!(start["content_block"]["input"], json!({}));
+}
+
+#[tokio::test]
+async fn anthropic_accepts_tool_result_history() {
+    let mut body = Route::Anthropic.request(None, false);
+    body["messages"] = json!([
+        {"role": "user", "content": "weather?"},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}}
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "sunny"}
+        ]}
+    ]);
+    let (status, text, _) = send(
+        stub(ToolCallFormat::Qwen, "It is sunny."),
+        Route::Anthropic,
+        &body,
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::OK, "{text}");
+    let json: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["content"][0]["text"], "It is sunny.");
+    assert_eq!(json["stop_reason"], "end_turn");
+}
