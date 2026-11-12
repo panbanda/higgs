@@ -122,6 +122,10 @@ Requests for `qwen` run locally; anything matching `claude-.*` is proxied to Ant
     llama.cpp-compatible `prompt_progress` chunks (`{total, cache, processed,
     time_ms}`) during chunked prefill.
 - Anthropic: `/v1/messages`, `/v1/messages/count_tokens`
+- OpenAI Responses: `POST /v1/responses` (streaming and non-streaming),
+  `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}`. Local models and
+  OpenAI-format providers only; supported fields, unsupported features, and
+  store limits are in [docs/responses.md](docs/responses.md).
 - Metrics: `/metrics` (window totals, latency and time-to-first-token
   percentiles, aggregate tokens/s, per-model and per-provider groups with
   TTFT, tokens/s, and prefix-cache hits). Local streaming requests record

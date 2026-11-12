@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// POST /v1/chat/completions request body.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatCompletionMessage>,
