@@ -225,6 +225,8 @@ traffic in metrics. The read-only ones never load a model.
 
 Benchmarks below were run on M4 Max 128GB. Methodology, harness details, and benchmark-driven defaults are documented in [docs/benchmarking.md](docs/benchmarking.md).
 
+A head-to-head comparison with oMLX (where Higgs is ahead, level, and behind, with reproduction steps) is in [docs/omlx-comparison.md](docs/omlx-comparison.md).
+
 ### Decode Throughput (tok/s)
 
 Single request, 500 generated tokens, median of 3 runs.
