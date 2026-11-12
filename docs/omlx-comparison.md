@@ -137,7 +137,7 @@ Loading the 27B and 35B checkpoints on `main` intermittently aborted with a Meta
 
 ## Features
 
-Higgs features added on this branch to close gaps with oMLX: the OpenAI Responses API (`/v1/responses`, stored responses, `previous_response_id`), on-demand model loading with LRU and idle-TTL eviction, pinning, a memory guard and load/unload/status endpoints, cached-token and timing fields in `usage`, `/v1/tokenize` and `/v1/detokenize`, regex and `guided_json` constrained output, a configurable thinking budget, `tool_choice` `none`/`auto`, and batched decode for five more architectures.
+Higgs features added on this branch to close gaps with oMLX: the OpenAI Responses API (`/v1/responses`, stored responses, `previous_response_id`), on-demand model loading with LRU and idle-TTL eviction, pinning, a memory guard and load/unload/status endpoints, cached-token and timing fields in `usage`, `/v1/tokenize` and `/v1/detokenize`, regex and `guided_json` constrained output, a configurable thinking budget, tool-call parsers for the Qwen, Mistral, Llama, Gemma, GLM and MiniMax formats with forced `tool_choice` where the format allows it, batching as the automatic default, and batched decode for five more architectures.
 
 | Capability | Higgs | oMLX |
 |---|---|---|
@@ -147,10 +147,10 @@ Higgs features added on this branch to close gaps with oMLX: the OpenAI Response
 | Usage timing and cached-token fields | yes | yes |
 | JSON schema and regex constrained output | yes | yes |
 | Grammar (EBNF) constrained output | no | yes (optional extra) |
-| Tool calling | Qwen formats | many model formats |
-| Forced `tool_choice` (`required`, named) | no | yes |
+| Tool calling | Qwen, Mistral, Llama, Gemma, GLM, MiniMax formats | many model formats |
+| Forced `tool_choice` (`required`, named) | Qwen, Mistral, Llama formats | yes |
 | On-demand load, LRU/TTL eviction, pinning, memory guard | yes | yes |
-| Continuous batching | opt-in per model | on by default |
+| Continuous batching | on by default (`batch = "auto"`) | on by default |
 | In-memory prefix cache | yes | optional (off by default) |
 | Disk prefix cache | opt-in | on by default |
 | KV cache quantization | TurboQuant | TurboQuant, affine 4/8-bit |
@@ -166,7 +166,7 @@ Higgs features added on this branch to close gaps with oMLX: the OpenAI Response
 | Model download manager, quantization tooling | no | yes |
 | Multi-machine clustering | no | experimental |
 
-In progress on this branch at the time of writing: batching as the automatic default (with a working prefix cache, thinking budget and embeddings in the batch engine), more tool-call formats with forced `tool_choice`, and an MCP client with web search/fetch.
+Not done on this branch: an MCP client with web search/fetch.
 
 ## Reproducing
 

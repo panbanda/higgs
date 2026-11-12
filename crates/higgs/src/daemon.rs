@@ -198,7 +198,7 @@ port = 8000
 # pinned = true              # never evicted or unloaded on idle
 # batch = "auto"             # true | false | "auto" (default). auto serves the model with the
 #                            # continuous-batching engine unless it needs a simple-engine-only
-#                            # feature (TurboQuant, kv_disk_dir, vision, MTP speculative decode)
+#                            # feature (TurboQuant, kv_disk_dir, vision, MTP speculative decode, HIGGS_PROMPT_LOOKUP)
 # kv_disk_dir = "/var/lib/higgs/prefix-kv" # optional durable prefix cache
 # kv_disk_space_mb = 4096                # LRU budget; minimum 64 MiB
 # prefill_yield_tokens = 512 # optional: interleave decode during long prefills
