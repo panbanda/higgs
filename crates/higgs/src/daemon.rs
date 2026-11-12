@@ -287,6 +287,20 @@ provider = "higgs"
 # [mcp.servers.remote]
 # url = "https://mcp.example.com/mcp"    # Streamable HTTP
 # headers = {{ Authorization = "Bearer ${{MCP_TOKEN}}" }}
+
+# --- Web search and fetch ---
+# POST /v1/web/search and POST /v1/web/fetch. Off by default: both answer 404
+# until enabled. Fetch refuses non-http(s) URLs and, by default, loopback,
+# private and link-local addresses (checked after DNS resolution and on every
+# redirect). See docs/mcp.md.
+
+# [web]
+# enabled = true
+# search_provider = "duckduckgo"       # keyless, or "searxng"
+# searxng_url = "http://localhost:8888" # required for searxng; JSON format must be enabled
+# allow_private_addresses = false      # true lets fetch reach loopback/private ranges
+# expose_as_tools = false              # offer web_search and web_fetch under the built-in "higgs" server
+# timeout_seconds = 15
 "#
     );
 
@@ -991,6 +1005,25 @@ mod tests {
                 (name == "EXAMPLE_TOKEN" || name == "MCP_TOKEN").then(|| "x".to_owned())
             };
             assert!(config.mcp.problems(&lookup).is_empty());
+        });
+    }
+
+    #[test]
+    fn cmd_init_template_web_examples_are_valid_when_uncommented() {
+        use figment::providers::Format;
+
+        with_temp_config_dir(|dir| {
+            std::fs::create_dir_all(dir).unwrap();
+            cmd_init(None);
+            let template = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+            let section = uncommented_section(&template, "# [web]");
+            let config: crate::config::HiggsConfig = figment::Figment::new()
+                .merge(figment::providers::Toml::string(&section))
+                .extract()
+                .unwrap();
+            assert!(config.web.enabled);
+            assert!(config.web.problems().is_empty());
+            assert_eq!(config.web.search_provider, "duckduckgo");
         });
     }
 

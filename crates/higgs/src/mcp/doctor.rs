@@ -1,4 +1,4 @@
-//! `higgs doctor` checks for the `[mcp]` section.
+//! `higgs doctor` checks for the `[mcp]` and `[web]` sections.
 //!
 //! Nothing here starts a server or makes a request; it validates what the
 //! configuration says and what is visible on this machine.
@@ -28,9 +28,11 @@ impl Finding {
     }
 }
 
-/// Findings for MCP servers against the real environment.
+/// Findings for MCP servers and web settings against the real environment.
 pub fn tool_integration_findings(config: &HiggsConfig) -> Vec<Finding> {
-    mcp_findings(&config.mcp, &process_env, &command_available)
+    let mut findings = mcp_findings(&config.mcp, &process_env, &command_available);
+    findings.extend(web_findings(config));
+    findings
 }
 
 pub fn mcp_findings(
@@ -122,6 +124,35 @@ fn stdio_warnings(
     findings
 }
 
+pub fn web_findings(config: &HiggsConfig) -> Vec<Finding> {
+    let web = &config.web;
+    let problems = web.problems();
+    let mut findings: Vec<Finding> = problems
+        .iter()
+        .map(|problem| Finding::new(Level::Fail, problem.clone()))
+        .collect();
+    findings.extend(
+        web.warnings()
+            .into_iter()
+            .map(|warning| Finding::new(Level::Warn, warning)),
+    );
+    if web.enabled && problems.is_empty() {
+        findings.push(Finding::new(
+            Level::Pass,
+            format!(
+                "web: search ({}) and fetch enabled; private addresses {}",
+                web.search_provider,
+                if web.allow_private_addresses {
+                    "allowed"
+                } else {
+                    "blocked"
+                }
+            ),
+        ));
+    }
+    findings
+}
+
 /// Whether `command` names an existing executable, either as a path or
 /// somewhere on `PATH`.
 pub fn command_available(command: &str) -> bool {
@@ -146,6 +177,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::web::config::WebConfig;
 
     fn no_env(_: &str) -> Option<String> {
         None
@@ -183,7 +215,7 @@ mod tests {
     #[test]
     fn no_servers_means_no_findings() {
         assert!(mcp_findings(&McpConfig::default(), &no_env, &always).is_empty());
-        assert!(tool_integration_findings(&HiggsConfig::default()).is_empty());
+        assert!(web_findings(&HiggsConfig::default()).is_empty());
     }
 
     #[test]
@@ -311,6 +343,48 @@ mod tests {
             levels(&mcp_findings(&config, &no_env, &always)),
             vec![Level::Fail]
         );
+    }
+
+    #[test]
+    fn web_findings_cover_provider_url_timeout_and_warnings() {
+        let invalid = HiggsConfig {
+            web: WebConfig {
+                enabled: true,
+                search_provider: "searxng".to_owned(),
+                timeout_seconds: -3.0,
+                ..WebConfig::default()
+            },
+            ..HiggsConfig::default()
+        };
+        let findings = web_findings(&invalid);
+        assert_eq!(levels(&findings), vec![Level::Fail, Level::Fail]);
+
+        let valid = HiggsConfig {
+            web: WebConfig {
+                enabled: true,
+                search_provider: "searxng".to_owned(),
+                searxng_url: Some("http://localhost:8888".to_owned()),
+                allow_private_addresses: true,
+                ..WebConfig::default()
+            },
+            ..HiggsConfig::default()
+        };
+        let valid_findings = web_findings(&valid);
+        assert_eq!(levels(&valid_findings), vec![Level::Warn, Level::Pass]);
+        assert!(
+            valid_findings[1]
+                .message
+                .contains("private addresses allowed")
+        );
+
+        let inert = HiggsConfig {
+            web: WebConfig {
+                expose_as_tools: true,
+                ..WebConfig::default()
+            },
+            ..HiggsConfig::default()
+        };
+        assert_eq!(levels(&web_findings(&inert)), vec![Level::Warn]);
     }
 
     #[test]

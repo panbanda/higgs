@@ -158,6 +158,7 @@ mod tests {
     use crate::mcp::transport::TransportFactory;
     use crate::test_support::{app_with_tools, send_request};
     use crate::tools::ToolHub;
+    use crate::web::WebService;
 
     fn resolved(name: &str, timeout: Duration) -> ResolvedServer {
         ResolvedServer {
@@ -211,7 +212,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        ToolHub::new(manager)
+        ToolHub::new(manager, WebService::disabled())
     }
 
     async fn single_server_app() -> (axum::Router, Arc<FakeMcp>) {
@@ -544,6 +545,14 @@ mod tests {
             "POST",
             "/v1/mcp/execute",
             Some(&json!({"name": "files__nope"})),
+            None,
+        )
+        .await;
+        send_request(
+            &app,
+            "POST",
+            "/v1/web/search",
+            Some(&json!({"query": "x"})),
             None,
         )
         .await;

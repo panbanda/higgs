@@ -135,9 +135,67 @@ The list can be passed as `tools` of a chat request. Strict clients that reject 
 - Credentials in `headers` and `env` come from `${VAR}`; they are not logged, and `higgs doctor` prints URLs without credentials or query strings.
 - HTTP servers are contacted at the configured URL only; redirects are not followed.
 
+## Web search and fetch
+
+Two endpoints for pages the model cannot reach itself. They are off by default and answer 404 (`web_disabled`) until enabled:
+
+```toml
+[web]
+enabled = true
+search_provider = "duckduckgo"           # or "searxng"
+searxng_url = "http://localhost:8888"    # required for searxng
+allow_private_addresses = false
+expose_as_tools = false
+timeout_seconds = 15
+```
+
+| Field | Meaning |
+|---|---|
+| `enabled` | Serve the endpoints. Default `false`. |
+| `search_provider` | `duckduckgo` (keyless; reads the HTML endpoint, so it can break or be rate limited) or `searxng` (self-hosted, more reliable). |
+| `searxng_url` | Base URL of a SearXNG instance with the `json` format enabled under `search.formats` in its `settings.yml`. |
+| `allow_private_addresses` | Let `/v1/web/fetch` reach loopback, private and link-local addresses. Default `false`. |
+| `expose_as_tools` | List `web_search` and `web_fetch` in `/v1/mcp/tools` under the built-in server `higgs` (as `higgs__web_search` and `higgs__web_fetch`) so the tool loop can use them. |
+| `timeout_seconds` | Bound on one search or one fetch, redirects included. |
+
+The search provider URL comes from your config and is trusted; only URLs in `/v1/web/fetch` requests are subject to the address checks. Higgs does not use Brave or other keyed providers.
+
+### `POST /v1/web/search`
+
+```json
+{"query": "rust async runtime", "max_results": 5}
+```
+
+returns `{"query": "...", "count": 5, "results": [{"title": "...", "url": "...", "snippet": "..."}]}`. `max_results` defaults to 5 and is capped at 20.
+
+### `POST /v1/web/fetch`
+
+```json
+{"url": "https://example.com/article", "max_chars": 20000}
+```
+
+returns `{"url": "<final url>", "title": "...", "text": "...", "truncated": false, "status": 200, "content_type": "text/html"}`. HTML is reduced to readable text (scripts, styles, navigation and footers dropped, links kept as `text (url)`); plain text and JSON are returned as is. `max_chars` defaults to 20000 and is capped at 200000. Bodies larger than 2 MiB are cut off; pages are decoded as UTF-8.
+
+| Status | Meaning |
+|---|---|
+| 400 | Missing or invalid `query`, malformed `url` |
+| 403 | The scheme is not `http`/`https`, the URL embeds credentials, or an address (including after a redirect or DNS lookup) is not public |
+| 404 | `[web]` is disabled |
+| 415 | The response is not text (images, archives, ...) |
+| 502 | The search provider or the page failed, or an upstream status was not 2xx |
+| 504 | Timed out |
+
+### Fetch protections
+
+- Only `http` and `https`; URLs with embedded credentials are refused.
+- The host is resolved by Higgs and **every** resolved address must be public. Loopback, private (RFC 1918), link-local (including the 169.254.169.254 metadata address), carrier-grade NAT, multicast, documentation and reserved ranges are refused, as are IPv6 forms that embed them (`::ffff:127.0.0.1`, NAT64, 6to4, unique-local). Numeric tricks such as `http://2130706433/` or `http://0x7f.1/` are normalized before the check.
+- The connection is pinned to the addresses that were checked, so a name cannot resolve to something public for the check and something internal for the connection (DNS rebinding).
+- Redirects are followed by Higgs, at most 5, and every hop gets the same checks. System proxy settings are ignored for fetches.
+- Requests carry a generic `Mozilla/5.0 (compatible; higgs-fetch/<version>)` user agent and no cookies, credentials, or host information.
+
 ## `higgs doctor`
 
-`higgs doctor` validates every server without starting it: unknown transport, missing `command` or `url`, a malformed URL, `timeout_seconds <= 0`, unresolved `${VAR}` references (failures), and a `command` that is not on `PATH` or a `cwd` that is missing (warnings). Each valid server is reported with its transport.
+`higgs doctor` validates every server without starting it: unknown transport, missing `command` or `url`, a malformed URL, `timeout_seconds <= 0`, unresolved `${VAR}` references (failures), and a `command` that is not on `PATH` or a `cwd` that is missing (warnings). Each valid server is reported with its transport. For `[web]` it fails on an unknown `search_provider`, a missing or invalid `searxng_url`, and an out-of-range timeout, and warns when `allow_private_addresses` is on, when `expose_as_tools` has no effect because web is disabled, or when `searxng_url` is set for another provider.
 
 ## Verifying against a real server
 
@@ -156,3 +214,11 @@ curl -s localhost:8000/v1/mcp/execute -H 'content-type: application/json' \
 ```
 
 Kill the `node` process while Higgs runs and call `execute` again to watch it restart.
+
+For web search, run a SearXNG instance with `json` enabled (or use `duckduckgo`), set `[web] enabled = true`, then:
+
+```bash
+curl -s localhost:8000/v1/web/search -H 'content-type: application/json' -d '{"query": "mlx apple silicon"}' | jq
+curl -s localhost:8000/v1/web/fetch -H 'content-type: application/json' -d '{"url": "https://example.com"}' | jq
+curl -s localhost:8000/v1/web/fetch -H 'content-type: application/json' -d '{"url": "http://169.254.169.254/"}'   # 403
+```

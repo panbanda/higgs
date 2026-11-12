@@ -2155,7 +2155,7 @@ mod tests {
 
         assert_eq!(run_lifecycle_check(&config, None, &[]).warnings, 1);
     }
-    // -- MCP integrations --
+    // -- MCP and web integrations --
 
     #[test]
     fn tool_integrations_add_no_checks_when_nothing_is_configured() {
@@ -2182,5 +2182,20 @@ mod tests {
         check_tool_integrations(&config, &mut result);
         assert_eq!(result.passes, 1);
         assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn tool_integrations_validate_the_web_section() {
+        let mut config = HiggsConfig::default();
+        config.web.enabled = true;
+        config.web.search_provider = "searxng".to_owned();
+        let mut result = empty_result();
+        check_tool_integrations(&config, &mut result);
+        assert_eq!(result.failures, 1);
+
+        config.web.searxng_url = Some("http://localhost:8888".to_owned());
+        let mut fixed = empty_result();
+        check_tool_integrations(&config, &mut fixed);
+        assert_eq!((fixed.passes, fixed.failures), (1, 0));
     }
 }

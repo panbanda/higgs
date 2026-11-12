@@ -23,6 +23,7 @@ Higgs is a Rust binary (plus its Metal shader library) built on [MLX](https://gi
 - **Memory you can manage.** Load models on first use, unload them after an idle timeout, cap how many stay resident or how much memory they use, and pin the ones that must stay. Least-recently-used eviction and load, unload, and status endpoints included.
 - **Drop-in for your tools.** `higgs shellenv` exports `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL`; Claude Code, Aider, and any OpenAI or Anthropic client just work.
 - **Tools without client code.** Connect [Model Context Protocol](docs/mcp.md) servers (stdio or Streamable HTTP) and call their tools through `/v1/mcp/*`, with servers that start in the background, restart when they crash, and namespace every tool as `server__tool`.
+- **Web search and fetch.** Optional `/v1/web/search` and `/v1/web/fetch` endpoints (SearXNG or keyless DuckDuckGo, SSRF-protected fetch), off by default and usable as tools by the server-side tool loop.
 - **You can see what is happening.** Time to first token, decode tokens per second, and prefix-cache hits for local streaming requests, plus latency, throughput, and memory, in the `/metrics` API and the desktop app.
 
 ## Install
@@ -192,6 +193,11 @@ Requests for `qwen` run locally; anything matching `claude-.*` is proxied to Ant
   `[mcp.servers.<name>]` in the config or `higgs serve --mcp-config mcp.json`
   (the common `{"mcpServers": {...}}` file format). Config reference, security
   notes, and verification steps: [docs/mcp.md](docs/mcp.md).
+- Web: `POST /v1/web/search` (`query`, `max_results`) and `POST /v1/web/fetch`
+  (`url`, `max_chars`: readable text, title, final URL). Disabled and answering 404
+  unless `[web] enabled = true`; fetch blocks non-http(s) schemes and private,
+  loopback and link-local addresses unless `allow_private_addresses = true`.
+  See [docs/mcp.md](docs/mcp.md#web-search-and-fetch).
 - Metrics: `/metrics` (window totals, latency and time-to-first-token
   percentiles, aggregate tokens/s, per-model and per-provider groups with
   TTFT, tokens/s, and prefix-cache hits). Local streaming requests record
@@ -202,7 +208,7 @@ Requests for `qwen` run locally; anything matching `claude-.*` is proxied to Ant
 - Health: `/health`
 
 `/health`, `/metrics`, `/v1/models`, `/v1/models/status`, `/v1/system`, the
-model load and unload endpoints, and `/v1/mcp/*` are dashboard and control endpoints and never count as
+model load and unload endpoints, and `/v1/mcp/*`, and `/v1/web/*` are dashboard and control endpoints and never count as
 traffic in metrics. The read-only ones never load a model.
 
 **Core commands**

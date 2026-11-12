@@ -9,3 +9,4 @@ pub mod models;
 pub mod responses;
 pub mod system;
 pub mod tokenize;
+pub mod web;

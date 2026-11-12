@@ -296,6 +296,9 @@ pub struct HiggsConfig {
     /// Model Context Protocol servers whose tools Higgs can run.
     #[serde(default)]
     pub mcp: crate::mcp::config::McpConfig,
+    /// Web search and fetch endpoints (off by default).
+    #[serde(default)]
+    pub web: crate::web::config::WebConfig,
 }
 
 // -- Server section ---------------------------------------------------------
@@ -2823,5 +2826,39 @@ mod integration_section_tests {
             panic!("expected serve");
         };
         assert_eq!(args.mcp_config, Some(PathBuf::from("/tmp/mcp.json")));
+    }
+
+    // -- Web section --
+
+    #[test]
+    fn web_section_defaults_off_and_parses_every_field() {
+        let defaults = write_and_load("[[models]]\npath = \"org/model\"\n");
+        assert!(!defaults.web.enabled);
+        assert!(!defaults.web.allow_private_addresses);
+        assert!(!defaults.web.expose_as_tools);
+
+        let config = write_and_load(
+            r#"
+            [[models]]
+            path = "org/model"
+            [web]
+            enabled = true
+            search_provider = "searxng"
+            searxng_url = "http://localhost:8888"
+            allow_private_addresses = true
+            expose_as_tools = true
+            timeout_seconds = 7
+            "#,
+        );
+        assert!(
+            config.web.enabled && config.web.allow_private_addresses && config.web.expose_as_tools
+        );
+        assert_eq!(config.web.search_provider, "searxng");
+        assert_eq!(
+            config.web.searxng_url.as_deref(),
+            Some("http://localhost:8888")
+        );
+        assert!((config.web.timeout_seconds - 7.0).abs() < f64::EPSILON);
+        assert!(config.web.problems().is_empty());
     }
 }

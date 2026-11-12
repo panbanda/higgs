@@ -30,6 +30,7 @@ pub mod translate;
 pub mod tui;
 pub mod types;
 pub mod usage;
+pub mod web;
 
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
@@ -69,8 +70,8 @@ const INFRASTRUCTURE_PATHS: &[&str] = &[
     "/v1/system",
 ];
 
-/// MCP tool endpoints are tool plumbing, not inference traffic.
-const TOOL_PATH_PREFIXES: &[&str] = &["/v1/mcp/"];
+/// MCP and web tool endpoints are tool plumbing, not inference traffic.
+const TOOL_PATH_PREFIXES: &[&str] = &["/v1/mcp/", "/v1/web/"];
 
 /// Model load/unload controls live under `/v1/models/` and are not API traffic either.
 fn is_infrastructure_path(path: &str) -> bool {
@@ -117,6 +118,8 @@ pub fn build_router(
         .route("/v1/mcp/servers", get(routes::mcp::list_servers))
         .route("/v1/mcp/tools", get(routes::mcp::list_tools))
         .route("/v1/mcp/execute", post(routes::mcp::execute))
+        .route("/v1/web/search", post(routes::web::search))
+        .route("/v1/web/fetch", post(routes::web::fetch))
         .route("/v1/tokenize", post(routes::tokenize::tokenize))
         .route("/tokenize", post(routes::tokenize::tokenize))
         .route("/v1/detokenize", post(routes::tokenize::detokenize))
