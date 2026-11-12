@@ -8,6 +8,7 @@ pub mod disk_prefix_store;
 pub mod engine;
 pub mod engine_thread;
 pub mod error;
+pub(crate) mod generation_support;
 pub mod mlx_tuning;
 pub mod model_loader;
 pub mod mtp;
