@@ -242,6 +242,33 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_becomes_leading_system_message() {
+        let messages: Vec<AnthropicMessage> =
+            serde_json::from_value(json!([{"role": "user", "content": "Hello"}])).unwrap();
+        let system = SystemPrompt::Text("Be helpful".to_owned());
+        let converted = messages_with_tool_history(&messages, Some(&system));
+        assert_eq!(converted.len(), 2);
+        assert_eq!(converted[0].role, "system");
+        assert_eq!(converted[0].content, "Be helpful");
+        assert_eq!(converted[1].role, "user");
+    }
+
+    #[test]
+    fn text_blocks_are_concatenated_and_empty_history_is_empty() {
+        let messages: Vec<AnthropicMessage> = serde_json::from_value(json!([
+            {"role": "user", "content": [
+                {"type": "text", "text": "Hello "},
+                {"type": "text", "text": "World"}
+            ]}
+        ]))
+        .unwrap();
+        let converted = messages_with_tool_history(&messages, None);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].content, "Hello World");
+        assert!(messages_with_tool_history(&[], None).is_empty());
+    }
+
+    #[test]
     fn anthropic_tools_become_function_tools() {
         let converted = openai_tools(&[json!({
             "name": "get_weather",
