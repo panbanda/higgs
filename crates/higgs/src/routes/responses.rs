@@ -27,7 +27,7 @@ use crate::{
         },
     },
     router::ResolvedRoute,
-    state::{Engine, SharedState},
+    state::{EngineLease, SharedState},
     types::responses::{
         CreateResponseRequest, DeletedResponse, InputItem, ResponseObject, ResponseStatus,
         StreamEvent,
@@ -93,7 +93,7 @@ pub async fn create_response(
         .router
         .resolve(&request.model, messages.as_deref())
         .await
-        .map_err(ServerError::ModelNotFound)?;
+        .map_err(ServerError::from)?;
 
     match resolved {
         ResolvedRoute::Higgs {
@@ -176,7 +176,7 @@ struct LocalRequest {
     state: SharedState,
     request_metrics: RequestMetricsContext,
     store: Arc<ResponseStore>,
-    engine: Arc<Engine>,
+    engine: EngineLease,
     model_name: String,
     routing_method: crate::router::RoutingMethod,
     received_at: Instant,
@@ -372,6 +372,7 @@ mod tests {
     use crate::metrics::MetricsStore;
     use crate::router::Router;
     use crate::state::AppState;
+    use crate::state::Engine;
     use crate::types::responses::ContentPart;
 
     const STUB_MODEL: &str = "stub-model";

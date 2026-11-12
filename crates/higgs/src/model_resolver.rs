@@ -28,6 +28,35 @@ pub fn resolve(path: &str) -> Result<PathBuf, String> {
     resolve_with_cache(path, default_hf_cache().as_deref())
 }
 
+/// Total size in bytes of the weight files directly inside a model directory.
+///
+/// This is the cheapest estimate of how much memory the model needs once loaded. Symlinks (the
+/// `HuggingFace` cache stores snapshots as links to blobs) are followed.
+pub fn weights_size_bytes(model_dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(model_dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "safetensors" || extension == "gguf")
+        })
+        .filter_map(|entry| std::fs::metadata(entry.path()).ok())
+        .filter(std::fs::Metadata::is_file)
+        .fold(0_u64, |total, metadata| {
+            total.saturating_add(metadata.len())
+        })
+}
+
+/// Estimated resident size of a model specifier, or `None` if it is not on disk yet.
+pub fn estimated_footprint_bytes(path: &str) -> Option<u64> {
+    let resolved = resolve(path).ok()?;
+    Some(weights_size_bytes(&resolved)).filter(|bytes| *bytes > 0)
+}
+
 /// Returns `true` if `s` looks like a `org/name` `HuggingFace` model ID.
 pub fn is_hf_model_id(s: &str) -> bool {
     if s.starts_with("~/") || s.starts_with('/') {
@@ -306,5 +335,43 @@ mod tests {
         std::fs::write(&ref_path, "abc123\n").unwrap();
         let result = resolve_with_cache("org/model", Some(cache.path()));
         assert_eq!(result.unwrap(), snapshot);
+    }
+
+    #[test]
+    fn weights_size_sums_sharded_weight_files_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("model-00001-of-00002.safetensors"),
+            vec![0; 100],
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("model-00002-of-00002.safetensors"),
+            vec![0; 50],
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("tokenizer.json"), vec![0; 999]).unwrap();
+
+        assert_eq!(weights_size_bytes(dir.path()), 150);
+    }
+
+    #[test]
+    fn weights_size_follows_symlinks_like_the_hf_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob");
+        std::fs::write(&blob, vec![0; 64]).unwrap();
+        std::os::unix::fs::symlink(&blob, dir.path().join("model.safetensors")).unwrap();
+
+        assert_eq!(weights_size_bytes(dir.path()), 64);
+    }
+
+    #[test]
+    fn weights_size_of_a_missing_directory_is_zero() {
+        assert_eq!(weights_size_bytes(Path::new("/nonexistent/higgs/model")), 0);
+    }
+
+    #[test]
+    fn footprint_of_an_unresolvable_model_is_unknown() {
+        assert_eq!(estimated_footprint_bytes("/nonexistent/higgs/model"), None);
     }
 }

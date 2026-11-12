@@ -657,6 +657,9 @@ mod tests {
                 kv_disk_dir: None,
                 kv_disk_space_mb: 4096,
                 mla_latent_cache: None,
+                load: None,
+                idle_ttl_seconds: None,
+                pinned: false,
             }],
             ..HiggsConfig::default()
         }

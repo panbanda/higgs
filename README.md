@@ -20,6 +20,7 @@ Higgs is a Rust binary (plus its Metal shader library) built on [MLX](https://gi
 
 - **Fast on Apple Silicon.** Native MLX inference with prefix caching, continuous batching for transformer families, quantized KV cache, and MoE prefill tuning. See [Performance](#performance).
 - **One endpoint for everything.** Local models and remote providers behind one URL, with regex routes, aliases, and an optional auto-router that picks a model per prompt.
+- **Memory you can manage.** Load models on first use, unload them after an idle timeout, cap how many stay resident or how much memory they use, and pin the ones that must stay. Least-recently-used eviction and load, unload, and status endpoints included.
 - **Drop-in for your tools.** `higgs shellenv` exports `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL`; Claude Code, Aider, and any OpenAI or Anthropic client just work.
 - **You can see what is happening.** Time to first token, decode tokens per second, and prefix-cache hits for local streaming requests, plus latency, throughput, and memory, in the `/metrics` API and the desktop app.
 
@@ -111,6 +112,21 @@ provider = "anthropic"
 provider = "higgs"
 ```
 
+By default every local model loads at startup. To load on first use and free memory when idle, add to the config:
+
+```toml
+[local]
+load = "on_demand"
+idle_ttl_seconds = 900      # unload after 15 idle minutes
+max_loaded_models = 2       # evict the least recently used beyond two
+memory_guard = "balanced"   # keep ~8% of unified memory for the system
+
+[[models]]
+path = "mlx-community/Qwen3.6-35B-A3B-4bit"
+name = "qwen"
+pinned = true               # never evicted or expired
+```
+
 Requests for `qwen` run locally; anything matching `claude-.*` is proxied to Anthropic with format translation; everything else falls through to the default. Routing precedence, the auto-router, KV cache and prefill options, profiles, and metrics settings are covered in [docs/configuration.md](docs/configuration.md).
 
 ## API and CLI Overview
@@ -122,6 +138,11 @@ Requests for `qwen` run locally; anything matching `claude-.*` is proxied to Ant
     llama.cpp-compatible `prompt_progress` chunks (`{total, cache, processed,
     time_ms}`) during chunked prefill.
 - Anthropic: `/v1/messages`, `/v1/messages/count_tokens`
+- Model lifecycle: `POST /v1/models/{id}/load`, `POST /v1/models/{id}/unload[?force=true]`,
+  `GET /v1/models/status` (state, pinned, in-flight requests, last use, load time,
+  estimated and measured memory per configured model); see
+  [docs/configuration.md](docs/configuration.md#model-lifecycle). `/v1/models` lists every
+  configured model with a `loaded` flag.
 - OpenAI Responses: `POST /v1/responses` (streaming and non-streaming),
   `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}`. Local models and
   OpenAI-format providers only; supported fields, unsupported features, and
@@ -131,11 +152,13 @@ Requests for `qwen` run locally; anything matching `claude-.*` is proxied to Ant
   TTFT, tokens/s, and prefix-cache hits). Local streaming requests record
   `ttft_ms` and `cached_tokens` in the metrics JSONL log.
 - System: `/v1/system` (version, pid, uptime, unified memory, process RSS,
-  MLX active/peak/cache memory, loaded models with engine kind and profile)
+  MLX active/peak/cache memory, every configured model with its lifecycle state,
+  engine kind and profile)
 - Health: `/health`
 
-`/health`, `/metrics`, `/v1/models`, and `/v1/system` are dashboard endpoints and
-never count as traffic in metrics.
+`/health`, `/metrics`, `/v1/models`, `/v1/models/status`, `/v1/system`, and the
+model load and unload endpoints are dashboard and control endpoints and never count as
+traffic in metrics. The read-only ones never load a model.
 
 **Core commands**
 
@@ -155,6 +178,7 @@ never count as traffic in metrics.
 - Release artifacts bundle `mlx.metallib`.
 - Source builds also require `mlx.metallib` next to the executable. Higgs now restores it automatically from Cargo build output when possible, then fails loudly if it still cannot be found.
 - `[local].raise_wired_limit` defaults to `false`. Enable it only when you explicitly want MLX to raise the process wired-memory limit.
+- With several large models, `load = "on_demand"` plus `max_loaded_models`, `memory_guard`, or `idle_ttl_seconds` keeps unified memory from filling up; unloading shuts the engine down and clears the MLX buffer cache.
 - `batch=true` is only supported for transformer families with true batched decode support.
 - For batch models, `prefill_yield_tokens` can interleave long prompt prefills with decode; use `0` or omit it for the synchronous default.
 

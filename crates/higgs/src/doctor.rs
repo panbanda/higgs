@@ -47,6 +47,12 @@ pub async fn run_doctor(
     check_config_file_permissions(config, config_path, &mut result);
     check_server_section(config, &mut result);
     check_models(config, &mut result);
+    check_model_lifecycle(
+        config,
+        crate::routes::system::physical_memory_bytes(),
+        &|model| model_resolver::estimated_footprint_bytes(&model.path),
+        &mut result,
+    );
     check_duplicate_models(config, &mut result);
     check_providers(config, &mut result).await;
     check_route_consistency(config, &mut result);
@@ -452,6 +458,173 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
     }
 }
 
+fn is_auto_router_model(config: &HiggsConfig, model: &crate::config::ModelConfig) -> bool {
+    config.auto_router.enabled && model.name.as_deref() == Some(config.auto_router.model.as_str())
+}
+
+struct LifecycleTotals {
+    /// Models that load when the server starts.
+    startup_models: usize,
+    startup_bytes: u64,
+    /// Models that are never evicted: pinned ones and the auto-router classifier.
+    pinned_bytes: u64,
+}
+
+/// Warn about per-model lifecycle conflicts and total what loads at startup or stays resident.
+fn tally_lifecycle(
+    config: &HiggsConfig,
+    footprint: &dyn Fn(&crate::config::ModelConfig) -> Option<u64>,
+    result: &mut DoctorResult,
+) -> LifecycleTotals {
+    use crate::config::LoadMode;
+
+    let local = &config.local;
+    let mut totals = LifecycleTotals {
+        startup_models: 0,
+        startup_bytes: 0,
+        pinned_bytes: 0,
+    };
+    for model in &config.models {
+        let label = model_label(model);
+        let is_classifier = is_auto_router_model(config, model);
+        if is_classifier && model.effective_load(local) == LoadMode::OnDemand {
+            warn(
+                &format!(
+                    "model {label} is the auto_router classifier; it always loads at startup and is never evicted, so load=\"on_demand\" is ignored"
+                ),
+                result,
+            );
+        }
+        if model.pinned && model.idle_ttl_seconds.is_some_and(|seconds| seconds > 0) {
+            warn(
+                &format!("model {label} is pinned, so its idle_ttl_seconds never applies"),
+                result,
+            );
+        }
+        let bytes = footprint(model).unwrap_or(0);
+        if is_classifier || model.effective_load(local) == LoadMode::Startup {
+            totals.startup_models += 1;
+            totals.startup_bytes = totals.startup_bytes.saturating_add(bytes);
+        }
+        if model.pinned || is_classifier {
+            totals.pinned_bytes = totals.pinned_bytes.saturating_add(bytes);
+        }
+    }
+    totals
+}
+
+const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+fn gib_label(bytes: u64) -> String {
+    #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+    let gib = bytes as f64 / GIB;
+    format!("{gib:.1} GiB")
+}
+
+/// Validate on-demand loading, eviction and memory-ceiling settings.
+///
+/// `footprint` returns a model's on-disk weight size, or `None` when it is not downloaded.
+fn check_model_lifecycle(
+    config: &HiggsConfig,
+    physical_memory: Option<u64>,
+    footprint: &dyn Fn(&crate::config::ModelConfig) -> Option<u64>,
+    result: &mut DoctorResult,
+) {
+    use crate::config::LoadMode;
+
+    let local = &config.local;
+    if let Err(error) = local.validate_lifecycle() {
+        fail(&error, result);
+        return;
+    }
+
+    let ceiling = local.memory_ceiling_bytes(physical_memory);
+    if let Some(ceiling_bytes) = ceiling {
+        pass(
+            &format!(
+                "memory ceiling for loaded models is {}",
+                gib_label(ceiling_bytes)
+            ),
+            result,
+        );
+    } else if local.memory_limit_gb.is_none()
+        && local.memory_guard != crate::config::MemoryGuard::Off
+    {
+        warn(
+            "local.memory_guard is set but total memory could not be read; no ceiling will be enforced",
+            result,
+        );
+    }
+
+    let LifecycleTotals {
+        startup_models,
+        startup_bytes,
+        pinned_bytes,
+    } = tally_lifecycle(config, footprint, result);
+
+    if let Some(ceiling_bytes) = ceiling
+        && pinned_bytes > ceiling_bytes
+    {
+        warn(
+            &format!(
+                "pinned models alone need about {} on disk, over the {} memory ceiling; loading them will be refused",
+                gib_label(pinned_bytes),
+                gib_label(ceiling_bytes)
+            ),
+            result,
+        );
+    } else if let Some(ceiling_bytes) = ceiling
+        && startup_bytes > ceiling_bytes
+    {
+        warn(
+            &format!(
+                "models loaded at startup need about {} on disk, over the {} memory ceiling; some will be evicted as others load",
+                gib_label(startup_bytes),
+                gib_label(ceiling_bytes)
+            ),
+            result,
+        );
+    }
+
+    if let Some(cap) = local.max_loaded_models
+        && startup_models > cap
+    {
+        warn(
+            &format!(
+                "{startup_models} models load at startup but local.max_loaded_models={cap}; the least recently used will be evicted during startup"
+            ),
+            result,
+        );
+    }
+
+    let on_demand_models = config
+        .models
+        .iter()
+        .filter(|model| {
+            !is_auto_router_model(config, model)
+                && model.effective_load(local) == LoadMode::OnDemand
+        })
+        .count();
+    if on_demand_models > 0 && config.models.len() == 1 {
+        warn(
+            "load=\"on_demand\" with a single model only delays the first request; use \"startup\" unless you rely on idle_ttl_seconds",
+            result,
+        );
+    }
+
+    let lifecycle_configured = ceiling.is_some()
+        || local.max_loaded_models.is_some()
+        || local.idle_ttl_seconds.is_some()
+        || on_demand_models > 0
+        || config
+            .models
+            .iter()
+            .any(|model| model.pinned || model.idle_ttl_seconds.is_some());
+    if lifecycle_configured {
+        pass("model lifecycle settings are valid", result);
+    }
+}
+
 fn check_duplicate_models(config: &HiggsConfig, result: &mut DoctorResult) {
     let mut seen_paths = HashSet::new();
     let mut seen_names = HashSet::new();
@@ -750,6 +923,9 @@ mod tests {
                     kv_disk_dir: None,
                     kv_disk_space_mb: 4096,
                     mla_latent_cache: None,
+                    load: None,
+                    idle_ttl_seconds: None,
+                    pinned: false,
                 },
                 ModelConfig {
                     path: "org/model-b".to_owned(),
@@ -767,6 +943,9 @@ mod tests {
                     kv_disk_dir: None,
                     kv_disk_space_mb: 4096,
                     mla_latent_cache: None,
+                    load: None,
+                    idle_ttl_seconds: None,
+                    pinned: false,
                 },
             ],
             ..HiggsConfig::default()
@@ -797,6 +976,9 @@ mod tests {
                     kv_disk_dir: None,
                     kv_disk_space_mb: 4096,
                     mla_latent_cache: None,
+                    load: None,
+                    idle_ttl_seconds: None,
+                    pinned: false,
                 },
                 ModelConfig {
                     path: "org/model-a".to_owned(),
@@ -814,6 +996,9 @@ mod tests {
                     kv_disk_dir: None,
                     kv_disk_space_mb: 4096,
                     mla_latent_cache: None,
+                    load: None,
+                    idle_ttl_seconds: None,
+                    pinned: false,
                 },
             ],
             ..HiggsConfig::default()
@@ -1293,6 +1478,9 @@ mod tests {
                 kv_disk_dir: None,
                 kv_disk_space_mb: 4096,
                 mla_latent_cache: None,
+                load: None,
+                idle_ttl_seconds: None,
+                pinned: false,
             }],
             ..HiggsConfig::default()
         };
@@ -1327,6 +1515,9 @@ mod tests {
                 kv_disk_dir: None,
                 kv_disk_space_mb: 4096,
                 mla_latent_cache: None,
+                load: None,
+                idle_ttl_seconds: None,
+                pinned: false,
             }],
             ..HiggsConfig::default()
         };
@@ -1363,6 +1554,9 @@ mod tests {
                 kv_disk_dir: None,
                 kv_disk_space_mb: 4096,
                 mla_latent_cache: None,
+                load: None,
+                idle_ttl_seconds: None,
+                pinned: false,
             }],
             routes: vec![RouteConfig {
                 name: Some("test".to_owned()),
@@ -1424,6 +1618,9 @@ mod tests {
             kv_disk_dir: None,
             kv_disk_space_mb: 4096,
             mla_latent_cache: None,
+            load: None,
+            idle_ttl_seconds: None,
+            pinned: false,
         }
     }
 
@@ -1532,6 +1729,9 @@ mod tests {
             write_model_config_json(dir.path(), "deepseek_v2");
             let model = ModelConfig {
                 mla_latent_cache: Some(true),
+                load: None,
+                idle_ttl_seconds: None,
+                pinned: false,
                 ..model_with_path(dir.path().to_str().unwrap().to_owned())
             };
             let mut result = empty_result();
@@ -1549,6 +1749,9 @@ mod tests {
             write_model_config_json(dir.path(), "qwen2");
             let model = ModelConfig {
                 mla_latent_cache: Some(true),
+                load: None,
+                idle_ttl_seconds: None,
+                pinned: false,
                 ..model_with_path(dir.path().to_str().unwrap().to_owned())
             };
             let mut result = empty_result();
@@ -1582,6 +1785,9 @@ mod tests {
             write_model_config_json(dir.path(), "qwen2");
             let model = ModelConfig {
                 mla_latent_cache: Some(true),
+                load: None,
+                idle_ttl_seconds: None,
+                pinned: false,
                 ..model_with_path(dir.path().to_str().unwrap().to_owned())
             };
             let mut result = empty_result();
@@ -1607,5 +1813,212 @@ mod tests {
             assert_eq!(result.warnings, 0);
             assert_eq!(result.failures, 0);
         });
+    }
+
+    // -- Model lifecycle --
+
+    fn lifecycle_config(
+        local: impl FnOnce(&mut crate::config::LocalConfig),
+        models: Vec<ModelConfig>,
+    ) -> HiggsConfig {
+        let mut config = HiggsConfig {
+            models,
+            ..HiggsConfig::default()
+        };
+        local(&mut config.local);
+        config
+    }
+
+    fn named_model(name: &str, modify: impl FnOnce(&mut ModelConfig)) -> ModelConfig {
+        let mut model = model_with_path(format!("/models/{name}"));
+        model.name = Some(name.to_owned());
+        modify(&mut model);
+        model
+    }
+
+    const GIB_BYTES: u64 = 1 << 30;
+
+    fn run_lifecycle_check(
+        config: &HiggsConfig,
+        physical_memory: Option<u64>,
+        sizes_gib: &[(&str, u64)],
+    ) -> DoctorResult {
+        let mut result = empty_result();
+        let footprint = |model: &ModelConfig| {
+            sizes_gib
+                .iter()
+                .find(|(name, _)| model.name.as_deref() == Some(*name))
+                .map(|(_, gib)| gib * GIB_BYTES)
+        };
+        check_model_lifecycle(config, physical_memory, &footprint, &mut result);
+        result
+    }
+
+    #[test]
+    fn lifecycle_defaults_are_silent() {
+        let config = lifecycle_config(
+            |_| {},
+            vec![named_model("a", |_| {}), named_model("b", |_| {})],
+        );
+
+        let result = run_lifecycle_check(&config, Some(64 * GIB_BYTES), &[]);
+
+        assert_eq!((result.passes, result.warnings, result.failures), (0, 0, 0));
+    }
+
+    #[test]
+    fn lifecycle_rejects_a_non_positive_memory_limit() {
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let config = lifecycle_config(|local| local.memory_limit_gb = Some(bad), vec![]);
+            let result = run_lifecycle_check(&config, None, &[]);
+            assert_eq!(result.failures, 1, "memory_limit_gb={bad}");
+        }
+    }
+
+    #[test]
+    fn lifecycle_rejects_zero_max_loaded_models() {
+        let config = lifecycle_config(|local| local.max_loaded_models = Some(0), vec![]);
+
+        assert_eq!(run_lifecycle_check(&config, None, &[]).failures, 1);
+    }
+
+    #[test]
+    fn lifecycle_warns_when_guard_cannot_read_physical_memory() {
+        let config = lifecycle_config(
+            |local| local.memory_guard = crate::config::MemoryGuard::Safe,
+            vec![named_model("a", |_| {}), named_model("b", |_| {})],
+        );
+
+        let result = run_lifecycle_check(&config, None, &[]);
+
+        assert_eq!((result.warnings, result.failures), (1, 0));
+    }
+
+    #[test]
+    fn lifecycle_warns_when_pinned_models_exceed_the_ceiling() {
+        let config = lifecycle_config(
+            |local| local.memory_limit_gb = Some(30.0),
+            vec![
+                named_model("big-a", |m| m.pinned = true),
+                named_model("big-b", |m| m.pinned = true),
+                named_model("small", |_| {}),
+            ],
+        );
+
+        let result =
+            run_lifecycle_check(&config, None, &[("big-a", 20), ("big-b", 20), ("small", 1)]);
+
+        assert_eq!((result.warnings, result.failures), (1, 0));
+    }
+
+    #[test]
+    fn lifecycle_does_not_warn_when_pinned_models_fit() {
+        let config = lifecycle_config(
+            |local| local.memory_limit_gb = Some(30.0),
+            vec![
+                named_model("a", |m| m.pinned = true),
+                named_model("b", |_| {}),
+            ],
+        );
+
+        let result = run_lifecycle_check(&config, None, &[("a", 10), ("b", 10)]);
+
+        assert_eq!((result.warnings, result.failures), (0, 0));
+    }
+
+    #[test]
+    fn lifecycle_uses_the_guard_ceiling_for_the_pinned_check() {
+        let config = lifecycle_config(
+            |local| local.memory_guard = crate::config::MemoryGuard::Safe,
+            vec![
+                named_model("a", |m| m.pinned = true),
+                named_model("b", |_| {}),
+            ],
+        );
+
+        let fits = run_lifecycle_check(&config, Some(100 * GIB_BYTES), &[("a", 70)]);
+        let too_big = run_lifecycle_check(&config, Some(100 * GIB_BYTES), &[("a", 90)]);
+
+        assert_eq!(fits.warnings, 0);
+        assert_eq!(too_big.warnings, 1);
+    }
+
+    #[test]
+    fn lifecycle_warns_when_on_demand_has_a_single_model() {
+        let config = lifecycle_config(
+            |local| local.load = crate::config::LoadMode::OnDemand,
+            vec![named_model("only", |_| {})],
+        );
+
+        assert_eq!(run_lifecycle_check(&config, None, &[]).warnings, 1);
+    }
+
+    #[test]
+    fn lifecycle_accepts_on_demand_with_several_models() {
+        let config = lifecycle_config(
+            |local| local.load = crate::config::LoadMode::OnDemand,
+            vec![named_model("a", |_| {}), named_model("b", |_| {})],
+        );
+
+        let result = run_lifecycle_check(&config, None, &[]);
+
+        assert_eq!((result.warnings, result.failures), (0, 0));
+        assert_eq!(result.passes, 1);
+    }
+
+    #[test]
+    fn lifecycle_warns_when_startup_models_exceed_the_count_cap() {
+        let config = lifecycle_config(
+            |local| local.max_loaded_models = Some(1),
+            vec![named_model("a", |_| {}), named_model("b", |_| {})],
+        );
+
+        assert_eq!(run_lifecycle_check(&config, None, &[]).warnings, 1);
+    }
+
+    #[test]
+    fn lifecycle_count_cap_ignores_on_demand_models() {
+        let config = lifecycle_config(
+            |local| {
+                local.max_loaded_models = Some(1);
+                local.load = crate::config::LoadMode::OnDemand;
+            },
+            vec![named_model("a", |_| {}), named_model("b", |_| {})],
+        );
+
+        assert_eq!(run_lifecycle_check(&config, None, &[]).warnings, 0);
+    }
+
+    #[test]
+    fn lifecycle_warns_when_a_pinned_model_has_an_idle_ttl() {
+        let config = lifecycle_config(
+            |_| {},
+            vec![
+                named_model("a", |m| {
+                    m.pinned = true;
+                    m.idle_ttl_seconds = Some(60);
+                }),
+                named_model("b", |_| {}),
+            ],
+        );
+
+        assert_eq!(run_lifecycle_check(&config, None, &[]).warnings, 1);
+    }
+
+    #[test]
+    fn lifecycle_warns_when_the_auto_router_model_is_on_demand() {
+        let mut config = lifecycle_config(
+            |_| {},
+            vec![
+                named_model("router", |m| {
+                    m.load = Some(crate::config::LoadMode::OnDemand);
+                }),
+                named_model("other", |_| {}),
+            ],
+        );
+        config.auto_router.enabled = true;
+        config.auto_router.model = "router".to_owned();
+
+        assert_eq!(run_lifecycle_check(&config, None, &[]).warnings, 1);
     }
 }

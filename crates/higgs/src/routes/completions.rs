@@ -19,7 +19,7 @@ use crate::{
     error::ServerError,
     metrics::{MetricsStore, RequestMetricsContext, RequestRecord, RequestTiming},
     router::ResolvedRoute,
-    state::{Engine, SharedState},
+    state::{EngineLease, SharedState},
     types::openai::{
         ChoiceLogprobs, CompletionChoice, CompletionChunkChoice, CompletionRequest,
         CompletionResponse, CompletionUsage, StopSequence, TokenLogprob, TopLogprob,
@@ -47,11 +47,7 @@ pub async fn completions(
         ));
     }
 
-    let resolved = state
-        .router
-        .resolve(&req.model, None)
-        .await
-        .map_err(ServerError::ModelNotFound)?;
+    let resolved = state.router.resolve(&req.model, None).await?;
 
     match resolved {
         ResolvedRoute::Higgs {
@@ -156,7 +152,7 @@ pub async fn completions(
 async fn completions_non_streaming(
     state: SharedState,
     req: CompletionRequest,
-    engine: Arc<Engine>,
+    engine: EngineLease,
 ) -> Result<CompletionResponse, ServerError> {
     let max_tokens = req.max_tokens.unwrap_or(state.config.server.max_tokens);
     let sampling = build_sampling_params(&req);
@@ -217,7 +213,7 @@ async fn completions_non_streaming(
 fn completions_stream(
     state: SharedState,
     req: CompletionRequest,
-    engine: Arc<Engine>,
+    engine: EngineLease,
     model_name: String,
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,

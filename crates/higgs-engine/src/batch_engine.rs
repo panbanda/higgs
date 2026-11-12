@@ -137,6 +137,7 @@ fn prefill_chunk_ranges(token_count: usize, quantum: usize) -> Vec<std::ops::Ran
 /// token level instead of being fully serialized.
 pub struct BatchEngine {
     request_tx: tokio::sync::mpsc::Sender<BatchRequest>,
+    worker: std::thread::JoinHandle<()>,
     tokenizer: Tokenizer,
     template: ChatTemplateRenderer,
     model_name: String,
@@ -174,7 +175,7 @@ impl BatchEngine {
         // the worker loads the model itself and reports back only plain data.
         let (loaded_tx, loaded_rx) = std::sync::mpsc::sync_channel::<Result<i32, EngineError>>(1);
 
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("batch-engine".into())
             .spawn(move || {
                 let model = match model_loader::load_model(&worker_model_dir) {
@@ -211,12 +212,24 @@ impl BatchEngine {
 
         Ok(Self {
             request_tx,
+            worker,
             tokenizer,
             template,
             model_name,
             eos_token_ids,
             hidden_size: AtomicI32::new(hidden_size),
         })
+    }
+
+    /// Free the model, returning only once the worker has dropped its MLX state.
+    ///
+    /// The worker finishes requests it already accepted, then exits when the queue closes.
+    pub fn shutdown(self) {
+        let Self {
+            request_tx, worker, ..
+        } = self;
+        drop(request_tx);
+        let _ = worker.join();
     }
 
     pub fn model_name(&self) -> &str {

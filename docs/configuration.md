@@ -29,6 +29,10 @@ This document collects the full CLI, environment, and config-file reference for 
 | `--kv-no-norm-correction` | -- | `false` | Disable TurboQuant norm correction |
 | `--kv-adaptive-dense-layers` | -- | `0` | Keep the last N KV cache layers dense |
 | `--kv-seed` | -- | `0` | TurboQuant seed |
+| `--load` | -- | `startup` | `startup` loads every model before serving; `on-demand` loads each on its first request |
+| `--idle-ttl` | -- | *(none)* | Unload a model after this many idle seconds (`0` never unloads) |
+| `--memory-guard` | -- | `off` | Memory ceiling tier: `off`, `safe`, `balanced`, or `aggressive` (see [Model lifecycle](#model-lifecycle)) |
+| `--max-loaded-models` | -- | *(none)* | Keep at most N models loaded, evicting the least recently used |
 
 `auto` resolves to `balanced` for small and medium models, and `throughput` for large and huge models.
 
@@ -69,11 +73,19 @@ port = 8000
 [local]
 mlx_profile = "auto"
 raise_wired_limit = false
+# load = "on_demand"
+# idle_ttl_seconds = 900
+# max_loaded_models = 2
+# memory_guard = "balanced"
+# memory_limit_gb = 48
 
 # --- Local models ---
 [[models]]
 path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
 # name = "llama"
+# load = "startup"
+# idle_ttl_seconds = 600
+# pinned = true
 # mlx_profile = "throughput"
 # batch = false
 # prefill_yield_tokens = 512 # 0 or omitted keeps synchronous prefill
@@ -144,6 +156,68 @@ Order of precedence:
 4. `[local].mlx_profile`
 5. built-in default `auto`
 
+## Model lifecycle
+
+By default every `[[models]]` entry loads at startup and stays resident until the server stops. Set `load = "on_demand"` to load a model on the first request that routes to it, and add an idle timeout, a model-count cap, or a memory ceiling to free memory for models that are not in use.
+
+### Fields
+
+`[local]` sets defaults; the same-named `[[models]]` field overrides it for one model.
+
+| Field | Where | Type | Default | Description |
+|---|---|---|---|---|
+| `load` | `[local]`, `[[models]]` | `"startup"` or `"on_demand"` | `"startup"` | When the model is loaded |
+| `idle_ttl_seconds` | `[local]`, `[[models]]` | integer | *(none)* | Unload after this many seconds with no in-flight request. `0` or unset never unloads on idle; a model-level `0` opts one model out of a `[local]` default |
+| `pinned` | `[[models]]` | bool | `false` | Never evicted or unloaded on idle. An explicit `/unload` still works |
+| `max_loaded_models` | `[local]` | integer >= 1 | *(none)* | Most models allowed in memory at once |
+| `memory_limit_gb` | `[local]` | number > 0 | *(none)* | Ceiling on MLX active memory, in GiB. Wins over `memory_guard` |
+| `memory_guard` | `[local]` | `"off"`, `"safe"`, `"balanced"`, `"aggressive"` | `"off"` | Derive the ceiling from total unified memory by reserving 20%, 8%, or 2% for the rest of the system |
+
+`higgs doctor` rejects out-of-range values and warns when pinned models alone exceed the ceiling (by weight size on disk), when more models load at startup than `max_loaded_models` allows, and when `on_demand` is used with a single model, which only delays the first request.
+
+### Rules
+
+- **Lazy loading.** A request for an unloaded model loads it first. Concurrent first requests share one load. If it fails, every waiting request gets a `503` and the next request tries again; a failed load is never cached.
+- **Startup models.** Models that resolve to `startup` load before the server binds, as before. The `auto_router` classifier always loads at startup and is never evicted or expired, whatever its `load`.
+- **Eviction.** Before a load that would exceed `max_loaded_models` or the memory ceiling, Higgs unloads the least recently used model that is idle and not pinned, repeating until the model fits. Models with requests in flight and pinned models are never evicted.
+- **Memory accounting.** The size of a model before loading is estimated from its weight files on disk. After loading, the growth in MLX active memory is recorded as the measured size, which includes any other model generating at that moment, so treat it as approximate. The ceiling is compared with MLX active memory (weights plus KV caches), not process RSS or MLX's reusable buffer cache.
+- **Refusal.** If the model still does not fit once nothing more can be evicted, or the model alone exceeds the ceiling, the load is refused with `503` and `code = "insufficient_memory"`. The message names the model, its estimated size, the ceiling, and each loaded model with the reason it could not be evicted (pinned or in use). A model that turns out larger than estimated is checked again after loading and unloaded if it breaks the ceiling.
+- **Idle expiry.** A model with `idle_ttl_seconds` is unloaded once it has had no in-flight request for that long. A request that is still streaming keeps its model alive; the idle clock starts when the last request finishes.
+- **Unloading frees memory.** The engine is shut down on the thread that owns its MLX state, Higgs waits for that to finish, and then clears the MLX buffer cache, so the memory is back by the time the unload returns.
+- **Reloading.** An unloaded model, however it was unloaded, loads again on its next request.
+
+### Endpoints
+
+All use the same authentication as the rest of the API. None of them count as traffic in `/metrics`, and none of the read-only ones ever trigger a load. A model id containing a slash (`org/name`) can be written as is or percent-encoded (`org%2Fname`).
+
+| Endpoint | Description |
+|---|---|
+| `GET /v1/models` | Every configured model, loaded or not, each with `"loaded": true\|false` |
+| `GET /v1/models/status` | Lifecycle state of every configured local model (fields below) |
+| `POST /v1/models/{id}/load` | Load the model if needed and return its status. `503` if the load fails or is refused, `404` for an unknown model |
+| `POST /v1/models/{id}/unload` | Unload the model and return its status. `409` while requests are in flight |
+| `POST /v1/models/{id}/unload?force=true` | Stop handing out the model, wait for in-flight requests to finish (streams are not cut), then unload |
+| `GET /v1/system` | Process and memory facts plus the same per-model fields for every configured model |
+
+Unloading a model that is already unloaded succeeds. Unloading a model that is loading or unloading returns `409`.
+
+`GET /v1/models/status` returns `{"object": "list", "data": [...]}`; each entry has:
+
+| Field | Description |
+|---|---|
+| `name` | Model name |
+| `state` | `unloaded`, `loading`, `loaded`, `unloading`, or `failed` |
+| `last_error` | Why the last load failed (only in state `failed`), otherwise `null` |
+| `pinned` | Whether the model is exempt from eviction and idle expiry |
+| `load` | Effective `startup` or `on_demand` |
+| `in_flight` | Requests currently using the model |
+| `last_used_at` | When a request last started or finished with the model, or `null` |
+| `load_duration_ms` | How long the current load took, while loaded |
+| `estimated_bytes` | Size predicted from weight files before loading |
+| `measured_bytes` | Growth in MLX active memory while loading, while loaded |
+| `engine` | `simple` or `batch` |
+| `idle_ttl_seconds` | Effective idle timeout, or `null` |
+
 ## Provider Options
 
 | Field | Type | Default | Description |
@@ -186,6 +260,7 @@ That means Higgs supports:
 - `batch=true` is only supported for transformer families with true batched decode support: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen3_5`, `qwen3_5_moe`, `phi3`, and `starcoder2`.
 - `higgs doctor` and server startup now reject unsupported `batch=true` combinations instead of silently degrading.
 - `[local].raise_wired_limit` defaults to `false`. Turn it on only when you explicitly want MLX to raise the process wired-memory limit.
+- With several resident models, consider `max_loaded_models`, `memory_guard`, or `load = "on_demand"`; see [Model lifecycle](#model-lifecycle).
 - Source builds on macOS require `mlx.metallib`. Higgs restores it from Cargo build output when possible and fails startup if it still cannot be resolved.
 
 ## Shell Integration

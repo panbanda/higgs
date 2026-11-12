@@ -296,6 +296,11 @@ struct PreparedGeneration<'a> {
 }
 
 impl SimpleEngine {
+    /// Free the model, returning only once the engine thread has dropped its MLX state.
+    pub fn shutdown(self) {
+        self.engine.shutdown();
+    }
+
     /// Load a model and tokenizer from a directory.
     pub fn load<P: AsRef<Path>>(
         dir: P,
@@ -2986,7 +2991,7 @@ fn check_stop_sequences(text: &str, stop_sequences: &[String]) -> Option<String>
 /// Detects `HuggingFace` cache paths (`models--<org>--<name>/snapshots/<hash>`)
 /// and extracts `<org>/<name>` instead of using the hash as the name.
 /// Falls back to the directory's file name.
-pub(crate) fn derive_model_name(model_dir: &Path) -> String {
+pub fn derive_model_name(model_dir: &Path) -> String {
     // HuggingFace cache: .../models--<org>--<name>/snapshots/<hash>
     if let (Some(leaf), Some(parent)) = (model_dir.file_name(), model_dir.parent()) {
         let leaf_str = leaf.to_string_lossy();

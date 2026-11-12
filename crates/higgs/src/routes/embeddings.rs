@@ -30,11 +30,7 @@ pub async fn embeddings(
         .map_err(|e| ServerError::BadRequest(format!("Invalid request body: {e}")))?;
     request_metrics.set_requested_model(&req.model);
 
-    let resolved = state
-        .router
-        .resolve(&req.model, None)
-        .await
-        .map_err(ServerError::ModelNotFound)?;
+    let resolved = state.router.resolve(&req.model, None).await?;
 
     match resolved {
         ResolvedRoute::Higgs {

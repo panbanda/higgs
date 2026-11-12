@@ -19,7 +19,7 @@ use crate::{
     error::ServerError,
     metrics::{MetricsStore, RequestMetricsContext, RequestRecord, RequestTiming},
     router::ResolvedRoute,
-    state::{Engine, SharedState},
+    state::{EngineLease, SharedState},
     types::openai::{
         ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessage, ChatCompletionRequest,
         ChatCompletionResponse, ChoiceLogprobs, CompletionUsage, MessageContent, StopSequence,
@@ -58,8 +58,7 @@ pub async fn chat_completions(
     let resolved = state
         .router
         .resolve(&req.model, messages_json.as_deref())
-        .await
-        .map_err(ServerError::ModelNotFound)?;
+        .await?;
 
     match resolved {
         ResolvedRoute::Higgs {
@@ -271,7 +270,7 @@ pub async fn chat_completions(
 pub(crate) async fn chat_completions_non_streaming(
     state: SharedState,
     req: ChatCompletionRequest,
-    engine: Arc<Engine>,
+    engine: EngineLease,
 ) -> Result<ChatCompletionResponse, ServerError> {
     let max_tokens = req.max_tokens.unwrap_or(state.config.server.max_tokens);
     let sampling = build_sampling_params(&req);
@@ -436,7 +435,7 @@ pub(crate) async fn chat_completions_non_streaming(
 fn chat_completions_stream(
     state: SharedState,
     req: ChatCompletionRequest,
-    engine: Arc<Engine>,
+    engine: EngineLease,
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,
     received_at: Instant,
@@ -454,7 +453,7 @@ fn chat_completions_stream(
 pub(crate) fn chat_completions_chunk_stream(
     state: SharedState,
     req: ChatCompletionRequest,
-    engine: Arc<Engine>,
+    engine: EngineLease,
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,
     received_at: Instant,
@@ -904,7 +903,7 @@ fn build_sampling_params(req: &ChatCompletionRequest) -> SamplingParams {
 /// Returns `None` if no constraint is needed (text mode or absent).
 fn build_constraint(
     response_format: Option<&crate::types::openai::ResponseFormat>,
-    engine: &std::sync::Arc<crate::state::Engine>,
+    engine: &crate::state::Engine,
 ) -> Result<Option<higgs_engine::constrained::ConstrainedGenerator>, ServerError> {
     let Some(fmt) = response_format else {
         return Ok(None);

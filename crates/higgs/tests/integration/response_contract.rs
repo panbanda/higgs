@@ -276,6 +276,7 @@ fn model_list_serialization() {
             object: "model",
             created: 1_700_000_000,
             owned_by: "local".to_owned(),
+            loaded: true,
         }],
     };
     let json: serde_json::Value = serde_json::to_value(&list).unwrap();
@@ -284,6 +285,7 @@ fn model_list_serialization() {
     assert_eq!(json["data"][0]["id"], "my-model");
     assert_eq!(json["data"][0]["object"], "model");
     assert_eq!(json["data"][0]["owned_by"], "local");
+    assert_eq!(json["data"][0]["loaded"], true);
 }
 
 // ---------------------------------------------------------------------------
