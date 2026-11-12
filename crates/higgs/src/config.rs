@@ -199,9 +199,13 @@ pub struct ServeArgs {
     #[arg(long, value_name = "PROFILE")]
     pub mlx_profile: Option<MlxProfile>,
 
-    /// Use batch engine for all models (simple mode only).
+    /// Force the batch engine for all models (the default picks per model).
     #[arg(long)]
     pub batch: bool,
+
+    /// Force the simple engine for all models.
+    #[arg(long, conflicts_with = "batch")]
+    pub no_batch: bool,
 
     /// KV cache mode for simple mode models.
     #[arg(long, value_name = "MODE", value_parser = ["off", "turboquant"])]
@@ -536,6 +540,78 @@ fn gib_to_bytes(gib: f64) -> Option<u64> {
 
 // -- Model config -----------------------------------------------------------
 
+/// The per-model `batch` setting: `true`, `false`, or `"auto"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BatchMode {
+    /// Batch engine unless a configured feature needs the simple engine.
+    #[default]
+    Auto,
+    /// Always the batch engine; fails to load if the model cannot batch.
+    On,
+    /// Always the simple engine.
+    Off,
+}
+
+impl BatchMode {
+    /// The mode `higgs serve --batch` / `--no-batch` selects.
+    pub const fn from_flags(batch: bool, no_batch: bool) -> Self {
+        match (batch, no_batch) {
+            (true, _) => Self::On,
+            (false, true) => Self::Off,
+            (false, false) => Self::Auto,
+        }
+    }
+}
+
+impl std::fmt::Display for BatchMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Auto => "auto",
+            Self::On => "true",
+            Self::Off => "false",
+        })
+    }
+}
+
+impl Serialize for BatchMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::On => serializer.serialize_bool(true),
+            Self::Off => serializer.serialize_bool(false),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BatchMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BatchModeVisitor;
+
+        impl serde::de::Visitor<'_> for BatchModeVisitor {
+            type Value = BatchMode;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("true, false, or \"auto\"")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<BatchMode, E> {
+                Ok(if value { BatchMode::On } else { BatchMode::Off })
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<BatchMode, E> {
+                match value.trim().to_ascii_lowercase().as_str() {
+                    "auto" => Ok(BatchMode::Auto),
+                    "true" => Ok(BatchMode::On),
+                    "false" => Ok(BatchMode::Off),
+                    _ => Err(E::invalid_value(serde::de::Unexpected::Str(value), &self)),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(BatchModeVisitor)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     /// Filesystem path or Hugging Face reference for the model.
@@ -546,9 +622,12 @@ pub struct ModelConfig {
     /// Optional per-model MLX tuning override for the simple engine.
     #[serde(default)]
     pub mlx_profile: Option<MlxProfile>,
-    /// Enable the separate batch engine for this model.
+    /// Which engine serves this model: `true` (batch, continuous batching),
+    /// `false` (simple, one request at a time), or `"auto"` (the default),
+    /// which picks batch unless the model uses a feature only the simple
+    /// engine provides. See [`crate::engine_selection`].
     #[serde(default)]
-    pub batch: bool,
+    pub batch: BatchMode,
     /// Maximum prompt tokens to prefill per batch-loop iteration. `None` and
     /// `0` retain synchronous prefill behavior.
     #[serde(default)]
@@ -890,7 +969,7 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             path: p.clone(),
             name: None,
             mlx_profile: None,
-            batch: args.batch,
+            batch: BatchMode::from_flags(args.batch, args.no_batch),
             prefill_yield_tokens: None,
             thinking_budget: None,
             kv_cache,
@@ -1009,7 +1088,7 @@ fn extract_config(
                     path: p.clone(),
                     name: None,
                     mlx_profile: None,
-                    batch: serve_args.batch,
+                    batch: BatchMode::from_flags(serve_args.batch, serve_args.no_batch),
                     prefill_yield_tokens: None,
                     thinking_budget: None,
                     kv_cache,
@@ -1074,13 +1153,13 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
             .kv_cache_config()
             .validate()
             .map_err(|err| err.to_string())?;
-        if model.batch && model.kv_cache_config().is_turboquant() {
+        if model.batch == BatchMode::On && model.kv_cache_config().is_turboquant() {
             return Err(format!(
                 "TurboQuant is not supported with batch=true for model {}",
                 model.path
             ));
         }
-        if model.batch
+        if model.batch == BatchMode::On
             && let Some(supported) = batch_support_for_model_path(&model.path)?
             && !supported
         {
@@ -1187,7 +1266,7 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         path,
         name: Some(name.clone()),
         mlx_profile: None,
-        batch: false,
+        batch: BatchMode::default(),
         prefill_yield_tokens: None,
         thinking_budget: None,
         kv_cache: KvCacheMode::Off,
@@ -1398,6 +1477,7 @@ mod tests {
             timeout: None,
             mlx_profile: None,
             batch: true,
+            no_batch: false,
             kv_cache: None,
             kv_bits: None,
             kv_seed: None,
@@ -1412,7 +1492,7 @@ mod tests {
         };
         let config = build_simple_config(&args).unwrap();
         assert_eq!(config.models.len(), 2);
-        assert!(config.models.iter().all(|m| m.batch));
+        assert!(config.models.iter().all(|m| m.batch == BatchMode::On));
         assert_eq!(
             config.models.first().map(|m| m.path.as_str()),
             Some("org/model-a")
@@ -1431,6 +1511,7 @@ mod tests {
             timeout: Some(60.0),
             mlx_profile: None,
             batch: false,
+            no_batch: false,
             kv_cache: None,
             kv_bits: None,
             kv_seed: None,
@@ -1464,6 +1545,7 @@ mod tests {
             timeout: None,
             mlx_profile: None,
             batch: false,
+            no_batch: false,
             kv_cache: Some("turboquant".to_owned()),
             kv_bits: Some(4),
             kv_seed: Some(99),
@@ -1495,6 +1577,7 @@ mod tests {
             timeout: None,
             mlx_profile: None,
             batch: false,
+            no_batch: false,
             kv_cache: None,
             kv_bits: None,
             kv_seed: None,
@@ -1522,6 +1605,7 @@ mod tests {
             timeout: None,
             mlx_profile: None,
             batch: false,
+            no_batch: false,
             kv_cache: None,
             kv_bits: None,
             kv_seed: None,
@@ -1549,6 +1633,7 @@ mod tests {
             timeout: None,
             mlx_profile: None,
             batch: false,
+            no_batch: false,
             kv_cache: None,
             kv_bits: None,
             kv_seed: None,
@@ -1576,6 +1661,7 @@ mod tests {
             timeout: None,
             mlx_profile: None,
             batch: true,
+            no_batch: false,
             kv_cache: Some("turboquant".to_owned()),
             kv_bits: Some(3),
             kv_seed: Some(0),
@@ -1625,7 +1711,12 @@ mod tests {
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 3100);
         assert_eq!(config.models.len(), 1);
-        assert!(config.models.first().is_some_and(|m| m.batch));
+        assert!(
+            config
+                .models
+                .first()
+                .is_some_and(|m| m.batch == BatchMode::On)
+        );
         assert_eq!(config.providers.len(), 1);
         assert_eq!(config.routes.len(), 1);
         assert_eq!(config.default.provider, "anthropic");
@@ -1891,6 +1982,7 @@ mod tests {
             timeout: Some(-1.0),
             mlx_profile: None,
             batch: false,
+            no_batch: false,
             kv_cache: None,
             kv_bits: None,
             kv_seed: None,
@@ -1933,6 +2025,7 @@ mod tests {
             timeout: None,
             mlx_profile: None,
             batch: false,
+            no_batch: false,
             kv_cache: None,
             kv_bits: None,
             kv_seed: None,
@@ -2641,5 +2734,121 @@ mod tests {
         assert_eq!(args.idle_ttl, Some(30));
         assert_eq!(args.memory_guard, Some(MemoryGuard::Aggressive));
         assert_eq!(args.max_loaded_models, Some(2));
+    }
+
+    // -- batch tri-state --
+
+    fn batch_from_toml(value: Option<&str>) -> Result<BatchMode, String> {
+        let setting = value.map_or_else(String::new, |v| format!("batch = {v}\n"));
+        let contents = format!("[[models]]\npath = \"org/model\"\n{setting}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, contents).unwrap();
+        load_config_file(&path, None).map(|config| config.models.first().unwrap().batch)
+    }
+
+    #[test]
+    fn batch_defaults_to_auto() {
+        assert_eq!(batch_from_toml(None).unwrap(), BatchMode::Auto);
+        assert_eq!(BatchMode::default(), BatchMode::Auto);
+    }
+
+    #[test]
+    fn batch_accepts_plain_booleans() {
+        assert_eq!(batch_from_toml(Some("true")).unwrap(), BatchMode::On);
+        assert_eq!(batch_from_toml(Some("false")).unwrap(), BatchMode::Off);
+    }
+
+    #[test]
+    fn batch_accepts_the_auto_string() {
+        assert_eq!(batch_from_toml(Some("\"auto\"")).unwrap(), BatchMode::Auto);
+        assert_eq!(batch_from_toml(Some("\"AUTO\"")).unwrap(), BatchMode::Auto);
+    }
+
+    #[test]
+    fn batch_accepts_boolean_strings() {
+        assert_eq!(batch_from_toml(Some("\"true\"")).unwrap(), BatchMode::On);
+        assert_eq!(batch_from_toml(Some("\"false\"")).unwrap(), BatchMode::Off);
+    }
+
+    #[test]
+    fn batch_rejects_other_values() {
+        for bad in ["\"sometimes\"", "1", "[true]"] {
+            let error = batch_from_toml(Some(bad)).unwrap_err();
+            assert!(error.contains("batch"), "{bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn batch_modes_round_trip_through_serde() {
+        for mode in [BatchMode::Auto, BatchMode::On, BatchMode::Off] {
+            let json = serde_json::to_string(&mode).unwrap();
+            assert_eq!(serde_json::from_str::<BatchMode>(&json).unwrap(), mode);
+        }
+        assert_eq!(serde_json::to_string(&BatchMode::Auto).unwrap(), "\"auto\"");
+        assert_eq!(serde_json::to_string(&BatchMode::On).unwrap(), "true");
+        assert_eq!(serde_json::to_string(&BatchMode::Off).unwrap(), "false");
+    }
+
+    #[test]
+    fn batch_survives_the_cli_model_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[models]]\npath = \"org/forced\"\nbatch = true\n\n[[models]]\npath = \"org/off\"\nbatch = false\n\n[[models]]\npath = \"org/auto\"\nbatch = \"auto\"\n",
+        )
+        .unwrap();
+        let args = ServeArgs::try_parse_from(["serve", "--model", "org/extra"]).unwrap();
+
+        let config = load_config_file(&path, Some(&args)).unwrap();
+        let modes: Vec<BatchMode> = config.models.iter().map(|m| m.batch).collect();
+
+        assert_eq!(
+            modes,
+            [
+                BatchMode::On,
+                BatchMode::Off,
+                BatchMode::Auto,
+                BatchMode::Auto
+            ]
+        );
+    }
+
+    #[test]
+    fn serve_flags_pick_the_batch_mode() {
+        let mode = |flags: &[&str]| {
+            let mut argv = vec!["serve", "--model", "org/model"];
+            argv.extend_from_slice(flags);
+            let args = ServeArgs::try_parse_from(argv).unwrap();
+            build_simple_config(&args)
+                .unwrap()
+                .models
+                .first()
+                .unwrap()
+                .batch
+        };
+        assert_eq!(mode(&[]), BatchMode::Auto);
+        assert_eq!(mode(&["--batch"]), BatchMode::On);
+        assert_eq!(mode(&["--no-batch"]), BatchMode::Off);
+    }
+
+    #[test]
+    fn serve_rejects_batch_with_no_batch() {
+        assert!(ServeArgs::try_parse_from(["serve", "--batch", "--no-batch"]).is_err());
+    }
+
+    #[test]
+    fn turboquant_with_auto_batch_is_allowed() {
+        let args = ServeArgs::try_parse_from([
+            "serve",
+            "--model",
+            "org/model",
+            "--kv-cache",
+            "turboquant",
+        ])
+        .unwrap();
+        let config = build_simple_config(&args).unwrap();
+        assert_eq!(config.models.first().unwrap().batch, BatchMode::Auto);
     }
 }

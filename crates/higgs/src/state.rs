@@ -61,14 +61,18 @@ impl Engine {
     pub fn load_batch<P: AsRef<Path>>(
         dir: P,
         kv_cache_config: KvCacheConfig,
+        tuning: &MlxRuntimeTuning,
         raise_wired_limit: bool,
         prefill_yield_tokens: Option<u32>,
+        default_thinking_budget: u32,
     ) -> Result<Self, EngineError> {
         BatchEngine::load(
             dir,
             kv_cache_config,
+            tuning,
             raise_wired_limit,
             prefill_yield_tokens,
+            default_thinking_budget,
         )
         .map(|e| Self::Batch(Box::new(e)))
     }
@@ -162,7 +166,7 @@ impl Engine {
     pub fn enable_thinking(&self) -> bool {
         match self {
             Self::Simple(e) => e.enable_thinking(),
-            Self::Batch(_) => false,
+            Self::Batch(e) => e.enable_thinking(),
             #[cfg(test)]
             Self::Stub(stub) => stub.script.enable_thinking,
         }

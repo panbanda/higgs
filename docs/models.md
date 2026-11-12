@@ -36,7 +36,7 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 
 ## Continuous Batching Support
 
-`batch=true` enables true batched decode only for these `model_type` values:
+The batch engine decodes only these `model_type` values:
 
 - `llama`
 - `mistral`
@@ -47,9 +47,32 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 - `phi3`
 - `starcoder2`
 
-Qwen3.5 hybrid models (`qwen3_5`, `qwen3_5_moe`) batch decode only: each prompt is prefilled on its own and then joins the decode batch, because left padding would corrupt the recurrent layers. A checkpoint that ships an MTP head decodes its requests one at a time under `batch=true`. `qwen3_next` is not verified for batched decode and is rejected.
+`batch = "auto"` (the default) serves these with the batch engine and every other architecture
+with the simple engine. `batch = true` on an architecture outside this list is rejected during
+config load, `doctor`, and server startup; `batch = false` always selects the simple engine.
 
-Other supported architectures still serve normally in simple mode, but Higgs now rejects `batch=true` during config load, `doctor`, and server startup.
+Qwen3.5 hybrid models (`qwen3_5`, `qwen3_5_moe`) batch decode only: each prompt is prefilled on its own and then joins the decode batch, because left padding would corrupt the recurrent layers. Their prefix cache keeps a snapshot of the recurrent state at the end of the conversation history (before the generation prompt), since that state cannot be cut back to a shorter prefix. A checkpoint that ships an MTP head decodes its requests one at a time under `batch = true`, and `batch = "auto"` keeps such a checkpoint on the simple engine so speculative decode stays on. `qwen3_next` is not verified for batched decode and is rejected.
+
+### Feature support by engine
+
+| Feature | Simple engine | Batch engine |
+|---|---|---|
+| Prefix cache (block-paged, generation prompt excluded from the key) | yes | yes |
+| Reuse of the shared leading blocks when a prompt diverges mid-entry (dense KV) | yes | yes |
+| Thinking budget and `reasoning_tokens` | yes | yes |
+| Embeddings (`/v1/embeddings`) | yes | yes (runs between decode rounds) |
+| Logprobs, stop sequences, structured/regex output | yes | yes (a request with logprobs or a constraint steps the whole batch one request at a time) |
+| `return_progress` prefill events | per prefill chunk | once at the start, then per chunk when the prompt is chunked |
+| Chunked prefill for long prompts (MLX profile thresholds) | yes | yes |
+| Models without a chat template (`/v1/completions` only) | yes | yes |
+| Vision inputs (LLaVA) | yes | no, rejected |
+| Disk prefix store (`kv_disk_dir`) | yes | no, ignored |
+| MTP speculative decode | yes | no, ignored |
+| TurboQuant KV cache | yes | no, rejected |
+| Prompt-lookup decoding (`HIGGS_PROMPT_LOOKUP`) | yes | no, ignored |
+| MLX profile settings other than the chunked-prefill thresholds | yes | no |
+
+The rows marked "no" are what `batch = "auto"` checks; see [Engine selection](configuration.md#engine-selection).
 
 ## Representative Working MLX Model IDs
 
