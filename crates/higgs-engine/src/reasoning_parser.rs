@@ -23,6 +23,12 @@ pub struct ReasoningParseResult {
     pub reasoning: Option<String>,
 }
 
+/// Append visible text, dropping any `</think>` that no `<think>` opened, as
+/// the streaming tracker does.
+fn push_without_stray_close(visible: &mut String, text: Option<&str>) {
+    visible.push_str(&text.unwrap_or_default().replace(THINK_CLOSE, ""));
+}
+
 /// Parse model output for `<think>...</think>` reasoning blocks.
 ///
 /// Extracts reasoning content and returns it separately from the visible text.
@@ -35,7 +41,7 @@ pub fn parse_reasoning(text: &str) -> ReasoningParseResult {
 
     loop {
         if let Some(start_pos) = remaining.find(THINK_OPEN) {
-            visible.push_str(remaining.get(..start_pos).unwrap_or_default());
+            push_without_stray_close(&mut visible, remaining.get(..start_pos));
 
             let after_open = remaining
                 .get(start_pos + THINK_OPEN.len()..)
@@ -67,7 +73,7 @@ pub fn parse_reasoning(text: &str) -> ReasoningParseResult {
                 break;
             }
         } else {
-            visible.push_str(remaining);
+            push_without_stray_close(&mut visible, Some(remaining));
             break;
         }
     }
@@ -365,6 +371,22 @@ mod tests {
             total_visible.contains("answer"),
             "content after duplicate close should remain visible, got: {total_visible}"
         );
+    }
+
+    /// A duplicated `</think>` (the simple engine once emitted the forced close
+    /// twice) must not reach the visible text of a non-streaming response.
+    #[test]
+    fn parse_reasoning_drops_a_duplicated_close() {
+        let result = parse_reasoning("<think>budget spent</think></think>\nThe answer.");
+        assert_eq!(result.text, "The answer.");
+        assert_eq!(result.reasoning.as_deref(), Some("budget spent"));
+    }
+
+    #[test]
+    fn parse_reasoning_drops_a_close_with_no_open() {
+        let result = parse_reasoning("answer</think> tail");
+        assert_eq!(result.text, "answer tail");
+        assert!(result.reasoning.is_none());
     }
 
     /// Flush when still inside thinking returns buffered content as reasoning.

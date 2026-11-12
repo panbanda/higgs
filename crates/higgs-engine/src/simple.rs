@@ -29,8 +29,8 @@ use crate::{
     engine_thread::EngineThread,
     error::EngineError,
     generation_support::{
-        ThinkingSupport, embed_tokens, generation_prompt_suffix_len, prefix_cache_key,
-        resume_from_prefix,
+        ThinkingBudgetGate, ThinkingSupport, embed_tokens, generation_prompt_suffix_len,
+        prefix_cache_key, resume_from_prefix,
     },
     mlx_tuning::MlxRuntimeTuning,
     model_loader,
@@ -1447,9 +1447,8 @@ impl SimpleEngineCore {
             None
         };
         // Seed thinking state from the first token (already emitted above).
-        let mut thinking_tokens: u32 = u32::from(think_close_token.is_some());
-        let mut seen_think_close =
-            think_close_token.is_some_and(|close_id| first_token_id == close_id);
+        let mut thinking_gate = think_close_token
+            .map(|close_id| ThinkingBudgetGate::new(close_id, thinking_budget, first_token_id));
 
         loop {
             let t0 = std::time::Instant::now();
@@ -1489,30 +1488,18 @@ impl SimpleEngineCore {
             let t2 = std::time::Instant::now();
 
             // In the unconstrained pipeline, extract the token here (after building following).
-            let mut token_id: u32 = constrained_token_id.unwrap_or_else(|| next_token.item_cast());
+            let token_id: u32 = constrained_token_id.unwrap_or_else(|| next_token.item_cast());
 
-            // Thinking budget: force </think> after N tokens if model hasn't closed it.
-            // NOTE: when the budget fires, token_id is overwritten but the KV cache
-            // already reflects the originally-sampled token.  The next forward pass
-            // feeds close_id as input while the cache holds a different token at this
-            // position — a one-entry discontinuity.  Re-running forward to fix the
-            // cache is expensive for negligible quality impact after 256+ tokens.
-            if let Some(close_id) = think_close_token {
-                if !seen_think_close {
-                    if token_id == close_id {
-                        seen_think_close = true;
-                    } else {
-                        thinking_tokens += 1;
-                        if thinking_tokens >= thinking_budget {
-                            token_id = close_id;
-                            seen_think_close = true;
-                            tracing::info!(
-                                budget = thinking_budget,
-                                "Thinking budget reached, forcing </think>"
-                            );
-                        }
-                    }
-                }
+            // Thinking budget: once the next token would reach the budget, feed
+            // </think> as the following token instead of the pipelined sample.
+            let forced_close_token = thinking_gate
+                .as_mut()
+                .and_then(|gate| gate.observe(token_id));
+            if forced_close_token.is_some() {
+                tracing::info!(
+                    budget = thinking_budget,
+                    "Thinking budget reached, forcing </think>"
+                );
             }
 
             // Materialize logprobs for the token we just extracted
@@ -1611,16 +1598,8 @@ impl SimpleEngineCore {
                 });
             }
 
-            // If thinking budget was just reached, override the pipelined token
-            // so the next decode step gets </think> as input.
-            if seen_think_close && thinking_tokens == thinking_budget {
-                if let Some(close_id) = think_close_token {
-                    next_token = Array::from_slice(&[close_id], &[1]);
-                }
-                thinking_tokens += 1; // prevent re-triggering
-            } else {
-                next_token = following;
-            }
+            next_token = forced_close_token
+                .map_or(following, |close_id| Array::from_slice(&[close_id], &[1]));
             next_logprob_data = following_logprob_data;
         }
     }
@@ -2638,9 +2617,8 @@ impl SimpleEngineCore {
             None
         };
         // Seed thinking state from the first token (already emitted above).
-        let mut thinking_tokens: u32 = u32::from(think_close_token.is_some());
-        let mut seen_think_close =
-            think_close_token.is_some_and(|close_id| first_token_id == close_id);
+        let mut thinking_gate = think_close_token
+            .map(|close_id| ThinkingBudgetGate::new(close_id, thinking_budget, first_token_id));
 
         // Pipelined decode loop: build step N+2 while GPU computes step N+1
         let (mut next_token, mut next_logprob_data) = Self::decode_step(
@@ -2693,26 +2671,18 @@ impl SimpleEngineCore {
                 }
             }
 
-            let mut token_id: u32 = constrained_token_id.unwrap_or_else(|| next_token.item_cast());
+            let token_id: u32 = constrained_token_id.unwrap_or_else(|| next_token.item_cast());
 
-            // Thinking budget: force </think> after N tokens if model hasn't closed it.
-            // NOTE: same KV-cache discontinuity caveat as the non-streaming path.
-            if let Some(close_id) = think_close_token {
-                if !seen_think_close {
-                    if token_id == close_id {
-                        seen_think_close = true;
-                    } else {
-                        thinking_tokens += 1;
-                        if thinking_tokens >= thinking_budget {
-                            token_id = close_id;
-                            seen_think_close = true;
-                            tracing::info!(
-                                budget = thinking_budget,
-                                "Thinking budget reached, forcing </think>"
-                            );
-                        }
-                    }
-                }
+            // Thinking budget: once the next token would reach the budget, feed
+            // </think> as the following token instead of the pipelined sample.
+            let forced_close_token = thinking_gate
+                .as_mut()
+                .and_then(|gate| gate.observe(token_id));
+            if forced_close_token.is_some() {
+                tracing::info!(
+                    budget = thinking_budget,
+                    "Thinking budget reached, forcing </think>"
+                );
             }
 
             let token_logprob = next_logprob_data
@@ -2780,16 +2750,8 @@ impl SimpleEngineCore {
                 break;
             }
 
-            // If thinking budget was just reached, override the pipelined token
-            // so the next decode step gets </think> as input.
-            if seen_think_close && thinking_tokens == thinking_budget {
-                if let Some(close_id) = think_close_token {
-                    next_token = Array::from_slice(&[close_id], &[1]);
-                }
-                thinking_tokens += 1; // prevent re-triggering
-            } else {
-                next_token = following;
-            }
+            next_token = forced_close_token
+                .map_or(following, |close_id| Array::from_slice(&[close_id], &[1]));
             next_logprob_data = following_logprob_data;
         }
 

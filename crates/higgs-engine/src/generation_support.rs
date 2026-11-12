@@ -18,6 +18,47 @@ use crate::{
     paged_prefix_cache::PagedPrefixMatch,
 };
 
+/// Counts a request's reasoning tokens for a decode loop that samples one
+/// token ahead of the one it emits, and says when `</think>` must be the next
+/// token so a reasoning block never runs past its budget.
+#[derive(Debug, Clone, Copy)]
+pub struct ThinkingBudgetGate {
+    close_token: u32,
+    budget: u32,
+    reasoning_tokens: u32,
+    closed: bool,
+}
+
+impl ThinkingBudgetGate {
+    /// `first_token` is the token already emitted before the decode loop.
+    pub const fn new(close_token: u32, budget: u32, first_token: u32) -> Self {
+        Self {
+            close_token,
+            budget,
+            reasoning_tokens: 1,
+            closed: first_token == close_token,
+        }
+    }
+
+    /// Record the token about to be emitted. Returns `</think>` when that
+    /// must be the token emitted after it; at most once per request.
+    pub const fn observe(&mut self, token_id: u32) -> Option<u32> {
+        if self.closed {
+            return None;
+        }
+        if token_id == self.close_token {
+            self.closed = true;
+            return None;
+        }
+        self.reasoning_tokens += 1;
+        if self.reasoning_tokens + 1 >= self.budget {
+            self.closed = true;
+            return Some(self.close_token);
+        }
+        None
+    }
+}
+
 /// Whether the model can reason inside `<think>` tags, and the token that closes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThinkingSupport {
@@ -302,6 +343,44 @@ mod tests {
         let normalized = l2_normalized(&[3.0, 4.0]);
         assert!((normalized[0] - 0.6).abs() < 1e-6);
         assert!((normalized[1] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn thinking_gate_forces_close_as_the_budgeth_token_exactly_once() {
+        let mut gate = ThinkingBudgetGate::new(99, 5, 1);
+        assert_eq!(gate.observe(2), None);
+        assert_eq!(gate.observe(3), None);
+        assert_eq!(gate.observe(4), Some(99));
+        assert_eq!(gate.observe(5), None);
+        assert_eq!(gate.observe(99), None);
+    }
+
+    #[test]
+    fn thinking_gate_stays_quiet_after_a_natural_close() {
+        let mut gate = ThinkingBudgetGate::new(99, 3, 1);
+        assert_eq!(gate.observe(99), None);
+        assert_eq!(gate.observe(5), None);
+        assert_eq!(gate.observe(6), None);
+    }
+
+    #[test]
+    fn thinking_gate_stays_quiet_when_the_first_token_closed() {
+        let mut gate = ThinkingBudgetGate::new(99, 2, 99);
+        assert_eq!(gate.observe(5), None);
+    }
+
+    #[test]
+    fn forced_close_yields_one_close_in_the_visible_text() {
+        let mut gate = ThinkingBudgetGate::new(99, 4, 1);
+        let mut emitted = vec![1];
+        let mut forced = None;
+        for sampled in [2, 3, 4, 5, 6] {
+            let token = forced.take().unwrap_or(sampled);
+            emitted.push(token);
+            forced = gate.observe(token);
+        }
+        assert_eq!(emitted.iter().filter(|&&token| token == 99).count(), 1);
+        assert_eq!(emitted.iter().position(|&token| token == 99), Some(3));
     }
 
     #[test]
