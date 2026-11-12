@@ -421,8 +421,12 @@ impl BatchEngine {
     }
 
     /// How this model writes tool calls.
-    pub const fn tool_call_format(&self) -> crate::tool_format::ToolCallFormat {
-        self.template.tool_call_format()
+    pub fn tool_call_format(&self) -> crate::tool_format::ToolCallFormat {
+        self.template
+            .as_ref()
+            .map_or(crate::tool_format::ToolCallFormat::Auto, |template| {
+                template.tool_call_format()
+            })
     }
 
     pub const fn tokenizer(&self) -> &Tokenizer {
