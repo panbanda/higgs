@@ -8,6 +8,7 @@ use higgs_engine::error::EngineError;
 use higgs_engine::mlx_tuning::MlxRuntimeTuning;
 use higgs_engine::simple::SimpleEngine;
 use higgs_engine::tokenizers::Tokenizer;
+use higgs_engine::tool_format::ToolCallFormat;
 use higgs_models::SamplingParams;
 use higgs_models::siglip::PixelValues;
 use higgs_models::turboquant::KvCacheConfig;
@@ -172,6 +173,16 @@ impl Engine {
         }
     }
 
+    /// How this model writes tool calls.
+    pub fn tool_call_format(&self) -> ToolCallFormat {
+        match self {
+            Self::Simple(e) => e.tool_call_format(),
+            Self::Batch(e) => e.tool_call_format(),
+            #[cfg(test)]
+            Self::Stub(stub) => stub.script.tool_call_format,
+        }
+    }
+
     pub fn is_vlm(&self) -> bool {
         match self {
             Self::Simple(e) => e.is_vlm(),
@@ -290,12 +301,19 @@ impl Engine {
                 pixel_values,
             ),
             #[cfg(test)]
-            Self::Stub(stub) => stub.generate(crate::test_support::StubCall {
-                max_tokens,
-                thinking_enabled: thinking.is_on(),
-                has_constraint: constraint.is_some(),
-                thinking_budget: request_thinking_budget(thinking),
-            }),
+            Self::Stub(stub) => {
+                let has_constraint = constraint.is_some();
+                let constraint_accepts_output = constraint.map(|generator| {
+                    stub.constraint_accepts(generator, &stub.scripted_generation_text())
+                });
+                stub.generate(crate::test_support::StubCall {
+                    max_tokens,
+                    thinking_enabled: thinking.is_on(),
+                    has_constraint,
+                    constraint_accepts_output,
+                    thinking_budget: request_thinking_budget(thinking),
+                })
+            }
         }
     }
 
@@ -371,15 +389,22 @@ impl Engine {
                 pixel_values,
             ),
             #[cfg(test)]
-            Self::Stub(stub) => stub.generate_streaming(
-                crate::test_support::StubCall {
-                    max_tokens,
-                    thinking_enabled: thinking.is_on(),
-                    has_constraint: constraint.is_some(),
-                    thinking_budget: request_thinking_budget(thinking),
-                },
-                sender,
-            ),
+            Self::Stub(stub) => {
+                let has_constraint = constraint.is_some();
+                let constraint_accepts_output = constraint.map(|generator| {
+                    stub.constraint_accepts(generator, &stub.scripted_stream_text())
+                });
+                stub.generate_streaming(
+                    crate::test_support::StubCall {
+                        max_tokens,
+                        thinking_enabled: thinking.is_on(),
+                        has_constraint,
+                        constraint_accepts_output,
+                        thinking_budget: request_thinking_budget(thinking),
+                    },
+                    sender,
+                )
+            }
         }
     }
 

@@ -1,4 +1,5 @@
 pub mod anthropic_adapter;
+pub mod anthropic_tools;
 pub mod attach;
 pub mod auto_router;
 pub mod cli_config;
@@ -25,6 +26,7 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tool_choice;
+pub mod tool_policy;
 pub mod translate;
 pub mod tui;
 pub mod types;

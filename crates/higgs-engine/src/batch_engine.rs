@@ -420,6 +420,11 @@ impl BatchEngine {
         &self.model_name
     }
 
+    /// How this model writes tool calls.
+    pub const fn tool_call_format(&self) -> crate::tool_format::ToolCallFormat {
+        self.template.tool_call_format()
+    }
+
     pub const fn tokenizer(&self) -> &Tokenizer {
         &self.tokenizer
     }

@@ -7,17 +7,32 @@ use std::sync::Mutex;
 use higgs_engine::engine::{GenerationOutput, StreamingOutput};
 use higgs_engine::error::EngineError;
 use higgs_engine::tokenizers::Tokenizer;
+use higgs_engine::tool_format::ToolCallFormat;
 
 /// Canned behavior for a [`StubEngine`].
-#[derive(Default)]
 pub struct StubScript {
     pub prompt_tokens: Vec<u32>,
     pub enable_thinking: bool,
+    /// Defaults to the Qwen/Hermes format, like the engines' original behavior.
+    pub tool_call_format: ToolCallFormat,
     pub generation: Option<GenerationOutput>,
     pub stream: Vec<StreamingOutput>,
     /// Stamp the non-streaming output's missing timestamps at call time, as a
     /// real engine would, so durations are measured against the request.
     pub stamp_times: bool,
+}
+
+impl Default for StubScript {
+    fn default() -> Self {
+        Self {
+            prompt_tokens: Vec::new(),
+            enable_thinking: false,
+            tool_call_format: ToolCallFormat::Qwen,
+            generation: None,
+            stream: Vec::new(),
+            stamp_times: false,
+        }
+    }
 }
 
 /// The arguments a generation call arrived with, for assertions.
@@ -26,6 +41,9 @@ pub struct StubCall {
     pub max_tokens: u32,
     pub thinking_enabled: bool,
     pub has_constraint: bool,
+    /// `Some` when the call carried a constraint: whether it accepts the
+    /// scripted output character by character (needs [`char_tokenizer`]).
+    pub constraint_accepts_output: Option<bool>,
     /// `Some` only when the request set its own budget.
     pub thinking_budget: Option<u32>,
 }
@@ -54,6 +72,43 @@ impl StubEngine {
         self.calls
             .lock()
             .map(|calls| calls.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether `constraint` accepts `text` when each character is one token.
+    pub fn constraint_accepts(
+        &self,
+        mut constraint: higgs_engine::constrained::ConstrainedGenerator,
+        text: &str,
+    ) -> bool {
+        let Some(tokenizer) = &self.tokenizer else {
+            return false;
+        };
+        for character in text.chars() {
+            let Some(id) = tokenizer.token_to_id(&character.to_string()) else {
+                return false;
+            };
+            if !constraint.advance(id) {
+                return false;
+            }
+        }
+        constraint.is_finished()
+    }
+
+    /// The scripted output a streaming call will send, as one string.
+    pub fn scripted_stream_text(&self) -> String {
+        self.script
+            .stream
+            .iter()
+            .map(|output| output.new_text.as_str())
+            .collect()
+    }
+
+    pub fn scripted_generation_text(&self) -> String {
+        self.script
+            .generation
+            .as_ref()
+            .map(|output| output.text.clone())
             .unwrap_or_default()
     }
 
@@ -129,6 +184,31 @@ pub fn word_tokenizer() -> Tokenizer {
         }
     }"#;
     json.parse::<Tokenizer>()
+        .unwrap_or_else(|error| unreachable!("test tokenizer definition is valid: {error}"))
+}
+
+/// Tokenizer with one token per printable ASCII character (and newline), so
+/// any pattern over those characters can be compiled into a constraint.
+pub fn char_tokenizer() -> Tokenizer {
+    let mut vocab = serde_json::Map::new();
+    vocab.insert("[UNK]".to_owned(), serde_json::json!(0));
+    for (offset, byte) in std::iter::once(b'\n').chain(0x20..=0x7e).enumerate() {
+        vocab.insert(char::from(byte).to_string(), serde_json::json!(offset + 1));
+    }
+    let definition = serde_json::json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [],
+        "normalizer": null,
+        "pre_tokenizer": {"type": "Split", "pattern": {"Regex": "."}, "behavior": "Isolated", "invert": false},
+        "post_processor": null,
+        "decoder": null,
+        "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "[UNK]"}
+    });
+    definition
+        .to_string()
+        .parse::<Tokenizer>()
         .unwrap_or_else(|error| unreachable!("test tokenizer definition is valid: {error}"))
 }
 

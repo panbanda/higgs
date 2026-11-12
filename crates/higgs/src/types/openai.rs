@@ -34,10 +34,16 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
-    /// `"auto"` (default) or `"none"`; `"required"` and named functions are
-    /// rejected as unsupported.
+    /// `"auto"` (default), `"none"`, `"required"` or
+    /// `{"type": "function", "function": {"name": …}}`. The last two force a
+    /// call through constrained decoding where the model's tool-call format
+    /// allows it.
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+    /// When `false`, at most one tool call is returned (exactly one when the
+    /// call is forced). Defaults to `true`.
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
     /// Accepted for client compatibility. Sampling is not yet reproducible
     /// per request, so the value is ignored.
     #[serde(default)]

@@ -576,8 +576,16 @@ mod tests {
                 "not a vision model",
             ),
             (
+                json!({"model": STUB_MODEL, "input": "hi", "tool_choice": "sometimes"}),
+                "\"sometimes\"",
+            ),
+            (
+                json!({"model": STUB_MODEL, "input": "hi", "tool_choice": {"type": "web_search"}}),
+                "web_search",
+            ),
+            (
                 json!({"model": STUB_MODEL, "input": "hi", "tool_choice": "required"}),
-                "'required'",
+                "no tools",
             ),
             (
                 json!({"model": STUB_MODEL, "input": "hi", "background": true}),

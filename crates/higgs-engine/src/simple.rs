@@ -372,6 +372,15 @@ impl SimpleEngine {
         &self.model_name
     }
 
+    /// How this model writes tool calls.
+    pub fn tool_call_format(&self) -> crate::tool_format::ToolCallFormat {
+        self.template
+            .as_ref()
+            .map_or(crate::tool_format::ToolCallFormat::Auto, |template| {
+                template.tool_call_format()
+            })
+    }
+
     /// Get a reference to the tokenizer.
     pub fn tokenizer(&self) -> &Tokenizer {
         &self.tokenizer
