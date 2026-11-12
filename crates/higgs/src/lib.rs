@@ -25,6 +25,7 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tool_choice;
+pub mod tool_loop;
 pub mod tools;
 pub mod translate;
 pub mod tui;

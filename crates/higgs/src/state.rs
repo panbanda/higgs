@@ -102,6 +102,14 @@ impl Engine {
     }
 
     #[cfg(test)]
+    pub fn stub_prompt_messages(&self) -> Vec<Vec<(String, String)>> {
+        match self {
+            Self::Stub(stub) => stub.recorded_prompt_messages(),
+            Self::Simple(_) | Self::Batch(_) => Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
     pub fn stub_prompt_tools(&self) -> Vec<Option<usize>> {
         match self {
             Self::Stub(stub) => stub.recorded_prompt_tools(),
@@ -220,7 +228,7 @@ impl Engine {
             }
             Self::Batch(e) => e.prepare_chat_prompt_with_thinking(messages, tools, enable_thinking),
             #[cfg(test)]
-            Self::Stub(stub) => Ok(stub.render_prompt(tools.map(<[_]>::len))),
+            Self::Stub(stub) => Ok(stub.render_prompt_for(messages, tools.map(<[_]>::len))),
         }
     }
 

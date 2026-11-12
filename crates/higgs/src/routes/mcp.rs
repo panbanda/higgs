@@ -152,67 +152,19 @@ mod tests {
     use http::StatusCode;
     use serde_json::json;
 
-    use crate::mcp::config::{ResolvedServer, ServerSpec, StdioSpec};
-    use crate::mcp::manager::{BackoffPolicy, McpManager};
-    use crate::mcp::testing::{CallBehavior, FakeFactory, FakeMcp, text_result};
-    use crate::mcp::transport::TransportFactory;
+    use crate::mcp::testing::{CallBehavior, FakeMcp, ready_manager, text_result};
     use crate::test_support::{app_with_tools, send_request};
     use crate::tools::ToolHub;
     use crate::web::WebService;
-
-    fn resolved(name: &str, timeout: Duration) -> ResolvedServer {
-        ResolvedServer {
-            name: name.to_owned(),
-            enabled: true,
-            timeout,
-            spec: ServerSpec::Stdio(StdioSpec {
-                command: "unused".to_owned(),
-                args: Vec::new(),
-                env: Vec::new(),
-                cwd: None,
-            }),
-        }
-    }
 
     async fn hub_with(
         servers: Vec<(&str, Arc<FakeMcp>, Duration)>,
         expected_ready: usize,
     ) -> ToolHub {
-        let factory: Arc<dyn TransportFactory> = FakeFactory::many(
-            servers
-                .iter()
-                .map(|(name, fake, _)| (*name, Arc::clone(fake)))
-                .collect(),
-        );
-        let manager = McpManager::start_with(
-            servers
-                .iter()
-                .map(|(name, _, timeout)| resolved(name, *timeout))
-                .collect(),
-            4096,
-            &factory,
-            BackoffPolicy {
-                initial: Duration::from_millis(10),
-                maximum: Duration::from_millis(40),
-            },
-        );
-        for _ in 0..300 {
-            let settled = manager
-                .statuses()
-                .iter()
-                .filter(|status| status.state == "ready" || status.state == "failed")
-                .count();
-            let ready = manager
-                .statuses()
-                .iter()
-                .filter(|s| s.state == "ready")
-                .count();
-            if settled == servers.len() && ready >= expected_ready {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        ToolHub::new(manager, WebService::disabled())
+        ToolHub::new(
+            ready_manager(servers, expected_ready).await,
+            WebService::disabled(),
+        )
     }
 
     async fn single_server_app() -> (axum::Router, Arc<FakeMcp>) {

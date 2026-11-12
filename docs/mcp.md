@@ -135,6 +135,48 @@ The list can be passed as `tools` of a chat request. Strict clients that reject 
 - Credentials in `headers` and `env` come from `${VAR}`; they are not logged, and `higgs doctor` prints URLs without credentials or query strings.
 - HTTP servers are contacted at the configured URL only; redirects are not followed.
 
+## Server-side tool loop
+
+Calling `/v1/mcp/execute` yourself works with any client. For clients that just want the model to use tools, add an `mcp` field to a chat completion (or Responses) request and Higgs runs the loop:
+
+```json
+{"model": "qwen", "messages": [{"role": "user", "content": "How big is /tmp/mcp-demo/hello.txt?"}],
+ "mcp": {"enabled": true, "servers": ["fs"], "max_iterations": 5}}
+```
+
+| Field | Meaning |
+|---|---|
+| `enabled` | Default `true`; sending the object is the opt-in. `false` behaves as if the field were absent. |
+| `servers` | Only offer these servers' tools (`higgs` selects the built-in web tools). Default: every available tool. An unknown name is a 400. |
+| `max_iterations` | How many times tool calls may be executed, 1 to 25, default 5. |
+
+Higgs adds the selected tools to the request's `tools`, generates, and when the model calls them runs the calls, appends the assistant message and one `tool` message per result to the conversation, and generates again. Calls within one round run in order. This repeats until the model answers without calling a server tool, or `max_iterations` rounds have run; if the model still wants a tool then, the pending call is returned as an ordinary `tool_calls` response with `"truncated": true` in the `mcp` block.
+
+- Tools you supply yourself in `tools` are never run by Higgs. If the model calls one, the loop stops and the call is returned to you as usual. If one response mixes your tools and server tools, only your calls are returned. A client tool with the same name as a server tool is treated as yours.
+- `tool_choice: "none"` turns the loop off.
+- Tool failures (an error result, a timeout, an unreachable server, arguments that are not JSON) are given to the model as the tool's output, prefixed `Error:`, so it can recover. Images and other non-text results are summarized for the model as `[image content omitted: image/png]`.
+- `usage` sums the tokens of every round, including re-reading the conversation each time.
+- Requests without `mcp` take exactly the path they always did.
+
+A non-streaming response gains an `mcp` object:
+
+```json
+"mcp": {"iterations": 1, "truncated": false,
+        "tool_calls": [{"round": 1, "id": "call_0_...", "name": "fs__get_file_info", "arguments": {"path": "..."}, "is_error": false}]}
+```
+
+### Streaming
+
+With `"stream": true`, assistant text and reasoning stream as they are produced in every round, under one response id and one initial `role` chunk. Calls to server tools never appear as `tool_calls` deltas. Their progress arrives as extra chunks whose `choices` is an empty array (the same shape as the usage chunk) and which carry a `higgs_mcp` field, so standard clients ignore them:
+
+```
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[],"higgs_mcp":{"event":"tool_call","round":1,"id":"call_0_...","name":"fs__get_file_info","arguments":{"path":"..."}}}
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[],"higgs_mcp":{"event":"tool_result","round":1,"id":"call_0_...","name":"fs__get_file_info","is_error":false,"content":"size: 15"}}
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[],"higgs_mcp":{"event":"summary","iterations":1,"truncated":false,"tool_calls":[...]}}
+```
+
+`tool_result.content` is cut at 1000 characters. The `summary` event comes last, before `[DONE]`, and only if a tool ran. With `stream_options.include_usage` a single usage chunk with the summed counts is sent. A client tool call (or, once `max_iterations` is exhausted, the pending server call) streams as a normal `tool_calls` delta with finish reason `tool_calls`. On the Responses route the same loop runs; intermediate calls are not represented in the output items, only the final answer is.
+
 ## Web search and fetch
 
 Two endpoints for pages the model cannot reach itself. They are off by default and answer 404 (`web_disabled`) until enabled:

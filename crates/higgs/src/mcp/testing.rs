@@ -303,3 +303,61 @@ impl TransportFactory for FakeFactory {
         })
     }
 }
+
+/// Start a manager over fake servers and wait until `expected_ready` of them
+/// are ready and the rest have settled (ready or failed).
+pub async fn ready_manager(
+    servers: Vec<(&str, Arc<FakeMcp>, std::time::Duration)>,
+    expected_ready: usize,
+) -> super::manager::McpManager {
+    use std::time::Duration;
+
+    use super::config::{ResolvedServer, StdioSpec};
+    use super::manager::{BackoffPolicy, McpManager};
+
+    let factory: Arc<dyn TransportFactory> = FakeFactory::many(
+        servers
+            .iter()
+            .map(|(name, fake, _)| (*name, Arc::clone(fake)))
+            .collect(),
+    );
+    let resolved = servers
+        .iter()
+        .map(|(name, _, timeout)| ResolvedServer {
+            name: (*name).to_owned(),
+            enabled: true,
+            timeout: *timeout,
+            spec: ServerSpec::Stdio(StdioSpec {
+                command: "unused".to_owned(),
+                args: Vec::new(),
+                env: Vec::new(),
+                cwd: None,
+            }),
+        })
+        .collect();
+    let manager = McpManager::start_with(
+        resolved,
+        4096,
+        &factory,
+        BackoffPolicy {
+            initial: Duration::from_millis(10),
+            maximum: Duration::from_millis(40),
+        },
+    );
+    for _ in 0..300 {
+        let statuses = manager.statuses();
+        let settled = statuses
+            .iter()
+            .filter(|status| status.state == "ready" || status.state == "failed")
+            .count();
+        let ready = statuses
+            .iter()
+            .filter(|status| status.state == "ready")
+            .count();
+        if settled == servers.len() && ready >= expected_ready {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    manager
+}

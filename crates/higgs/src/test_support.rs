@@ -15,6 +15,11 @@ pub struct StubScript {
     pub enable_thinking: bool,
     pub generation: Option<GenerationOutput>,
     pub stream: Vec<StreamingOutput>,
+    /// Per-call outputs, consulted before `generation`; the Nth call uses the
+    /// Nth entry and later calls fall back to `generation`.
+    pub generations: Vec<GenerationOutput>,
+    /// Per-call streams, consulted before `stream`, indexed like `generations`.
+    pub streams: Vec<Vec<StreamingOutput>>,
     /// Stamp the non-streaming output's missing timestamps at call time, as a
     /// real engine would, so durations are measured against the request.
     pub stamp_times: bool,
@@ -37,6 +42,8 @@ pub struct StubEngine {
     pub calls: Mutex<Vec<StubCall>>,
     /// Tool count passed to each prompt rendering (`None` when no tools).
     pub prompt_tools: Mutex<Vec<Option<usize>>>,
+    /// Role and text of every message in each rendered prompt.
+    pub prompt_messages: Mutex<Vec<Vec<(String, String)>>>,
 }
 
 impl StubEngine {
@@ -47,6 +54,7 @@ impl StubEngine {
             script: StubScript::default(),
             calls: Mutex::new(Vec::new()),
             prompt_tools: Mutex::new(Vec::new()),
+            prompt_messages: Mutex::new(Vec::new()),
         }
     }
 
@@ -58,11 +66,13 @@ impl StubEngine {
     }
 
     pub fn generate(&self, call: StubCall) -> Result<GenerationOutput, EngineError> {
-        self.record(call);
+        let index = self.record(call);
         let mut output = self
             .script
-            .generation
-            .clone()
+            .generations
+            .get(index)
+            .or(self.script.generation.as_ref())
+            .cloned()
             .ok_or_else(|| EngineError::Generation("test stub".to_owned()))?;
         if self.script.stamp_times {
             let now = std::time::Instant::now();
@@ -78,11 +88,16 @@ impl StubEngine {
         call: StubCall,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
     ) -> Result<(), EngineError> {
-        self.record(call);
-        if self.script.stream.is_empty() {
+        let index = self.record(call);
+        let events = self
+            .script
+            .streams
+            .get(index)
+            .unwrap_or(&self.script.stream);
+        if events.is_empty() {
             return Err(EngineError::Generation("test stub".to_owned()));
         }
-        for output in &self.script.stream {
+        for output in events {
             if sender.blocking_send(output.clone()).is_err() {
                 break;
             }
@@ -104,10 +119,35 @@ impl StubEngine {
             .unwrap_or_default()
     }
 
-    fn record(&self, call: StubCall) {
-        if let Ok(mut calls) = self.calls.lock() {
-            calls.push(call);
+    pub fn render_prompt_for(
+        &self,
+        messages: &[higgs_engine::chat_template::ChatMessage],
+        tool_count: Option<usize>,
+    ) -> Vec<u32> {
+        if let Ok(mut rendered) = self.prompt_messages.lock() {
+            rendered.push(
+                messages
+                    .iter()
+                    .map(|message| (message.role.clone(), message.content.clone()))
+                    .collect(),
+            );
         }
+        self.render_prompt(tool_count)
+    }
+
+    pub fn recorded_prompt_messages(&self) -> Vec<Vec<(String, String)>> {
+        self.prompt_messages
+            .lock()
+            .map(|rendered| rendered.clone())
+            .unwrap_or_default()
+    }
+
+    /// Record a generation call and return how many came before it.
+    fn record(&self, call: StubCall) -> usize {
+        self.calls.lock().map_or(0, |mut calls| {
+            calls.push(call);
+            calls.len() - 1
+        })
     }
 }
 
@@ -142,6 +182,15 @@ pub fn app_with_stub_and_config(
     stub: StubEngine,
     extra_config: &str,
 ) -> (axum::Router, std::sync::Arc<crate::state::Engine>) {
+    app_with_stub_config_and_tools(stub, extra_config, crate::tools::ToolHub::disabled())
+}
+
+/// Like [`app_with_stub_and_config`], with a tool hub for server-side tools.
+pub fn app_with_stub_config_and_tools(
+    stub: StubEngine,
+    extra_config: &str,
+    tools: crate::tools::ToolHub,
+) -> (axum::Router, std::sync::Arc<crate::state::Engine>) {
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -166,7 +215,7 @@ pub fn app_with_stub_and_config(
         config,
         http_client: reqwest::Client::new(),
         metrics: None,
-        tools: Arc::new(crate::tools::ToolHub::disabled()),
+        tools: Arc::new(tools),
     });
     (
         crate::build_router(state, 30.0, None, 0, 1024 * 1024, None),

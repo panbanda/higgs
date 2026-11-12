@@ -192,7 +192,10 @@ Requests for `qwen` run locally; anything matching `claude-.*` is proxied to Ant
   `POST /v1/mcp/execute` (run `server__tool` with JSON arguments). Servers come from
   `[mcp.servers.<name>]` in the config or `higgs serve --mcp-config mcp.json`
   (the common `{"mcpServers": {...}}` file format). Config reference, security
-  notes, and verification steps: [docs/mcp.md](docs/mcp.md).
+  notes, and verification steps: [docs/mcp.md](docs/mcp.md). Chat completion and
+  Responses requests can set `"mcp": {"enabled": true, "servers": [...], "max_iterations": 5}`
+  to have Higgs run those tools itself and continue the generation, streaming included
+  ([tool loop](docs/mcp.md#server-side-tool-loop)).
 - Web: `POST /v1/web/search` (`query`, `max_results`) and `POST /v1/web/fetch`
   (`url`, `max_chars`: readable text, title, final URL). Disabled and answering 404
   unless `[web] enabled = true`; fetch blocks non-http(s) schemes and private,

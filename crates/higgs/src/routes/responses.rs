@@ -224,7 +224,7 @@ async fn create_local_response(
     let store_response = request.store.unwrap_or(true).then(|| Arc::clone(&store));
 
     if request.stream == Some(true) {
-        let chunks = crate::routes::chat::chat_completions_chunk_stream(
+        let chunks = crate::tool_loop::chunk_stream(
             Arc::clone(&state),
             chat,
             engine,
@@ -243,7 +243,7 @@ async fn create_local_response(
     }
 
     let start = Instant::now();
-    let chat_response = crate::routes::chat::chat_completions_non_streaming(
+    let chat_response = crate::tool_loop::complete(
         Arc::clone(&state),
         chat,
         engine,

@@ -109,6 +109,7 @@ fn chat_completion_response_has_required_fields() {
             logprobs: None,
         }],
         usage: make_usage(10, 5),
+        mcp: None,
     };
 
     let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -517,6 +518,7 @@ fn chat_completion_response_with_tool_calls_in_choices() {
             logprobs: None,
         }],
         usage: make_usage(10, 20),
+        mcp: None,
     };
     let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
 
