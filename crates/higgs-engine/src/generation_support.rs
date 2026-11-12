@@ -108,6 +108,43 @@ impl ThinkingSupport {
     }
 }
 
+/// Render `messages` through the chat template and tokenize the result.
+pub fn tokenize_chat_prompt(
+    template: Option<&ChatTemplateRenderer>,
+    tokenizer: &Tokenizer,
+    messages: &[ChatMessage],
+    tools: Option<&[serde_json::Value]>,
+    enable_thinking: bool,
+) -> Result<Vec<u32>, EngineError> {
+    let renderer = template.ok_or_else(|| {
+        EngineError::Template(
+            "This model has no chat template; use /v1/completions instead".to_owned(),
+        )
+    })?;
+    let prompt = renderer.apply_with_thinking(messages, tools, true, enable_thinking)?;
+    let encoding = tokenizer
+        .encode(prompt.as_str(), false)
+        .map_err(|e| EngineError::Tokenization(e.to_string()))?;
+    Ok(encoding.get_ids().to_vec())
+}
+
+/// Where a prefill that resumes at `resume_at` must pause to snapshot its
+/// cache for the prefix cache, as an index into the tokens it will run.
+///
+/// Dense KV caches are sliced to the key length when stored. A recurrent
+/// (hybrid) state cannot be cut back, so it is captured while the cache
+/// holds exactly the key's tokens, before the generation suffix runs.
+pub fn snapshot_boundary(
+    prompt: &[u32],
+    resume_at: usize,
+    generation_suffix_len: usize,
+    cache: &AnyCache,
+) -> Option<usize> {
+    let key_len = prefix_cache_key(prompt, generation_suffix_len).len();
+    (matches!(cache, AnyCache::Hybrid(_)) && key_len > resume_at && key_len < prompt.len())
+        .then(|| key_len - resume_at)
+}
+
 /// Number of trailing tokens `add_generation_prompt=true` appends to a chat
 /// prompt (for example `<|im_start|>assistant\n<think>\n`).
 ///

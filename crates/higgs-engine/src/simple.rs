@@ -30,7 +30,7 @@ use crate::{
     error::EngineError,
     generation_support::{
         ThinkingBudgetGate, ThinkingSupport, embed_tokens, generation_prompt_suffix_len,
-        prefix_cache_key, resume_from_prefix,
+        prefix_cache_key, resume_from_prefix, snapshot_boundary, tokenize_chat_prompt,
     },
     mlx_tuning::MlxRuntimeTuning,
     model_loader,
@@ -418,17 +418,13 @@ impl SimpleEngine {
         tools: Option<&[serde_json::Value]>,
         enable_thinking: bool,
     ) -> Result<Vec<u32>, EngineError> {
-        let renderer = self.template.as_ref().ok_or_else(|| {
-            EngineError::Template(
-                "This model has no chat template; use /v1/completions instead".to_owned(),
-            )
-        })?;
-        let prompt = renderer.apply_with_thinking(messages, tools, true, enable_thinking)?;
-        let encoding = self
-            .tokenizer
-            .encode(prompt.as_str(), false)
-            .map_err(|e| EngineError::Tokenization(e.to_string()))?;
-        Ok(encoding.get_ids().to_vec())
+        tokenize_chat_prompt(
+            self.template.as_deref(),
+            &self.tokenizer,
+            messages,
+            tools,
+            enable_thinking,
+        )
     }
 
     /// Apply chat template and tokenize messages.
@@ -918,15 +914,14 @@ impl SimpleEngineCore {
         prompt_tokens: &[u32],
         prepared: &PreparedGeneration<'_>,
     ) -> Option<i32> {
-        let key_len = prefix_cache_key(prompt_tokens, self.gen_prompt_suffix_len).len();
         let resumed_at = prompt_tokens.len() - prepared.actual_prompt_tokens.len();
-        if !matches!(prepared.cache, AnyCache::Hybrid(_))
-            || key_len <= resumed_at
-            || key_len >= prompt_tokens.len()
-        {
-            return None;
-        }
-        i32::try_from(key_len - resumed_at).ok()
+        snapshot_boundary(
+            prompt_tokens,
+            resumed_at,
+            self.gen_prompt_suffix_len,
+            &prepared.cache,
+        )
+        .and_then(|boundary| i32::try_from(boundary).ok())
     }
 
     /// Feed prompt tokens through the model, chunked when long to bound peak

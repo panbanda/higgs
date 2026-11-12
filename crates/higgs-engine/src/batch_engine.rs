@@ -27,7 +27,7 @@ use crate::{
     error::EngineError,
     generation_support::{
         ThinkingSupport, embed_tokens, generation_prompt_suffix_len, prefix_cache_key,
-        resume_from_prefix,
+        resume_from_prefix, snapshot_boundary, tokenize_chat_prompt,
     },
     mlx_tuning::MlxRuntimeTuning,
     model_loader,
@@ -453,17 +453,13 @@ impl BatchEngine {
         tools: Option<&[serde_json::Value]>,
         enable_thinking: bool,
     ) -> Result<Vec<u32>, EngineError> {
-        let renderer = self.template.as_ref().ok_or_else(|| {
-            EngineError::Template(
-                "This model has no chat template; use /v1/completions instead".to_owned(),
-            )
-        })?;
-        let prompt = renderer.apply_with_thinking(messages, tools, true, enable_thinking)?;
-        let encoding = self
-            .tokenizer
-            .encode(prompt.as_str(), false)
-            .map_err(|e| EngineError::Tokenization(e.to_string()))?;
-        Ok(encoding.get_ids().to_vec())
+        tokenize_chat_prompt(
+            self.template.as_ref(),
+            &self.tokenizer,
+            messages,
+            tools,
+            enable_thinking,
+        )
     }
 
     /// Apply chat template and tokenize messages.
@@ -761,21 +757,13 @@ impl PromptCache {
         self.entries.longest_prefix_len(prompt)
     }
 
-    /// Where a prefill that resumes at `resume_at` must pause to snapshot its
-    /// cache for the prefix cache, as an index into the tokens it will run.
-    ///
-    /// Dense KV caches are sliced to the key length when stored. A recurrent
-    /// (hybrid) state cannot be cut back, so it is captured while the cache
-    /// holds exactly the key's tokens, before the generation suffix runs.
     fn snapshot_boundary(
         &self,
         prompt: &[u32],
         resume_at: usize,
         cache: &AnyCache,
     ) -> Option<usize> {
-        let key_len = prefix_cache_key(prompt, self.generation_suffix_len).len();
-        (matches!(cache, AnyCache::Hybrid(_)) && key_len > resume_at && key_len < prompt.len())
-            .then(|| key_len - resume_at)
+        snapshot_boundary(prompt, resume_at, self.generation_suffix_len, cache)
     }
 
     /// Keep the state a finished prefill left behind, keyed without the
