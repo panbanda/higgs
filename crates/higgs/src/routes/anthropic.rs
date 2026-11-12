@@ -274,13 +274,8 @@ async fn create_message_non_streaming(
     )?;
     let tools = plan.tools.as_deref();
     let thinking_budget = requested_thinking_budget(req.thinking.as_ref())?;
-    // A forced call is the whole answer, so there is no room to think first.
-    let thinking_enabled = !plan.policy.forces_call()
-        && crate::reasoning::effective_thinking_enabled(
-            engine.enable_thinking(),
-            &[engine.model_name(), req.model.as_str()],
-            None,
-        );
+    let thinking_enabled =
+        crate::reasoning::thinking_enabled_for_request(&engine, &plan.policy, &req.model, None);
 
     let prompt_tokens = engine
         .prepare_chat_prompt_with_thinking(&engine_messages, tools, thinking_enabled)
@@ -400,13 +395,8 @@ fn create_message_stream(
     )?;
     let tools = plan.tools.as_deref();
     let thinking_budget = requested_thinking_budget(req.thinking.as_ref())?;
-    // A forced call is the whole answer, so there is no room to think first.
-    let thinking_enabled = !plan.policy.forces_call()
-        && crate::reasoning::effective_thinking_enabled(
-            engine.enable_thinking(),
-            &[engine.model_name(), req.model.as_str()],
-            None,
-        );
+    let thinking_enabled =
+        crate::reasoning::thinking_enabled_for_request(&engine, &plan.policy, &req.model, None);
 
     let prompt_tokens = engine
         .prepare_chat_prompt_with_thinking(&engine_messages, tools, thinking_enabled)

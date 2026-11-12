@@ -320,13 +320,12 @@ pub(crate) async fn chat_completions_non_streaming(
         tool_policy.forced_constraint(tools.unwrap_or_default(), tool_format)?,
     )?;
     let thinking_budget = crate::reasoning::requested_thinking_budget(req.reasoning.as_ref())?;
-    // A forced call is the whole answer, so there is no room to think first.
-    let thinking_enabled = !tool_policy.forces_call()
-        && crate::reasoning::effective_thinking_enabled(
-            engine.enable_thinking(),
-            &[engine.model_name(), req.model.as_str()],
-            req.reasoning.as_ref(),
-        );
+    let thinking_enabled = crate::reasoning::thinking_enabled_for_request(
+        &engine,
+        &tool_policy,
+        &req.model,
+        req.reasoning.as_ref(),
+    );
 
     let mut prompt_tokens = engine
         .prepare_chat_prompt_with_thinking(&messages, tools, thinking_enabled)
@@ -542,12 +541,12 @@ pub(crate) fn chat_completions_chunk_stream(
 
     let messages = convert_messages(&effective_messages);
     let thinking_budget = crate::reasoning::requested_thinking_budget(req.reasoning.as_ref())?;
-    let thinking_enabled_stream = !tool_policy.forces_call()
-        && crate::reasoning::effective_thinking_enabled(
-            engine.enable_thinking(),
-            &[engine.model_name(), req.model.as_str()],
-            req.reasoning.as_ref(),
-        );
+    let thinking_enabled_stream = crate::reasoning::thinking_enabled_for_request(
+        &engine,
+        &tool_policy,
+        &req.model,
+        req.reasoning.as_ref(),
+    );
 
     // Pass tools into prompt rendering so the chat template emits the
     // tool spec the model recognises. The on-the-fly

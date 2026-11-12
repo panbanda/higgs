@@ -282,18 +282,6 @@ enum PrefillAdvance {
     Complete(Option<ActiveRequest>),
 }
 
-#[cfg(test)]
-fn prefill_chunk_ranges(token_count: usize, quantum: usize) -> Vec<std::ops::Range<usize>> {
-    let mut ranges = Vec::new();
-    let mut start = 0;
-    while start < token_count {
-        let end = start.saturating_add(quantum).min(token_count);
-        ranges.push(start..end);
-        start = end;
-    }
-    ranges
-}
-
 // ---------------------------------------------------------------------------
 // BatchEngine
 // ---------------------------------------------------------------------------
@@ -1943,12 +1931,6 @@ mod tests {
         let all_unconstrained = true;
         let use_batched = n_active > 1 && supports_batched && all_unconstrained;
         assert!(use_batched);
-    }
-
-    #[test]
-    fn prefill_chunk_ranges_cover_each_token_once() {
-        let ranges = prefill_chunk_ranges(10, 4);
-        assert_eq!(ranges, vec![0..4, 4..8, 8..10]);
     }
 
     // -----------------------------------------------------------------------
