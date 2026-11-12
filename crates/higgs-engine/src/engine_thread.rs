@@ -9,6 +9,7 @@ use crate::error::EngineError;
 /// Handle to a worker thread that owns a `T`.
 pub struct EngineThread<T> {
     jobs: std::sync::mpsc::Sender<Job<T>>,
+    worker: std::thread::JoinHandle<()>,
 }
 
 type Job<T> = Box<dyn FnOnce(&mut T) + Send>;
@@ -24,7 +25,7 @@ impl<T: 'static> EngineThread<T> {
         let (jobs, job_rx) = std::sync::mpsc::channel::<Job<T>>();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), EngineError>>(1);
 
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name(name.to_owned())
             .spawn(move || {
                 let mut core = match init() {
@@ -50,7 +51,17 @@ impl<T: 'static> EngineThread<T> {
         ready_rx
             .recv()
             .map_err(|_| EngineError::Generation(format!("{name} exited while starting")))??;
-        Ok(Self { jobs })
+        Ok(Self { jobs, worker })
+    }
+
+    /// Stop the worker and wait until it has dropped the core.
+    ///
+    /// Dropping the handle also ends the worker, but returns before the core is freed. Use this
+    /// when the memory the core holds must be released by the time the call returns.
+    pub fn shutdown(self) {
+        let Self { jobs, worker } = self;
+        drop(jobs);
+        let _ = worker.join();
     }
 
     /// Run `job` against the core on the owning thread and wait for its result.
@@ -147,6 +158,34 @@ mod tests {
 
         assert!(failed.is_err());
         assert_eq!(engine.run(|value| value.get()).unwrap(), 7);
+    }
+
+    #[test]
+    fn shutdown_returns_only_after_the_core_is_dropped() {
+        struct SetsFlagOnDrop {
+            flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            _not_send: Rc<()>,
+        }
+        impl Drop for SetsFlagOnDrop {
+            fn drop(&mut self) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&dropped);
+        let engine = EngineThread::spawn("test-engine", move || {
+            Ok(SetsFlagOnDrop {
+                flag,
+                _not_send: Rc::new(()),
+            })
+        })
+        .unwrap();
+
+        engine.shutdown();
+
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
