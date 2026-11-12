@@ -46,6 +46,7 @@ pub async fn run_doctor(
     check_config_valid(&mut result);
     check_config_file_permissions(config, config_path, &mut result);
     check_server_section(config, &mut result);
+    check_local_section(config, &mut result);
     check_models(config, &mut result);
     check_model_lifecycle(
         config,
@@ -292,6 +293,48 @@ fn check_prefill_yield_tokens(
     true
 }
 
+/// Reject a zero thinking budget and warn when the budget alone would use up
+/// the server's `max_tokens`, leaving no room for the answer.
+///
+/// Disabling thinking is the job of reasoning effort `"none"`, not a zero budget.
+fn check_thinking_budget(
+    scope: &str,
+    thinking_budget: Option<u32>,
+    max_tokens: u32,
+    result: &mut DoctorResult,
+) -> bool {
+    let Some(budget) = thinking_budget else {
+        return true;
+    };
+    if budget == 0 {
+        fail(
+            &format!(
+                "{scope} thinking_budget=0 is invalid; it must be at least 1 (disable thinking with reasoning effort \"none\")"
+            ),
+            result,
+        );
+        return false;
+    }
+    if budget >= max_tokens {
+        warn(
+            &format!(
+                "{scope} thinking_budget={budget} is not below server max_tokens={max_tokens}; reasoning can consume the whole response"
+            ),
+            result,
+        );
+    }
+    true
+}
+
+fn check_local_section(config: &HiggsConfig, result: &mut DoctorResult) {
+    check_thinking_budget(
+        "[local]",
+        config.local.thinking_budget,
+        config.server.max_tokens,
+        result,
+    );
+}
+
 /// Warn (not fail) when the *resolved* MLA decision is enabled for an adapter
 /// that does not advertise MLA latent-cache support. The flag is a no-op for
 /// those adapters at runtime, so this is advisory rather than a hard failure.
@@ -363,6 +406,20 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
         }
         if !check_prefill_yield_tokens(&label, model.prefill_yield_tokens, result) {
             continue;
+        }
+        if !check_thinking_budget(
+            &format!("model {label}"),
+            model.thinking_budget,
+            config.server.max_tokens,
+            result,
+        ) {
+            continue;
+        }
+        if model.batch && model.thinking_budget.is_some() {
+            warn(
+                &format!("model {label} thinking_budget has no effect with batch=true"),
+                result,
+            );
         }
         let kv_cache_config = model.kv_cache_config();
         match kv_cache_config.validate() {
@@ -880,6 +937,62 @@ mod tests {
     }
 
     #[test]
+    fn thinking_budget_unset_is_accepted() {
+        let mut result = empty_result();
+        assert!(check_thinking_budget("model x", None, 4096, &mut result));
+        assert_eq!((result.warnings, result.failures), (0, 0));
+    }
+
+    #[test]
+    fn thinking_budget_zero_is_rejected() {
+        let mut result = empty_result();
+        assert!(!check_thinking_budget(
+            "model x",
+            Some(0),
+            4096,
+            &mut result
+        ));
+        assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn thinking_budget_one_is_accepted() {
+        let mut result = empty_result();
+        assert!(check_thinking_budget("model x", Some(1), 4096, &mut result));
+        assert_eq!((result.warnings, result.failures), (0, 0));
+    }
+
+    #[test]
+    fn thinking_budget_not_below_max_tokens_warns() {
+        let mut result = empty_result();
+        assert!(check_thinking_budget(
+            "model x",
+            Some(4096),
+            4096,
+            &mut result
+        ));
+        assert_eq!((result.warnings, result.failures), (1, 0));
+    }
+
+    #[test]
+    fn local_section_rejects_zero_thinking_budget() {
+        let mut config = HiggsConfig::default();
+        config.local.thinking_budget = Some(0);
+        let mut result = empty_result();
+        check_local_section(&config, &mut result);
+        assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn local_section_accepts_valid_thinking_budget() {
+        let mut config = HiggsConfig::default();
+        config.local.thinking_budget = Some(512);
+        let mut result = empty_result();
+        check_local_section(&config, &mut result);
+        assert_eq!((result.warnings, result.failures), (0, 0));
+    }
+
+    #[test]
     fn prefill_yield_tokens_rejects_small_nonzero_values() {
         let mut result = empty_result();
         assert!(!check_prefill_yield_tokens("test", Some(127), &mut result));
@@ -913,6 +1026,7 @@ mod tests {
                     mlx_profile: None,
                     batch: false,
                     prefill_yield_tokens: None,
+                    thinking_budget: None,
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
@@ -933,6 +1047,7 @@ mod tests {
                     mlx_profile: None,
                     batch: false,
                     prefill_yield_tokens: None,
+                    thinking_budget: None,
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
@@ -966,6 +1081,7 @@ mod tests {
                     mlx_profile: None,
                     batch: false,
                     prefill_yield_tokens: None,
+                    thinking_budget: None,
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
@@ -986,6 +1102,7 @@ mod tests {
                     mlx_profile: None,
                     batch: false,
                     prefill_yield_tokens: None,
+                    thinking_budget: None,
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
@@ -1468,6 +1585,7 @@ mod tests {
                 mlx_profile: None,
                 batch: false,
                 prefill_yield_tokens: None,
+                thinking_budget: None,
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
                 kv_seed: 0,
@@ -1505,6 +1623,7 @@ mod tests {
                 mlx_profile: None,
                 batch: false,
                 prefill_yield_tokens: None,
+                thinking_budget: None,
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
                 kv_seed: 0,
@@ -1544,6 +1663,7 @@ mod tests {
                 mlx_profile: None,
                 batch: false,
                 prefill_yield_tokens: None,
+                thinking_budget: None,
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
                 kv_seed: 0,
@@ -1608,6 +1728,7 @@ mod tests {
             mlx_profile: None,
             batch: false,
             prefill_yield_tokens: None,
+            thinking_budget: None,
             kv_cache: higgs_models::turboquant::KvCacheMode::Off,
             kv_bits: 3,
             kv_seed: 0,

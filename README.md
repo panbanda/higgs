@@ -137,7 +137,45 @@ Requests for `qwen` run locally; anything matching `claude-.*` is proxied to Ant
   - Streaming requests may set `"return_progress": true` to receive
     llama.cpp-compatible `prompt_progress` chunks (`{total, cache, processed,
     time_ms}`) during chunked prefill.
+  - Streaming requests on both chat and completions may set
+    `"stream_options": {"include_usage": true}` to receive a final chunk with
+    an empty `choices` array and a `usage` object.
+  - `usage` carries `prompt_tokens`, `completion_tokens`, `total_tokens`, plus
+    only the fields that were measured for that request:
+    `prompt_tokens_details.cached_tokens` (prompt tokens served from the prefix
+    cache), `completion_tokens_details.reasoning_tokens` (chat only, when the
+    response had reasoning content), and oMLX-compatible timings in seconds:
+    `time_to_first_token`, `prompt_eval_duration`, `generation_duration`,
+    `total_time`, `prompt_tokens_per_second`, `generation_tokens_per_second`.
+    See [Usage fields](docs/configuration.md#usage-fields) for exact definitions.
+  - Constrained output on `/v1/chat/completions`: `response_format`
+    (`json_object`, `json_schema`, or `{"type": "regex", "regex": "..."}`), or
+    the vLLM-style `guided_regex` (string) and `guided_json` (schema object).
+    At most one may be set; more than one, an invalid regex, or a schema the
+    grammar compiler rejects returns 400 with the reason.
+  - `reasoning.max_tokens` sets the reasoning-token budget for a request;
+    Anthropic `thinking.budget_tokens` does the same on `/v1/messages`.
+    Defaults come from `[[models]].thinking_budget`, then `[local].thinking_budget`,
+    then 256. See [Thinking budget](docs/configuration.md#thinking-budget).
+  - `tool_choice`: `"auto"` (default) and `"none"` (tools are not shown to the
+    model and tool calls are not parsed) are supported; `"required"` and a
+    named function return 400 until they are implemented.
+  - `seed` is accepted for client compatibility but does not make sampling
+    reproducible yet.
+  - Unrecognized request fields are ignored.
+- Tokenizer: `POST /v1/tokenize` and `POST /v1/detokenize` (also at `/tokenize`
+  and `/detokenize`), local models only.
+  - `{"model": "m", "text": "hello"}` or `{"model": "m", "messages": [...]}`
+    (rendered through the chat template, optional `tools`) returns
+    `{"tokens": [...], "count": n}`. Text input does not add special tokens
+    unless `"add_special_tokens": true`.
+  - `{"model": "m", "tokens": [...]}` to `/v1/detokenize` returns
+    `{"text": "..."}`; optional `"skip_special_tokens": true`. Unknown token
+    ids are rejected with 400, as are models routed to a remote provider.
 - Anthropic: `/v1/messages`, `/v1/messages/count_tokens`
+  - `usage.cache_read_input_tokens` reports prompt tokens served from the
+    prefix cache when known. `usage.input_tokens` still counts the whole
+    prompt, cached tokens included.
 - Model lifecycle: `POST /v1/models/{id}/load`, `POST /v1/models/{id}/unload[?force=true]`,
   `GET /v1/models/status` (state, pinned, in-flight requests, last use, load time,
   estimated and measured memory per configured model); see

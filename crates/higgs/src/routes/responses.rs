@@ -16,6 +16,7 @@ use tokio_stream::{Stream, StreamExt};
 
 use crate::{
     config::ApiFormat,
+    constraint::ConstraintSpec,
     error::{ErrorDetail, ErrorResponse, ServerError},
     metrics::{RequestMetricsContext, RequestRecord, RequestTiming},
     responses::{
@@ -218,6 +219,7 @@ async fn create_local_response(
     }
 
     let chat = build_chat_request(&request, &model_name, &conversation)?;
+    let constraint_spec = ConstraintSpec::from_request(chat.response_format.as_ref(), None, None)?;
     let context = ResponseContext::from_request(&request, model_name);
     let store_response = request.store.unwrap_or(true).then(|| Arc::clone(&store));
 
@@ -226,6 +228,7 @@ async fn create_local_response(
             Arc::clone(&state),
             chat,
             engine,
+            constraint_spec,
             state.metrics.clone(),
             routing_method,
             received_at,
@@ -240,9 +243,14 @@ async fn create_local_response(
     }
 
     let start = Instant::now();
-    let chat_response =
-        crate::routes::chat::chat_completions_non_streaming(Arc::clone(&state), chat, engine)
-            .await?;
+    let chat_response = crate::routes::chat::chat_completions_non_streaming(
+        Arc::clone(&state),
+        chat,
+        engine,
+        constraint_spec,
+        received_at,
+    )
+    .await?;
     let input_tokens = u64::from(chat_response.usage.prompt_tokens);
     let output_tokens = u64::from(chat_response.usage.completion_tokens);
     let object = context.object(outcome_from_chat(chat_response));

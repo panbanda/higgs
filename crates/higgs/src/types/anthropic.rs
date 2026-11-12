@@ -47,6 +47,16 @@ pub struct CreateMessageRequest {
     pub stop_sequences: Option<Vec<String>>,
     #[serde(default)]
     pub tools: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub thinking: Option<ThinkingConfig>,
+}
+
+/// Anthropic `thinking` request parameter. Only `budget_tokens` is honored;
+/// whether the model reasons at all stays a server-side decision.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ThinkingConfig {
+    #[serde(default)]
+    pub budget_tokens: Option<u32>,
 }
 
 /// A message in the Anthropic format.
@@ -162,8 +172,12 @@ pub struct ContentBlockResponse {
 /// Anthropic usage stats.
 #[derive(Debug, Clone, Serialize)]
 pub struct AnthropicUsage {
+    /// Total prompt tokens, including those served from the prefix cache.
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Prompt tokens served from the prefix cache, when the engine reported it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u32>,
 }
 
 /// POST `/v1/messages/count_tokens` request.
@@ -271,6 +285,7 @@ mod tests {
         AnthropicUsage {
             input_tokens: input,
             output_tokens: output,
+            cache_read_input_tokens: None,
         }
     }
 

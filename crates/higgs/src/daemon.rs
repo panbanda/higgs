@@ -171,8 +171,13 @@ port = 8000
 # MLX profile applies to simple-engine local models. "auto" picks balanced for
 # small/medium models and throughput for large models.
 
+# thinking_budget caps reasoning tokens before </think> is forced (default 256,
+# minimum 1); a model's own thinking_budget and per-request
+# reasoning.max_tokens / thinking.budget_tokens take precedence.
+
 # [local]
 # mlx_profile = "auto"
+# thinking_budget = 256
 # Model lifecycle. By default every model loads at startup and stays loaded.
 # load = "on_demand"          # load a model on the first request that uses it
 # idle_ttl_seconds = 900      # unload a model after this long with no requests (0 = never)
@@ -195,6 +200,7 @@ port = 8000
 # kv_disk_dir = "/var/lib/higgs/prefix-kv" # optional durable prefix cache
 # kv_disk_space_mb = 4096                # LRU budget; minimum 64 MiB
 # prefill_yield_tokens = 512 # optional: interleave decode during long prefills
+# thinking_budget = 256 # optional: reasoning tokens before </think> is forced; overrides [local]
 # mla_latent_cache = true # DeepSeek-V2 only: compressed latent KV cache; cannot combine with kv_cache = "turboquant"
 
 # --- Remote providers ---
@@ -918,6 +924,16 @@ mod tests {
             std::fs::create_dir_all(dir).unwrap();
             cmd_init(None);
             assert!(dir.join("config.toml").exists());
+        });
+    }
+
+    #[test]
+    fn cmd_init_template_documents_thinking_budget() {
+        with_temp_config_dir(|dir| {
+            std::fs::create_dir_all(dir).unwrap();
+            cmd_init(None);
+            let template = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+            assert_eq!(template.matches("# thinking_budget = 256").count(), 2);
         });
     }
 

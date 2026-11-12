@@ -16,16 +16,20 @@ use tokio_stream::Stream;
 
 use crate::{
     config::ApiFormat,
+    constraint::ConstraintSpec,
     error::ServerError,
     metrics::{MetricsStore, RequestMetricsContext, RequestRecord, RequestTiming},
     router::ResolvedRoute,
     state::{EngineLease, SharedState},
+    tool_choice::ToolChoice,
     types::openai::{
         ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessage, ChatCompletionRequest,
-        ChatCompletionResponse, ChoiceLogprobs, CompletionUsage, MessageContent, StopSequence,
-        TokenLogprob, ToolCall, ToolCallDelta, ToolCallFunction, ToolCallFunctionDelta, TopLogprob,
+        ChatCompletionResponse, ChoiceLogprobs, MessageContent, StopSequence, TokenLogprob,
+        ToolCall, ToolCallDelta, ToolCallFunction, ToolCallFunctionDelta, TopLogprob,
     },
+    usage::{TokenCounts, build_usage, count_text_tokens},
 };
+use higgs_engine::engine::{GenerationStats, ThinkingMode};
 use higgs_models::SamplingParams;
 
 #[allow(clippy::too_many_lines)]
@@ -67,11 +71,20 @@ pub async fn chat_completions(
             routing_method,
         } => {
             req.model = model_name;
+            if ToolChoice::from_request(req.tool_choice.as_ref())? == ToolChoice::Disabled {
+                req.tools = None;
+            }
+            let constraint_spec = ConstraintSpec::from_request(
+                req.response_format.as_ref(),
+                req.guided_regex.as_deref(),
+                req.guided_json.as_ref(),
+            )?;
             if req.stream == Some(true) {
                 let stream = chat_completions_stream(
                     Arc::clone(&state),
                     req,
                     engine,
+                    constraint_spec,
                     state.metrics.clone(),
                     routing_method,
                     received_at,
@@ -83,8 +96,14 @@ pub async fn chat_completions(
                 Ok(sse.into_response())
             } else {
                 let start = Instant::now();
-                let response =
-                    chat_completions_non_streaming(Arc::clone(&state), req, engine).await?;
+                let response = chat_completions_non_streaming(
+                    Arc::clone(&state),
+                    req,
+                    engine,
+                    constraint_spec,
+                    received_at,
+                )
+                .await?;
                 if let Some(ref metrics) = state.metrics {
                     metrics.record(RequestRecord {
                         id: 0,
@@ -271,6 +290,8 @@ pub(crate) async fn chat_completions_non_streaming(
     state: SharedState,
     req: ChatCompletionRequest,
     engine: EngineLease,
+    constraint_spec: Option<ConstraintSpec>,
+    received_at: Instant,
 ) -> Result<ChatCompletionResponse, ServerError> {
     let max_tokens = req.max_tokens.unwrap_or(state.config.server.max_tokens);
     let sampling = build_sampling_params(&req);
@@ -290,6 +311,7 @@ pub(crate) async fn chat_completions_non_streaming(
     // Treat an empty `tools: []` as absent (mirrors the streaming path) so it
     // doesn't define `tools` in the template context or trigger tool parsing.
     let tools = req.tools.as_deref().filter(|t| !t.is_empty());
+    let thinking_budget = crate::reasoning::requested_thinking_budget(req.reasoning.as_ref())?;
     let thinking_enabled = crate::reasoning::effective_thinking_enabled(
         engine.enable_thinking(),
         &[engine.model_name(), req.model.as_str()],
@@ -317,7 +339,7 @@ pub(crate) async fn chat_completions_non_streaming(
         None
     };
 
-    let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
+    let constraint = build_constraint(constraint_spec.as_ref(), &engine)?;
 
     let tokenizer = engine.tokenizer().clone();
     let output = tokio::task::spawn_blocking(move || {
@@ -328,7 +350,7 @@ pub(crate) async fn chat_completions_non_streaming(
             &stop_sequences,
             want_logprobs,
             top_logprobs,
-            thinking_enabled,
+            ThinkingMode::new(thinking_enabled, thinking_budget),
             constraint,
             pixel_values,
         )
@@ -407,6 +429,10 @@ pub(crate) async fn chat_completions_non_streaming(
         )
     };
 
+    let reasoning_tokens = reasoning_content
+        .as_deref()
+        .and_then(|text| count_text_tokens(&tokenizer, text));
+
     Ok(ChatCompletionResponse {
         id: request_id,
         object: "chat.completion",
@@ -424,11 +450,15 @@ pub(crate) async fn chat_completions_non_streaming(
             finish_reason,
             logprobs: logprobs_response,
         }],
-        usage: CompletionUsage {
-            prompt_tokens: output.prompt_tokens,
-            completion_tokens: output.completion_tokens,
-            total_tokens: output.prompt_tokens + output.completion_tokens,
-        },
+        usage: build_usage(
+            TokenCounts {
+                prompt: output.prompt_tokens,
+                completion: output.completion_tokens,
+                reasoning: reasoning_tokens,
+            },
+            &output.stats,
+            received_at,
+        ),
     })
 }
 
@@ -436,12 +466,20 @@ fn chat_completions_stream(
     state: SharedState,
     req: ChatCompletionRequest,
     engine: EngineLease,
+    constraint_spec: Option<ConstraintSpec>,
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,
     received_at: Instant,
 ) -> Result<impl Stream<Item = Result<Event, Infallible>>, ServerError> {
-    let chunks =
-        chat_completions_chunk_stream(state, req, engine, metrics, routing_method, received_at)?;
+    let chunks = chat_completions_chunk_stream(
+        state,
+        req,
+        engine,
+        constraint_spec,
+        metrics,
+        routing_method,
+        received_at,
+    )?;
     Ok(tokio_stream::StreamExt::map(chunks, |data| {
         Ok(Event::default().data(data))
     }))
@@ -454,6 +492,7 @@ pub(crate) fn chat_completions_chunk_stream(
     state: SharedState,
     req: ChatCompletionRequest,
     engine: EngineLease,
+    constraint_spec: Option<ConstraintSpec>,
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,
     received_at: Instant,
@@ -487,6 +526,7 @@ pub(crate) fn chat_completions_chunk_stream(
     };
 
     let messages = convert_messages(&effective_messages);
+    let thinking_budget = crate::reasoning::requested_thinking_budget(req.reasoning.as_ref())?;
     let thinking_enabled_stream = crate::reasoning::effective_thinking_enabled(
         engine.enable_thinking(),
         &[engine.model_name(), req.model.as_str()],
@@ -520,7 +560,7 @@ pub(crate) fn chat_completions_chunk_stream(
         None
     };
 
-    let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
+    let constraint = build_constraint(constraint_spec.as_ref(), &engine)?;
 
     let request_id = generate_request_id();
     let include_usage = req
@@ -561,7 +601,7 @@ pub(crate) fn chat_completions_chunk_stream(
             want_logprobs,
             top_logprobs,
             &tx,
-            thinking_enabled_stream,
+            ThinkingMode::new(thinking_enabled_stream, thinking_budget),
             // Always requested so the metrics record sees prefix-cache hits;
             // progress chunks are only forwarded when the client opted in.
             true,
@@ -627,8 +667,11 @@ pub(crate) fn chat_completions_chunk_stream(
         let mut pending_finish_reason: Option<String> = None;
         let mut pending_finish_logprobs: Option<ChoiceLogprobs> = None;
         let mut timing = RequestTiming::default();
+        let mut stats = GenerationStats::default();
+        let mut reasoning_text = String::new();
 
         while let Some(output) = rx.recv().await {
+            stats.observe(&output, Instant::now());
             // Prefill-progress events carry no tokens: forward as
             // `prompt_progress` chunks when the client opted in, and keep
             // them away from the delta/tool trackers either way.
@@ -653,6 +696,9 @@ pub(crate) fn chat_completions_chunk_stream(
             let (visible, reasoning) = reasoning_tracker.process(&output.new_text);
 
             if !reasoning.is_empty() {
+                if include_usage {
+                    reasoning_text.push_str(&reasoning);
+                }
                 let d = ChatCompletionDelta {
                     role: None,
                     content: None,
@@ -706,6 +752,9 @@ pub(crate) fn chat_completions_chunk_stream(
         // Flush any remaining buffered content.
         let (flush_vis, flush_reas) = reasoning_tracker.flush();
         if !flush_reas.is_empty() {
+            if include_usage {
+                reasoning_text.push_str(&flush_reas);
+            }
             let d = ChatCompletionDelta {
                 role: None,
                 content: None,
@@ -771,11 +820,15 @@ pub(crate) fn chat_completions_chunk_stream(
 
         // Emit final chunk with usage only when explicitly requested.
         if include_usage {
-            let usage = CompletionUsage {
-                prompt_tokens: prompt_token_count,
-                completion_tokens: output_token_count,
-                total_tokens: prompt_token_count + output_token_count,
-            };
+            let usage = build_usage(
+                TokenCounts {
+                    prompt: prompt_token_count,
+                    completion: output_token_count,
+                    reasoning: count_text_tokens(&tokenizer, &reasoning_text),
+                },
+                &stats,
+                received_at,
+            );
             match writer.write_usage(&usage) {
                 Ok(json) => yield json.to_owned(),
                 Err(e) => tracing::error!(error = %e, "Failed to serialize usage chunk"),
@@ -795,7 +848,7 @@ pub(crate) fn chat_completions_chunk_stream(
     Ok(stream)
 }
 
-fn convert_messages(
+pub(crate) fn convert_messages(
     messages: &[ChatCompletionMessage],
 ) -> Vec<higgs_engine::chat_template::ChatMessage> {
     messages
@@ -898,53 +951,32 @@ fn build_sampling_params(req: &ChatCompletionRequest) -> SamplingParams {
     }
 }
 
-/// Build a constrained generator from the request's `response_format`.
+/// Compile the requested constraint against the model's vocabulary.
 ///
-/// Returns `None` if no constraint is needed (text mode or absent).
+/// A pattern or schema the grammar compiler rejects is the client's fault, so
+/// those failures are reported as `400`; failing to build the vocabulary is a
+/// server error.
 fn build_constraint(
-    response_format: Option<&crate::types::openai::ResponseFormat>,
+    requested: Option<&ConstraintSpec>,
     engine: &crate::state::Engine,
 ) -> Result<Option<higgs_engine::constrained::ConstrainedGenerator>, ServerError> {
-    let Some(fmt) = response_format else {
+    use higgs_engine::constrained::ConstrainedGenerator;
+
+    let Some(spec) = requested else {
         return Ok(None);
     };
-
-    match fmt.r#type.as_str() {
-        "text" => Ok(None),
-        "json_object" | "json_schema" => {
-            let eos_id = engine.eos_token_ids().first().copied().unwrap_or(0);
-            let vocab = higgs_engine::constrained::build_vocabulary(engine.tokenizer(), eos_id)
-                .map_err(ServerError::Engine)?;
-            let constraint = if fmt.r#type == "json_schema" {
-                if let Some(ref schema) = fmt.json_schema {
-                    // OpenAI spec wraps the actual schema under a `schema` key:
-                    // {"name": "...", "schema": {<actual schema>}}
-                    // Fall back to the whole value for bare schemas.
-                    let inner = schema
-                        .get("schema")
-                        .cloned()
-                        .unwrap_or_else(|| schema.clone());
-                    let schema_str = inner.to_string();
-                    higgs_engine::constrained::ConstrainedGenerator::from_json_schema(
-                        &schema_str,
-                        &vocab,
-                    )
-                    .map_err(ServerError::Engine)?
-                } else {
-                    higgs_engine::constrained::ConstrainedGenerator::for_json_object(&vocab)
-                        .map_err(ServerError::Engine)?
-                }
-            } else {
-                higgs_engine::constrained::ConstrainedGenerator::for_json_object(&vocab)
-                    .map_err(ServerError::Engine)?
-            };
-
-            Ok(Some(constraint))
+    let eos_id = engine.eos_token_ids().first().copied().unwrap_or(0);
+    let vocab = higgs_engine::constrained::build_vocabulary(engine.tokenizer(), eos_id)
+        .map_err(ServerError::Engine)?;
+    let constraint = match spec {
+        ConstraintSpec::JsonObject => ConstrainedGenerator::for_json_object(&vocab),
+        ConstraintSpec::JsonSchema(schema) => {
+            ConstrainedGenerator::from_json_schema(&schema.to_string(), &vocab)
         }
-        other => Err(ServerError::BadRequest(format!(
-            "Unsupported response_format type: {other}"
-        ))),
+        ConstraintSpec::Regex(pattern) => ConstrainedGenerator::from_regex(pattern, &vocab),
     }
+    .map_err(|error| ServerError::BadRequest(error.to_string()))?;
+    Ok(Some(constraint))
 }
 
 fn logprobs_to_response(
@@ -986,7 +1018,7 @@ fn current_unix_timestamp() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-#[allow(clippy::panic, clippy::unwrap_used)]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1107,5 +1139,484 @@ mod tests {
     fn test_current_unix_timestamp_reasonable_value() {
         let ts = current_unix_timestamp();
         assert!(ts > 1_700_000_000, "timestamp too old: {ts}");
+    }
+
+    mod route {
+        use crate::test_support::{
+            StubEngine, app_with_stub, generation_output, post_json, progress_event,
+            sse_json_events, token_event, word_tokenizer,
+        };
+        use higgs_engine::engine::GenerationStats;
+
+        fn stub_with_tokenizer() -> StubEngine {
+            let mut stub = StubEngine::named("stub");
+            stub.tokenizer = Some(word_tokenizer());
+            stub.script.prompt_tokens = vec![1, 2, 1, 2, 1];
+            stub.script.stamp_times = true;
+            stub
+        }
+
+        fn chat_body(extra: &serde_json::Value) -> serde_json::Value {
+            let mut body = serde_json::json!({
+                "model": "stub",
+                "messages": [{"role": "user", "content": "hello"}],
+            });
+            if let (Some(target), Some(fields)) = (body.as_object_mut(), extra.as_object()) {
+                target.extend(fields.clone());
+            }
+            body
+        }
+
+        #[tokio::test]
+        async fn non_streaming_usage_reports_cache_hit_and_timings() {
+            let mut stub = stub_with_tokenizer();
+            let mut output = generation_output("hello world", 5, 4);
+            output.stats = GenerationStats {
+                cached_tokens: Some(3),
+                ..GenerationStats::default()
+            };
+            stub.script.generation = Some(output);
+            let (app, _engine) = app_with_stub(stub);
+
+            let (status, body) = post_json(
+                &app,
+                "/v1/chat/completions",
+                &chat_body(&serde_json::json!({})),
+            )
+            .await;
+
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let usage = &json["usage"];
+            assert_eq!(usage["prompt_tokens"], 5);
+            assert_eq!(usage["completion_tokens"], 4);
+            assert_eq!(usage["total_tokens"], 9);
+            assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 3);
+            for field in [
+                "time_to_first_token",
+                "prompt_eval_duration",
+                "generation_duration",
+                "total_time",
+            ] {
+                assert!(usage[field].is_f64(), "{field} missing in {usage}");
+            }
+            assert!(usage.get("completion_tokens_details").is_none());
+        }
+
+        #[tokio::test]
+        async fn non_streaming_usage_omits_unmeasured_fields() {
+            let mut stub = stub_with_tokenizer();
+            stub.script.stamp_times = false;
+            stub.script.generation = Some(generation_output("hello", 5, 2));
+            let (app, _engine) = app_with_stub(stub);
+
+            let (status, body) = post_json(
+                &app,
+                "/v1/chat/completions",
+                &chat_body(&serde_json::json!({})),
+            )
+            .await;
+
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                json["usage"],
+                serde_json::json!({"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7})
+            );
+        }
+
+        #[tokio::test]
+        async fn non_streaming_usage_counts_reasoning_tokens() {
+            let mut stub = stub_with_tokenizer();
+            stub.script.enable_thinking = true;
+            stub.script.generation = Some(generation_output(
+                "think again hello</think>hello world",
+                5,
+                8,
+            ));
+            let (app, _engine) = app_with_stub(stub);
+
+            let (status, body) = post_json(
+                &app,
+                "/v1/chat/completions",
+                &chat_body(&serde_json::json!({})),
+            )
+            .await;
+
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                json["choices"][0]["message"]["reasoning_content"],
+                "think again hello"
+            );
+            assert_eq!(
+                json["usage"]["completion_tokens_details"]["reasoning_tokens"],
+                3
+            );
+        }
+
+        #[tokio::test]
+        async fn streaming_usage_chunk_carries_details_and_timings() {
+            let mut stub = stub_with_tokenizer();
+            stub.script.stream = vec![
+                progress_event(2, 5),
+                token_event("hello", 1, None),
+                token_event(" world", 2, Some("stop")),
+            ];
+            let (app, _engine) = app_with_stub(stub);
+            let request = chat_body(&serde_json::json!({
+                "stream": true,
+                "stream_options": {"include_usage": true},
+            }));
+
+            let (status, body) = post_json(&app, "/v1/chat/completions", &request).await;
+
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            let events = sse_json_events(&body);
+            let usage_chunk = events.last().unwrap();
+            assert_eq!(usage_chunk["choices"], serde_json::json!([]));
+            let usage = &usage_chunk["usage"];
+            assert_eq!(usage["prompt_tokens"], 5);
+            assert_eq!(usage["completion_tokens"], 2);
+            assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 2);
+            for field in [
+                "time_to_first_token",
+                "prompt_eval_duration",
+                "generation_duration",
+                "total_time",
+            ] {
+                assert!(usage[field].is_f64(), "{field} missing in {usage}");
+            }
+            assert!(
+                !body.contains("prompt_progress"),
+                "progress chunks must stay opt-in"
+            );
+        }
+
+        #[tokio::test]
+        async fn streaming_without_include_usage_has_no_usage_chunk() {
+            let mut stub = stub_with_tokenizer();
+            stub.script.stream = vec![progress_event(0, 5), token_event("hello", 1, Some("stop"))];
+            let (app, _engine) = app_with_stub(stub);
+
+            let (status, body) = post_json(
+                &app,
+                "/v1/chat/completions",
+                &chat_body(&serde_json::json!({"stream": true})),
+            )
+            .await;
+
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            assert!(!body.contains("\"usage\""), "{body}");
+        }
+
+        #[tokio::test]
+        async fn streaming_usage_counts_reasoning_tokens() {
+            let mut stub = stub_with_tokenizer();
+            stub.script.enable_thinking = true;
+            stub.script.stream = vec![
+                progress_event(0, 5),
+                token_event("think again", 2, None),
+                token_event("</think>", 3, None),
+                token_event("hello", 4, Some("stop")),
+            ];
+            let (app, _engine) = app_with_stub(stub);
+            let request = chat_body(&serde_json::json!({
+                "stream": true,
+                "stream_options": {"include_usage": true},
+            }));
+
+            let (_status, body) = post_json(&app, "/v1/chat/completions", &request).await;
+
+            let events = sse_json_events(&body);
+            let usage = &events.last().unwrap()["usage"];
+            assert_eq!(usage["completion_tokens_details"]["reasoning_tokens"], 2);
+            assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 0);
+        }
+
+        async fn post_chat(
+            stub: StubEngine,
+            extra: &serde_json::Value,
+        ) -> (
+            http::StatusCode,
+            String,
+            std::sync::Arc<crate::state::Engine>,
+        ) {
+            let (app, engine) = app_with_stub(stub);
+            let (status, body) = post_json(&app, "/v1/chat/completions", &chat_body(extra)).await;
+            (status, body, engine)
+        }
+
+        fn recorded_calls(engine: &crate::state::Engine) -> Vec<crate::test_support::StubCall> {
+            engine.stub_calls()
+        }
+
+        fn generating_stub() -> StubEngine {
+            let mut stub = stub_with_tokenizer();
+            stub.script.generation = Some(generation_output("hello", 5, 1));
+            stub
+        }
+
+        #[tokio::test]
+        async fn guided_regex_constrains_generation() {
+            let (status, body, engine) = post_chat(
+                generating_stub(),
+                &serde_json::json!({"guided_regex": "hello|world"}),
+            )
+            .await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            let calls = recorded_calls(&engine);
+            assert_eq!(calls.len(), 1);
+            assert!(calls[0].has_constraint);
+        }
+
+        #[tokio::test]
+        async fn regex_response_format_constrains_generation() {
+            let extra =
+                serde_json::json!({"response_format": {"type": "regex", "regex": "hello|world"}});
+            let (status, body, engine) = post_chat(generating_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            assert!(recorded_calls(&engine)[0].has_constraint);
+        }
+
+        #[tokio::test]
+        async fn guided_regex_constrains_streaming_generation() {
+            let mut stub = stub_with_tokenizer();
+            stub.script.stream = vec![progress_event(0, 5), token_event("hello", 1, Some("stop"))];
+            let extra = serde_json::json!({"stream": true, "guided_regex": "hello|world"});
+            let (status, body, engine) = post_chat(stub, &extra).await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            assert!(recorded_calls(&engine)[0].has_constraint);
+        }
+
+        #[tokio::test]
+        async fn unconstrained_requests_carry_no_constraint() {
+            let (status, _body, engine) =
+                post_chat(generating_stub(), &serde_json::json!({})).await;
+            assert_eq!(status, http::StatusCode::OK);
+            assert!(!recorded_calls(&engine)[0].has_constraint);
+        }
+
+        #[tokio::test]
+        async fn invalid_regex_is_a_client_error_with_the_compile_error() {
+            let (status, body, engine) = post_chat(
+                generating_stub(),
+                &serde_json::json!({"guided_regex": "(unclosed"}),
+            )
+            .await;
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("Invalid regex constraint"), "{body}");
+            assert!(recorded_calls(&engine).is_empty());
+        }
+
+        #[tokio::test]
+        async fn invalid_regex_via_response_format_is_a_client_error() {
+            let extra = serde_json::json!({"response_format": {"type": "regex", "regex": "[a-"}});
+            let (status, body, _engine) = post_chat(generating_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        }
+
+        #[tokio::test]
+        async fn multiple_constraints_are_rejected_before_generation() {
+            let extra = serde_json::json!({
+                "guided_regex": "hello",
+                "response_format": {"type": "json_object"},
+            });
+            let (status, body, engine) = post_chat(generating_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("Only one output constraint"), "{body}");
+            assert!(recorded_calls(&engine).is_empty());
+        }
+
+        #[tokio::test]
+        async fn unsatisfiable_schema_is_a_client_error() {
+            let extra = serde_json::json!({"guided_json": {"type": "bogus"}});
+            let (status, body, _engine) = post_chat(generating_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        }
+
+        #[tokio::test]
+        async fn guided_json_must_be_an_object() {
+            let extra = serde_json::json!({"guided_json": "not a schema"});
+            let (status, body, _engine) = post_chat(generating_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        }
+
+        fn thinking_stub() -> StubEngine {
+            let mut stub = generating_stub();
+            stub.script.enable_thinking = true;
+            stub.script.stream = vec![progress_event(0, 5), token_event("hello", 1, Some("stop"))];
+            stub
+        }
+
+        #[tokio::test]
+        async fn thinking_budget_defaults_to_engine_configuration() {
+            let (status, _body, engine) = post_chat(thinking_stub(), &serde_json::json!({})).await;
+            assert_eq!(status, http::StatusCode::OK);
+            let call = &recorded_calls(&engine)[0];
+            assert!(call.thinking_enabled);
+            assert_eq!(call.thinking_budget, None);
+        }
+
+        #[tokio::test]
+        async fn request_reasoning_max_tokens_sets_the_budget() {
+            let extra = serde_json::json!({"reasoning": {"max_tokens": 64}});
+            let (status, body, engine) = post_chat(thinking_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            assert_eq!(recorded_calls(&engine)[0].thinking_budget, Some(64));
+        }
+
+        #[tokio::test]
+        async fn request_reasoning_max_tokens_applies_when_streaming() {
+            let extra = serde_json::json!({"stream": true, "reasoning": {"max_tokens": 32}});
+            let (status, body, engine) = post_chat(thinking_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            assert_eq!(recorded_calls(&engine)[0].thinking_budget, Some(32));
+        }
+
+        #[tokio::test]
+        async fn zero_reasoning_max_tokens_is_rejected() {
+            let extra = serde_json::json!({"reasoning": {"max_tokens": 0}});
+            let (status, body, engine) = post_chat(thinking_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+            assert!(
+                body.contains("reasoning.max_tokens must be at least 1"),
+                "{body}"
+            );
+            assert!(recorded_calls(&engine).is_empty());
+        }
+
+        #[tokio::test]
+        async fn budget_is_inert_when_thinking_is_off() {
+            let extra = serde_json::json!({"reasoning": {"effort": "none", "max_tokens": 64}});
+            let (status, _body, engine) = post_chat(thinking_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::OK);
+            let call = &recorded_calls(&engine)[0];
+            assert!(!call.thinking_enabled);
+            assert_eq!(call.thinking_budget, None);
+        }
+
+        fn tools_json() -> serde_json::Value {
+            serde_json::json!([{
+                "type": "function",
+                "function": {"name": "get_weather", "parameters": {"type": "object"}},
+            }])
+        }
+
+        const TOOL_CALL_TEXT: &str =
+            r#"<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>"#;
+
+        fn tool_stub() -> StubEngine {
+            let mut stub = stub_with_tokenizer();
+            stub.script.generation = Some(generation_output(TOOL_CALL_TEXT, 5, 12));
+            stub
+        }
+
+        #[tokio::test]
+        async fn tool_choice_auto_exposes_and_parses_tools() {
+            let extra = serde_json::json!({"tools": tools_json(), "tool_choice": "auto"});
+            let (status, body, engine) = post_chat(tool_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            assert_eq!(engine.stub_prompt_tools(), vec![Some(1)]);
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["choices"][0]["finish_reason"], "tool_calls");
+            assert_eq!(
+                json["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+                "get_weather"
+            );
+        }
+
+        #[tokio::test]
+        async fn absent_tool_choice_behaves_like_auto() {
+            let extra = serde_json::json!({"tools": tools_json()});
+            let (status, _body, engine) = post_chat(tool_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::OK);
+            assert_eq!(engine.stub_prompt_tools(), vec![Some(1)]);
+        }
+
+        #[tokio::test]
+        async fn tool_choice_none_hides_and_does_not_parse_tools() {
+            let extra = serde_json::json!({"tools": tools_json(), "tool_choice": "none"});
+            let (status, body, engine) = post_chat(tool_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            assert_eq!(engine.stub_prompt_tools(), vec![None]);
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let message = &json["choices"][0]["message"];
+            assert!(message.get("tool_calls").is_none(), "{body}");
+            assert_eq!(message["content"], TOOL_CALL_TEXT);
+            assert_eq!(json["choices"][0]["finish_reason"], "stop");
+        }
+
+        #[tokio::test]
+        async fn tool_choice_none_applies_when_streaming() {
+            let mut stub = stub_with_tokenizer();
+            stub.script.stream = vec![
+                progress_event(0, 5),
+                token_event(TOOL_CALL_TEXT, 12, Some("stop")),
+            ];
+            let extra = serde_json::json!({
+                "stream": true,
+                "tools": tools_json(),
+                "tool_choice": "none",
+            });
+            let (status, body, engine) = post_chat(stub, &extra).await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            assert_eq!(engine.stub_prompt_tools(), vec![None]);
+            assert!(!body.contains("tool_calls"), "{body}");
+            assert!(body.contains("get_weather"), "text stays visible: {body}");
+        }
+
+        #[tokio::test]
+        async fn tool_choice_required_is_rejected_before_generation() {
+            let extra = serde_json::json!({"tools": tools_json(), "tool_choice": "required"});
+            let (status, body, engine) = post_chat(tool_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(
+                json["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("\"required\" is not supported yet"),
+                "{body}"
+            );
+            assert!(engine.stub_calls().is_empty());
+        }
+
+        #[tokio::test]
+        async fn named_tool_choice_is_rejected_before_generation() {
+            let extra = serde_json::json!({
+                "tools": tools_json(),
+                "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+            });
+            let (status, body, engine) = post_chat(tool_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("not supported yet"), "{body}");
+            assert!(engine.stub_calls().is_empty());
+        }
+
+        #[tokio::test]
+        async fn seed_is_accepted_and_does_not_change_the_call() {
+            let (status, body, engine) =
+                post_chat(generating_stub(), &serde_json::json!({"seed": 42})).await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            assert_eq!(engine.stub_calls().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn non_integer_seed_is_rejected() {
+            let (status, _body, _engine) =
+                post_chat(generating_stub(), &serde_json::json!({"seed": "abc"})).await;
+            assert_eq!(status, http::StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn unknown_fields_are_still_ignored() {
+            let (status, body, _engine) = post_chat(
+                generating_stub(),
+                &serde_json::json!({"frobnicate": true, "parallel_tool_calls": false}),
+            )
+            .await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+        }
     }
 }

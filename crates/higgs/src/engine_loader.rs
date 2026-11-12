@@ -97,6 +97,7 @@ pub fn load_engine(
             local.raise_wired_limit,
             model.kv_disk_dir.as_deref().map(Path::new),
             model.kv_disk_space_mb.saturating_mul(1024 * 1024),
+            model.effective_thinking_budget(local),
         )
     }
     .map_err(|error| error.to_string())?;

@@ -1,3 +1,4 @@
+use crate::error::ServerError;
 use crate::types::openai::ReasoningConfig;
 
 fn model_defaults_to_non_thinking(model_names: &[&str]) -> bool {
@@ -18,6 +19,29 @@ fn model_defaults_to_non_thinking(model_names: &[&str]) -> bool {
             before_is_boundary && after_is_boundary
         })
     })
+}
+
+/// Reasoning-token budget requested by the client, validated.
+pub fn requested_thinking_budget(
+    reasoning: Option<&ReasoningConfig>,
+) -> Result<Option<u32>, ServerError> {
+    validate_thinking_budget(
+        reasoning.and_then(|config| config.max_tokens),
+        "reasoning.max_tokens",
+    )
+}
+
+/// A client-supplied budget must allow at least one reasoning token.
+pub fn validate_thinking_budget(
+    budget: Option<u32>,
+    field: &str,
+) -> Result<Option<u32>, ServerError> {
+    if budget == Some(0) {
+        return Err(ServerError::BadRequest(format!(
+            "{field} must be at least 1; use reasoning effort \"none\" to disable thinking"
+        )));
+    }
+    Ok(budget)
 }
 
 pub fn effective_thinking_enabled(
@@ -84,6 +108,7 @@ mod tests {
             &["mlx-community/Qwen3.5-foo"],
             Some(&ReasoningConfig {
                 effort: Some("none".to_owned()),
+                max_tokens: None,
             }),
         ));
     }
@@ -95,6 +120,7 @@ mod tests {
             &["mlx-community/Qwen3.5-foo"],
             Some(&ReasoningConfig {
                 effort: Some(String::new()),
+                max_tokens: None,
             }),
         ));
     }
@@ -106,6 +132,7 @@ mod tests {
             &["mlx-community/Qwen3.6-35B-A3B-4bit"],
             Some(&ReasoningConfig {
                 effort: Some("low".to_owned()),
+                max_tokens: None,
             }),
         ));
     }
@@ -117,7 +144,41 @@ mod tests {
             &["mlx-community/Qwen3.5-foo"],
             Some(&ReasoningConfig {
                 effort: Some("low".to_owned()),
+                max_tokens: None,
             }),
         ));
+    }
+
+    #[test]
+    fn requested_budget_absent_defers() {
+        assert_eq!(requested_thinking_budget(None).unwrap(), None);
+        let config = ReasoningConfig {
+            effort: Some("low".to_owned()),
+            max_tokens: None,
+        };
+        assert_eq!(requested_thinking_budget(Some(&config)).unwrap(), None);
+    }
+
+    #[test]
+    fn requested_budget_is_passed_through() {
+        let config = ReasoningConfig {
+            effort: None,
+            max_tokens: Some(64),
+        };
+        assert_eq!(requested_thinking_budget(Some(&config)).unwrap(), Some(64));
+    }
+
+    #[test]
+    fn requested_budget_zero_is_rejected() {
+        let config = ReasoningConfig {
+            effort: None,
+            max_tokens: Some(0),
+        };
+        let error = requested_thinking_budget(Some(&config)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reasoning.max_tokens must be at least 1")
+        );
     }
 }

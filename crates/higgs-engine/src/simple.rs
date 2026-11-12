@@ -25,7 +25,7 @@ use crate::{
     cache::PagedKvCache,
     chat_template::{ChatMessage, ChatTemplateRenderer},
     disk_prefix_store::{DiskPrefixStore, StoreIdentity},
-    engine::{GenerationOutput, StreamingOutput},
+    engine::{GenerationOutput, GenerationStats, StreamingOutput, ThinkingMode},
     engine_thread::EngineThread,
     error::EngineError,
     mlx_tuning::MlxRuntimeTuning,
@@ -273,6 +273,9 @@ struct SimpleEngineCore {
     decode_skip_ids: std::sync::Arc<std::collections::HashSet<u32>>,
     /// Whether to enable thinking mode (Qwen3.5 `<think>` tags).
     enable_thinking: bool,
+    /// Reasoning tokens allowed before `</think>` is forced, when a request
+    /// does not set its own budget.
+    default_thinking_budget: u32,
     /// Token ID for `</think>`, resolved from the tokenizer at load time.
     /// `None` if the tokenizer doesn't know this token (thinking is unavailable).
     think_close_token: Option<u32>,
@@ -295,6 +298,14 @@ struct PreparedGeneration<'a> {
     disk_loaded: bool,
 }
 
+impl PreparedGeneration<'_> {
+    /// Prompt tokens served from the prefix cache rather than prefilled.
+    fn cached_tokens(&self) -> u32 {
+        let prefilled = u32::try_from(self.actual_prompt_tokens.len()).unwrap_or(u32::MAX);
+        self.prompt_len.saturating_sub(prefilled)
+    }
+}
+
 impl SimpleEngine {
     /// Free the model, returning only once the engine thread has dropped its MLX state.
     pub fn shutdown(self) {
@@ -309,6 +320,7 @@ impl SimpleEngine {
         raise_wired_limit: bool,
         disk_prefix_dir: Option<&Path>,
         disk_prefix_budget: u64,
+        default_thinking_budget: u32,
     ) -> Result<Self, EngineError> {
         let model_dir = dir.as_ref().to_path_buf();
         let prefix_dir = disk_prefix_dir.map(Path::to_path_buf);
@@ -320,6 +332,7 @@ impl SimpleEngine {
                 raise_wired_limit,
                 prefix_dir.as_deref(),
                 disk_prefix_budget,
+                default_thinking_budget,
             )
         })?;
         let (tokenizer, template, model_name, eos_token_ids, enable_thinking) =
@@ -526,7 +539,7 @@ impl SimpleEngine {
             stop_sequences,
             logprobs,
             top_logprobs,
-            self.enable_thinking,
+            ThinkingMode::new(self.enable_thinking, None),
             constraint,
             pixel_values,
         )
@@ -541,7 +554,7 @@ impl SimpleEngine {
         stop_sequences: &[String],
         logprobs: bool,
         top_logprobs: Option<u32>,
-        enable_thinking: bool,
+        thinking: ThinkingMode,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<PixelValues>,
     ) -> Result<GenerationOutput, EngineError> {
@@ -556,7 +569,7 @@ impl SimpleEngine {
                 &stops,
                 logprobs,
                 top_logprobs,
-                enable_thinking,
+                thinking,
                 constraint,
                 pixel_values.as_ref().map(PixelValues::to_array),
             )
@@ -587,7 +600,7 @@ impl SimpleEngine {
             logprobs,
             top_logprobs,
             sender,
-            self.enable_thinking,
+            ThinkingMode::new(self.enable_thinking, None),
             // Non-thinking convenience entry (used by /v1/completions) never
             // streams prefill progress.
             false,
@@ -606,7 +619,7 @@ impl SimpleEngine {
         logprobs: bool,
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
-        enable_thinking: bool,
+        thinking: ThinkingMode,
         return_progress: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<PixelValues>,
@@ -624,7 +637,7 @@ impl SimpleEngine {
                 logprobs,
                 top_logprobs,
                 &stream,
-                enable_thinking,
+                thinking,
                 return_progress,
                 constraint,
                 pixel_values.as_ref().map(PixelValues::to_array),
@@ -642,6 +655,7 @@ impl SimpleEngineCore {
         raise_wired_limit: bool,
         disk_prefix_dir: Option<&Path>,
         disk_prefix_budget: u64,
+        default_thinking_budget: u32,
     ) -> Result<Self, EngineError> {
         let model_dir = dir.as_ref();
         let model_name = derive_model_name(model_dir);
@@ -817,6 +831,7 @@ impl SimpleEngineCore {
             eos_token_ids,
             decode_skip_ids,
             enable_thinking,
+            default_thinking_budget,
             think_close_token,
             gen_prompt_suffix_len,
             kv_cache_config,
@@ -1265,10 +1280,12 @@ impl SimpleEngineCore {
         stop_sequences: &[String],
         logprobs: bool,
         top_logprobs: Option<u32>,
-        enable_thinking: bool,
+        thinking: ThinkingMode,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
     ) -> Result<GenerationOutput, EngineError> {
+        let enable_thinking = thinking.is_on();
+        let thinking_budget = thinking.budget_or(self.default_thinking_budget);
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
         }
@@ -1279,12 +1296,17 @@ impl SimpleEngineCore {
                 prompt_tokens: Self::prompt_len(prompt_tokens)?,
                 completion_tokens: 0,
                 token_logprobs: None,
+                stats: crate::engine::GenerationStats::default(),
             });
         }
 
+        let mut stats = GenerationStats {
+            prefill_started_at: Some(std::time::Instant::now()),
+            ..GenerationStats::default()
+        };
         // Set a task-local default stream so every MLX operation reuses it
         // instead of creating a new Stream (5 FFI calls) per operation.
-        with_stream(&Stream::new(), || {
+        let mut output = with_stream(&Stream::new(), || {
             self.generate_inner(
                 prompt_tokens,
                 max_tokens,
@@ -1293,10 +1315,15 @@ impl SimpleEngineCore {
                 logprobs,
                 top_logprobs,
                 enable_thinking,
+                thinking_budget,
                 constraint,
                 pixel_values,
+                &mut stats,
             )
-        })
+        })?;
+        stats.finished_at = Some(std::time::Instant::now());
+        output.stats = stats;
+        Ok(output)
     }
 
     #[allow(
@@ -1313,13 +1340,16 @@ impl SimpleEngineCore {
         logprobs: bool,
         top_logprobs: Option<u32>,
         enable_thinking: bool,
+        thinking_budget: u32,
         mut constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
+        stats: &mut GenerationStats,
     ) -> Result<GenerationOutput, EngineError> {
         let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
 
         let mut prepared = self.prepare_generation(prompt_tokens, pixel_values)?;
         let prompt_len = prepared.prompt_len;
+        stats.cached_tokens = Some(prepared.cached_tokens());
         #[allow(clippy::float_cmp)]
         let capture_mtp_prefill = mtp_prefill_priming_enabled()
             && self.tuning.enable_mtp()
@@ -1340,6 +1370,7 @@ impl SimpleEngineCore {
 
         // Capture T1 (already eval'd inside run_prefill).
         let first_token_id: u32 = current_token.item_cast();
+        stats.first_token_at = Some(std::time::Instant::now());
         // Advance the constraint past the first sampled token before decode.
         if let Some(ref mut cg) = constraint {
             cg.advance(first_token_id);
@@ -1359,6 +1390,7 @@ impl SimpleEngineCore {
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
                 token_logprobs: all_logprobs,
+                stats: crate::engine::GenerationStats::default(),
             });
         }
         if has_stop_sequences {
@@ -1370,6 +1402,7 @@ impl SimpleEngineCore {
                     prompt_tokens: prompt_len,
                     completion_tokens: 1,
                     token_logprobs: all_logprobs,
+                    stats: crate::engine::GenerationStats::default(),
                 });
             }
         }
@@ -1380,6 +1413,7 @@ impl SimpleEngineCore {
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
                 token_logprobs: all_logprobs,
+                stats: crate::engine::GenerationStats::default(),
             });
         }
 
@@ -1398,6 +1432,7 @@ impl SimpleEngineCore {
                 &mut tokens,
                 stop_sequences,
                 enable_thinking,
+                thinking_budget,
             );
         }
 
@@ -1422,6 +1457,7 @@ impl SimpleEngineCore {
                 &mut tokens,
                 stop_sequences,
                 enable_thinking,
+                thinking_budget,
             );
         }
 
@@ -1457,7 +1493,6 @@ impl SimpleEngineCore {
         let mut step_count: u32 = 0;
 
         // Thinking budget: force </think> after N tokens if model hasn't closed it.
-        const THINKING_BUDGET: u32 = 256;
         let think_close_token = if enable_thinking {
             self.think_close_token
         } else {
@@ -1520,11 +1555,11 @@ impl SimpleEngineCore {
                         seen_think_close = true;
                     } else {
                         thinking_tokens += 1;
-                        if thinking_tokens >= THINKING_BUDGET {
+                        if thinking_tokens >= thinking_budget {
                             token_id = close_id;
                             seen_think_close = true;
                             tracing::info!(
-                                budget = THINKING_BUDGET,
+                                budget = thinking_budget,
                                 "Thinking budget reached, forcing </think>"
                             );
                         }
@@ -1567,6 +1602,7 @@ impl SimpleEngineCore {
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: all_logprobs,
+                    stats: crate::engine::GenerationStats::default(),
                 });
             }
 
@@ -1584,6 +1620,7 @@ impl SimpleEngineCore {
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: all_logprobs,
+                    stats: crate::engine::GenerationStats::default(),
                 });
             }
 
@@ -1603,6 +1640,7 @@ impl SimpleEngineCore {
                         prompt_tokens: prompt_len,
                         completion_tokens: completion_len,
                         token_logprobs: all_logprobs,
+                        stats: crate::engine::GenerationStats::default(),
                     });
                 }
             }
@@ -1621,12 +1659,13 @@ impl SimpleEngineCore {
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: all_logprobs,
+                    stats: crate::engine::GenerationStats::default(),
                 });
             }
 
             // If thinking budget was just reached, override the pipelined token
             // so the next decode step gets </think> as input.
-            if seen_think_close && thinking_tokens == THINKING_BUDGET {
+            if seen_think_close && thinking_tokens == thinking_budget {
                 if let Some(close_id) = think_close_token {
                     next_token = Array::from_slice(&[close_id], &[1]);
                 }
@@ -1718,6 +1757,7 @@ impl SimpleEngineCore {
         tokens: &mut Vec<u32>,
         stop_sequences: &[String],
         enable_thinking: bool,
+        thinking_budget: u32,
     ) -> Result<GenerationOutput, EngineError> {
         let has_stop_sequences = !stop_sequences.is_empty();
         let unchecked_lookup = unchecked_prompt_lookup_enabled();
@@ -1735,8 +1775,6 @@ impl SimpleEngineCore {
         let base_config = prompt_lookup_config();
         let mut stats = crate::mtp::MtpStats::default();
         let t_start = std::time::Instant::now();
-
-        const THINKING_BUDGET: u32 = 256;
         let think_close_token = if enable_thinking {
             self.think_close_token
         } else {
@@ -1757,6 +1795,7 @@ impl SimpleEngineCore {
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: None,
+                    stats: crate::engine::GenerationStats::default(),
                 });
             }
 
@@ -1787,11 +1826,11 @@ impl SimpleEngineCore {
                             seen_think_close = true;
                         } else {
                             thinking_tokens += 1;
-                            if thinking_tokens >= THINKING_BUDGET {
+                            if thinking_tokens >= thinking_budget {
                                 tokens.push(close_id);
                                 seen_think_close = true;
                                 tracing::info!(
-                                    budget = THINKING_BUDGET,
+                                    budget = thinking_budget,
                                     "Prompt lookup: thinking budget reached, forcing </think>"
                                 );
                                 if self.eos_token_ids.contains(&close_id) {
@@ -1803,6 +1842,7 @@ impl SimpleEngineCore {
                                         prompt_tokens: prompt_len,
                                         completion_tokens: Self::completion_len(tokens)?,
                                         token_logprobs: None,
+                                        stats: crate::engine::GenerationStats::default(),
                                     });
                                 }
 
@@ -1821,6 +1861,7 @@ impl SimpleEngineCore {
                                             prompt_tokens: prompt_len,
                                             completion_tokens: Self::completion_len(tokens)?,
                                             token_logprobs: None,
+                                            stats: crate::engine::GenerationStats::default(),
                                         });
                                     }
                                 }
@@ -1835,6 +1876,7 @@ impl SimpleEngineCore {
                                         prompt_tokens: prompt_len,
                                         completion_tokens: forced_completion_len,
                                         token_logprobs: None,
+                                        stats: crate::engine::GenerationStats::default(),
                                     });
                                 }
                                 break;
@@ -1854,6 +1896,7 @@ impl SimpleEngineCore {
                         prompt_tokens: prompt_len,
                         completion_tokens: Self::completion_len(tokens)?,
                         token_logprobs: None,
+                        stats: crate::engine::GenerationStats::default(),
                     });
                 }
             }
@@ -1869,6 +1912,7 @@ impl SimpleEngineCore {
                         prompt_tokens: prompt_len,
                         completion_tokens: Self::completion_len(tokens)?,
                         token_logprobs: None,
+                        stats: crate::engine::GenerationStats::default(),
                     });
                 }
             }
@@ -1883,6 +1927,7 @@ impl SimpleEngineCore {
                     prompt_tokens: prompt_len,
                     completion_tokens: final_completion_len,
                     token_logprobs: None,
+                    stats: crate::engine::GenerationStats::default(),
                 });
             }
 
@@ -1911,6 +1956,7 @@ impl SimpleEngineCore {
         tokens: &mut Vec<u32>,
         stop_sequences: &[String],
         enable_thinking: bool,
+        thinking_budget: u32,
     ) -> Result<GenerationOutput, EngineError> {
         let has_stop_sequences = !stop_sequences.is_empty();
 
@@ -1948,7 +1994,6 @@ impl SimpleEngineCore {
         let t_start = std::time::Instant::now();
 
         // Thinking budget: force </think> after N tokens if model hasn't closed it.
-        const THINKING_BUDGET: u32 = 256;
         let think_close_token = if enable_thinking {
             self.think_close_token
         } else {
@@ -2023,11 +2068,11 @@ impl SimpleEngineCore {
                             seen_think_close = true;
                         } else {
                             thinking_tokens += 1;
-                            if thinking_tokens >= THINKING_BUDGET {
+                            if thinking_tokens >= thinking_budget {
                                 tokens.push(close_id);
                                 seen_think_close = true;
                                 tracing::info!(
-                                    budget = THINKING_BUDGET,
+                                    budget = thinking_budget,
                                     "MTP: thinking budget reached, forcing </think>"
                                 );
                                 if self.eos_token_ids.contains(&close_id) {
@@ -2039,6 +2084,7 @@ impl SimpleEngineCore {
                                         prompt_tokens: prompt_len,
                                         completion_tokens: Self::completion_len(tokens)?,
                                         token_logprobs: None,
+                                        stats: crate::engine::GenerationStats::default(),
                                     });
                                 }
 
@@ -2055,6 +2101,7 @@ impl SimpleEngineCore {
                                             prompt_tokens: prompt_len,
                                             completion_tokens: Self::completion_len(tokens)?,
                                             token_logprobs: None,
+                                            stats: crate::engine::GenerationStats::default(),
                                         });
                                     }
                                 }
@@ -2069,6 +2116,7 @@ impl SimpleEngineCore {
                                         prompt_tokens: prompt_len,
                                         completion_tokens: completion_len,
                                         token_logprobs: None,
+                                        stats: crate::engine::GenerationStats::default(),
                                     });
                                 }
 
@@ -2090,6 +2138,7 @@ impl SimpleEngineCore {
                         prompt_tokens: prompt_len,
                         completion_tokens: Self::completion_len(tokens)?,
                         token_logprobs: None,
+                        stats: crate::engine::GenerationStats::default(),
                     });
                 }
             }
@@ -2105,6 +2154,7 @@ impl SimpleEngineCore {
                         prompt_tokens: prompt_len,
                         completion_tokens: Self::completion_len(tokens)?,
                         token_logprobs: None,
+                        stats: crate::engine::GenerationStats::default(),
                     });
                 }
             }
@@ -2119,6 +2169,7 @@ impl SimpleEngineCore {
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: None,
+                    stats: crate::engine::GenerationStats::default(),
                 });
             }
 
@@ -2151,6 +2202,7 @@ impl SimpleEngineCore {
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         mut detok: IncrementalDetok,
         enable_thinking: bool,
+        thinking_budget: u32,
     ) -> Result<(), EngineError> {
         let has_stop_sequences = !stop_sequences.is_empty();
 
@@ -2185,8 +2237,6 @@ impl SimpleEngineCore {
         let hybrid_prompt_lookup = mtp_prompt_lookup_enabled();
         let hybrid_prompt_lookup_config = prompt_lookup_config();
         let t_start = std::time::Instant::now();
-
-        const THINKING_BUDGET: u32 = 256;
         let think_close_token = if enable_thinking {
             self.think_close_token
         } else {
@@ -2260,11 +2310,11 @@ impl SimpleEngineCore {
                             seen_think_close = true;
                         } else {
                             thinking_tokens += 1;
-                            if thinking_tokens >= THINKING_BUDGET {
+                            if thinking_tokens >= thinking_budget {
                                 tokens.push(close_id);
                                 seen_think_close = true;
                                 tracing::info!(
-                                    budget = THINKING_BUDGET,
+                                    budget = thinking_budget,
                                     "MTP streaming: thinking budget reached, forcing </think>"
                                 );
 
@@ -2417,11 +2467,13 @@ impl SimpleEngineCore {
         logprobs: bool,
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
-        enable_thinking: bool,
+        thinking: ThinkingMode,
         return_progress: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
     ) -> Result<(), EngineError> {
+        let enable_thinking = thinking.is_on();
+        let thinking_budget = thinking.budget_or(self.default_thinking_budget);
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
         }
@@ -2449,6 +2501,7 @@ impl SimpleEngineCore {
                 top_logprobs,
                 sender,
                 enable_thinking,
+                thinking_budget,
                 return_progress,
                 constraint,
                 pixel_values,
@@ -2471,6 +2524,7 @@ impl SimpleEngineCore {
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         enable_thinking: bool,
+        thinking_budget: u32,
         return_progress: bool,
         mut constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
@@ -2499,9 +2553,7 @@ impl SimpleEngineCore {
         // consumer — dropped progress events are harmless. The returned guard is
         // held for the prefill's duration and uninstalls the sink on drop.
         let prefill_sink = return_progress.then(|| {
-            let actual_tokens =
-                u32::try_from(prepared.actual_prompt_tokens.len()).unwrap_or(u32::MAX);
-            let cached = prompt_len.saturating_sub(actual_tokens);
+            let cached = prepared.cached_tokens();
             let make_progress_output = move |suffix_done: u32| StreamingOutput {
                 new_text: String::new(),
                 finished: false,
@@ -2627,11 +2679,11 @@ impl SimpleEngineCore {
                 sender,
                 detok,
                 enable_thinking,
+                thinking_budget,
             );
         }
 
         // Thinking budget (streaming): force </think> after N tokens.
-        const THINKING_BUDGET: u32 = 256;
         let think_close_token = if enable_thinking {
             self.think_close_token
         } else {
@@ -2703,11 +2755,11 @@ impl SimpleEngineCore {
                         seen_think_close = true;
                     } else {
                         thinking_tokens += 1;
-                        if thinking_tokens >= THINKING_BUDGET {
+                        if thinking_tokens >= thinking_budget {
                             token_id = close_id;
                             seen_think_close = true;
                             tracing::info!(
-                                budget = THINKING_BUDGET,
+                                budget = thinking_budget,
                                 "Thinking budget reached, forcing </think>"
                             );
                         }
@@ -2782,7 +2834,7 @@ impl SimpleEngineCore {
 
             // If thinking budget was just reached, override the pipelined token
             // so the next decode step gets </think> as input.
-            if seen_think_close && thinking_tokens == THINKING_BUDGET {
+            if seen_think_close && thinking_tokens == thinking_budget {
                 if let Some(close_id) = think_close_token {
                     next_token = Array::from_slice(&[close_id], &[1]);
                 }

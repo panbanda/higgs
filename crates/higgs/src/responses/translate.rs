@@ -9,9 +9,9 @@ use crate::types::openai::{
     ImageUrl, MessageContent, ResponseFormat, StreamOptions, ToolCall, ToolCallFunction,
 };
 use crate::types::responses::{
-    ContentPart, CreateResponseRequest, IncompleteDetails, InputContent, InputItem, Metadata,
-    OutputItem, ResponseError, ResponseInput, ResponseObject, ResponseStatus, ResponseUsage,
-    TextConfig,
+    ContentPart, CreateResponseRequest, IncompleteDetails, InputContent, InputItem,
+    InputTokensDetails, Metadata, OutputItem, OutputTokensDetails, ResponseError, ResponseInput,
+    ResponseObject, ResponseStatus, ResponseUsage, TextConfig,
 };
 
 const SUPPORTED_ROLES: &[&str] = &["user", "assistant", "system", "developer"];
@@ -275,6 +275,7 @@ pub fn convert_text_format(
         "json_object" => Ok(Some(ResponseFormat {
             r#type: "json_object".to_owned(),
             json_schema: None,
+            regex: None,
         })),
         "json_schema" => {
             let schema = format.schema.clone().ok_or_else(|| {
@@ -286,6 +287,7 @@ pub fn convert_text_format(
                     "name": format.name.as_deref().unwrap_or("response"),
                     "schema": schema,
                 })),
+                regex: None,
             }))
         }
         other => Err(bad_request(format!(
@@ -631,8 +633,16 @@ pub fn outcome_from_chat(response: ChatCompletionResponse) -> Outcome {
             input_tokens: response.usage.prompt_tokens,
             output_tokens: response.usage.completion_tokens,
             total_tokens: response.usage.total_tokens,
-            input_tokens_details: None,
-            output_tokens_details: None,
+            input_tokens_details: response.usage.prompt_tokens_details.map(|details| {
+                InputTokensDetails {
+                    cached_tokens: details.cached_tokens,
+                }
+            }),
+            output_tokens_details: response.usage.completion_tokens_details.map(|details| {
+                OutputTokensDetails {
+                    reasoning_tokens: details.reasoning_tokens,
+                }
+            }),
         }),
         incomplete_reason,
         error: None,
@@ -1119,11 +1129,7 @@ mod tests {
                 finish_reason: finish_reason.to_owned(),
                 logprobs: None,
             }],
-            usage: CompletionUsage {
-                prompt_tokens: usage.0,
-                completion_tokens: usage.1,
-                total_tokens: usage.0 + usage.1,
-            },
+            usage: CompletionUsage::new(usage.0, usage.1),
         }
     }
 
@@ -1164,6 +1170,33 @@ mod tests {
         assert_eq!(object.metadata["k"], "v");
         assert_eq!(object.previous_response_id.as_deref(), Some("resp_prev"));
         assert!(object.incomplete_details.is_none());
+    }
+
+    #[test]
+    fn measured_usage_details_are_carried_into_the_response() {
+        let mut chat = chat_response(assistant(Some("Hello!")), "stop", (7, 3));
+        chat.usage.prompt_tokens_details =
+            Some(crate::types::openai::PromptTokensDetails { cached_tokens: 5 });
+        chat.usage.completion_tokens_details =
+            Some(crate::types::openai::CompletionTokensDetails {
+                reasoning_tokens: 2,
+            });
+
+        let object = context().object(outcome_from_chat(chat));
+
+        let usage = object.usage.as_ref().unwrap();
+        assert_eq!(
+            usage.input_tokens_details.as_ref().unwrap().cached_tokens,
+            5
+        );
+        assert_eq!(
+            usage
+                .output_tokens_details
+                .as_ref()
+                .unwrap()
+                .reasoning_tokens,
+            2
+        );
     }
 
     #[test]

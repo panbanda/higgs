@@ -4,8 +4,8 @@ use serde::Deserialize;
 
 use super::translate::{Outcome, ResponseContext, generate_item_id, status_for_finish_reason};
 use crate::types::responses::{
-    ContentPart, InputTokensDetails, OutputItem, ResponseError, ResponseObject, ResponseStatus,
-    ResponseUsage, StreamEvent, StreamEventBody,
+    ContentPart, InputTokensDetails, OutputItem, OutputTokensDetails, ResponseError,
+    ResponseObject, ResponseStatus, ResponseUsage, StreamEvent, StreamEventBody,
 };
 
 #[derive(Deserialize)]
@@ -56,6 +56,20 @@ struct ToolFunctionDelta {
 struct ChunkUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: Option<ChunkPromptDetails>,
+    #[serde(default)]
+    completion_tokens_details: Option<ChunkCompletionDetails>,
+}
+
+#[derive(Deserialize)]
+struct ChunkPromptDetails {
+    cached_tokens: u32,
+}
+
+#[derive(Deserialize)]
+struct ChunkCompletionDetails {
+    reasoning_tokens: u32,
 }
 
 #[derive(Deserialize)]
@@ -88,7 +102,9 @@ pub struct ResponseStreamBuilder {
     open: Option<OpenItem>,
     finish_reason: Option<String>,
     usage: Option<(u32, u32)>,
+    /// From `prompt_progress` chunks; superseded by the usage chunk's figure.
     cached_tokens: Option<u32>,
+    reasoning_tokens: Option<u32>,
 }
 
 impl ResponseStreamBuilder {
@@ -101,6 +117,7 @@ impl ResponseStreamBuilder {
             finish_reason: None,
             usage: None,
             cached_tokens: None,
+            reasoning_tokens: None,
         }
     }
 
@@ -141,6 +158,12 @@ impl ResponseStreamBuilder {
         }
         if let Some(usage) = chunk.usage {
             self.usage = Some((usage.prompt_tokens, usage.completion_tokens));
+            if let Some(details) = usage.prompt_tokens_details {
+                self.cached_tokens = Some(details.cached_tokens);
+            }
+            self.reasoning_tokens = usage
+                .completion_tokens_details
+                .map(|details| details.reasoning_tokens);
         }
         for choice in chunk.choices {
             if let Some(text) = choice
@@ -420,7 +443,9 @@ impl ResponseStreamBuilder {
             input_tokens_details: self
                 .cached_tokens
                 .map(|cached_tokens| InputTokensDetails { cached_tokens }),
-            output_tokens_details: None,
+            output_tokens_details: self
+                .reasoning_tokens
+                .map(|reasoning_tokens| OutputTokensDetails { reasoning_tokens }),
         });
         let error = (status == ResponseStatus::Failed).then(|| ResponseError {
             code: "server_error".to_owned(),
@@ -514,6 +539,26 @@ mod tests {
                 "sequence_number must count 0,1,2,... without gaps"
             );
         }
+    }
+
+    #[test]
+    fn usage_chunk_details_set_cached_and_reasoning_tokens() {
+        let detailed_usage = json!({
+            "id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 0, "model": "m",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 20, "completion_tokens": 9, "total_tokens": 29,
+                "prompt_tokens_details": {"cached_tokens": 16},
+                "completion_tokens_details": {"reasoning_tokens": 4}
+            }
+        })
+        .to_string();
+
+        let (_events, response) = run(&[progress_chunk(2), detailed_usage]);
+
+        let usage = response.usage.unwrap();
+        assert_eq!(usage.input_tokens_details.unwrap().cached_tokens, 16);
+        assert_eq!(usage.output_tokens_details.unwrap().reasoning_tokens, 4);
     }
 
     #[test]

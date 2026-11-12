@@ -84,9 +84,11 @@ message text. Reasoning is returned as a `reasoning_text` content part, not as
 a summary.
 
 `usage` reports `input_tokens`, `output_tokens` and `total_tokens`.
-`input_tokens_details.cached_tokens` appears only on streamed responses, where
-the prefix-cache hit count is measured; `output_tokens_details` is never sent
-because reasoning tokens are not counted separately.
+`input_tokens_details.cached_tokens` is the measured prefix-cache hit, streamed
+or not, and is omitted when the engine did not report one.
+`output_tokens_details.reasoning_tokens` appears when the response had a
+reasoning item; it is a re-encoding of the reasoning text, so it can differ by
+a token or two from the tokens sampled.
 
 A response stopped by the token limit has `status: "incomplete"` and
 `incomplete_details: {"reason": "max_output_tokens"}`.

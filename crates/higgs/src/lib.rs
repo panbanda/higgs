@@ -3,6 +3,7 @@ pub mod attach;
 pub mod auto_router;
 pub mod cli_config;
 pub mod config;
+pub mod constraint;
 pub mod daemon;
 pub mod doctor;
 pub mod engine_loader;
@@ -20,9 +21,13 @@ pub mod routes;
 #[doc(hidden)]
 pub mod sse;
 pub mod state;
+#[cfg(test)]
+pub(crate) mod test_support;
+pub mod tool_choice;
 pub mod translate;
 pub mod tui;
 pub mod types;
+pub mod usage;
 
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
@@ -100,6 +105,10 @@ pub fn build_router(
             "/v1/messages/count_tokens",
             post(routes::anthropic::count_tokens),
         )
+        .route("/v1/tokenize", post(routes::tokenize::tokenize))
+        .route("/tokenize", post(routes::tokenize::tokenize))
+        .route("/v1/detokenize", post(routes::tokenize::detokenize))
+        .route("/detokenize", post(routes::tokenize::detokenize))
         .merge(responses_routes());
 
     if let Some(rpm) = NonZeroU32::new(rate_limit) {

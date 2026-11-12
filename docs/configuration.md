@@ -73,6 +73,7 @@ port = 8000
 [local]
 mlx_profile = "auto"
 raise_wired_limit = false
+# thinking_budget = 256 # reasoning tokens before </think> is forced; minimum 1
 # load = "on_demand"
 # idle_ttl_seconds = 900
 # max_loaded_models = 2
@@ -89,6 +90,7 @@ path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
 # mlx_profile = "throughput"
 # batch = false
 # prefill_yield_tokens = 512 # 0 or omitted keeps synchronous prefill
+# thinking_budget = 256 # overrides [local].thinking_budget for this model
 # kv_cache = "turboquant"
 # kv_bits = 3
 # kv_key_bits = 2
@@ -304,6 +306,113 @@ higgs exec -- aider --model openai/gpt-4o
 | `--config <FILE>` | Path to config file, conflicts with `--profile` |
 | `--profile <NAME>` | Named profile, resolves to `config.<NAME>.toml`, conflicts with `--config` |
 | `--verbose` | Enable debug logging |
+
+## API request options
+
+These apply to locally served models. Requests routed to a remote provider are
+forwarded unchanged.
+
+### Usage fields
+
+Responses from `/v1/chat/completions` and `/v1/completions` (and the terminal chunk
+requested with `stream_options.include_usage`) carry a `usage` object. Beyond the OpenAI
+token counts it includes the fields below. A field is omitted when it was not measured for
+the request; the server never fills in zeros as placeholders.
+
+| Field | Meaning |
+|---|---|
+| `prompt_tokens_details.cached_tokens` | Prompt tokens served from the prefix cache (memory or disk) instead of being prefilled. Reported as `0` when the engine measured a miss. |
+| `completion_tokens_details.reasoning_tokens` | Tokens in the reasoning block, chat only, present when the response had reasoning content. Counted by re-encoding the extracted reasoning text with the model's tokenizer, so it can differ by a token or two from the tokens actually sampled. |
+| `time_to_first_token` | Seconds from receiving the request to the first completion token. Includes queueing, template rendering and prefill. |
+| `prompt_eval_duration` | Seconds from the engine starting on the prompt to the first completion token. Excludes queueing. |
+| `generation_duration` | Seconds from the first completion token to the last. Omitted for single-token completions. |
+| `total_time` | Seconds from receiving the request to the last completion token. |
+| `prompt_tokens_per_second` | Prompt tokens that were actually prefilled (`prompt_tokens - cached_tokens`) divided by `prompt_eval_duration`. Omitted when the whole prompt was cached. |
+| `generation_tokens_per_second` | `(completion_tokens - 1) / generation_duration`; the first token is produced by prefill and is not part of the decode rate. |
+
+For streaming requests the engine events are timestamped as the server receives them, so
+the figures include the channel hop between engine and HTTP handler. The batch engine
+reports a prefix-cache hit only for requests prefilled individually; requests prefilled
+together in a group are reported with `cached_tokens: 0`.
+
+`/v1/messages` adds `usage.cache_read_input_tokens` when the cache hit is known.
+Unlike Anthropic's API, `input_tokens` still includes those cached tokens.
+
+### Guided output
+
+`/v1/chat/completions` can constrain generation to a grammar. Exactly one of these may be
+set per request; setting more than one returns `400` naming the conflicting fields.
+
+| Field | Constraint |
+|---|---|
+| `response_format: {"type": "json_object"}` | Any JSON object |
+| `response_format: {"type": "json_schema", "json_schema": {"name": "...", "schema": {...}}}` | The JSON schema (a bare schema is also accepted) |
+| `response_format: {"type": "regex", "regex": "..."}` | Output must match the regular expression |
+| `guided_regex: "..."` | Same as the regex response format |
+| `guided_json: {...}` | Same as `json_schema`, with the schema given directly |
+
+Regexes use the Rust `regex` syntax and are matched against the whole output; look-around
+and backreferences are not supported. An invalid pattern returns `400` with the compile
+error. `response_format: {"type": "text"}` means no constraint. The constraint is applied
+by masking token logits, so it requires the model's tokenizer to be representable by the
+grammar compiler; patterns whose automaton is very large take time and memory to compile.
+
+### Tool choice and seed
+
+`tool_choice` on `/v1/chat/completions` accepts `"auto"` (the default, also used when the
+field is absent or `null`) and `"none"`. With `"none"` the `tools` array is dropped before
+the prompt is rendered and the output is never parsed for tool calls, streaming or not.
+`"required"`, a named function (`{"type": "function", ...}`) and any other value return `400`;
+they are not silently treated as `"auto"`. Requests routed to a remote provider are forwarded
+untouched, so the provider interprets `tool_choice` itself.
+
+`seed` must be an integer when present but has no effect: MLX samples from a process-wide
+random key, and sampling happens in several decode paths (single, pipelined, batched), so a
+per-request seed cannot be applied without affecting concurrent requests. Treat sampling as
+non-reproducible for now; use `temperature: 0` for repeatable output.
+
+### Thinking budget
+
+Models that emit a `<think>` block get a cap on reasoning tokens: once the budget is spent
+the engine forces `</think>` so the model moves on to its answer. The budget resolves in this
+order, first match wins:
+
+1. Per request: `reasoning.max_tokens` on `/v1/chat/completions`, or
+   `thinking.budget_tokens` on `/v1/messages`.
+2. `thinking_budget` in the model's `[[models]]` entry.
+3. `thinking_budget` under `[local]`.
+4. The built-in default, 256.
+
+A budget must be at least 1, in config (`higgs doctor` fails on `0`) and in requests (`400`).
+To turn thinking off use reasoning effort `"none"`; a zero budget is not a way to do that.
+`higgs doctor` warns when a budget is not below `server.max_tokens`, since reasoning could
+then consume the whole response. The budget only applies to the simple engine; models with
+`batch = true` do not reason, and `thinking_budget` has no effect on them. On `/v1/messages`
+only `budget_tokens` is read from `thinking`; `type` is ignored.
+
+### Tokenizer endpoints
+
+`POST /v1/tokenize` and `POST /v1/detokenize` (also served as `/tokenize` and
+`/detokenize`) expose the loaded model's tokenizer. Requests for models routed to a remote
+provider fail with `400`.
+
+```json
+{"model": "qwen", "text": "Hello"}
+{"model": "qwen", "messages": [{"role": "user", "content": "Hello"}]}
+```
+
+return `{"tokens": [ids], "count": n}`. `messages` are rendered through the chat template
+with the generation prompt, exactly as `/v1/chat/completions` would feed them to the
+model; `tools` and `reasoning` are honored so the count matches. `text` is encoded without
+special tokens unless `"add_special_tokens": true`, matching `/v1/completions`.
+`text` and `messages` are mutually exclusive.
+
+```json
+{"model": "qwen", "tokens": [9707]}
+```
+
+to `/v1/detokenize` returns `{"text": "Hello"}`. Special tokens are kept unless
+`"skip_special_tokens": true`. Token ids missing from the vocabulary are rejected with `400`.
 
 ## Migration Notes
 
