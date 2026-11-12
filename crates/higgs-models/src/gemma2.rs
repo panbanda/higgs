@@ -26,7 +26,7 @@ use serde::Deserialize;
 use crate::{
     cache::{KeyValueCache, KvCacheView},
     error::ModelError,
-    utils::{AttentionMask, apply_rope, create_attention_mask},
+    utils::{AttentionMask, apply_rope, apply_rope_at_cache, create_attention_mask},
 };
 
 // ---------------------------------------------------------------------------
@@ -240,8 +240,8 @@ where
             .transpose_axes(&[0, 2, 1, 3])?;
 
         if let Some(ref mut kv_cache) = cache {
-            queries = apply_rope(&queries, &self.rope, kv_cache.offset())?;
-            keys = apply_rope(&keys, &self.rope, kv_cache.offset())?;
+            queries = apply_rope_at_cache(&queries, &self.rope, kv_cache)?;
+            keys = apply_rope_at_cache(&keys, &self.rope, kv_cache)?;
 
             match kv_cache.update_and_view(keys, values)? {
                 KvCacheView::TurboQuant(view) if is_single_token_decode(&queries) => {

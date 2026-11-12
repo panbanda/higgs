@@ -183,7 +183,7 @@ That means Higgs supports:
 
 ## Local Model Notes
 
-- `batch=true` is only supported for transformer families with true batched decode support: `llama`, `mistral`, `qwen2`, and `qwen3`.
+- `batch=true` is only supported for transformer families with true batched decode support: `llama`, `mistral`, `qwen2`, `qwen3`, `phi3`, and `starcoder2`.
 - `higgs doctor` and server startup now reject unsupported `batch=true` combinations instead of silently degrading.
 - `[local].raise_wired_limit` defaults to `false`. Turn it on only when you explicitly want MLX to raise the process wired-memory limit.
 - Source builds on macOS require `mlx.metallib`. Higgs restores it from Cargo build output when possible and fails startup if it still cannot be resolved.

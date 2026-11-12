@@ -25,7 +25,8 @@ use crate::{
         QEmbedding, QLinear, QuantizationConfig, SwitchMlpWeights, new_mlp_projections, swiglu,
     },
     utils::{
-        AttentionMask, apply_rope, cached_scaled_dot_product_attention, create_attention_mask,
+        AttentionMask, apply_rope, apply_rope_at_cache, cached_scaled_dot_product_attention,
+        create_attention_mask,
     },
 };
 
@@ -195,8 +196,8 @@ impl Qwen3MoeAttention {
             .transpose_axes(&[0, 2, 1, 3])?;
 
         if let Some(kv_cache) = cache {
-            queries = apply_rope(&queries, &self.rope, kv_cache.offset())?;
-            keys = apply_rope(&keys, &self.rope, kv_cache.offset())?;
+            queries = apply_rope_at_cache(&queries, &self.rope, kv_cache)?;
+            keys = apply_rope_at_cache(&keys, &self.rope, kv_cache)?;
 
             // Causal mask: bypass TurboQuant loop, use MLX fast SDPA causal mode
             if matches!(mask, Some(AttentionMask::Causal)) {
@@ -506,31 +507,41 @@ impl Qwen3MoeCausalLM {
     }
 
     /// Forward pass returning hidden states before the LM head.
-    #[allow(non_snake_case)]
     pub fn forward_hidden(
         &mut self,
         inputs: &Array,
         mask: Option<&Array>,
         kv_cache: &mut Vec<Option<SteppingKeyValueCache>>,
     ) -> Result<Array, Exception> {
-        let mut h = self.model.embed_tokens.forward(inputs)?;
-
-        let computed_mask: Option<AttentionMask> = match mask {
-            Some(m) => Some(AttentionMask::Array(m.clone())),
-            None => create_attention_mask(&h, kv_cache, None)?,
-        };
-
         if kv_cache.is_empty() {
             *kv_cache = (0..self.model.layers.len())
                 .map(|_| Some(SteppingKeyValueCache::new()))
                 .collect();
-        } else if kv_cache.len() != self.model.layers.len() {
+        }
+        self.forward_hidden_with_cache(inputs, mask, kv_cache)
+    }
+
+    /// [`Self::forward_hidden`] over any cache type; `kv_cache` must already
+    /// hold one entry per layer.
+    fn forward_hidden_with_cache<C: KeyValueCache>(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        kv_cache: &mut [Option<C>],
+    ) -> Result<Array, Exception> {
+        if kv_cache.len() != self.model.layers.len() {
             return Err(Exception::custom(format!(
                 "kv_cache length ({}) must match num layers ({})",
                 kv_cache.len(),
                 self.model.layers.len()
             )));
         }
+        let mut h = self.model.embed_tokens.forward(inputs)?;
+
+        let computed_mask: Option<AttentionMask> = match mask {
+            Some(m) => Some(AttentionMask::Array(m.clone())),
+            None => create_attention_mask(&h, kv_cache, None)?,
+        };
 
         for (layer, layer_cache) in self.model.layers.iter_mut().zip(kv_cache.iter_mut()) {
             h = layer.forward(&h, computed_mask.as_ref(), layer_cache.as_mut())?;
@@ -540,7 +551,6 @@ impl Qwen3MoeCausalLM {
     }
 
     /// Forward pass producing logits.
-    #[allow(non_snake_case)]
     pub fn forward(
         &mut self,
         inputs: &Array,
@@ -548,14 +558,27 @@ impl Qwen3MoeCausalLM {
         kv_cache: &mut Vec<Option<SteppingKeyValueCache>>,
     ) -> Result<Array, Exception> {
         let h = self.forward_hidden(inputs, mask, kv_cache)?;
-        let _h_last = h.index((.., -1.., ..)); // [B, 1, hidden]
+        self.last_position_logits(&h)
+    }
 
-        let T = inputs.shape().get(1).copied().unwrap_or(1);
-        let lm_input = if T > 1 { h.index((.., -1.., ..)) } else { h };
-        match self.lm_head.as_ref() {
-            Some(head) => head.forward(&lm_input),
-            None => self.model.embed_tokens.as_linear(&lm_input),
-        }
+    /// [`Self::forward`] over any cache type; `kv_cache` must already hold one
+    /// entry per layer.
+    pub fn forward_with_cache<C: KeyValueCache>(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        kv_cache: &mut [Option<C>],
+    ) -> Result<Array, Exception> {
+        let h = self.forward_hidden_with_cache(inputs, mask, kv_cache)?;
+        self.last_position_logits(&h)
+    }
+
+    fn last_position_logits(&self, hidden: &Array) -> Result<Array, Exception> {
+        let lm_input = hidden.index((.., -1.., ..));
+        self.lm_head.as_ref().map_or_else(
+            || self.model.embed_tokens.as_linear(&lm_input),
+            |head| head.forward(&lm_input),
+        )
     }
 
     /// Forward pass producing logits for every input position.

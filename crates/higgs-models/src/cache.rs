@@ -296,6 +296,13 @@ pub trait KeyValueCache {
     /// Current sequence offset (number of tokens already cached).
     fn offset(&self) -> i32;
 
+    /// Per-row `RoPE` positions `[B]` for the next token, when rows of a
+    /// batch sit at different positions. `None` means every row is at
+    /// [`Self::offset`].
+    fn rope_positions(&self) -> Option<Array> {
+        None
+    }
+
     /// Maximum cache size, if bounded.
     fn max_size(&self) -> Option<i32>;
 
@@ -341,6 +348,10 @@ where
 
     fn offset(&self) -> i32 {
         T::offset(self)
+    }
+
+    fn rope_positions(&self) -> Option<Array> {
+        T::rope_positions(self)
     }
 
     fn max_size(&self) -> Option<i32> {

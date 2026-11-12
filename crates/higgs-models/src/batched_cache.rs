@@ -7,9 +7,9 @@
 //!
 //! Rows are **left-padded** to a common length, so every row's next token lands
 //! at the same index and one `slice_update` appends for the whole batch.
-//! Padding slots are zeros and are masked out of attention. Each row keeps its
-//! true position (`lengths`) for `RoPE`, so cached keys stay valid when a row
-//! moves between batches.
+//! Padding slots are masked out of attention. Each row is rotated at its true
+//! position for `RoPE`, so cached keys stay valid when a row moves between
+//! batches.
 
 use mlx_rs::{
     Array,
@@ -17,17 +17,53 @@ use mlx_rs::{
     ops::{self, indexing::IndexOp},
 };
 
-use crate::cache::{KeyValueCache, SteppingKeyValueCache};
+use crate::cache::{KeyValueCache, KvCacheView, SteppingKeyValueCache};
 
 /// Per-layer caches for one sequence, as used by non-batched decode.
 pub type KvRow = Vec<Option<SteppingKeyValueCache>>;
 
+/// One layer of a [`BatchedKvCache`].
+///
+/// Keys and values are shaped `[B, H, capacity, D]`, with each row's left
+/// padding tracked alongside. It implements [`KeyValueCache`], so a model's
+/// ordinary forward pass runs batched when handed these instead of
+/// per-sequence caches.
+#[derive(Debug)]
+pub struct BatchedLayerCache {
+    storage: SteppingKeyValueCache,
+    padding: Vec<i32>,
+}
+
+impl KeyValueCache for BatchedLayerCache {
+    fn offset(&self) -> i32 {
+        self.storage.offset()
+    }
+
+    fn rope_positions(&self) -> Option<Array> {
+        let padded_len = self.storage.offset();
+        let positions: Vec<i32> = self
+            .padding
+            .iter()
+            .map(|&padding| padded_len - padding)
+            .collect();
+        let batch = i32::try_from(positions.len()).ok()?;
+        Some(Array::from_slice(&positions, &[batch]))
+    }
+
+    fn max_size(&self) -> Option<i32> {
+        None
+    }
+
+    fn update_and_view(&mut self, keys: Array, values: Array) -> Result<KvCacheView, Exception> {
+        self.storage.update_and_view(keys, values)
+    }
+}
+
 #[derive(Debug)]
 pub struct BatchedKvCache {
-    /// One cache per layer with keys/values shaped `[B, H, capacity, D]`.
-    layers: Vec<SteppingKeyValueCache>,
-    /// True token count of each row; the rest of the row is left padding.
-    lengths: Vec<i32>,
+    layers: Vec<Option<BatchedLayerCache>>,
+    /// Left padding of each row: slots before the row's first real token.
+    padding: Vec<i32>,
 }
 
 impl BatchedKvCache {
@@ -45,6 +81,7 @@ impl BatchedKvCache {
             })
             .collect();
         let padded_len = lengths.iter().copied().max().unwrap_or(0);
+        let padding: Vec<i32> = lengths.iter().map(|&length| padded_len - length).collect();
         let num_layers = rows.first().map_or(0, Vec::len);
         if rows.iter().any(|row| row.len() != num_layers) {
             return Err(Exception::custom(
@@ -56,32 +93,40 @@ impl BatchedKvCache {
         for layer_index in 0..num_layers {
             let mut row_keys = Vec::with_capacity(rows.len());
             let mut row_values = Vec::with_capacity(rows.len());
-            for (row, &length) in rows.iter().zip(&lengths) {
+            for ((row, &length), &row_padding) in rows.iter().zip(&lengths).zip(&padding) {
                 let cache = row
                     .get(layer_index)
                     .and_then(Option::as_ref)
                     .ok_or_else(|| Exception::custom("batched cache row has an empty layer"))?;
                 let (keys, values) = dense_prefix(cache, length)?;
-                row_keys.push(left_pad(&keys, padded_len - length)?);
-                row_values.push(left_pad(&values, padded_len - length)?);
+                row_keys.push(left_pad(&keys, row_padding)?);
+                row_values.push(left_pad(&values, row_padding)?);
             }
-            layers.push(SteppingKeyValueCache::from_arrays(
-                stack_rows(&row_keys)?,
-                stack_rows(&row_values)?,
-            )?);
+            layers.push(Some(BatchedLayerCache {
+                storage: SteppingKeyValueCache::from_arrays(
+                    stack_rows(&row_keys)?,
+                    stack_rows(&row_values)?,
+                )?,
+                padding: padding.clone(),
+            }));
         }
-        Ok(Self { layers, lengths })
+        Ok(Self { layers, padding })
     }
 
-    /// An empty batch about to receive a left-padded prefill: `lengths` are
-    /// the true token counts the rows will hold once the padded prompt
-    /// (as long as the longest row) has been written to every layer.
-    pub fn for_prefill(num_layers: usize, lengths: Vec<i32>) -> Self {
+    /// An empty batch about to receive a left-padded prefill of `steps`
+    /// tokens per row, where `lengths` are the rows' true token counts.
+    pub fn for_prefill(num_layers: usize, lengths: &[i32], steps: i32) -> Self {
+        let padding: Vec<i32> = lengths.iter().map(|&length| steps - length).collect();
         Self {
             layers: (0..num_layers)
-                .map(|_| SteppingKeyValueCache::new())
+                .map(|_| {
+                    Some(BatchedLayerCache {
+                        storage: SteppingKeyValueCache::new(),
+                        padding: padding.clone(),
+                    })
+                })
                 .collect(),
-            lengths,
+            padding,
         }
     }
 
@@ -89,19 +134,24 @@ impl BatchedKvCache {
     pub fn into_rows(self) -> Result<Vec<KvRow>, Exception> {
         let padded_len = self.padded_len();
         let mut rows: Vec<KvRow> = self
-            .lengths
+            .padding
             .iter()
             .map(|_| Vec::with_capacity(self.layers.len()))
             .collect();
         for layer in &self.layers {
-            let keys = layer
+            let storage = &layer
+                .as_ref()
+                .ok_or_else(|| Exception::custom("batched cache has an empty layer"))?
+                .storage;
+            let keys = storage
                 .keys()
                 .ok_or_else(|| Exception::custom("batched cache layer has no keys"))?;
-            let values = layer
+            let values = storage
                 .values()
                 .ok_or_else(|| Exception::custom("batched cache layer has no values"))?;
-            for ((row, &length), row_index) in rows.iter_mut().zip(&self.lengths).zip(0_i32..) {
-                let valid = (padded_len - length)..padded_len;
+            for ((row, &row_padding), row_index) in rows.iter_mut().zip(&self.padding).zip(0_i32..)
+            {
+                let valid = row_padding..padded_len;
                 let row_range = row_index..row_index + 1;
                 row.push(Some(SteppingKeyValueCache::from_arrays(
                     keys.index((row_range.clone(), .., valid.clone(), ..)),
@@ -113,49 +163,46 @@ impl BatchedKvCache {
     }
 
     pub const fn batch_size(&self) -> usize {
-        self.lengths.len()
+        self.padding.len()
     }
 
     pub const fn num_layers(&self) -> usize {
         self.layers.len()
     }
 
-    /// True token count of each row, which is also the `RoPE` position of the
-    /// next token appended to that row.
-    pub fn lengths(&self) -> &[i32] {
-        &self.lengths
+    /// True token count of each row.
+    pub fn lengths(&self) -> Vec<i32> {
+        let padded_len = self.padded_len();
+        self.padding
+            .iter()
+            .map(|&row_padding| padded_len - row_padding)
+            .collect()
     }
 
+    /// Tokens held per row including padding (every layer agrees).
     fn padded_len(&self) -> i32 {
-        self.lengths.iter().copied().max().unwrap_or(0)
+        self.layers
+            .first()
+            .and_then(Option::as_ref)
+            .map_or(0, KeyValueCache::offset)
     }
 
-    pub fn layer_mut(
-        &mut self,
-        layer_index: usize,
-    ) -> Result<&mut SteppingKeyValueCache, Exception> {
-        self.layers
-            .get_mut(layer_index)
-            .ok_or_else(|| Exception::custom("batched cache layer index out of range"))
+    /// The per-layer caches in the shape a model's forward pass takes.
+    pub const fn layers_mut(&mut self) -> &mut Vec<Option<BatchedLayerCache>> {
+        &mut self.layers
     }
 
     /// Boolean `[B, 1, 1, L + new_tokens]` mask (true = attend) covering the
     /// cache contents plus `new_tokens` about to be appended. `None` when no
     /// row has padding, so equal-length batches skip masking entirely.
     pub fn attention_mask(&self, new_tokens: i32) -> Result<Option<Array>, Exception> {
-        let padded_len = self.padded_len();
-        if self.lengths.iter().all(|&length| length == padded_len) {
+        if self.padding.iter().all(|&row_padding| row_padding == 0) {
             return Ok(None);
         }
-        let batch = i32::try_from(self.lengths.len())
+        let batch = i32::try_from(self.padding.len())
             .map_err(|_| Exception::custom("batch size overflow"))?;
-        let row_padding: Vec<i32> = self
-            .lengths
-            .iter()
-            .map(|&length| padded_len - length)
-            .collect();
-        let total = padded_len + new_tokens;
-        let padding_array = Array::from_slice(&row_padding, &[batch, 1]);
+        let total = self.padded_len() + new_tokens;
+        let padding_array = Array::from_slice(&self.padding, &[batch, 1]);
         let positions = ops::arange::<_, i32>(None, total, None)?.reshape(&[1, total])?;
         let mask = positions.ge(padding_array)?;
         mask.reshape(&[batch, 1, 1, total]).map(Some)
@@ -180,21 +227,30 @@ impl BatchedKvCache {
         mask.reshape(&[batch, 1, steps, steps])
     }
 
-    /// Record that every row grew by `new_tokens` (call once per forward pass,
-    /// after all layers were updated).
-    pub fn advance(&mut self, new_tokens: i32) {
-        for length in &mut self.lengths {
-            *length += new_tokens;
-        }
-    }
-
     /// Arrays that must be evaluated to materialize the cache state.
     pub fn eval_targets(&self) -> Vec<&Array> {
         self.layers
             .iter()
-            .flat_map(SteppingKeyValueCache::eval_targets)
+            .flatten()
+            .flat_map(|layer| layer.storage.eval_targets())
             .collect()
     }
+}
+
+/// Check `[B, T]` prefill inputs against per-row `lengths` and return `T`.
+pub(crate) fn validate_prefill_shape(inputs: &Array, lengths: &[i32]) -> Result<i32, Exception> {
+    let &[batch, steps] = inputs.shape() else {
+        return Err(Exception::custom("prefill inputs must be [B, T]"));
+    };
+    if usize::try_from(batch).ok() != Some(lengths.len())
+        || lengths.iter().copied().max() != Some(steps)
+        || lengths.iter().any(|&length| length < 1)
+    {
+        return Err(Exception::custom(
+            "prefill lengths must be positive, one per row, with the longest equal to T",
+        ));
+    }
+    Ok(steps)
 }
 
 /// The first `length` cached positions of a dense cache as `[1, H, length, D]`.
@@ -252,7 +308,7 @@ mod tests {
     #[test]
     fn equal_length_rows_need_no_mask() {
         let batch = BatchedKvCache::from_rows(vec![row(3, 1.0), row(3, 2.0)]).unwrap();
-        assert_eq!(batch.lengths(), &[3, 3]);
+        assert_eq!(batch.lengths(), vec![3, 3]);
         assert!(batch.attention_mask(1).unwrap().is_none());
     }
 
@@ -307,13 +363,11 @@ mod tests {
         let mut batch = BatchedKvCache::from_rows(vec![row(1, 1.0), row(3, 2.0)]).unwrap();
         let new_keys = ops::full::<f32>(&[2, HEADS, 1, DIM], Array::from_f32(9.0)).unwrap();
         let new_values = new_keys.clone();
-        batch
-            .layer_mut(0)
-            .unwrap()
-            .update_and_fetch(new_keys, new_values)
-            .unwrap();
-        batch.advance(1);
-        assert_eq!(batch.lengths(), &[2, 4]);
+        let layer = batch.layers_mut()[0].as_mut().unwrap();
+        let positions = layer.rope_positions().unwrap();
+        assert_eq!(positions.as_slice::<i32>(), &[1, 3]);
+        layer.update_and_fetch(new_keys, new_values).unwrap();
+        assert_eq!(batch.lengths(), vec![2, 4]);
 
         let rows = batch.into_rows().unwrap();
         let short = rows[0][0]

@@ -493,59 +493,81 @@ impl AnyModel {
         Ok(logits)
     }
 
-    /// Batched decode forward pass for N requests each with 1 token.
-    ///
-    /// Only supported for the `Transformer` variant (Llama/Qwen/Mistral).
+    /// Batched decode: one forward pass appending one token to each of the
+    /// `B` sequences held in `cache`. `inputs` is `[B, 1]`; returns
+    /// `[B, 1, vocab]` logits. See [`Self::supports_batched_decode`].
     pub fn forward_batched(
         &mut self,
         inputs: &Array,
         cache: &mut batched_cache::BatchedKvCache,
     ) -> Result<Array, Exception> {
-        match self {
-            Self::Transformer(m) => m.forward_batched(inputs, cache),
-            Self::Qwen3Moe(_)
-            | Self::Qwen3Next(_)
-            | Self::Gemma2(_)
-            | Self::Gemma3(_)
-            | Self::Gemma4(_)
-            | Self::Phi3(_)
-            | Self::Starcoder2(_)
-            | Self::LlavaQwen2(_)
-            | Self::DeepSeekV2(_)
-            | Self::BonsaiQ1(_) => Err(Exception::custom(
-                "Batched forward only supported for Transformer models",
-            )),
-        }
+        let mask = cache.attention_mask(1)?;
+        self.forward_with_batched_cache(inputs, mask.as_ref(), cache)
     }
 
-    /// Prefill several left-padded prompts in one pass (see
-    /// [`transformer::Model::prefill_batched`]). Same model support as
-    /// [`Self::forward_batched`].
+    /// Prefill several prompts in one forward pass.
+    ///
+    /// `inputs` is `[B, T]` with each prompt **left-padded** to the longest
+    /// (`T`), and `lengths` holds the true token counts. Returns last-position
+    /// logits `[B, 1, vocab]` and the filled cache. Real tokens are rotated at
+    /// their true positions, so the rows are interchangeable with caches
+    /// built by an unbatched prefill.
     pub fn prefill_batched(
         &mut self,
         inputs: &Array,
         lengths: &[i32],
     ) -> Result<(Array, batched_cache::BatchedKvCache), Exception> {
+        let steps = batched_cache::validate_prefill_shape(inputs, lengths)?;
+        let mut cache =
+            batched_cache::BatchedKvCache::for_prefill(self.num_layers()?, lengths, steps);
+        let mask = batched_cache::BatchedKvCache::prefill_mask(lengths, steps)?;
+        let logits = self.forward_with_batched_cache(inputs, Some(&mask), &mut cache)?;
+        Ok((logits, cache))
+    }
+
+    /// The model's ordinary forward pass, run over a batched cache.
+    fn forward_with_batched_cache(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut batched_cache::BatchedKvCache,
+    ) -> Result<Array, Exception> {
+        let layers = cache.layers_mut();
         match self {
-            Self::Transformer(m) => m.prefill_batched(inputs, lengths),
-            Self::Qwen3Moe(_)
-            | Self::Qwen3Next(_)
+            Self::Transformer(m) => m.forward(inputs, mask, layers),
+            Self::Qwen3Moe(m) => m.forward_with_cache(inputs, mask, layers),
+            Self::Phi3(m) => m.forward(inputs, mask, layers),
+            Self::Starcoder2(m) => m.forward(inputs, mask, layers),
+            // Gemma 2 attends over grouped `[B, kv_heads, groups, T, S]`
+            // scores, which the 4D padding mask does not broadcast against.
+            Self::Qwen3Next(_)
             | Self::Gemma2(_)
             | Self::Gemma3(_)
             | Self::Gemma4(_)
-            | Self::Phi3(_)
-            | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => Err(Exception::custom(
-                "Batched prefill only supported for Transformer models",
+                "Batched decode is not supported for this model architecture",
             )),
         }
     }
 
-    /// Whether this model supports batched decode.
+    fn num_layers(&self) -> Result<usize, Exception> {
+        match self.make_cache()? {
+            AnyCache::KV(layers) => Ok(layers.len()),
+            AnyCache::Hybrid(layers) => Ok(layers.len()),
+        }
+    }
+
+    /// Whether this model supports batched decode: its attention must take
+    /// per-row positions and a padding mask from the cache (see
+    /// [`batched_cache::BatchedKvCache`]), verified against unbatched decode
+    /// on real weights for each architecture listed here.
     pub const fn supports_batched_decode(&self) -> bool {
-        matches!(self, Self::Transformer(_))
+        matches!(
+            self,
+            Self::Transformer(_) | Self::Qwen3Moe(_) | Self::Phi3(_) | Self::Starcoder2(_)
+        )
     }
 
     /// Whether this model has a loaded MTP head for speculative decode.

@@ -23,8 +23,8 @@ use crate::{
     cache::KeyValueCache,
     error::ModelError,
     utils::{
-        AttentionMask, apply_rope, cached_scaled_dot_product_attention, create_attention_mask,
-        scaled_dot_product_attention,
+        AttentionMask, apply_rope, apply_rope_at_cache, cached_scaled_dot_product_attention,
+        create_attention_mask, scaled_dot_product_attention,
     },
 };
 
@@ -294,8 +294,8 @@ where
             .transpose_axes(&[0, 2, 1, 3])?;
 
         if let Some(ref mut kv_cache) = cache {
-            queries = apply_rope(&queries, &self.rope, kv_cache.offset())?;
-            keys = apply_rope(&keys, &self.rope, kv_cache.offset())?;
+            queries = apply_rope_at_cache(&queries, &self.rope, kv_cache)?;
+            keys = apply_rope_at_cache(&keys, &self.rope, kv_cache)?;
 
             let output = cached_scaled_dot_product_attention(
                 queries, kv_cache, keys, values, self.scale, mask,
@@ -692,90 +692,13 @@ impl Model {
 
     /// Batched decode: one forward pass appending one token to each of the
     /// `B` sequences held in `cache`. `inputs` is `[B, 1]`.
-    ///
-    /// Each row is rotated at its own position (rows differ in length), while
-    /// the cache append and attention run once for the whole batch.
     pub fn forward_batched(
         &mut self,
         inputs: &Array,
         cache: &mut BatchedKvCache,
     ) -> Result<Array, Exception> {
-        let batch = *inputs
-            .shape()
-            .first()
-            .ok_or_else(|| Exception::custom("inputs must have batch dimension"))?;
-        if usize::try_from(batch).ok() != Some(cache.batch_size()) {
-            return Err(Exception::custom("cache batch size must match inputs"));
-        }
-        if cache.num_layers() != self.model.layers.len() {
-            return Err(Exception::custom(
-                "cache layer count must match model layers",
-            ));
-        }
-
-        let positions = Array::from_slice(cache.lengths(), &[batch]);
         let mask = cache.attention_mask(1)?;
-
-        let mut h = self.model.embed_tokens.forward(inputs)?;
-
-        for (layer_index, layer) in self.model.layers.iter_mut().enumerate() {
-            let attention = &mut layer.self_attn;
-            let normed = layer.input_layernorm.forward(&h)?;
-
-            // [B, 1, proj_dim] -> [B, heads, 1, head_dim]
-            let split_heads = |projected: Array, heads: i32| {
-                projected
-                    .reshape(&[batch, 1, heads, -1])?
-                    .transpose_axes(&[0, 2, 1, 3])
-            };
-            let mut queries = split_heads(attention.q_proj.forward(&normed)?, attention.n_heads)?;
-            let mut keys = split_heads(attention.k_proj.forward(&normed)?, attention.n_kv_heads)?;
-            let values = split_heads(attention.v_proj.forward(&normed)?, attention.n_kv_heads)?;
-
-            if let Some(ref mut q_norm) = attention.q_norm {
-                queries = q_norm.forward(&queries)?;
-            }
-            if let Some(ref mut k_norm) = attention.k_norm {
-                keys = k_norm.forward(&keys)?;
-            }
-
-            let rotate = |array: &Array| {
-                mlx_rs::fast::rope_dynamic(
-                    array,
-                    attention.rope.dimensions,
-                    attention.rope.traditional,
-                    attention.rope.base,
-                    attention.rope.scale,
-                    &positions,
-                    None,
-                )
-            };
-            let rotated_queries = rotate(&queries)?;
-            let rotated_keys = rotate(&keys)?;
-
-            let (all_keys, all_values) = cache
-                .layer_mut(layer_index)?
-                .update_and_fetch(rotated_keys, values)?;
-            let attended = scaled_dot_product_attention(
-                rotated_queries,
-                all_keys,
-                all_values,
-                attention.scale,
-                mask.as_ref(),
-            )?;
-
-            let merged = attended
-                .transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[batch, 1, -1])?;
-            h = h.add(attention.o_proj.forward(&merged)?)?;
-
-            let normed_post = layer.post_attention_layernorm.forward(&h)?;
-            h = h.add(layer.mlp.forward(&normed_post)?)?;
-        }
-        cache.advance(1);
-
-        let out = self.model.norm.forward(&h)?;
-        self.apply_lm_head(&out)
+        self.forward(inputs, mask.as_ref(), cache.layers_mut())
     }
 
     /// Prefill several prompts in one forward pass.
@@ -790,90 +713,11 @@ impl Model {
         inputs: &Array,
         lengths: &[i32],
     ) -> Result<(Array, BatchedKvCache), Exception> {
-        let &[batch, steps] = inputs.shape() else {
-            return Err(Exception::custom("prefill inputs must be [B, T]"));
-        };
-        if usize::try_from(batch).ok() != Some(lengths.len())
-            || lengths.iter().copied().max() != Some(steps)
-            || lengths.iter().any(|&length| length < 1)
-        {
-            return Err(Exception::custom(
-                "prefill lengths must be positive, one per row, with the longest equal to T",
-            ));
-        }
-
-        let mut cache = BatchedKvCache::for_prefill(self.model.layers.len(), lengths.to_vec());
+        let steps = crate::batched_cache::validate_prefill_shape(inputs, lengths)?;
+        let mut cache = BatchedKvCache::for_prefill(self.model.layers.len(), lengths, steps);
         let mask = BatchedKvCache::prefill_mask(lengths, steps)?;
-        // Negative for padded rows, so the first real token lands on position 0.
-        let row_first_positions: Vec<i32> = lengths.iter().map(|&length| length - steps).collect();
-        let first_positions = Array::from_slice(&row_first_positions, &[batch]);
-
-        let mut h = self.model.embed_tokens.forward(inputs)?;
-
-        for (layer_index, layer) in self.model.layers.iter_mut().enumerate() {
-            let attention = &mut layer.self_attn;
-            let normed = layer.input_layernorm.forward(&h)?;
-
-            let mut queries = attention.q_proj.forward(&normed)?.reshape(&[
-                batch,
-                steps,
-                attention.n_heads,
-                -1,
-            ])?;
-            let mut keys = attention.k_proj.forward(&normed)?.reshape(&[
-                batch,
-                steps,
-                attention.n_kv_heads,
-                -1,
-            ])?;
-            let values = attention
-                .v_proj
-                .forward(&normed)?
-                .reshape(&[batch, steps, attention.n_kv_heads, -1])?
-                .transpose_axes(&[0, 2, 1, 3])?;
-            if let Some(ref mut q_norm) = attention.q_norm {
-                queries = q_norm.forward(&queries)?;
-            }
-            if let Some(ref mut k_norm) = attention.k_norm {
-                keys = k_norm.forward(&keys)?;
-            }
-
-            let rotate = |array: Array| {
-                mlx_rs::fast::rope_dynamic(
-                    array.transpose_axes(&[0, 2, 1, 3])?,
-                    attention.rope.dimensions,
-                    attention.rope.traditional,
-                    attention.rope.base,
-                    attention.rope.scale,
-                    &first_positions,
-                    None,
-                )
-            };
-            let rotated_queries = rotate(queries)?;
-            let rotated_keys = rotate(keys)?;
-
-            let (all_keys, all_values) = cache
-                .layer_mut(layer_index)?
-                .update_and_fetch(rotated_keys, values)?;
-            let attended = scaled_dot_product_attention(
-                rotated_queries,
-                all_keys,
-                all_values,
-                attention.scale,
-                Some(&mask),
-            )?;
-
-            let merged = attended
-                .transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[batch, steps, -1])?;
-            h = h.add(attention.o_proj.forward(&merged)?)?;
-
-            let normed_post = layer.post_attention_layernorm.forward(&h)?;
-            h = h.add(layer.mlp.forward(&normed_post)?)?;
-        }
-
-        let out = self.model.norm.forward(&h)?;
-        Ok((self.apply_lm_head(&out)?, cache))
+        let logits = self.forward(inputs, Some(&mask), cache.layers_mut())?;
+        Ok((logits, cache))
     }
 
     /// Apply the LM head to hidden states (last position only during prefill).
@@ -1494,7 +1338,7 @@ mod tests {
             worst_relative < 0.03,
             "batched logits differ from unbatched by {worst_relative} of the largest logit"
         );
-        assert_eq!(batch.lengths(), &[10, 6, 8]);
+        assert_eq!(batch.lengths(), vec![10, 6, 8]);
     }
 
     /// Batched prefill must leave the same logits and the same decode

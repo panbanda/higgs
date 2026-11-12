@@ -42,6 +42,8 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 - `mistral`
 - `qwen2`
 - `qwen3`
+- `phi3`
+- `starcoder2`
 
 Other supported architectures still serve normally in simple mode, but Higgs now rejects `batch=true` during config load, `doctor`, and server startup.
 

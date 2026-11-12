@@ -56,11 +56,129 @@ pub fn load_tokenizer<P: AsRef<Path>>(model_dir: P) -> Result<tokenizers::Tokeni
     shared_load_tokenizer(model_dir).map_err(|e| EngineError::Tokenization(e.to_string()))
 }
 
-#[allow(clippy::panic, clippy::unwrap_used)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::print_stdout,
+    clippy::indexing_slicing
+)]
 #[cfg(test)]
 mod tests {
     use super::*;
     use higgs_models::error::ModelError;
+
+    /// Largest absolute difference between two same-shaped arrays, relative
+    /// to the largest magnitude in `expected`.
+    fn relative_difference(expected: &mlx_rs::Array, actual: &mlx_rs::Array) -> f32 {
+        let to_vec = |array: &mlx_rs::Array| {
+            array
+                .as_dtype(mlx_rs::Dtype::Float32)
+                .unwrap()
+                .contiguous()
+                .unwrap()
+                .as_slice::<f32>()
+                .to_vec()
+        };
+        let expected_values = to_vec(expected);
+        let actual_values = to_vec(actual);
+        assert_eq!(expected_values.len(), actual_values.len());
+        let largest = expected_values
+            .iter()
+            .fold(0.0_f32, |max, x| max.max(x.abs()));
+        let difference = expected_values
+            .iter()
+            .zip(&actual_values)
+            .fold(0.0_f32, |max, (a, b)| max.max((a - b).abs()));
+        difference / largest
+    }
+
+    /// Batched prefill and decode must reproduce one-at-a-time prefill and
+    /// decode for every architecture `supports_batched_decode` admits. Needs a
+    /// real checkpoint:
+    /// `HIGGS_MODEL_PATH=<model dir> cargo test -p higgs-engine -- --ignored batched_decode_matches`
+    #[test]
+    #[ignore = "requires real model weights (set HIGGS_MODEL_PATH)"]
+    fn batched_decode_matches_unbatched_decode() {
+        use mlx_rs::{Array, ops::indexing::IndexOp};
+
+        let Ok(model_path) = std::env::var("HIGGS_MODEL_PATH") else {
+            println!("HIGGS_MODEL_PATH not set, skipping");
+            return;
+        };
+        let mut model = load_model(&model_path).unwrap();
+        assert!(
+            model.supports_batched_decode(),
+            "this architecture does not claim batched decode support"
+        );
+
+        // Different lengths exercise left padding, masking, and per-row positions.
+        let prompts: [&[u32]; 3] = [
+            &[101, 2002, 3003, 404, 505, 6006, 707, 88, 99],
+            &[909, 808, 7007],
+            &[1100, 1200, 130, 1400, 150],
+        ];
+        let steps: [[u32; 3]; 3] = [[210, 2200, 230], [3100, 320, 3300], [41, 4200, 430]];
+        let longest = prompts.iter().map(|p| p.len()).max().unwrap();
+
+        let mut padded = Vec::new();
+        for prompt in prompts {
+            padded.extend(std::iter::repeat_n(0_u32, longest - prompt.len()));
+            padded.extend_from_slice(prompt);
+        }
+        let lengths: Vec<i32> = prompts
+            .iter()
+            .map(|p| i32::try_from(p.len()).unwrap())
+            .collect();
+        let (batched_prefill, mut batch) = model
+            .prefill_batched(
+                &Array::from_slice(&padded, &[3, i32::try_from(longest).unwrap()]),
+                &lengths,
+            )
+            .unwrap();
+        let batched_steps: Vec<Array> = steps
+            .iter()
+            .map(|tokens| {
+                let logits = model
+                    .forward_batched(&Array::from_slice(tokens, &[3, 1]), &mut batch)
+                    .unwrap();
+                logits.eval().unwrap();
+                logits
+            })
+            .collect();
+
+        let mut worst = 0.0_f32;
+        for (row, prompt) in prompts.iter().enumerate() {
+            let row_index = i32::try_from(row).unwrap();
+            let row_of = |logits: &Array| logits.index((row_index..row_index + 1, -1, ..));
+            let mut cache = model.make_cache().unwrap();
+            let length = i32::try_from(prompt.len()).unwrap();
+            let prefill = model
+                .forward(&Array::from_slice(prompt, &[1, length]), None, &mut cache)
+                .unwrap();
+            worst = worst.max(relative_difference(
+                &prefill.index((.., -1, ..)),
+                &row_of(&batched_prefill),
+            ));
+            for (step, batched) in steps.iter().zip(&batched_steps) {
+                let logits = model
+                    .forward(&Array::from_slice(&[step[row]], &[1, 1]), None, &mut cache)
+                    .unwrap();
+                worst = worst.max(relative_difference(
+                    &logits.index((.., -1, ..)),
+                    &row_of(batched),
+                ));
+            }
+        }
+        println!("largest logit difference relative to the largest logit: {worst}");
+        // Half-precision kernels round differently by batch size (about 1.5%
+        // on Qwen3-1.7B-4bit, 0.4% on Llama-3.2-1B-4bit). A positional or
+        // masking bug is an order of magnitude larger.
+        assert!(
+            worst < 0.03,
+            "batched logits differ from unbatched by {worst} of the largest logit"
+        );
+        assert!(!worst.is_nan(), "batched decode produced NaN logits");
+    }
 
     /// Create a temp dir with a config.json containing the given `model_type` and
     /// return the `ModelConfig` result.

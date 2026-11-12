@@ -25,6 +25,29 @@ pub(crate) fn apply_rope(x: &Array, rope: &nn::Rope, offset: i32) -> Result<Arra
     )
 }
 
+/// Rotate `x` at the position its cache is at: one shared offset normally,
+/// or one position per row for a batched cache whose rows differ in length.
+pub(crate) fn apply_rope_at_cache<C: KeyValueCache>(
+    x: &Array,
+    rope: &nn::Rope,
+    cache: &C,
+) -> Result<Array, Exception> {
+    cache.rope_positions().map_or_else(
+        || apply_rope(x, rope, cache.offset()),
+        |positions| {
+            mlx_rs::fast::rope_dynamic(
+                x,
+                rope.dimensions,
+                rope.traditional,
+                rope.base,
+                rope.scale,
+                &positions,
+                None,
+            )
+        },
+    )
+}
+
 /// Attention mask variant.
 #[derive(Debug, Clone)]
 pub(crate) enum AttentionMask {

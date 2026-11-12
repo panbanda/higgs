@@ -307,7 +307,7 @@ static PHI3: BuiltinAdapter = BuiltinAdapter {
     id: "phi3",
     family: phi,
     version_range: "Phi 3.x",
-    capabilities: caps(false, false, false, false, false),
+    capabilities: caps(false, false, false, false, true),
     notes: "Phi-3",
     kind: LoadKind::Phi3,
 };
@@ -315,7 +315,7 @@ static STARCODER2: BuiltinAdapter = BuiltinAdapter {
     id: "starcoder2",
     family: starcoder,
     version_range: "Starcoder 2.x",
-    capabilities: caps(false, false, false, false, false),
+    capabilities: caps(false, false, false, false, true),
     notes: "Starcoder2",
     kind: LoadKind::Starcoder2,
 };
