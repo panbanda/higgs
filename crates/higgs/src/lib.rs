@@ -9,6 +9,7 @@ pub mod error;
 pub mod metrics;
 pub mod metrics_log;
 pub mod model_download;
+pub mod model_pool;
 pub mod model_resolver;
 pub mod proxy;
 pub(crate) mod reasoning;
