@@ -31,7 +31,7 @@ use std::time::Instant;
 use axum::{
     Router,
     extract::DefaultBodyLimit,
-    extract::{ConnectInfo, Request},
+    extract::{ConnectInfo, Extension, Request},
     http::{HeaderValue, StatusCode},
     middleware::{self, Next},
     response::Response,
@@ -84,7 +84,8 @@ pub fn build_router(
         .route(
             "/v1/messages/count_tokens",
             post(routes::anthropic::count_tokens),
-        );
+        )
+        .merge(responses_routes());
 
     if let Some(rpm) = NonZeroU32::new(rate_limit) {
         let limiter: SharedRateLimiter = Arc::new(RateLimiter::keyed(Quota::per_minute(rpm)));
@@ -124,6 +125,18 @@ pub fn build_router(
     }));
 
     router.with_state(state)
+}
+
+fn responses_routes() -> Router<SharedState> {
+    Router::new()
+        .route("/v1/responses", post(routes::responses::create_response))
+        .route(
+            "/v1/responses/{id}",
+            get(routes::responses::get_response).delete(routes::responses::delete_response),
+        )
+        .layer(Extension(Arc::new(
+            responses::store::ResponseStore::default(),
+        )))
 }
 
 async fn record_http_response(
