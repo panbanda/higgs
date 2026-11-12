@@ -1,0 +1,1254 @@
+//! Translation between the Responses API and the internal chat request and
+//! response types that the shared generation path speaks.
+
+use serde_json::{Value, json};
+
+use crate::error::ServerError;
+use crate::types::openai::{
+    ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse, ContentPart as ChatPart,
+    ImageUrl, MessageContent, ResponseFormat, StreamOptions, ToolCall, ToolCallFunction,
+};
+use crate::types::responses::{
+    ContentPart, CreateResponseRequest, IncompleteDetails, InputContent, InputItem, Metadata,
+    OutputItem, ResponseError, ResponseInput, ResponseObject, ResponseStatus, ResponseUsage,
+    TextConfig,
+};
+
+const SUPPORTED_ROLES: &[&str] = &["user", "assistant", "system", "developer"];
+
+pub fn generate_response_id() -> String {
+    format!("resp_{}", uuid::Uuid::new_v4().simple())
+}
+
+pub fn generate_item_id(prefix: &str) -> String {
+    format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
+}
+
+const fn bad_request(message: String) -> ServerError {
+    ServerError::BadRequest(message)
+}
+
+/// Validate the `input` field into [`InputItem`]s.
+///
+/// `allow_images` is true only for vision models; otherwise an `input_image`
+/// part is rejected instead of being dropped.
+pub fn parse_input(
+    input: Option<ResponseInput>,
+    allow_images: bool,
+) -> Result<Vec<InputItem>, ServerError> {
+    match input {
+        None => Err(bad_request("input is required".to_owned())),
+        Some(ResponseInput::Text(text)) => Ok(vec![InputItem::Message {
+            role: "user".to_owned(),
+            content: vec![InputContent::Text(text)],
+        }]),
+        Some(ResponseInput::Items(values)) => {
+            let mut items = Vec::with_capacity(values.len());
+            for (index, value) in values.iter().enumerate() {
+                if let Some(item) = parse_item(index, value, allow_images)? {
+                    items.push(item);
+                }
+            }
+            Ok(items)
+        }
+    }
+}
+
+/// `Ok(None)` marks an item that is valid but intentionally not replayed to
+/// the model: prior `reasoning` items, which clients echo back verbatim.
+fn parse_item(
+    index: usize,
+    value: &Value,
+    allow_images: bool,
+) -> Result<Option<InputItem>, ServerError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| bad_request(format!("input[{index}] must be an object")))?;
+    let required_string = |field: &str| -> Result<String, ServerError> {
+        object
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| bad_request(format!("input[{index}].{field} must be a string")))
+    };
+
+    match object.get("type").and_then(Value::as_str) {
+        None | Some("message") => parse_message(index, object, allow_images).map(Some),
+        Some("function_call") => {
+            let arguments = match object.get("arguments") {
+                Some(Value::String(text)) => text.clone(),
+                Some(other) if !other.is_null() => other.to_string(),
+                Some(_) | None => "{}".to_owned(),
+            };
+            Ok(Some(InputItem::FunctionCall {
+                call_id: required_string("call_id")?,
+                name: required_string("name")?,
+                arguments,
+            }))
+        }
+        Some("function_call_output") => Ok(Some(InputItem::FunctionCallOutput {
+            call_id: required_string("call_id")?,
+            output: function_output_text(object.get("output")),
+        })),
+        Some("reasoning") => Ok(None),
+        Some(other) => Err(bad_request(format!(
+            "Unsupported input item type '{other}' at input[{index}]; supported types are \
+             message, function_call, function_call_output and reasoning"
+        ))),
+    }
+}
+
+fn function_output_text(output: Option<&Value>) -> String {
+    match output {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => {
+            let texts: Vec<&str> = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect();
+            if texts.len() == parts.len() {
+                texts.join("")
+            } else {
+                Value::Array(parts.clone()).to_string()
+            }
+        }
+        Some(other) => other.to_string(),
+    }
+}
+
+fn parse_message(
+    index: usize,
+    object: &serde_json::Map<String, Value>,
+    allow_images: bool,
+) -> Result<InputItem, ServerError> {
+    let role = object
+        .get("role")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad_request(format!("input[{index}].role must be a string")))?;
+    if !SUPPORTED_ROLES.contains(&role) {
+        return Err(bad_request(format!(
+            "Unsupported role '{role}' at input[{index}]; supported roles are user, assistant, \
+             system and developer"
+        )));
+    }
+
+    let content = match object.get("content") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(text)) => vec![InputContent::Text(text.clone())],
+        Some(Value::Array(parts)) => {
+            let mut content = Vec::with_capacity(parts.len());
+            for (part_index, part) in parts.iter().enumerate() {
+                content.push(parse_content_part(index, part_index, part, allow_images)?);
+            }
+            content
+        }
+        Some(_) => {
+            return Err(bad_request(format!(
+                "input[{index}].content must be a string or an array of content parts"
+            )));
+        }
+    };
+
+    Ok(InputItem::Message {
+        role: role.to_owned(),
+        content,
+    })
+}
+
+fn parse_content_part(
+    index: usize,
+    part_index: usize,
+    part: &Value,
+    allow_images: bool,
+) -> Result<InputContent, ServerError> {
+    let location = format!("input[{index}].content[{part_index}]");
+    let part_type = part
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad_request(format!("{location}.type must be a string")))?;
+    match part_type {
+        "input_text" | "output_text" => part
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| InputContent::Text(text.to_owned()))
+            .ok_or_else(|| bad_request(format!("{location}.text must be a string"))),
+        "input_image" => {
+            if !allow_images {
+                return Err(bad_request(format!(
+                    "Unsupported content part type 'input_image' at {location}: the model is not \
+                     a vision model"
+                )));
+            }
+            let url = part
+                .get("image_url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    bad_request(format!(
+                        "{location}.image_url must be a string (file_id images are not supported)"
+                    ))
+                })?;
+            if !url.starts_with("data:") {
+                return Err(bad_request(format!(
+                    "{location}.image_url must be a base64 data URI; remote image URLs are not \
+                     supported"
+                )));
+            }
+            Ok(InputContent::ImageUrl(url.to_owned()))
+        }
+        other => Err(bad_request(format!(
+            "Unsupported content part type '{other}' at {location}; supported types are \
+             input_text, output_text and input_image"
+        ))),
+    }
+}
+
+/// Convert Responses function tools to the chat `tools` shape.
+pub fn convert_tools(tools: &[Value]) -> Result<Vec<Value>, ServerError> {
+    tools
+        .iter()
+        .enumerate()
+        .map(|(index, tool)| {
+            let tool_type = tool
+                .get("type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| bad_request(format!("tools[{index}].type must be a string")))?;
+            if tool_type != "function" {
+                return Err(bad_request(format!(
+                    "Unsupported tool type '{tool_type}' at tools[{index}]; only function tools \
+                     are supported"
+                )));
+            }
+            let name = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| bad_request(format!("tools[{index}].name must be a string")))?;
+            let mut function = json!({ "name": name });
+            for field in ["description", "parameters"] {
+                if let Some(value) = tool.get(field).filter(|value| !value.is_null())
+                    && let Some(target) = function.as_object_mut()
+                {
+                    target.insert(field.to_owned(), value.clone());
+                }
+            }
+            Ok(json!({ "type": "function", "function": function }))
+        })
+        .collect()
+}
+
+/// Whether the model may call tools.
+///
+/// Only `auto` and `none` can be honored: the engine has no way to force or
+/// restrict a call, so `required` and named-tool choices are rejected rather
+/// than silently downgraded.
+pub fn tools_enabled(tool_choice: Option<&Value>) -> Result<bool, ServerError> {
+    match tool_choice {
+        None | Some(Value::Null) => Ok(true),
+        Some(Value::String(choice)) => match choice.as_str() {
+            "auto" => Ok(true),
+            "none" => Ok(false),
+            "required" => Err(bad_request(
+                "tool_choice 'required' is not supported; use 'auto' or 'none'".to_owned(),
+            )),
+            other => Err(bad_request(format!("Unknown tool_choice '{other}'"))),
+        },
+        Some(other) => {
+            let kind = other
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("object");
+            Err(bad_request(format!(
+                "tool_choice of type '{kind}' is not supported; use 'auto' or 'none'"
+            )))
+        }
+    }
+}
+
+pub fn convert_text_format(
+    text: Option<&TextConfig>,
+) -> Result<Option<ResponseFormat>, ServerError> {
+    let Some(format) = text.and_then(|config| config.format.as_ref()) else {
+        return Ok(None);
+    };
+    match format.r#type.as_str() {
+        "text" => Ok(None),
+        "json_object" => Ok(Some(ResponseFormat {
+            r#type: "json_object".to_owned(),
+            json_schema: None,
+        })),
+        "json_schema" => {
+            let schema = format.schema.clone().ok_or_else(|| {
+                bad_request("text.format of type 'json_schema' requires a schema".to_owned())
+            })?;
+            Ok(Some(ResponseFormat {
+                r#type: "json_schema".to_owned(),
+                json_schema: Some(json!({
+                    "name": format.name.as_deref().unwrap_or("response"),
+                    "schema": schema,
+                })),
+            }))
+        }
+        other => Err(bad_request(format!(
+            "Unsupported text.format type '{other}'; supported types are text, json_object and \
+             json_schema"
+        ))),
+    }
+}
+
+/// Reject request fields that would change behavior if silently ignored.
+pub fn reject_unsupported_fields(request: &CreateResponseRequest) -> Result<(), ServerError> {
+    if request.background == Some(true) {
+        return Err(bad_request(
+            "background responses are not supported".to_owned(),
+        ));
+    }
+    if request
+        .conversation
+        .as_ref()
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err(bad_request(
+            "conversation is not supported; use previous_response_id to chain responses".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn text_of(content: &[InputContent]) -> String {
+    content
+        .iter()
+        .filter_map(|part| match part {
+            InputContent::Text(text) => Some(text.as_str()),
+            InputContent::ImageUrl(_) => None,
+        })
+        .collect()
+}
+
+fn chat_content(content: &[InputContent]) -> Option<MessageContent> {
+    if content.is_empty() {
+        return None;
+    }
+    let has_image = content
+        .iter()
+        .any(|part| matches!(part, InputContent::ImageUrl(_)));
+    if !has_image {
+        return Some(MessageContent::Text(text_of(content)));
+    }
+    Some(MessageContent::Parts(
+        content
+            .iter()
+            .map(|part| match part {
+                InputContent::Text(text) => ChatPart::Text { text: text.clone() },
+                InputContent::ImageUrl(url) => ChatPart::ImageUrl {
+                    image_url: ImageUrl { url: url.clone() },
+                },
+            })
+            .collect(),
+    ))
+}
+
+fn chat_message(role: &str) -> ChatCompletionMessage {
+    ChatCompletionMessage {
+        role: role.to_owned(),
+        content: None,
+        reasoning_content: None,
+        tool_calls: None,
+        tool_call_id: None,
+    }
+}
+
+/// Flatten instructions plus the conversation into chat messages.
+///
+/// Consecutive `function_call` items collapse into one assistant message
+/// (parallel tool calls), and a call that directly follows assistant text
+/// joins that message, matching how the model produced them.
+pub fn items_to_messages(
+    instructions: Option<&str>,
+    items: &[InputItem],
+) -> Vec<ChatCompletionMessage> {
+    let mut messages = Vec::with_capacity(items.len() + 1);
+    if let Some(text) = instructions.filter(|text| !text.is_empty()) {
+        messages.push(ChatCompletionMessage {
+            content: Some(MessageContent::Text(text.to_owned())),
+            ..chat_message("system")
+        });
+    }
+    for item in items {
+        match item {
+            InputItem::Message { role, content } => {
+                let chat_role = if role == "developer" { "system" } else { role };
+                messages.push(ChatCompletionMessage {
+                    content: chat_content(content),
+                    ..chat_message(chat_role)
+                });
+            }
+            InputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => {
+                let call = ToolCall {
+                    id: call_id.clone(),
+                    r#type: "function".to_owned(),
+                    function: ToolCallFunction {
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                    },
+                };
+                match messages.last_mut() {
+                    Some(last) if last.role == "assistant" => {
+                        last.tool_calls.get_or_insert_with(Vec::new).push(call);
+                    }
+                    Some(_) | None => messages.push(ChatCompletionMessage {
+                        tool_calls: Some(vec![call]),
+                        ..chat_message("assistant")
+                    }),
+                }
+            }
+            InputItem::FunctionCallOutput { call_id, output } => {
+                messages.push(ChatCompletionMessage {
+                    content: Some(MessageContent::Text(output.clone())),
+                    tool_call_id: Some(call_id.clone()),
+                    ..chat_message("tool")
+                });
+            }
+        }
+    }
+    messages
+}
+
+/// Build the chat request that drives generation for a Responses request.
+pub fn build_chat_request(
+    request: &CreateResponseRequest,
+    model: &str,
+    conversation: &[InputItem],
+) -> Result<ChatCompletionRequest, ServerError> {
+    let streaming = request.stream == Some(true);
+    let tools = if tools_enabled(request.tool_choice.as_ref())? {
+        match request.tools.as_deref() {
+            Some(tools) if !tools.is_empty() => Some(convert_tools(tools)?),
+            Some(_) | None => None,
+        }
+    } else {
+        None
+    };
+    Ok(ChatCompletionRequest {
+        model: model.to_owned(),
+        messages: items_to_messages(request.instructions.as_deref(), conversation),
+        max_tokens: request.max_output_tokens,
+        temperature: request.temperature,
+        top_p: request.top_p,
+        stream: Some(streaming),
+        stream_options: streaming.then_some(StreamOptions {
+            include_usage: Some(true),
+        }),
+        tools,
+        response_format: convert_text_format(request.text.as_ref())?,
+        reasoning: request.reasoning.clone(),
+        return_progress: streaming.then_some(true),
+        ..ChatCompletionRequest::default()
+    })
+}
+
+/// Per-request values echoed in every Response object.
+#[derive(Debug, Clone)]
+pub struct ResponseContext {
+    pub id: String,
+    pub created_at: i64,
+    pub model: String,
+    pub instructions: Option<String>,
+    pub metadata: Metadata,
+    pub previous_response_id: Option<String>,
+    pub tools: Vec<Value>,
+    pub tool_choice: Value,
+    pub parallel_tool_calls: bool,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub max_output_tokens: Option<u32>,
+}
+
+/// How a response ended, plus what it produced.
+#[derive(Debug, Clone)]
+pub struct Outcome {
+    pub status: ResponseStatus,
+    pub output: Vec<OutputItem>,
+    pub usage: Option<ResponseUsage>,
+    pub incomplete_reason: Option<String>,
+    pub error: Option<ResponseError>,
+}
+
+impl Outcome {
+    pub const fn in_progress() -> Self {
+        Self {
+            status: ResponseStatus::InProgress,
+            output: Vec::new(),
+            usage: None,
+            incomplete_reason: None,
+            error: None,
+        }
+    }
+}
+
+impl ResponseContext {
+    pub fn from_request(request: &CreateResponseRequest, model: String) -> Self {
+        Self {
+            id: generate_response_id(),
+            created_at: chrono::Utc::now().timestamp(),
+            model,
+            instructions: request.instructions.clone(),
+            metadata: request.metadata.clone().unwrap_or_default(),
+            previous_response_id: request.previous_response_id.clone(),
+            tools: request.tools.clone().unwrap_or_default(),
+            tool_choice: request
+                .tool_choice
+                .clone()
+                .unwrap_or_else(|| Value::String("auto".to_owned())),
+            parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
+            temperature: request.temperature,
+            top_p: request.top_p,
+            max_output_tokens: request.max_output_tokens,
+        }
+    }
+
+    pub fn object(&self, outcome: Outcome) -> ResponseObject {
+        let output_text = outcome
+            .output
+            .iter()
+            .filter_map(|item| match item {
+                OutputItem::Message { content, .. } => Some(content),
+                OutputItem::Reasoning { .. } | OutputItem::FunctionCall { .. } => None,
+            })
+            .flatten()
+            .filter_map(|part| match part {
+                ContentPart::OutputText { text, .. } => Some(text.as_str()),
+                ContentPart::ReasoningText { .. } => None,
+            })
+            .collect();
+        ResponseObject {
+            id: self.id.clone(),
+            object: "response",
+            created_at: self.created_at,
+            status: outcome.status,
+            model: self.model.clone(),
+            output: outcome.output,
+            output_text,
+            usage: outcome.usage,
+            incomplete_details: outcome
+                .incomplete_reason
+                .map(|reason| IncompleteDetails { reason }),
+            error: outcome.error,
+            instructions: self.instructions.clone(),
+            metadata: self.metadata.clone(),
+            previous_response_id: self.previous_response_id.clone(),
+            tools: self.tools.clone(),
+            tool_choice: self.tool_choice.clone(),
+            parallel_tool_calls: self.parallel_tool_calls,
+            temperature: self.temperature,
+            top_p: self.top_p,
+            max_output_tokens: self.max_output_tokens,
+        }
+    }
+}
+
+/// Map a chat `finish_reason` to a response status and incomplete reason.
+pub fn status_for_finish_reason(finish_reason: &str) -> (ResponseStatus, Option<String>) {
+    match finish_reason {
+        "length" => (
+            ResponseStatus::Incomplete,
+            Some("max_output_tokens".to_owned()),
+        ),
+        "content_filter" => (
+            ResponseStatus::Incomplete,
+            Some("content_filter".to_owned()),
+        ),
+        _ => (ResponseStatus::Completed, None),
+    }
+}
+
+/// Build the output items of a non-streaming chat response.
+pub fn outcome_from_chat(response: ChatCompletionResponse) -> Outcome {
+    let Some(choice) = response.choices.into_iter().next() else {
+        return Outcome {
+            status: ResponseStatus::Failed,
+            output: Vec::new(),
+            usage: None,
+            incomplete_reason: None,
+            error: Some(ResponseError {
+                code: "server_error".to_owned(),
+                message: "generation produced no output".to_owned(),
+            }),
+        };
+    };
+    let (status, incomplete_reason) = status_for_finish_reason(&choice.finish_reason);
+    let message = choice.message;
+
+    let mut output = Vec::new();
+    let has_reasoning = message
+        .reasoning_content
+        .as_deref()
+        .is_some_and(|text| !text.is_empty());
+    if let Some(reasoning) = message.reasoning_content.filter(|text| !text.is_empty()) {
+        output.push(OutputItem::Reasoning {
+            id: generate_item_id("rs"),
+            summary: Vec::new(),
+            content: vec![ContentPart::ReasoningText { text: reasoning }],
+            status: ResponseStatus::Completed,
+        });
+    }
+    let text = message
+        .content
+        .as_ref()
+        .map(MessageContent::text)
+        .unwrap_or_default();
+    let calls = message.tool_calls.unwrap_or_default();
+    if !text.is_empty() || (!has_reasoning && calls.is_empty()) {
+        output.push(OutputItem::Message {
+            id: generate_item_id("msg"),
+            role: "assistant",
+            content: vec![ContentPart::output_text(text)],
+            status: ResponseStatus::Completed,
+        });
+    }
+    for call in calls {
+        output.push(OutputItem::FunctionCall {
+            id: generate_item_id("fc"),
+            call_id: call.id,
+            name: call.function.name,
+            arguments: call.function.arguments,
+            status: ResponseStatus::Completed,
+        });
+    }
+    if status == ResponseStatus::Incomplete
+        && let Some(last) = output.last_mut()
+    {
+        set_item_status(last, ResponseStatus::Incomplete);
+    }
+
+    Outcome {
+        status,
+        output,
+        usage: Some(ResponseUsage {
+            input_tokens: response.usage.prompt_tokens,
+            output_tokens: response.usage.completion_tokens,
+            total_tokens: response.usage.total_tokens,
+            input_tokens_details: None,
+            output_tokens_details: None,
+        }),
+        incomplete_reason,
+        error: None,
+    }
+}
+
+pub const fn set_item_status(item: &mut OutputItem, new_status: ResponseStatus) {
+    match item {
+        OutputItem::Reasoning { status, .. }
+        | OutputItem::Message { status, .. }
+        | OutputItem::FunctionCall { status, .. } => *status = new_status,
+    }
+}
+
+/// Convert a finished turn's output back into input items so a later request
+/// can chain from it. Reasoning is not replayed.
+pub fn output_to_input_items(output: &[OutputItem]) -> Vec<InputItem> {
+    output
+        .iter()
+        .filter_map(|item| match item {
+            OutputItem::Message { content, .. } => {
+                let text: String = content
+                    .iter()
+                    .filter_map(|part| match part {
+                        ContentPart::OutputText { text, .. } => Some(text.as_str()),
+                        ContentPart::ReasoningText { .. } => None,
+                    })
+                    .collect();
+                (!text.is_empty()).then(|| InputItem::Message {
+                    role: "assistant".to_owned(),
+                    content: vec![InputContent::Text(text)],
+                })
+            }
+            OutputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+                ..
+            } => Some(InputItem::FunctionCall {
+                call_id: call_id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+            }),
+            OutputItem::Reasoning { .. } => None,
+        })
+        .collect()
+}
+
+/// Best-effort `role`/`content` view of the input for model auto-routing,
+/// which runs before strict validation (a remote provider may understand
+/// items that local translation rejects).
+pub fn routing_messages(input: Option<&ResponseInput>) -> Option<Vec<Value>> {
+    let messages: Vec<Value> = match input? {
+        ResponseInput::Text(text) => vec![json!({ "role": "user", "content": text })],
+        ResponseInput::Items(values) => values
+            .iter()
+            .filter_map(|value| {
+                let role = value.get("role")?.as_str()?;
+                let content = match value.get("content")? {
+                    Value::String(text) => text.clone(),
+                    Value::Array(parts) => parts
+                        .iter()
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .collect(),
+                    Value::Null | Value::Bool(_) | Value::Number(_) | Value::Object(_) => {
+                        return None;
+                    }
+                };
+                Some(json!({ "role": role, "content": content }))
+            })
+            .collect(),
+    };
+    Some(messages)
+}
+
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::wildcard_enum_match_arm
+)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::openai::{
+        ChatCompletionChoice, ChatCompletionMessage as ChatMessage, CompletionUsage,
+    };
+
+    fn request(value: Value) -> CreateResponseRequest {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn parse(value: &Value) -> Vec<InputItem> {
+        let parsed = request(json!({"model": "m", "input": value}));
+        parse_input(parsed.input, false).unwrap()
+    }
+
+    fn parse_error(value: &Value, allow_images: bool) -> String {
+        let parsed = request(json!({"model": "m", "input": value}));
+        match parse_input(parsed.input, allow_images) {
+            Err(ServerError::BadRequest(message)) => message,
+            other => panic!("expected bad request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn string_input_becomes_one_user_message() {
+        let items = parse(&json!("hello"));
+        assert_eq!(
+            items,
+            vec![InputItem::Message {
+                role: "user".to_owned(),
+                content: vec![InputContent::Text("hello".to_owned())],
+            }]
+        );
+    }
+
+    #[test]
+    fn missing_input_is_rejected() {
+        let parsed = request(json!({"model": "m"}));
+        assert!(matches!(
+            parse_input(parsed.input, false),
+            Err(ServerError::BadRequest(message)) if message == "input is required"
+        ));
+    }
+
+    #[test]
+    fn mixed_items_translate_to_chat_messages() {
+        let items = parse(&json!([
+            {"role": "developer", "content": "be terse"},
+            {"role": "user", "content": [{"type": "input_text", "text": "weather in "}, {"type": "input_text", "text": "Paris?"}]},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Checking."}]},
+            {"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+            {"type": "function_call", "call_id": "call_2", "name": "get_time", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "sunny"},
+            {"type": "function_call_output", "call_id": "call_2", "output": [{"type": "output_text", "text": "noon"}]},
+            {"type": "reasoning", "id": "rs_1", "summary": []}
+        ]));
+        let messages = items_to_messages(Some("You are helpful."), &items);
+
+        let roles: Vec<&str> = messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["system", "system", "user", "assistant", "tool", "tool"]
+        );
+        assert_eq!(
+            messages[0].content.as_ref().unwrap().text(),
+            "You are helpful."
+        );
+        assert_eq!(messages[1].content.as_ref().unwrap().text(), "be terse");
+        assert_eq!(
+            messages[2].content.as_ref().unwrap().text(),
+            "weather in Paris?"
+        );
+
+        let assistant = &messages[3];
+        assert_eq!(assistant.content.as_ref().unwrap().text(), "Checking.");
+        let calls = assistant.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[1].id, "call_2");
+
+        assert_eq!(messages[4].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(messages[4].content.as_ref().unwrap().text(), "sunny");
+        assert_eq!(messages[5].content.as_ref().unwrap().text(), "noon");
+    }
+
+    #[test]
+    fn function_call_without_preceding_assistant_gets_its_own_message() {
+        let items = parse(&json!([
+            {"role": "user", "content": "hi"},
+            {"type": "function_call", "call_id": "c", "name": "f", "arguments": "{}"}
+        ]));
+        let messages = items_to_messages(None, &items);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, "assistant");
+        assert!(messages[1].content.is_none());
+        assert_eq!(messages[1].tool_calls.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn empty_instructions_add_no_system_message() {
+        let items = parse(&json!("hi"));
+        assert_eq!(items_to_messages(Some(""), &items).len(), 1);
+    }
+
+    #[test]
+    fn previous_turn_is_prepended_to_new_input() {
+        let history = vec![
+            InputItem::Message {
+                role: "user".to_owned(),
+                content: vec![InputContent::Text("first".to_owned())],
+            },
+            InputItem::Message {
+                role: "assistant".to_owned(),
+                content: vec![InputContent::Text("answer".to_owned())],
+            },
+        ];
+        let mut conversation = history;
+        conversation.extend(parse(&json!("second")));
+        let chat = build_chat_request(
+            &request(json!({"model": "m", "input": "second", "instructions": "sys"})),
+            "m",
+            &conversation,
+        )
+        .unwrap();
+        let texts: Vec<(String, String)> = chat
+            .messages
+            .iter()
+            .map(|m| (m.role.clone(), m.content.as_ref().unwrap().text()))
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                ("system".to_owned(), "sys".to_owned()),
+                ("user".to_owned(), "first".to_owned()),
+                ("assistant".to_owned(), "answer".to_owned()),
+                ("user".to_owned(), "second".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn output_items_round_trip_into_input_items() {
+        let output = vec![
+            OutputItem::Reasoning {
+                id: "rs_1".to_owned(),
+                summary: vec![],
+                content: vec![ContentPart::ReasoningText {
+                    text: "hmm".to_owned(),
+                }],
+                status: ResponseStatus::Completed,
+            },
+            OutputItem::Message {
+                id: "msg_1".to_owned(),
+                role: "assistant",
+                content: vec![ContentPart::output_text("hello".to_owned())],
+                status: ResponseStatus::Completed,
+            },
+            OutputItem::FunctionCall {
+                id: "fc_1".to_owned(),
+                call_id: "call_1".to_owned(),
+                name: "f".to_owned(),
+                arguments: "{}".to_owned(),
+                status: ResponseStatus::Completed,
+            },
+        ];
+        assert_eq!(
+            output_to_input_items(&output),
+            vec![
+                InputItem::Message {
+                    role: "assistant".to_owned(),
+                    content: vec![InputContent::Text("hello".to_owned())],
+                },
+                InputItem::FunctionCall {
+                    call_id: "call_1".to_owned(),
+                    name: "f".to_owned(),
+                    arguments: "{}".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unsupported_item_type_is_named() {
+        let message = parse_error(&json!([{"type": "web_search_call", "id": "x"}]), false);
+        assert!(message.contains("'web_search_call'"), "{message}");
+        assert!(message.contains("input[0]"), "{message}");
+    }
+
+    #[test]
+    fn unsupported_role_is_named() {
+        let message = parse_error(&json!([{"role": "critic", "content": "x"}]), false);
+        assert!(message.contains("'critic'"), "{message}");
+    }
+
+    #[test]
+    fn malformed_items_are_rejected() {
+        assert!(parse_error(&json!(["text"]), false).contains("must be an object"));
+        assert!(parse_error(&json!([{"content": "x"}]), false).contains("role"));
+        assert!(parse_error(&json!([{"role": "user", "content": 5}]), false).contains("content"));
+        assert!(
+            parse_error(&json!([{"type": "function_call", "name": "f"}]), false)
+                .contains("call_id")
+        );
+    }
+
+    #[test]
+    fn unsupported_content_part_is_named() {
+        let message = parse_error(
+            &json!([{"role": "user", "content": [{"type": "input_file", "file_id": "f"}]}]),
+            false,
+        );
+        assert!(message.contains("'input_file'"), "{message}");
+        assert!(message.contains("input[0].content[0]"), "{message}");
+    }
+
+    #[test]
+    fn images_require_a_vision_model() {
+        let input = json!([{"role": "user", "content": [
+            {"type": "input_text", "text": "what is this"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+        ]}]);
+        let message = parse_error(&input, false);
+        assert!(message.contains("input_image"), "{message}");
+        assert!(message.contains("not a vision model"), "{message}");
+
+        let parsed = request(json!({"model": "m", "input": input}));
+        let items = parse_input(parsed.input, true).unwrap();
+        let messages = items_to_messages(None, &items);
+        let content = messages[0].content.as_ref().unwrap();
+        assert!(content.has_images());
+        assert_eq!(content.text(), "what is this");
+    }
+
+    #[test]
+    fn remote_image_urls_are_rejected_for_vision_models() {
+        let parsed = request(json!({"model": "m", "input": [{"role": "user", "content": [
+            {"type": "input_image", "image_url": "https://example.com/cat.png"}
+        ]}]}));
+        match parse_input(parsed.input, true) {
+            Err(ServerError::BadRequest(message)) => {
+                assert!(message.contains("data URI"), "{message}");
+            }
+            other => panic!("expected bad request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_tools_convert_to_the_chat_shape() {
+        let tools = convert_tools(&[json!({
+            "type": "function",
+            "name": "get_weather",
+            "description": "Look up weather",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+            "strict": true
+        })])
+        .unwrap();
+        assert_eq!(
+            tools[0],
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Look up weather",
+                    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn non_function_tools_are_rejected_by_name() {
+        for tool_type in ["web_search", "file_search", "code_interpreter", "mcp"] {
+            let error = convert_tools(&[json!({"type": tool_type})]).unwrap_err();
+            match error {
+                ServerError::BadRequest(message) => {
+                    assert!(message.contains(&format!("'{tool_type}'")), "{message}");
+                }
+                other => panic!("unexpected error {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn tool_choice_support_matches_what_the_engine_can_honor() {
+        assert!(tools_enabled(None).unwrap());
+        assert!(tools_enabled(Some(&json!("auto"))).unwrap());
+        assert!(!tools_enabled(Some(&json!("none"))).unwrap());
+        assert!(tools_enabled(Some(&json!("required"))).is_err());
+        assert!(tools_enabled(Some(&json!({"type": "function", "name": "f"}))).is_err());
+        assert!(tools_enabled(Some(&json!("bogus"))).is_err());
+    }
+
+    #[test]
+    fn tool_choice_none_drops_tools_from_the_chat_request() {
+        let chat = build_chat_request(
+            &request(json!({
+                "model": "m", "input": "hi", "tool_choice": "none",
+                "tools": [{"type": "function", "name": "f"}]
+            })),
+            "m",
+            &[],
+        )
+        .unwrap();
+        assert!(chat.tools.is_none());
+    }
+
+    #[test]
+    fn text_format_maps_to_response_format() {
+        let schema = json!({"type": "object", "properties": {"a": {"type": "string"}}});
+        let format = convert_text_format(
+            request(json!({"model": "m", "input": "x", "text": {"format": {
+                "type": "json_schema", "name": "thing", "schema": schema
+            }}}))
+            .text
+            .as_ref(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(format.r#type, "json_schema");
+        assert_eq!(
+            format.json_schema.unwrap(),
+            json!({"name": "thing", "schema": schema})
+        );
+
+        let object = convert_text_format(
+            request(
+                json!({"model": "m", "input": "x", "text": {"format": {"type": "json_object"}}}),
+            )
+            .text
+            .as_ref(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(object.r#type, "json_object");
+
+        assert!(
+            convert_text_format(
+                request(json!({"model": "m", "input": "x", "text": {"format": {"type": "text"}}}))
+                    .text
+                    .as_ref()
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn invalid_text_formats_are_rejected() {
+        for format in [json!({"type": "json_schema"}), json!({"type": "xml"})] {
+            let parsed = request(json!({"model": "m", "input": "x", "text": {"format": format}}));
+            assert!(convert_text_format(parsed.text.as_ref()).is_err());
+        }
+    }
+
+    #[test]
+    fn unsupported_request_fields_are_rejected() {
+        assert!(
+            reject_unsupported_fields(&request(json!({"model": "m", "background": true}))).is_err()
+        );
+        assert!(
+            reject_unsupported_fields(&request(json!({"model": "m", "conversation": "conv_1"})))
+                .is_err()
+        );
+        assert!(
+            reject_unsupported_fields(&request(json!({"model": "m", "background": false}))).is_ok()
+        );
+    }
+
+    #[test]
+    fn chat_request_carries_sampling_and_streaming_options() {
+        let chat = build_chat_request(
+            &request(json!({
+                "model": "m", "input": "hi", "stream": true, "max_output_tokens": 64,
+                "temperature": 0.2, "top_p": 0.9, "reasoning": {"effort": "low"}
+            })),
+            "resolved",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(chat.model, "resolved");
+        assert_eq!(chat.max_tokens, Some(64));
+        assert_eq!(chat.stream, Some(true));
+        assert_eq!(chat.stream_options.unwrap().include_usage, Some(true));
+        assert_eq!(chat.return_progress, Some(true));
+        assert_eq!(chat.reasoning.unwrap().effort.as_deref(), Some("low"));
+    }
+
+    fn chat_response(
+        message: ChatMessage,
+        finish_reason: &str,
+        usage: (u32, u32),
+    ) -> ChatCompletionResponse {
+        ChatCompletionResponse {
+            id: "chatcmpl-1".to_owned(),
+            object: "chat.completion",
+            created: 0,
+            model: "m".to_owned(),
+            choices: vec![ChatCompletionChoice {
+                index: 0,
+                message,
+                finish_reason: finish_reason.to_owned(),
+                logprobs: None,
+            }],
+            usage: CompletionUsage {
+                prompt_tokens: usage.0,
+                completion_tokens: usage.1,
+                total_tokens: usage.0 + usage.1,
+            },
+        }
+    }
+
+    fn assistant(content: Option<&str>) -> ChatMessage {
+        ChatMessage {
+            content: content.map(|text| MessageContent::Text(text.to_owned())),
+            ..chat_message("assistant")
+        }
+    }
+
+    fn context() -> ResponseContext {
+        ResponseContext::from_request(
+            &request(json!({
+                "model": "m", "input": "hi", "instructions": "sys",
+                "metadata": {"k": "v"}, "previous_response_id": "resp_prev"
+            })),
+            "m".to_owned(),
+        )
+    }
+
+    #[test]
+    fn text_response_builds_message_item_with_usage_and_echoes() {
+        let outcome = outcome_from_chat(chat_response(assistant(Some("Hello!")), "stop", (7, 3)));
+        let object = context().object(outcome);
+
+        assert!(object.id.starts_with("resp_"));
+        assert_eq!(object.status, ResponseStatus::Completed);
+        assert_eq!(object.output_text, "Hello!");
+        assert_eq!(object.output.len(), 1);
+        let usage = object.usage.as_ref().unwrap();
+        assert_eq!(
+            (usage.input_tokens, usage.output_tokens, usage.total_tokens),
+            (7, 3, 10)
+        );
+        assert!(usage.input_tokens_details.is_none());
+        assert!(usage.output_tokens_details.is_none());
+        assert_eq!(object.instructions.as_deref(), Some("sys"));
+        assert_eq!(object.metadata["k"], "v");
+        assert_eq!(object.previous_response_id.as_deref(), Some("resp_prev"));
+        assert!(object.incomplete_details.is_none());
+    }
+
+    #[test]
+    fn reasoning_and_tool_calls_become_separate_items_in_order() {
+        let mut message = assistant(Some("Let me check."));
+        message.reasoning_content = Some("need weather".to_owned());
+        message.tool_calls = Some(vec![ToolCall {
+            id: "call_0_x".to_owned(),
+            r#type: "function".to_owned(),
+            function: ToolCallFunction {
+                name: "get_weather".to_owned(),
+                arguments: "{\"city\":\"Paris\"}".to_owned(),
+            },
+        }]);
+        let outcome = outcome_from_chat(chat_response(message, "tool_calls", (1, 1)));
+        let kinds: Vec<&str> = outcome
+            .output
+            .iter()
+            .map(|item| match item {
+                OutputItem::Reasoning { .. } => "reasoning",
+                OutputItem::Message { .. } => "message",
+                OutputItem::FunctionCall { .. } => "function_call",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["reasoning", "message", "function_call"]);
+        assert_eq!(outcome.status, ResponseStatus::Completed);
+        match &outcome.output[2] {
+            OutputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+                ..
+            } => {
+                assert_eq!(call_id, "call_0_x");
+                assert_eq!(name, "get_weather");
+                assert_eq!(arguments, "{\"city\":\"Paris\"}");
+            }
+            other => panic!("unexpected item {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_call_only_response_has_no_empty_message() {
+        let mut message = assistant(None);
+        message.tool_calls = Some(vec![ToolCall {
+            id: "c".to_owned(),
+            r#type: "function".to_owned(),
+            function: ToolCallFunction {
+                name: "f".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+        }]);
+        let outcome = outcome_from_chat(chat_response(message, "tool_calls", (1, 1)));
+        assert_eq!(outcome.output.len(), 1);
+        assert!(matches!(outcome.output[0], OutputItem::FunctionCall { .. }));
+    }
+
+    #[test]
+    fn length_stop_is_incomplete_with_details() {
+        let outcome = outcome_from_chat(chat_response(assistant(Some("cut")), "length", (1, 1)));
+        let object = context().object(outcome);
+        assert_eq!(object.status, ResponseStatus::Incomplete);
+        assert_eq!(
+            object.incomplete_details.unwrap().reason,
+            "max_output_tokens"
+        );
+        match &object.output[0] {
+            OutputItem::Message { status, .. } => assert_eq!(*status, ResponseStatus::Incomplete),
+            other => panic!("unexpected item {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_text_still_yields_a_message_item() {
+        let outcome = outcome_from_chat(chat_response(assistant(Some("")), "stop", (1, 0)));
+        assert_eq!(outcome.output.len(), 1);
+    }
+
+    #[test]
+    fn routing_messages_flattens_text_content() {
+        let input = ResponseInput::Items(vec![
+            json!({"role": "user", "content": [{"type": "input_text", "text": "a"}, {"type": "input_text", "text": "b"}]}),
+            json!({"type": "function_call", "call_id": "c"}),
+        ]);
+        let messages = routing_messages(Some(&input)).unwrap();
+        assert_eq!(messages, vec![json!({"role": "user", "content": "ab"})]);
+    }
+}
