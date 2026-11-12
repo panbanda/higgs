@@ -25,6 +25,7 @@ pub struct StubScript {
 pub struct StubCall {
     pub max_tokens: u32,
     pub thinking_enabled: bool,
+    pub has_constraint: bool,
 }
 
 pub struct StubEngine {

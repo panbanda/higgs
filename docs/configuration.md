@@ -261,6 +261,25 @@ together in a group are reported with `cached_tokens: 0`.
 `/v1/messages` adds `usage.cache_read_input_tokens` when the cache hit is known.
 Unlike Anthropic's API, `input_tokens` still includes those cached tokens.
 
+### Guided output
+
+`/v1/chat/completions` can constrain generation to a grammar. Exactly one of these may be
+set per request; setting more than one returns `400` naming the conflicting fields.
+
+| Field | Constraint |
+|---|---|
+| `response_format: {"type": "json_object"}` | Any JSON object |
+| `response_format: {"type": "json_schema", "json_schema": {"name": "...", "schema": {...}}}` | The JSON schema (a bare schema is also accepted) |
+| `response_format: {"type": "regex", "regex": "..."}` | Output must match the regular expression |
+| `guided_regex: "..."` | Same as the regex response format |
+| `guided_json: {...}` | Same as `json_schema`, with the schema given directly |
+
+Regexes use the Rust `regex` syntax and are matched against the whole output; look-around
+and backreferences are not supported. An invalid pattern returns `400` with the compile
+error. `response_format: {"type": "text"}` means no constraint. The constraint is applied
+by masking token logits, so it requires the model's tokenizer to be representable by the
+grammar compiler; patterns whose automaton is very large take time and memory to compile.
+
 ### Tokenizer endpoints
 
 `POST /v1/tokenize` and `POST /v1/detokenize` (also served as `/tokenize` and

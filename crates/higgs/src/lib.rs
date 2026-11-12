@@ -3,6 +3,7 @@ pub mod attach;
 pub mod auto_router;
 pub mod cli_config;
 pub mod config;
+pub mod constraint;
 pub mod daemon;
 pub mod doctor;
 pub mod error;

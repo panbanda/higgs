@@ -132,6 +132,11 @@ Requests for `qwen` run locally; anything matching `claude-.*` is proxied to Ant
     `time_to_first_token`, `prompt_eval_duration`, `generation_duration`,
     `total_time`, `prompt_tokens_per_second`, `generation_tokens_per_second`.
     See [Usage fields](docs/configuration.md#usage-fields) for exact definitions.
+  - Constrained output on `/v1/chat/completions`: `response_format`
+    (`json_object`, `json_schema`, or `{"type": "regex", "regex": "..."}`), or
+    the vLLM-style `guided_regex` (string) and `guided_json` (schema object).
+    At most one may be set; more than one, an invalid regex, or a schema the
+    grammar compiler rejects returns 400 with the reason.
 - Tokenizer: `POST /v1/tokenize` and `POST /v1/detokenize` (also at `/tokenize`
   and `/detokenize`), local models only.
   - `{"model": "m", "text": "hello"}` or `{"model": "m", "messages": [...]}`

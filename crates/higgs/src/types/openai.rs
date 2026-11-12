@@ -34,6 +34,12 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
+    /// vLLM-style: constrain output to this regular expression.
+    #[serde(default)]
+    pub guided_regex: Option<String>,
+    /// vLLM-style: constrain output to this JSON schema (an object).
+    #[serde(default)]
+    pub guided_json: Option<serde_json::Value>,
     #[serde(default)]
     pub logprobs: Option<bool>,
     #[serde(default)]
@@ -75,6 +81,9 @@ pub struct ResponseFormat {
     pub r#type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub json_schema: Option<serde_json::Value>,
+    /// Pattern for `type: "regex"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
 }
 
 /// Message content: either a plain string or an array of content parts (for multimodal).

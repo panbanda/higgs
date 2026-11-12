@@ -70,6 +70,14 @@ impl Engine {
         Self::Stub(Box::new(stub))
     }
 
+    #[cfg(test)]
+    pub fn stub_calls(&self) -> Vec<crate::test_support::StubCall> {
+        match self {
+            Self::Stub(stub) => stub.recorded_calls(),
+            Self::Simple(_) | Self::Batch(_) => Vec::new(),
+        }
+    }
+
     pub fn model_name(&self) -> &str {
         match self {
             Self::Simple(e) => e.model_name(),
@@ -240,6 +248,7 @@ impl Engine {
             Self::Stub(stub) => stub.generate(crate::test_support::StubCall {
                 max_tokens,
                 thinking_enabled: enable_thinking,
+                has_constraint: constraint.is_some(),
             }),
         }
     }
@@ -320,6 +329,7 @@ impl Engine {
                 crate::test_support::StubCall {
                     max_tokens,
                     thinking_enabled: enable_thinking,
+                    has_constraint: constraint.is_some(),
                 },
                 sender,
             ),

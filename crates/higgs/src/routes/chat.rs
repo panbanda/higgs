@@ -16,6 +16,7 @@ use tokio_stream::Stream;
 
 use crate::{
     config::ApiFormat,
+    constraint::ConstraintSpec,
     error::ServerError,
     metrics::{MetricsStore, RequestMetricsContext, RequestRecord, RequestTiming},
     router::ResolvedRoute,
@@ -70,11 +71,17 @@ pub async fn chat_completions(
             routing_method,
         } => {
             req.model = model_name;
+            let constraint_spec = ConstraintSpec::from_request(
+                req.response_format.as_ref(),
+                req.guided_regex.as_deref(),
+                req.guided_json.as_ref(),
+            )?;
             if req.stream == Some(true) {
                 let stream = chat_completions_stream(
                     Arc::clone(&state),
                     req,
                     engine,
+                    constraint_spec,
                     state.metrics.clone(),
                     routing_method,
                     received_at,
@@ -86,9 +93,14 @@ pub async fn chat_completions(
                 Ok(sse.into_response())
             } else {
                 let start = Instant::now();
-                let response =
-                    chat_completions_non_streaming(Arc::clone(&state), req, engine, received_at)
-                        .await?;
+                let response = chat_completions_non_streaming(
+                    Arc::clone(&state),
+                    req,
+                    engine,
+                    constraint_spec,
+                    received_at,
+                )
+                .await?;
                 if let Some(ref metrics) = state.metrics {
                     metrics.record(RequestRecord {
                         id: 0,
@@ -275,6 +287,7 @@ async fn chat_completions_non_streaming(
     state: SharedState,
     req: ChatCompletionRequest,
     engine: Arc<Engine>,
+    constraint_spec: Option<ConstraintSpec>,
     received_at: Instant,
 ) -> Result<ChatCompletionResponse, ServerError> {
     let max_tokens = req.max_tokens.unwrap_or(state.config.server.max_tokens);
@@ -322,7 +335,7 @@ async fn chat_completions_non_streaming(
         None
     };
 
-    let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
+    let constraint = build_constraint(constraint_spec.as_ref(), &engine)?;
 
     let tokenizer = engine.tokenizer().clone();
     let output = tokio::task::spawn_blocking(move || {
@@ -450,6 +463,7 @@ fn chat_completions_stream(
     state: SharedState,
     req: ChatCompletionRequest,
     engine: Arc<Engine>,
+    constraint_spec: Option<ConstraintSpec>,
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,
     received_at: Instant,
@@ -516,7 +530,7 @@ fn chat_completions_stream(
         None
     };
 
-    let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
+    let constraint = build_constraint(constraint_spec.as_ref(), &engine)?;
 
     let request_id = generate_request_id();
     let include_usage = req
@@ -907,53 +921,32 @@ fn build_sampling_params(req: &ChatCompletionRequest) -> SamplingParams {
     }
 }
 
-/// Build a constrained generator from the request's `response_format`.
+/// Compile the requested constraint against the model's vocabulary.
 ///
-/// Returns `None` if no constraint is needed (text mode or absent).
+/// A pattern or schema the grammar compiler rejects is the client's fault, so
+/// those failures are reported as `400`; failing to build the vocabulary is a
+/// server error.
 fn build_constraint(
-    response_format: Option<&crate::types::openai::ResponseFormat>,
+    requested: Option<&ConstraintSpec>,
     engine: &std::sync::Arc<crate::state::Engine>,
 ) -> Result<Option<higgs_engine::constrained::ConstrainedGenerator>, ServerError> {
-    let Some(fmt) = response_format else {
+    use higgs_engine::constrained::ConstrainedGenerator;
+
+    let Some(spec) = requested else {
         return Ok(None);
     };
-
-    match fmt.r#type.as_str() {
-        "text" => Ok(None),
-        "json_object" | "json_schema" => {
-            let eos_id = engine.eos_token_ids().first().copied().unwrap_or(0);
-            let vocab = higgs_engine::constrained::build_vocabulary(engine.tokenizer(), eos_id)
-                .map_err(ServerError::Engine)?;
-            let constraint = if fmt.r#type == "json_schema" {
-                if let Some(ref schema) = fmt.json_schema {
-                    // OpenAI spec wraps the actual schema under a `schema` key:
-                    // {"name": "...", "schema": {<actual schema>}}
-                    // Fall back to the whole value for bare schemas.
-                    let inner = schema
-                        .get("schema")
-                        .cloned()
-                        .unwrap_or_else(|| schema.clone());
-                    let schema_str = inner.to_string();
-                    higgs_engine::constrained::ConstrainedGenerator::from_json_schema(
-                        &schema_str,
-                        &vocab,
-                    )
-                    .map_err(ServerError::Engine)?
-                } else {
-                    higgs_engine::constrained::ConstrainedGenerator::for_json_object(&vocab)
-                        .map_err(ServerError::Engine)?
-                }
-            } else {
-                higgs_engine::constrained::ConstrainedGenerator::for_json_object(&vocab)
-                    .map_err(ServerError::Engine)?
-            };
-
-            Ok(Some(constraint))
+    let eos_id = engine.eos_token_ids().first().copied().unwrap_or(0);
+    let vocab = higgs_engine::constrained::build_vocabulary(engine.tokenizer(), eos_id)
+        .map_err(ServerError::Engine)?;
+    let constraint = match spec {
+        ConstraintSpec::JsonObject => ConstrainedGenerator::for_json_object(&vocab),
+        ConstraintSpec::JsonSchema(schema) => {
+            ConstrainedGenerator::from_json_schema(&schema.to_string(), &vocab)
         }
-        other => Err(ServerError::BadRequest(format!(
-            "Unsupported response_format type: {other}"
-        ))),
+        ConstraintSpec::Regex(pattern) => ConstrainedGenerator::from_regex(pattern, &vocab),
     }
+    .map_err(|error| ServerError::BadRequest(error.to_string()))?;
+    Ok(Some(constraint))
 }
 
 fn logprobs_to_response(
@@ -1309,6 +1302,114 @@ mod tests {
             let usage = &events.last().unwrap()["usage"];
             assert_eq!(usage["completion_tokens_details"]["reasoning_tokens"], 2);
             assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 0);
+        }
+
+        async fn post_chat(
+            stub: StubEngine,
+            extra: &serde_json::Value,
+        ) -> (
+            http::StatusCode,
+            String,
+            std::sync::Arc<crate::state::Engine>,
+        ) {
+            let (app, engine) = app_with_stub(stub);
+            let (status, body) = post_json(&app, "/v1/chat/completions", &chat_body(extra)).await;
+            (status, body, engine)
+        }
+
+        fn recorded_calls(engine: &crate::state::Engine) -> Vec<crate::test_support::StubCall> {
+            engine.stub_calls()
+        }
+
+        fn generating_stub() -> StubEngine {
+            let mut stub = stub_with_tokenizer();
+            stub.script.generation = Some(generation_output("hello", 5, 1));
+            stub
+        }
+
+        #[tokio::test]
+        async fn guided_regex_constrains_generation() {
+            let (status, body, engine) = post_chat(
+                generating_stub(),
+                &serde_json::json!({"guided_regex": "hello|world"}),
+            )
+            .await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            let calls = recorded_calls(&engine);
+            assert_eq!(calls.len(), 1);
+            assert!(calls[0].has_constraint);
+        }
+
+        #[tokio::test]
+        async fn regex_response_format_constrains_generation() {
+            let extra =
+                serde_json::json!({"response_format": {"type": "regex", "regex": "hello|world"}});
+            let (status, body, engine) = post_chat(generating_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            assert!(recorded_calls(&engine)[0].has_constraint);
+        }
+
+        #[tokio::test]
+        async fn guided_regex_constrains_streaming_generation() {
+            let mut stub = stub_with_tokenizer();
+            stub.script.stream = vec![progress_event(0, 5), token_event("hello", 1, Some("stop"))];
+            let extra = serde_json::json!({"stream": true, "guided_regex": "hello|world"});
+            let (status, body, engine) = post_chat(stub, &extra).await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            assert!(recorded_calls(&engine)[0].has_constraint);
+        }
+
+        #[tokio::test]
+        async fn unconstrained_requests_carry_no_constraint() {
+            let (status, _body, engine) =
+                post_chat(generating_stub(), &serde_json::json!({})).await;
+            assert_eq!(status, http::StatusCode::OK);
+            assert!(!recorded_calls(&engine)[0].has_constraint);
+        }
+
+        #[tokio::test]
+        async fn invalid_regex_is_a_client_error_with_the_compile_error() {
+            let (status, body, engine) = post_chat(
+                generating_stub(),
+                &serde_json::json!({"guided_regex": "(unclosed"}),
+            )
+            .await;
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("Invalid regex constraint"), "{body}");
+            assert!(recorded_calls(&engine).is_empty());
+        }
+
+        #[tokio::test]
+        async fn invalid_regex_via_response_format_is_a_client_error() {
+            let extra = serde_json::json!({"response_format": {"type": "regex", "regex": "[a-"}});
+            let (status, body, _engine) = post_chat(generating_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        }
+
+        #[tokio::test]
+        async fn multiple_constraints_are_rejected_before_generation() {
+            let extra = serde_json::json!({
+                "guided_regex": "hello",
+                "response_format": {"type": "json_object"},
+            });
+            let (status, body, engine) = post_chat(generating_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("Only one output constraint"), "{body}");
+            assert!(recorded_calls(&engine).is_empty());
+        }
+
+        #[tokio::test]
+        async fn unsatisfiable_schema_is_a_client_error() {
+            let extra = serde_json::json!({"guided_json": {"type": "bogus"}});
+            let (status, body, _engine) = post_chat(generating_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        }
+
+        #[tokio::test]
+        async fn guided_json_must_be_an_object() {
+            let extra = serde_json::json!({"guided_json": "not a schema"});
+            let (status, body, _engine) = post_chat(generating_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
         }
     }
 }
