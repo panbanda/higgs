@@ -19,6 +19,42 @@ use crate::{
     },
 };
 
+fn embed_inputs(
+    engine: &crate::state::Engine,
+    inputs: &[String],
+) -> Result<(Vec<EmbeddingObject>, u32), ServerError> {
+    let mut data = Vec::with_capacity(inputs.len());
+    let mut total_tokens: u32 = 0;
+    for (idx, text) in inputs.iter().enumerate() {
+        let encoding = engine
+            .tokenizer()
+            .encode(text.as_str(), false)
+            .map_err(|e| ServerError::BadRequest(format!("Tokenization error: {e}")))?;
+
+        let token_ids = encoding.get_ids();
+        let token_count: u32 = token_ids
+            .len()
+            .try_into()
+            .map_err(|_| ServerError::BadRequest("Input too long".to_owned()))?;
+        total_tokens = total_tokens.saturating_add(token_count);
+
+        let embedding = engine
+            .embed(token_ids)
+            .map_err(|e| ServerError::InternalError(format!("Embedding error: {e}")))?;
+
+        let index: u32 = idx
+            .try_into()
+            .map_err(|_| ServerError::BadRequest("Too many inputs".to_owned()))?;
+
+        data.push(EmbeddingObject {
+            object: "embedding",
+            embedding,
+            index,
+        });
+    }
+    Ok((data, total_tokens))
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn embeddings(
     State(state): State<SharedState>,
@@ -50,36 +86,13 @@ pub async fn embeddings(
             }
 
             let start = Instant::now();
-            let mut data = Vec::new();
-            let mut total_tokens: u32 = 0;
-
-            for (idx, text) in inputs.iter().enumerate() {
-                let encoding = engine
-                    .tokenizer()
-                    .encode(text.as_str(), false)
-                    .map_err(|e| ServerError::BadRequest(format!("Tokenization error: {e}")))?;
-
-                let token_ids = encoding.get_ids();
-                let token_count: u32 = token_ids
-                    .len()
-                    .try_into()
-                    .map_err(|_| ServerError::BadRequest("Input too long".to_owned()))?;
-                total_tokens = total_tokens.saturating_add(token_count);
-
-                let embedding = engine
-                    .embed(token_ids)
-                    .map_err(|e| ServerError::InternalError(format!("Embedding error: {e}")))?;
-
-                let index: u32 = idx
-                    .try_into()
-                    .map_err(|_| ServerError::BadRequest("Too many inputs".to_owned()))?;
-
-                data.push(EmbeddingObject {
-                    object: "embedding",
-                    embedding,
-                    index,
-                });
-            }
+            // Embedding waits on the engine, so it runs off the async workers.
+            let (data, total_tokens) =
+                tokio::task::spawn_blocking(move || embed_inputs(&engine, &inputs))
+                    .await
+                    .map_err(|e| {
+                        ServerError::InternalError(format!("Embedding task failed: {e}"))
+                    })??;
 
             if let Some(ref metrics) = state.metrics {
                 metrics.record(RequestRecord {

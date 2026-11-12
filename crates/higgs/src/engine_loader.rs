@@ -81,15 +81,17 @@ pub fn load_engine(
         ));
     }
     let kv_cache_config = model.kv_cache_config();
+    let tuning = resolve_runtime_tuning(resolved, model.requested_mlx_profile(local));
     let engine = if model.batch {
         Engine::load_batch(
             resolved,
             kv_cache_config,
+            &tuning,
             local.raise_wired_limit,
             model.prefill_yield_tokens,
+            model.effective_thinking_budget(local),
         )
     } else {
-        let tuning = resolve_runtime_tuning(resolved, model.requested_mlx_profile(local));
         Engine::load_simple(
             resolved,
             kv_cache_config,
