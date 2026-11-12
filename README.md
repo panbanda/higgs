@@ -132,6 +132,15 @@ Requests for `qwen` run locally; anything matching `claude-.*` is proxied to Ant
     `time_to_first_token`, `prompt_eval_duration`, `generation_duration`,
     `total_time`, `prompt_tokens_per_second`, `generation_tokens_per_second`.
     See [Usage fields](docs/configuration.md#usage-fields) for exact definitions.
+- Tokenizer: `POST /v1/tokenize` and `POST /v1/detokenize` (also at `/tokenize`
+  and `/detokenize`), local models only.
+  - `{"model": "m", "text": "hello"}` or `{"model": "m", "messages": [...]}`
+    (rendered through the chat template, optional `tools`) returns
+    `{"tokens": [...], "count": n}`. Text input does not add special tokens
+    unless `"add_special_tokens": true`.
+  - `{"model": "m", "tokens": [...]}` to `/v1/detokenize` returns
+    `{"text": "..."}`; optional `"skip_special_tokens": true`. Unknown token
+    ids are rejected with 400, as are models routed to a remote provider.
 - Anthropic: `/v1/messages`, `/v1/messages/count_tokens`
   - `usage.cache_read_input_tokens` reports prompt tokens served from the
     prefix cache when known. `usage.input_tokens` still counts the whole

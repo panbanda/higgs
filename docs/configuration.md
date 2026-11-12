@@ -261,6 +261,30 @@ together in a group are reported with `cached_tokens: 0`.
 `/v1/messages` adds `usage.cache_read_input_tokens` when the cache hit is known.
 Unlike Anthropic's API, `input_tokens` still includes those cached tokens.
 
+### Tokenizer endpoints
+
+`POST /v1/tokenize` and `POST /v1/detokenize` (also served as `/tokenize` and
+`/detokenize`) expose the loaded model's tokenizer. Requests for models routed to a remote
+provider fail with `400`.
+
+```json
+{"model": "qwen", "text": "Hello"}
+{"model": "qwen", "messages": [{"role": "user", "content": "Hello"}]}
+```
+
+return `{"tokens": [ids], "count": n}`. `messages` are rendered through the chat template
+with the generation prompt, exactly as `/v1/chat/completions` would feed them to the
+model; `tools` and `reasoning` are honored so the count matches. `text` is encoded without
+special tokens unless `"add_special_tokens": true`, matching `/v1/completions`.
+`text` and `messages` are mutually exclusive.
+
+```json
+{"model": "qwen", "tokens": [9707]}
+```
+
+to `/v1/detokenize` returns `{"text": "Hello"}`. Special tokens are kept unless
+`"skip_special_tokens": true`. Token ids missing from the vocabulary are rejected with `400`.
+
 ## Migration Notes
 
 - `higgs start` no longer accepts serve-style flags like `--model`, `--port`, or `--batch`.

@@ -86,7 +86,11 @@ pub fn build_router(
         .route(
             "/v1/messages/count_tokens",
             post(routes::anthropic::count_tokens),
-        );
+        )
+        .route("/v1/tokenize", post(routes::tokenize::tokenize))
+        .route("/tokenize", post(routes::tokenize::tokenize))
+        .route("/v1/detokenize", post(routes::tokenize::detokenize))
+        .route("/detokenize", post(routes::tokenize::detokenize));
 
     if let Some(rpm) = NonZeroU32::new(rate_limit) {
         let limiter: SharedRateLimiter = Arc::new(RateLimiter::keyed(Quota::per_minute(rpm)));

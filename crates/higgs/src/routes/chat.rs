@@ -804,7 +804,7 @@ fn chat_completions_stream(
     Ok(stream)
 }
 
-fn convert_messages(
+pub(crate) fn convert_messages(
     messages: &[ChatCompletionMessage],
 ) -> Vec<higgs_engine::chat_template::ChatMessage> {
     messages
