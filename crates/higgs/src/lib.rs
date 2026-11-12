@@ -5,6 +5,7 @@ pub mod cli_config;
 pub mod config;
 pub mod daemon;
 pub mod doctor;
+pub mod engine_loader;
 pub mod error;
 pub mod metrics;
 pub mod metrics_log;
@@ -53,7 +54,18 @@ type SharedRateLimiter = Arc<RateLimiter<String, DefaultKeyedStateStore<String>,
 
 // Observability/control-plane routes must never perturb API traffic metrics.
 /// Requests that dashboards poll; they never count as traffic in metrics.
-const INFRASTRUCTURE_PATHS: &[&str] = &["/health", "/metrics", "/v1/models", "/v1/system"];
+const INFRASTRUCTURE_PATHS: &[&str] = &[
+    "/health",
+    "/metrics",
+    "/v1/models",
+    "/v1/models/status",
+    "/v1/system",
+];
+
+/// Model load/unload controls live under `/v1/models/` and are not API traffic either.
+fn is_infrastructure_path(path: &str) -> bool {
+    INFRASTRUCTURE_PATHS.contains(&path) || path.starts_with("/v1/models/")
+}
 
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
@@ -78,6 +90,8 @@ pub fn build_router(
         .route("/metrics", get(routes::metrics::metrics))
         .route("/v1/system", get(routes::system::system))
         .route("/v1/models", get(routes::models::list_models))
+        .route("/v1/models/status", get(routes::models::models_status))
+        .route("/v1/models/{*target}", post(routes::models::model_action))
         .route("/v1/chat/completions", post(routes::chat::chat_completions))
         .route("/v1/completions", post(routes::completions::completions))
         .route("/v1/embeddings", post(routes::embeddings::embeddings))
@@ -152,7 +166,7 @@ async fn record_http_response(
     let wallclock = chrono::Utc::now();
     let response = next.run(request).await;
 
-    if !INFRASTRUCTURE_PATHS.contains(&path.as_str())
+    if !is_infrastructure_path(&path)
         && !context.was_recorded()
         && let Some(store) = metrics
     {

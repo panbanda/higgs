@@ -382,6 +382,8 @@ pub struct ModelObject {
     pub object: &'static str,
     pub created: i64,
     pub owned_by: String,
+    /// Whether the model is in memory now. Unloaded models are still listed and load on use.
+    pub loaded: bool,
 }
 
 /// POST /v1/embeddings request body.
@@ -572,6 +574,7 @@ mod tests {
                 object: "model",
                 created: 1_234_567_890,
                 owned_by: "local".to_owned(),
+                loaded: true,
             }],
         };
         let json = serde_json::to_string(&list).unwrap();

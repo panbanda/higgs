@@ -45,6 +45,31 @@ pub trait ModelLoader<M>: Send + Sync + 'static {
     fn release_cached_memory(&self);
 }
 
+/// Loader for a pool whose models were built by the caller: they cannot be rebuilt.
+pub struct ResidentOnly;
+
+impl<M: Send + Sync + 'static> ModelLoader<M> for ResidentOnly {
+    fn load(&self, name: &str) -> Result<M, String> {
+        Err(format!(
+            "model '{name}' was supplied already loaded and cannot be reloaded"
+        ))
+    }
+
+    fn unload(&self, _name: &str, model: Arc<M>) {
+        drop(model);
+    }
+
+    fn estimate_bytes(&self, _name: &str) -> Option<u64> {
+        None
+    }
+
+    fn memory_in_use(&self) -> Option<u64> {
+        None
+    }
+
+    fn release_cached_memory(&self) {}
+}
+
 /// Why a request for a model could not be served.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ModelError {
@@ -399,6 +424,24 @@ impl<M: Send + Sync + 'static> ModelPool<M> {
             clock,
             admission: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// A pool over models the caller already built, with no limits. Once one is unloaded it
+    /// cannot come back, so callers should pin them.
+    pub fn from_resident(models: Vec<(ModelSpec, Arc<M>)>) -> Arc<Self> {
+        let (specs, built): (Vec<ModelSpec>, Vec<Arc<M>>) = models.into_iter().unzip();
+        let pool = Self::new(specs, Arc::new(ResidentOnly), PoolLimits::default());
+        for (spec, model) in pool.order.iter().zip(built) {
+            if let Some(slot) = pool.slots.get(spec) {
+                slot.set_phase(Phase::Loaded(Resident {
+                    model,
+                    loaded_at: (pool.clock)(),
+                    load_duration: Duration::ZERO,
+                    measured_bytes: None,
+                }));
+            }
+        }
+        pool
     }
 
     pub fn contains(&self, name: &str) -> bool {

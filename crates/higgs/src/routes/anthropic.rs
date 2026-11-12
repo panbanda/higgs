@@ -20,7 +20,7 @@ use crate::{
     error::ServerError,
     metrics::{MetricsStore, RequestMetricsContext, RequestTiming},
     router::ResolvedRoute,
-    state::{Engine, SharedState},
+    state::{EngineLease, SharedState},
     types::anthropic::{
         AnthropicUsage, ContentBlockResponse, ContentBlockStartEvent, ContentBlockStartPayload,
         ContentBlockStopEvent, CountTokensRequest, CountTokensResponse, CreateMessageRequest,
@@ -60,8 +60,7 @@ pub async fn create_message(
     let resolved = state
         .router
         .resolve(&req.model, messages_json.as_deref())
-        .await
-        .map_err(ServerError::ModelNotFound)?;
+        .await?;
 
     match resolved {
         ResolvedRoute::Higgs {
@@ -241,7 +240,7 @@ pub async fn create_message(
 
 async fn create_message_non_streaming(
     req: CreateMessageRequest,
-    engine: Arc<Engine>,
+    engine: EngineLease,
 ) -> Result<CreateMessageResponse, ServerError> {
     let max_tokens = req.max_tokens;
     let sampling = SamplingParams {
@@ -325,7 +324,7 @@ async fn create_message_non_streaming(
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 fn create_message_stream(
     req: CreateMessageRequest,
-    engine: Arc<Engine>,
+    engine: EngineLease,
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,
     received_at: Instant,
@@ -549,8 +548,7 @@ pub async fn count_tokens(
     let resolved = state
         .router
         .resolve(&req.model, messages_json.as_deref())
-        .await
-        .map_err(ServerError::ModelNotFound)?;
+        .await?;
 
     match resolved {
         ResolvedRoute::Higgs {

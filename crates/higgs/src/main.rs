@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::io::IsTerminal;
 use std::net::SocketAddr;
@@ -8,17 +7,15 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use clap::Parser;
-use higgs_engine::mlx_tuning::resolve_runtime_tuning;
-
 use higgs::{
     build_router,
     config::{
         self, Cli, Commands, ConfigAction, HiggsConfig, MetricsLogConfig, ServeArgs, StartArgs,
         StopArgs,
     },
-    model_download, model_resolver,
+    engine_loader, model_download, model_resolver,
     router::Router,
-    state::{AppState, Engine},
+    state::AppState,
 };
 
 #[tokio::main]
@@ -195,9 +192,13 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
         );
     }
 
-    // Load all local models and build router
-    let engines = load_engines(&higgs_config)?;
-    let router = Router::from_config(&higgs_config, engines)?;
+    // Models that load at startup are fetched and loaded before the server binds; the rest
+    // load when a request first routes to them.
+    download_missing_startup_models(&higgs_config)?;
+    let pool = engine_loader::build_pool(&higgs_config)?;
+    pool.load_startup_models().await?;
+    pool.spawn_idle_sweeper();
+    let router = Router::new(&higgs_config, pool)?;
 
     // Validate timeout
     let timeout_secs = higgs_config.server.timeout;
@@ -257,16 +258,12 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-fn load_engines(
-    config: &HiggsConfig,
-) -> Result<HashMap<String, Arc<Engine>>, Box<dyn std::error::Error>> {
-    let mut engines = HashMap::new();
-
-    for model_cfg in &config.models {
+fn download_missing_startup_models(config: &HiggsConfig) -> Result<(), Box<dyn std::error::Error>> {
+    for model_cfg in engine_loader::startup_models(config) {
         let model_path = &model_cfg.path;
         tracing::info!(model = %model_path, "Resolving model path");
-        let resolved = match model_resolver::resolve(model_path) {
-            Ok(path) => path,
+        match model_resolver::resolve(model_path) {
+            Ok(_) => {}
             Err(resolve_err) if model_resolver::is_hf_model_id(model_path) => {
                 tracing::debug!(error = %resolve_err, "model not in cache; attempting download");
                 let is_interactive = std::io::stdin().is_terminal();
@@ -277,53 +274,12 @@ fn load_engines(
                     std::io::stdin().lock(),
                     || download_via_hf_cli(model_path),
                 )?;
-                model_resolver::resolve(model_path)?
+                model_resolver::resolve(model_path)?;
             }
             Err(err) => return Err(err.into()),
-        };
-
-        tracing::info!(model = %model_path, resolved = %resolved.display(), "Loading model");
-        if model_cfg.batch && !config::resolved_model_supports_batch(&resolved)? {
-            return Err(format!(
-                "batch=true is only supported for models with batched decode (llama, mistral, qwen2, qwen3, phi3, starcoder2); {model_path} is not supported"
-            )
-            .into());
-        }
-        let kv_cache_config = model_cfg.kv_cache_config();
-        let engine = if model_cfg.batch {
-            Engine::load_batch(
-                &resolved,
-                kv_cache_config,
-                config.local.raise_wired_limit,
-                model_cfg.prefill_yield_tokens,
-            )?
-        } else {
-            let tuning =
-                resolve_runtime_tuning(&resolved, model_cfg.requested_mlx_profile(&config.local));
-            Engine::load_simple(
-                &resolved,
-                kv_cache_config,
-                tuning,
-                config.local.raise_wired_limit,
-                model_cfg.kv_disk_dir.as_deref().map(std::path::Path::new),
-                model_cfg.kv_disk_space_mb.saturating_mul(1024 * 1024),
-            )?
-        };
-        let name = model_cfg
-            .name
-            .clone()
-            .unwrap_or_else(|| engine.model_name().to_owned());
-        tracing::info!(model_name = %name, "Model loaded");
-
-        if engines.insert(name.clone(), Arc::new(engine)).is_some() {
-            return Err(format!(
-                "model name collision: two model paths resolve to the same name '{name}'"
-            )
-            .into());
         }
     }
-
-    Ok(engines)
+    Ok(())
 }
 
 fn ensure_local_runtime_ready(config: &HiggsConfig) -> Result<(), Box<dyn std::error::Error>> {
