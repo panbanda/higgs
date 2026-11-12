@@ -2764,21 +2764,17 @@ impl SimpleEngineCore {
 /// undecodable tokens from growing the window without bound.
 const MAX_DETOK_WINDOW: usize = 64;
 
-/// Incremental streaming detokenizer.
-///
-/// Re-decoding the full completion on every generated token is O(n^2) in
-/// completion length. Instead, decode only `tokens[prefix_offset..]` and emit
-/// the difference against `tokens[prefix_offset..read_offset]`; both windows
-/// start at the same token, so tokenizer boundary effects cancel out. Text
-/// ending in an incomplete UTF-8 sequence (trailing replacement char) is held
-/// back until a later token completes it.
+/// Special tokens shaped like control delimiters that carry tool-call content.
+const CONTENT_BEARING_DELIMITERS: [&str; 1] = ["<|\"|>"];
+
 /// Token IDs that must never surface in decoded output text.
 ///
 /// Seeded with the model's EOS ids, plus every added *control* special token:
 /// the `<|…|>` chat-control delimiters and the classic `<s>`/`</s>`/`<pad>`/
 /// `<unk>`/`<mask>` sentinels. Content-bearing special tokens (`<think>`,
-/// `<tool_call>`, `MiniCPM`'s `<function>`/`<param>`) deliberately do NOT match,
-/// so they survive decoding and reach the tool-call / reasoning parsers. Shared
+/// `<tool_call>`, `MiniCPM`'s `<function>`/`<param>`, and Gemma 4's `<|"|>`
+/// string delimiter, which has the control-token shape) deliberately do NOT
+/// match, so they survive decoding and reach the tool-call / reasoning parsers. Shared
 /// by the non-streaming decode path ([`SimpleEngine::decode_tokens`]) and the
 /// streaming detokenizer ([`IncrementalDetok`]) so the two strip identically.
 pub(crate) fn content_preserving_skip_ids(
@@ -2788,7 +2784,9 @@ pub(crate) fn content_preserving_skip_ids(
     let mut ids: std::collections::HashSet<u32> = eos_token_ids.iter().copied().collect();
     for (id, added) in tokenizer.get_added_tokens_decoder() {
         let content = added.content.as_str();
-        let is_control = (content.starts_with("<|") && content.ends_with("|>"))
+        let is_control = (content.starts_with("<|")
+            && content.ends_with("|>")
+            && !CONTENT_BEARING_DELIMITERS.contains(&content))
             || matches!(content, "<s>" | "</s>" | "<pad>" | "<unk>" | "<mask>");
         if is_control {
             ids.insert(id);
@@ -2797,6 +2795,14 @@ pub(crate) fn content_preserving_skip_ids(
     ids
 }
 
+/// Incremental streaming detokenizer.
+///
+/// Re-decoding the full completion on every generated token is O(n^2) in
+/// completion length. Instead, decode only `tokens[prefix_offset..]` and emit
+/// the difference against `tokens[prefix_offset..read_offset]`; both windows
+/// start at the same token, so tokenizer boundary effects cancel out. Text
+/// ending in an incomplete UTF-8 sequence (trailing replacement char) is held
+/// back until a later token completes it.
 pub(crate) struct IncrementalDetok {
     /// Start of the decode window; advanced whenever text is emitted.
     prefix_offset: usize,
@@ -3559,6 +3565,8 @@ mod tests {
             tokenizers::AddedToken::from("</s>", true),
             tokenizers::AddedToken::from("<function>", true),
             tokenizers::AddedToken::from("<tool_call>", true),
+            tokenizers::AddedToken::from("<|\"|>", true),
+            tokenizers::AddedToken::from("<|endoftext|>", true),
         ]);
         let im_end = tok.token_to_id("<|im_end|>").unwrap();
         let skip = super::content_preserving_skip_ids(&tok, &[im_end, 7]);
@@ -3578,6 +3586,34 @@ mod tests {
         assert!(
             !skip.contains(&tok.token_to_id("<tool_call>").unwrap()),
             "<tool_call> preserved"
+        );
+        assert!(
+            !skip.contains(&tok.token_to_id("<|\"|>").unwrap()),
+            "Gemma 4 string delimiter preserved for the tool-call parser"
+        );
+        assert!(
+            skip.contains(&tok.token_to_id("<|endoftext|>").unwrap()),
+            "other <|…|> tokens stay control tokens"
+        );
+    }
+
+    #[test]
+    fn detok_keeps_the_gemma_string_delimiter_and_drops_end_of_text() {
+        let mut tokenizer = Tokenizer::new(tokenizers::models::bpe::BPE::default());
+        let _ = tokenizer.add_special_tokens([
+            tokenizers::AddedToken::from("<|\"|>", true),
+            tokenizers::AddedToken::from("<|endoftext|>", true),
+        ]);
+        let quote = tokenizer.token_to_id("<|\"|>").unwrap();
+        let end_of_text = tokenizer.token_to_id("<|endoftext|>").unwrap();
+        let skip = std::sync::Arc::new(super::content_preserving_skip_ids(&tokenizer, &[]));
+
+        let tokens = [quote, end_of_text, quote];
+        let mut detok = IncrementalDetok::new(String::new(), 0, skip);
+        let text = detok.append(&tokenizer, &tokens).unwrap();
+        assert_eq!(
+            text.split_whitespace().collect::<Vec<_>>(),
+            ["<|\"|>", "<|\"|>"]
         );
     }
 
