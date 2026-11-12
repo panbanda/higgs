@@ -21,6 +21,7 @@ use crate::{
     metrics::{MetricsStore, RequestMetricsContext, RequestRecord, RequestTiming},
     router::ResolvedRoute,
     state::{Engine, SharedState},
+    tool_choice::ToolChoice,
     types::openai::{
         ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessage, ChatCompletionRequest,
         ChatCompletionResponse, ChoiceLogprobs, MessageContent, StopSequence, TokenLogprob,
@@ -71,6 +72,9 @@ pub async fn chat_completions(
             routing_method,
         } => {
             req.model = model_name;
+            if ToolChoice::from_request(req.tool_choice.as_ref())? == ToolChoice::Disabled {
+                req.tools = None;
+            }
             let constraint_spec = ConstraintSpec::from_request(
                 req.response_format.as_ref(),
                 req.guided_regex.as_deref(),
@@ -1466,6 +1470,129 @@ mod tests {
             let call = &recorded_calls(&engine)[0];
             assert!(!call.thinking_enabled);
             assert_eq!(call.thinking_budget, None);
+        }
+
+        fn tools_json() -> serde_json::Value {
+            serde_json::json!([{
+                "type": "function",
+                "function": {"name": "get_weather", "parameters": {"type": "object"}},
+            }])
+        }
+
+        const TOOL_CALL_TEXT: &str =
+            r#"<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>"#;
+
+        fn tool_stub() -> StubEngine {
+            let mut stub = stub_with_tokenizer();
+            stub.script.generation = Some(generation_output(TOOL_CALL_TEXT, 5, 12));
+            stub
+        }
+
+        #[tokio::test]
+        async fn tool_choice_auto_exposes_and_parses_tools() {
+            let extra = serde_json::json!({"tools": tools_json(), "tool_choice": "auto"});
+            let (status, body, engine) = post_chat(tool_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            assert_eq!(engine.stub_prompt_tools(), vec![Some(1)]);
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["choices"][0]["finish_reason"], "tool_calls");
+            assert_eq!(
+                json["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+                "get_weather"
+            );
+        }
+
+        #[tokio::test]
+        async fn absent_tool_choice_behaves_like_auto() {
+            let extra = serde_json::json!({"tools": tools_json()});
+            let (status, _body, engine) = post_chat(tool_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::OK);
+            assert_eq!(engine.stub_prompt_tools(), vec![Some(1)]);
+        }
+
+        #[tokio::test]
+        async fn tool_choice_none_hides_and_does_not_parse_tools() {
+            let extra = serde_json::json!({"tools": tools_json(), "tool_choice": "none"});
+            let (status, body, engine) = post_chat(tool_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            assert_eq!(engine.stub_prompt_tools(), vec![None]);
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let message = &json["choices"][0]["message"];
+            assert!(message.get("tool_calls").is_none(), "{body}");
+            assert_eq!(message["content"], TOOL_CALL_TEXT);
+            assert_eq!(json["choices"][0]["finish_reason"], "stop");
+        }
+
+        #[tokio::test]
+        async fn tool_choice_none_applies_when_streaming() {
+            let mut stub = stub_with_tokenizer();
+            stub.script.stream = vec![
+                progress_event(0, 5),
+                token_event(TOOL_CALL_TEXT, 12, Some("stop")),
+            ];
+            let extra = serde_json::json!({
+                "stream": true,
+                "tools": tools_json(),
+                "tool_choice": "none",
+            });
+            let (status, body, engine) = post_chat(stub, &extra).await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            assert_eq!(engine.stub_prompt_tools(), vec![None]);
+            assert!(!body.contains("tool_calls"), "{body}");
+            assert!(body.contains("get_weather"), "text stays visible: {body}");
+        }
+
+        #[tokio::test]
+        async fn tool_choice_required_is_rejected_before_generation() {
+            let extra = serde_json::json!({"tools": tools_json(), "tool_choice": "required"});
+            let (status, body, engine) = post_chat(tool_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(
+                json["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("\"required\" is not supported yet"),
+                "{body}"
+            );
+            assert!(engine.stub_calls().is_empty());
+        }
+
+        #[tokio::test]
+        async fn named_tool_choice_is_rejected_before_generation() {
+            let extra = serde_json::json!({
+                "tools": tools_json(),
+                "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+            });
+            let (status, body, engine) = post_chat(tool_stub(), &extra).await;
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("not supported yet"), "{body}");
+            assert!(engine.stub_calls().is_empty());
+        }
+
+        #[tokio::test]
+        async fn seed_is_accepted_and_does_not_change_the_call() {
+            let (status, body, engine) =
+                post_chat(generating_stub(), &serde_json::json!({"seed": 42})).await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            assert_eq!(engine.stub_calls().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn non_integer_seed_is_rejected() {
+            let (status, _body, _engine) =
+                post_chat(generating_stub(), &serde_json::json!({"seed": "abc"})).await;
+            assert_eq!(status, http::StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn unknown_fields_are_still_ignored() {
+            let (status, body, _engine) = post_chat(
+                generating_stub(),
+                &serde_json::json!({"frobnicate": true, "parallel_tool_calls": false}),
+            )
+            .await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
         }
     }
 }

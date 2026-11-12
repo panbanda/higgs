@@ -34,6 +34,14 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
+    /// `"auto"` (default) or `"none"`; `"required"` and named functions are
+    /// rejected as unsupported.
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+    /// Accepted for client compatibility. Sampling is not yet reproducible
+    /// per request, so the value is ignored.
+    #[serde(default)]
+    pub seed: Option<i64>,
     /// vLLM-style: constrain output to this regular expression.
     #[serde(default)]
     pub guided_regex: Option<String>,

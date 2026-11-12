@@ -141,6 +141,12 @@ Requests for `qwen` run locally; anything matching `claude-.*` is proxied to Ant
     Anthropic `thinking.budget_tokens` does the same on `/v1/messages`.
     Defaults come from `[[models]].thinking_budget`, then `[local].thinking_budget`,
     then 256. See [Thinking budget](docs/configuration.md#thinking-budget).
+  - `tool_choice`: `"auto"` (default) and `"none"` (tools are not shown to the
+    model and tool calls are not parsed) are supported; `"required"` and a
+    named function return 400 until they are implemented.
+  - `seed` is accepted for client compatibility but does not make sampling
+    reproducible yet.
+  - Unrecognized request fields are ignored.
 - Tokenizer: `POST /v1/tokenize` and `POST /v1/detokenize` (also at `/tokenize`
   and `/detokenize`), local models only.
   - `{"model": "m", "text": "hello"}` or `{"model": "m", "messages": [...]}`

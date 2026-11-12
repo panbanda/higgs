@@ -282,6 +282,20 @@ error. `response_format: {"type": "text"}` means no constraint. The constraint i
 by masking token logits, so it requires the model's tokenizer to be representable by the
 grammar compiler; patterns whose automaton is very large take time and memory to compile.
 
+### Tool choice and seed
+
+`tool_choice` on `/v1/chat/completions` accepts `"auto"` (the default, also used when the
+field is absent or `null`) and `"none"`. With `"none"` the `tools` array is dropped before
+the prompt is rendered and the output is never parsed for tool calls, streaming or not.
+`"required"`, a named function (`{"type": "function", ...}`) and any other value return `400`;
+they are not silently treated as `"auto"`. Requests routed to a remote provider are forwarded
+untouched, so the provider interprets `tool_choice` itself.
+
+`seed` must be an integer when present but has no effect: MLX samples from a process-wide
+random key, and sampling happens in several decode paths (single, pipelined, batched), so a
+per-request seed cannot be applied without affecting concurrent requests. Treat sampling as
+non-reproducible for now; use `temperature: 0` for repeatable output.
+
 ### Thinking budget
 
 Models that emit a `<think>` block get a cap on reasoning tokens: once the budget is spent

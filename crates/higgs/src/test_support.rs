@@ -35,6 +35,8 @@ pub struct StubEngine {
     pub tokenizer: Option<Tokenizer>,
     pub script: StubScript,
     pub calls: Mutex<Vec<StubCall>>,
+    /// Tool count passed to each prompt rendering (`None` when no tools).
+    pub prompt_tools: Mutex<Vec<Option<usize>>>,
 }
 
 impl StubEngine {
@@ -44,6 +46,7 @@ impl StubEngine {
             tokenizer: None,
             script: StubScript::default(),
             calls: Mutex::new(Vec::new()),
+            prompt_tools: Mutex::new(Vec::new()),
         }
     }
 
@@ -85,6 +88,20 @@ impl StubEngine {
             }
         }
         Ok(())
+    }
+
+    pub fn render_prompt(&self, tool_count: Option<usize>) -> Vec<u32> {
+        if let Ok(mut prompts) = self.prompt_tools.lock() {
+            prompts.push(tool_count);
+        }
+        self.script.prompt_tokens.clone()
+    }
+
+    pub fn recorded_prompt_tools(&self) -> Vec<Option<usize>> {
+        self.prompt_tools
+            .lock()
+            .map(|prompts| prompts.clone())
+            .unwrap_or_default()
     }
 
     fn record(&self, call: StubCall) {
