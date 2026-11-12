@@ -56,12 +56,12 @@ impl ToolCallFormat {
     }
 }
 
-struct ToolDefinition<'a> {
-    name: &'a str,
+pub(super) struct ToolDefinition<'a> {
+    pub(super) name: &'a str,
     parameters: Option<&'a serde_json::Value>,
 }
 
-fn tool_definitions(tools: &[serde_json::Value]) -> Vec<ToolDefinition<'_>> {
+pub(super) fn tool_definitions(tools: &[serde_json::Value]) -> Vec<ToolDefinition<'_>> {
     tools
         .iter()
         .filter_map(|tool| {

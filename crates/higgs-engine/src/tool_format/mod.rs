@@ -496,13 +496,9 @@ impl ToolCallParser {
     /// `tools` is the request's `OpenAI` `tools` array, if any.
     #[must_use]
     pub fn new(format: ToolCallFormat, tools: Option<&[serde_json::Value]>) -> Self {
-        let tool_names = tools
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|tool| {
-                let function = tool.get("function").unwrap_or(tool);
-                function.get("name")?.as_str().map(ToOwned::to_owned)
-            })
+        let tool_names = forced::tool_definitions(tools.unwrap_or_default())
+            .into_iter()
+            .map(|definition| definition.name.to_owned())
             .collect();
         Self {
             format,
