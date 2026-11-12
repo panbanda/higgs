@@ -259,7 +259,7 @@ static QWEN35_DENSE: BuiltinAdapter = BuiltinAdapter {
     id: "qwen3.5-dense",
     family: qwen,
     version_range: "Qwen 3.5+ dense",
-    capabilities: caps(false, true, false, false, false),
+    capabilities: caps(false, true, false, false, true),
     notes: "Qwen3.5 text backbone, including structurally compatible newer revisions",
     kind: LoadKind::Qwen35Dense,
 };
@@ -267,7 +267,7 @@ static QWEN35_MOE: BuiltinAdapter = BuiltinAdapter {
     id: "qwen3.5-moe",
     family: qwen,
     version_range: "Qwen 3.5+ MoE",
-    capabilities: caps(false, true, true, false, false),
+    capabilities: caps(false, true, true, false, true),
     notes: "Qwen3.5 MoE text backbone, including structurally compatible newer revisions",
     kind: LoadKind::Qwen35Moe,
 };

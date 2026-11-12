@@ -303,6 +303,12 @@ pub trait KeyValueCache {
         None
     }
 
+    /// Arrays to evaluate asynchronously so the next step does not wait on
+    /// this cache's updates.
+    fn eval_targets(&self) -> Vec<&Array> {
+        Vec::new()
+    }
+
     /// Maximum cache size, if bounded.
     fn max_size(&self) -> Option<i32>;
 
@@ -352,6 +358,10 @@ where
 
     fn rope_positions(&self) -> Option<Array> {
         T::rope_positions(self)
+    }
+
+    fn eval_targets(&self) -> Vec<&Array> {
+        T::eval_targets(self)
     }
 
     fn max_size(&self) -> Option<i32> {
@@ -1256,6 +1266,10 @@ impl KeyValueCache for SteppingKeyValueCache {
 
     fn offset(&self) -> i32 {
         self.offset
+    }
+
+    fn eval_targets(&self) -> Vec<&Array> {
+        Self::eval_targets(self)
     }
 
     fn max_size(&self) -> Option<i32> {
