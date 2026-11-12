@@ -59,7 +59,7 @@ Server names may contain letters, digits, `-` and `_`, but not `__` (the tool na
 }
 ```
 
-`type` is accepted as an alias for `transport`, `disabled: true` and `enabled: false` both turn a server off, and keys other clients add (`autoApprove`, ...) are ignored. A server name defined in both the file and the config is an error. The flag also works with `higgs doctor`.
+`type` is accepted as an alias for `transport`, `disabled: true` and `enabled: false` both turn a server off, and keys other clients add (`autoApprove`, ...) are ignored. A server name defined in both the file and the config is an error. The flag also works with `higgs doctor`. `higgs start` (the background daemon) takes no flags, so put servers in the config file for daemon use.
 
 ## Lifecycle
 
