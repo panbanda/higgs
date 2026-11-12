@@ -5410,6 +5410,16 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
         };
         match concat_and_permute(a, b, perm) {
             Ok(fused) => {
+                // Materialize each fused weight on its own. Leaving all of
+                // them lazy makes the final `model.eval()` read and permute
+                // every projection in the checkpoint inside one Metal command
+                // buffer, which intermittently trips the GPU watchdog
+                // (kIOGPUCommandBufferCallbackErrorTimeout) on large models.
+                fused.eval().map_err(|e| {
+                    crate::error::ModelError::Io(std::io::Error::other(format!(
+                        "GDN fusion eval failed for key {combined_key}: {e}"
+                    )))
+                })?;
                 **param = fused;
                 fused_count += 1;
             }
