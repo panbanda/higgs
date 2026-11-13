@@ -137,7 +137,7 @@ Loading the 27B and 35B checkpoints on `main` intermittently aborted with a Meta
 
 ## Features
 
-Higgs features added on this branch to close gaps with oMLX: the OpenAI Responses API (`/v1/responses`, stored responses, `previous_response_id`), on-demand model loading with LRU and idle-TTL eviction, pinning, a memory guard and load/unload/status endpoints, cached-token and timing fields in `usage`, `/v1/tokenize` and `/v1/detokenize`, regex and `guided_json` constrained output, a configurable thinking budget, tool-call parsers for the Qwen, Mistral, Llama, Gemma, GLM and MiniMax formats with forced `tool_choice` where the format allows it, batching as the automatic default, and batched decode for five more architectures.
+Higgs features added on this branch to close gaps with oMLX: the OpenAI Responses API (`/v1/responses`, stored responses, `previous_response_id`), on-demand model loading with LRU and idle-TTL eviction, pinning, a memory guard and load/unload/status endpoints, cached-token and timing fields in `usage`, `/v1/tokenize` and `/v1/detokenize`, regex and `guided_json` constrained output, a configurable thinking budget, tool-call parsers for the Qwen, Mistral, Llama, Gemma, GLM and MiniMax formats with forced `tool_choice` where the format allows it, Anthropic `tool_use` output on `/v1/messages`, an MCP client (stdio and Streamable HTTP) with web search/fetch endpoints and an opt-in server-side tool loop, batching as the automatic default, and batched decode for five more architectures.
 
 | Capability | Higgs | oMLX |
 |---|---|---|
@@ -158,7 +158,7 @@ Higgs features added on this branch to close gaps with oMLX: the OpenAI Response
 | Vision | LLaVA-Qwen2 | broad (via mlx-vlm) |
 | Audio (speech to text, text to speech, realtime) | no | yes |
 | Dedicated embedding models, rerank | no | yes |
-| MCP client, web search/fetch | no | yes |
+| MCP client, web search/fetch | yes | yes |
 | Remote provider proxying, regex routes, auto-router | yes | no |
 | OpenAI/Anthropic format translation for remote providers | yes | no |
 | Metrics endpoint, terminal dashboard | yes | status endpoint, admin stats |
@@ -166,7 +166,7 @@ Higgs features added on this branch to close gaps with oMLX: the OpenAI Response
 | Model download manager, quantization tooling | no | yes |
 | Multi-machine clustering | no | experimental |
 
-Not done on this branch: an MCP client with web search/fetch.
+Still missing in Higgs relative to oMLX: grammar (EBNF) constrained output, audio, dedicated embedding and rerank models, broad vision support, affine KV quantization, draft-model speculative decoding, a model download manager and quantization tooling, an HTTP admin UI, and clustering.
 
 ## Reproducing
 
