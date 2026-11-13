@@ -84,8 +84,15 @@ fn log_scoped_in(dir: &Path, path: &str) -> Result<PathBuf, String> {
     ))
 }
 
-/// Metrics log paths declared as `logging.metrics.path` by the config files
-/// in `dir`. Only these (and their rotations) may be read outside `dir`.
+/// A config file in `dir` or one of the files it includes lives next to it, so
+/// every `.toml` there counts.
+fn is_config_file_name(name: &str) -> bool {
+    name.ends_with(".toml")
+}
+
+/// Metrics log paths declared as `observability.metrics_log.path` (or the
+/// deprecated `logging.metrics.path`) by the config files in `dir`. Only these
+/// (and their rotations) may be read outside `dir`.
 fn configured_metrics_logs(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -94,16 +101,16 @@ fn configured_metrics_logs(dir: &Path) -> Vec<PathBuf> {
         .flatten()
         .filter(|entry| {
             let name = entry.file_name();
-            let name = name.to_string_lossy();
-            name.starts_with("config") && name.ends_with(".toml")
+            is_config_file_name(&name.to_string_lossy())
         })
         .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
         .filter_map(|raw| toml::from_str::<toml::Value>(&raw).ok())
         .filter_map(|value| {
-            value
-                .get("logging")?
-                .get("metrics")?
-                .get("path")?
+            let current = value.get("observability").and_then(|o| o.get("metrics_log"));
+            let deprecated = value.get("logging").and_then(|l| l.get("metrics"));
+            current
+                .and_then(|table| table.get("path"))
+                .or_else(|| deprecated.and_then(|table| table.get("path")))?
                 .as_str()
                 .map(expand_home)
         })
@@ -120,8 +127,7 @@ fn configured_model_paths(dir: &Path) -> Vec<PathBuf> {
         .flatten()
         .filter(|entry| {
             let name = entry.file_name();
-            let name = name.to_string_lossy();
-            name.starts_with("config") && name.ends_with(".toml")
+            is_config_file_name(&name.to_string_lossy())
         })
         .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
         .filter_map(|raw| toml::from_str::<toml::Value>(&raw).ok())
@@ -163,7 +169,7 @@ fn is_same_or_rotation(allowed: &Path, candidate: &Path) -> bool {
 
 /// Like [`config_scoped`] but also accepts the metrics log declared by a
 /// config file in the config directory (and its rotations), since
-/// `logging.metrics.path` may point outside the config directory.
+/// `observability.metrics_log.path` may point outside the config directory.
 fn log_scoped(path: &str) -> Result<PathBuf, String> {
     log_scoped_in(&config_dir(), path)
 }
@@ -722,7 +728,22 @@ fn validate_config_subcommand_args(rest: &[String]) -> Result<(), String> {
             let _ = value;
             validate_selector_args(&rest[3..])
         }
-        Some("path") => validate_selector_args(&rest[1..]),
+        Some("path" | "check") => validate_selector_args(&rest[1..]),
+        Some("migrate") => {
+            let selectors = if rest.get(1).map(String::as_str) == Some("--write") {
+                &rest[2..]
+            } else {
+                &rest[1..]
+            };
+            validate_selector_args(selectors)
+        }
+        Some("explain") => {
+            let after_model = match rest.get(1) {
+                Some(model) if !model.starts_with("--") => &rest[2..],
+                _ => &rest[1..],
+            };
+            validate_selector_args(after_model)
+        }
         Some(other) => Err(format!("unexpected config subcommand: {other}")),
         None => Err("`config` requires a subcommand".to_owned()),
     }
@@ -731,8 +752,9 @@ fn validate_config_subcommand_args(rest: &[String]) -> Result<(), String> {
 /// Validates every argument after the subcommand, so the bridge cannot be
 /// used to smuggle arbitrary flags to the `higgs` binary: `doctor`, `start`,
 /// and `stop` accept only `--profile <name>` / `--config <path>` selectors;
-/// `config` additionally accepts `get <key>`, `set <key> <value>`, or `path`
-/// before those same selectors; `--version` accepts nothing else.
+/// `config` additionally accepts `get <key>`, `set <key> <value>`, `path`,
+/// `check`, `migrate [--write]`, or `explain [model]` before those same
+/// selectors; `--version` accepts nothing else.
 fn validate_subcommand_args(subcommand: &str, rest: &[String]) -> Result<(), String> {
     match subcommand {
         "doctor" | "start" | "stop" => validate_selector_args(rest),
@@ -1024,6 +1046,16 @@ mod tests {
         )
         .expect("write");
         assert!(log_scoped_in(dir, &external_str).is_ok());
+        // The current spelling declares the log too.
+        let current = TempDir::new("log-current");
+        let current_log = current.path.join("m.jsonl").to_string_lossy().into_owned();
+        assert!(log_scoped_in(dir, &current_log).is_err());
+        std::fs::write(
+            dir.join("config.new.toml"),
+            format!("[observability.metrics_log]\npath = \"{current_log}\"\n"),
+        )
+        .expect("write");
+        assert!(log_scoped_in(dir, &current_log).is_ok());
         assert!(log_scoped_in(dir, &format!("{external_str}.3")).is_ok());
         assert!(log_scoped_in(dir, &format!("{external_str}.bak")).is_err());
         assert!(
@@ -1069,6 +1101,37 @@ mod tests {
         assert!(validate_subcommand_args("config", &args(&["get"])).is_err());
         assert!(validate_subcommand_args("config", &args(&["rm"])).is_err());
         assert!(validate_subcommand_args("config", &args(&[])).is_err());
+    }
+
+    #[test]
+    fn validates_config_migrate_check_and_explain_args() {
+        for ok in [
+            vec!["check"],
+            vec!["check", "--profile", "work"],
+            vec!["migrate"],
+            vec!["migrate", "--write", "--profile", "work"],
+            vec!["migrate", "--config", "config.toml"],
+            vec!["explain"],
+            vec!["explain", "qwen"],
+            vec!["explain", "qwen", "--profile", "work"],
+            vec!["explain", "--profile", "work"],
+        ] {
+            assert!(
+                validate_subcommand_args("config", &args(&ok)).is_ok(),
+                "{ok:?}"
+            );
+        }
+        for bad in [
+            vec!["check", "--port", "1"],
+            vec!["migrate", "--write", "--evil"],
+            vec!["migrate", "--config", "/etc/passwd"],
+            vec!["explain", "qwen", "--api-key", "x"],
+        ] {
+            assert!(
+                validate_subcommand_args("config", &args(&bad)).is_err(),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]
