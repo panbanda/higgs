@@ -112,16 +112,6 @@ fn estimate_paged_kv_blocks(
 }
 
 #[allow(unsafe_code)]
-pub(crate) fn should_clear_mlx_cache_after_prefill() -> bool {
-    parse_enabled_flag(
-        std::env::var("HIGGS_CLEAR_CACHE_AFTER_PREFILL")
-            .ok()
-            .as_deref(),
-    )
-    .unwrap_or(false)
-}
-
-#[allow(unsafe_code)]
 pub(crate) fn maybe_clear_mlx_cache(enabled: bool, reason: &str) {
     if !enabled {
         return;

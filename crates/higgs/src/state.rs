@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use higgs_engine::batch_engine::BatchEngine;
+use higgs_engine::batch_engine::{BatchEngine, EngineOptions};
 use higgs_engine::chat_template::ChatMessage;
 use higgs_engine::engine::{GenerationOutput, StreamingOutput, ThinkingMode};
 use higgs_engine::error::EngineError;
@@ -59,23 +59,8 @@ impl Engine {
         .map(|e| Self::Simple(Box::new(e)))
     }
 
-    pub fn load_batch<P: AsRef<Path>>(
-        dir: P,
-        kv_cache_config: KvCacheConfig,
-        tuning: &MlxRuntimeTuning,
-        raise_wired_limit: bool,
-        prefill_yield_tokens: Option<u32>,
-        default_thinking_budget: u32,
-    ) -> Result<Self, EngineError> {
-        BatchEngine::load(
-            dir,
-            kv_cache_config,
-            tuning,
-            raise_wired_limit,
-            prefill_yield_tokens,
-            default_thinking_budget,
-        )
-        .map(|e| Self::Batch(Box::new(e)))
+    pub fn load_batch<P: AsRef<Path>>(dir: P, options: EngineOptions) -> Result<Self, EngineError> {
+        BatchEngine::load(dir, options).map(|e| Self::Batch(Box::new(e)))
     }
 
     /// Free the engine, returning only once its MLX state has been dropped.
@@ -194,7 +179,7 @@ impl Engine {
     pub fn is_vlm(&self) -> bool {
         match self {
             Self::Simple(e) => e.is_vlm(),
-            Self::Batch(_) => false,
+            Self::Batch(e) => e.is_vlm(),
             #[cfg(test)]
             Self::Stub(_) => false,
         }
@@ -203,7 +188,7 @@ impl Engine {
     pub fn vlm_image_size(&self) -> Option<i32> {
         match self {
             Self::Simple(e) => e.vlm_image_size(),
-            Self::Batch(_) => None,
+            Self::Batch(e) => e.vlm_image_size(),
             #[cfg(test)]
             Self::Stub(_) => None,
         }
@@ -212,7 +197,7 @@ impl Engine {
     pub fn replace_image_tokens(&self, tokens: &mut [u32]) {
         match self {
             Self::Simple(e) => e.replace_image_tokens(tokens),
-            Self::Batch(_) => {}
+            Self::Batch(e) => e.replace_image_tokens(tokens),
             #[cfg(test)]
             Self::Stub(_) => {}
         }

@@ -103,19 +103,6 @@ fn simple_mode_rejects_missing_empty_and_duplicate_models() {
 }
 
 #[test]
-fn simple_mode_rejects_turboquant_with_forced_batch() {
-    let error = simple(&[
-        "--model",
-        "org/model",
-        "--kv-cache",
-        "turboquant",
-        "--batch",
-    ])
-    .unwrap_err();
-    assert!(error.contains("TurboQuant"), "{error}");
-}
-
-#[test]
 fn turboquant_with_auto_batch_is_allowed() {
     let config = simple(&["--model", "org/model", "--kv-cache", "turboquant"]).unwrap();
     assert_eq!(config.models[0].batch, BatchMode::Auto);

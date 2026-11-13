@@ -106,50 +106,31 @@ impl EngineChoice {
     }
 }
 
-/// Pick the engine for a model.
-///
-/// `BatchMode::On` always answers `Batch`: an unsupported model must fail
-/// loudly when it loads, not be silently served by the other engine.
-/// `Auto` answers `Batch` only when no simple-engine-only feature applies.
-pub const fn choose_engine(mode: BatchMode, facts: &BatchFacts) -> EngineChoice {
+/// Pick the engine for a model: the worker engine serves everything except a
+/// model that still asks for the simple engine with `batch = false`.
+pub const fn choose_engine(mode: BatchMode, _facts: &BatchFacts) -> EngineChoice {
     match mode {
-        BatchMode::On => EngineChoice::Batch,
         BatchMode::Off => EngineChoice::Simple(SimpleReason::Requested),
-        BatchMode::Auto => {
-            if !facts.architecture_batches {
-                EngineChoice::Simple(SimpleReason::UnsupportedArchitecture)
-            } else if facts.turboquant_kv {
-                EngineChoice::Simple(SimpleReason::TurboQuantKv)
-            } else if facts.disk_prefix_store {
-                EngineChoice::Simple(SimpleReason::DiskPrefixStore)
-            } else if facts.vision {
-                EngineChoice::Simple(SimpleReason::Vision)
-            } else if facts.mtp_speculative_decode {
-                EngineChoice::Simple(SimpleReason::MtpSpeculativeDecode)
-            } else if facts.prompt_lookup {
-                EngineChoice::Simple(SimpleReason::PromptLookup)
-            } else {
-                EngineChoice::Batch
-            }
-        }
+        BatchMode::On | BatchMode::Auto => EngineChoice::Batch,
     }
 }
 
-/// The engine a model will get, or `None` when its checkpoint cannot be
-/// inspected yet (for example a Hugging Face model not downloaded).
-pub fn planned_engine(
+/// The engine a model will get.
+pub const fn planned_engine(
     model: &ModelConfig,
-    experimental: &ExperimentalConfig,
+    _experimental: &ExperimentalConfig,
 ) -> Option<EngineChoice> {
-    match model.batch {
-        BatchMode::On => Some(EngineChoice::Batch),
-        BatchMode::Off => Some(EngineChoice::Simple(SimpleReason::Requested)),
-        BatchMode::Auto => {
-            let resolved = crate::model_resolver::resolve(&model.path).ok()?;
-            let facts = BatchFacts::inspect(model, experimental, &resolved).ok()?;
-            Some(choose_engine(BatchMode::Auto, &facts))
-        }
-    }
+    Some(choose_engine(
+        model.batch,
+        &BatchFacts {
+            architecture_batches: true,
+            turboquant_kv: false,
+            disk_prefix_store: false,
+            vision: false,
+            mtp_speculative_decode: false,
+            prompt_lookup: false,
+        },
+    ))
 }
 
 #[allow(clippy::panic, clippy::unwrap_used)]
@@ -166,103 +147,14 @@ mod tests {
         prompt_lookup: false,
     };
 
-    fn auto(facts: BatchFacts) -> EngineChoice {
-        choose_engine(BatchMode::Auto, &facts)
-    }
-
     #[test]
-    fn auto_batches_a_plain_batchable_model() {
-        assert_eq!(auto(BATCHABLE), EngineChoice::Batch);
-    }
-
-    #[test]
-    fn auto_falls_back_for_an_architecture_without_batched_decode() {
-        let facts = BatchFacts {
-            architecture_batches: false,
-            ..BATCHABLE
-        };
+    fn only_batch_off_selects_the_simple_engine() {
         assert_eq!(
-            auto(facts),
-            EngineChoice::Simple(SimpleReason::UnsupportedArchitecture)
+            choose_engine(BatchMode::Auto, &BATCHABLE),
+            EngineChoice::Batch
         );
-    }
-
-    #[test]
-    fn auto_falls_back_for_each_simple_only_feature() {
-        let cases = [
-            (
-                BatchFacts {
-                    turboquant_kv: true,
-                    ..BATCHABLE
-                },
-                SimpleReason::TurboQuantKv,
-            ),
-            (
-                BatchFacts {
-                    disk_prefix_store: true,
-                    ..BATCHABLE
-                },
-                SimpleReason::DiskPrefixStore,
-            ),
-            (
-                BatchFacts {
-                    vision: true,
-                    ..BATCHABLE
-                },
-                SimpleReason::Vision,
-            ),
-            (
-                BatchFacts {
-                    mtp_speculative_decode: true,
-                    ..BATCHABLE
-                },
-                SimpleReason::MtpSpeculativeDecode,
-            ),
-            (
-                BatchFacts {
-                    prompt_lookup: true,
-                    ..BATCHABLE
-                },
-                SimpleReason::PromptLookup,
-            ),
-        ];
-        for (facts, reason) in cases {
-            assert_eq!(auto(facts), EngineChoice::Simple(reason));
-        }
-    }
-
-    #[test]
-    fn auto_reports_the_first_applicable_rule() {
-        let many_problems = BatchFacts {
-            architecture_batches: false,
-            turboquant_kv: true,
-            vision: true,
-            ..BATCHABLE
-        };
         assert_eq!(
-            auto(many_problems),
-            EngineChoice::Simple(SimpleReason::UnsupportedArchitecture)
-        );
-        let two_features = BatchFacts {
-            turboquant_kv: true,
-            disk_prefix_store: true,
-            ..BATCHABLE
-        };
-        assert_eq!(
-            auto(two_features),
-            EngineChoice::Simple(SimpleReason::TurboQuantKv)
-        );
-    }
-
-    #[test]
-    fn explicit_modes_ignore_the_facts() {
-        let unsupported = BatchFacts {
-            architecture_batches: false,
-            turboquant_kv: true,
-            ..BATCHABLE
-        };
-        assert_eq!(
-            choose_engine(BatchMode::On, &unsupported),
+            choose_engine(BatchMode::On, &BATCHABLE),
             EngineChoice::Batch
         );
         assert_eq!(
@@ -325,24 +217,5 @@ mod tests {
             BatchFacts::inspect(&model, &ExperimentalConfig::default(), checkpoint.path()).unwrap();
 
         assert!(facts.turboquant_kv);
-        assert_eq!(
-            choose_engine(model.batch, &facts),
-            EngineChoice::Simple(SimpleReason::TurboQuantKv)
-        );
-    }
-
-    #[test]
-    fn plan_for_explicit_modes_needs_no_checkpoint() {
-        let on = model_config("[[models]]\npath = \"org/missing\"\nbatch = true\n");
-        let off = model_config("[[models]]\npath = \"org/missing\"\nbatch = false\n");
-        let auto_mode = model_config("[[models]]\npath = \"org/never-downloaded\"\n");
-        let local = ExperimentalConfig::default();
-
-        assert_eq!(planned_engine(&on, &local), Some(EngineChoice::Batch));
-        assert_eq!(
-            planned_engine(&off, &local),
-            Some(EngineChoice::Simple(SimpleReason::Requested))
-        );
-        assert_eq!(planned_engine(&auto_mode, &local), None);
     }
 }
