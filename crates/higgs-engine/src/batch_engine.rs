@@ -19,6 +19,7 @@ use mlx_rs::{
     transforms::{async_eval, eval},
     with_stream,
 };
+use std::sync::Arc;
 use tokenizers::Tokenizer;
 
 use crate::{
@@ -26,12 +27,13 @@ use crate::{
     engine::{GenerationOutput, GenerationStats, PrefillProgress, StreamingOutput, ThinkingMode},
     error::EngineError,
     generation_support::{
-        ThinkingSupport, embed_tokens, generation_prompt_suffix_len, prefix_cache_key,
-        resume_from_prefix, snapshot_boundary, tokenize_chat_prompt,
+        PrefixResume, ThinkingSupport, embed_tokens, generation_prompt_suffix_len,
+        prefix_cache_key, resume_from_prefix, tokenize_chat_prompt,
     },
     mlx_tuning::MlxRuntimeTuning,
     model_loader,
     paged_prefix_cache::{DEFAULT_BLOCK_SIZE, PagedPrefixCache},
+    prefix_checkpoints::{Arrival, CheckpointPolicy, PrefillCheckpoints, RecurrentCheckpoint},
     simple::{IncrementalDetok, find_stop_in_tail},
 };
 
@@ -273,8 +275,8 @@ struct PendingPrefill {
     tokens: Vec<u32>,
     offset: usize,
     cache: AnyCache,
-    /// Index into `tokens` at which to pause and keep a prefix-cache snapshot.
-    snapshot_at: Option<usize>,
+    /// Where to pause so recurrent state can be kept for the prefix cache.
+    checkpoints: PrefillCheckpoints,
 }
 
 enum PrefillAdvance {
@@ -727,12 +729,18 @@ impl PromptCache {
         }
     }
 
+    #[must_use]
+    fn with_checkpoint_policy(mut self, policy: CheckpointPolicy) -> Self {
+        self.entries = self.entries.with_checkpoint_policy(policy);
+        self
+    }
+
     /// Where prefill of `prompt` resumes and the cache to resume from.
     fn resume(
         &mut self,
         prompt: &[u32],
         fresh_cache: impl FnOnce() -> Result<AnyCache, EngineError>,
-    ) -> Result<(usize, AnyCache), EngineError> {
+    ) -> Result<PrefixResume, EngineError> {
         resume_from_prefix(
             self.entries.find_longest_prefix(prompt),
             prompt,
@@ -745,20 +753,33 @@ impl PromptCache {
         self.entries.longest_prefix_len(prompt)
     }
 
-    fn snapshot_boundary(
+    /// The pauses a prefill of `prompt` resumed at `resume_at` makes to keep
+    /// state for the cache.
+    fn plan_checkpoints(
         &self,
         prompt: &[u32],
         resume_at: usize,
         cache: &AnyCache,
-    ) -> Option<usize> {
-        snapshot_boundary(prompt, resume_at, self.generation_suffix_len, cache)
+        inherited: Vec<Arc<RecurrentCheckpoint>>,
+    ) -> PrefillCheckpoints {
+        PrefillCheckpoints::plan(
+            self.entries.checkpoint_policy(),
+            cache,
+            resume_at,
+            prefix_cache_key(prompt, self.generation_suffix_len).len(),
+            prompt.len(),
+            inherited,
+        )
     }
 
-    /// Keep the state a finished prefill left behind, keyed without the
-    /// chat template's generation suffix.
-    fn remember(&mut self, prompt: &[u32], cache: &AnyCache) {
-        self.entries
-            .store(prefix_cache_key(prompt, self.generation_suffix_len), cache);
+    /// Keep the state a prefill left behind, keyed without the chat
+    /// template's generation suffix.
+    fn remember(&mut self, prompt: &[u32], cache: &AnyCache, checkpoints: &PrefillCheckpoints) {
+        self.entries.store_with_checkpoints(
+            prefix_cache_key(prompt, self.generation_suffix_len),
+            cache,
+            checkpoints.collected(),
+        );
     }
 }
 
@@ -775,7 +796,10 @@ fn worker_loop(
         tracing::warn!("This model cannot batch decode; requests will decode one at a time");
     }
     let mut prompt_cache =
-        PromptCache::new(DEFAULT_PREFIX_CACHE_SIZE, settings.generation_suffix_len);
+        PromptCache::new(DEFAULT_PREFIX_CACHE_SIZE, settings.generation_suffix_len)
+            .with_checkpoint_policy(CheckpointPolicy::resolve(
+                usize::try_from(settings.chunking.chunk_tokens).unwrap_or(1),
+            ));
     let mut active: Vec<ActiveRequest> = Vec::new();
     let mut pending_prefill: Option<PendingPrefill> = None;
     let mut decode_batch: Option<DecodeBatch> = None;
@@ -1303,6 +1327,7 @@ fn prefill_group(
                 req,
                 prompt_len,
                 row,
+                &PrefillCheckpoints::default(),
                 row_logits,
             )
         });
@@ -1348,7 +1373,11 @@ fn start_prefill(
         .len()
         .try_into()
         .map_err(|_| EngineError::Generation("Prompt too long".to_owned()))?;
-    let (resume_at, cache) = prompt_cache.resume(&req.prompt_tokens, || {
+    let PrefixResume {
+        resume_at,
+        cache,
+        checkpoints: inherited,
+    } = prompt_cache.resume(&req.prompt_tokens, || {
         model.make_cache().map_err(EngineError::Mlx)
     })?;
     let tokens = req
@@ -1357,7 +1386,8 @@ fn start_prefill(
         .unwrap_or_default()
         .to_vec();
 
-    let snapshot_at = prompt_cache.snapshot_boundary(&req.prompt_tokens, resume_at, &cache);
+    let checkpoints =
+        prompt_cache.plan_checkpoints(&req.prompt_tokens, resume_at, &cache, inherited);
 
     let cached_tokens = u32::try_from(resume_at).unwrap_or(prompt_len);
     announce_prefill(&req, cached_tokens, cached_tokens, prompt_len);
@@ -1370,7 +1400,7 @@ fn start_prefill(
         tokens,
         offset: 0,
         cache,
-        snapshot_at,
+        checkpoints,
     })
 }
 
@@ -1383,14 +1413,20 @@ fn advance_prefill(
     quantum: u32,
 ) -> Result<PrefillAdvance, EngineError> {
     let start = prefill.offset;
-    let mut end = start
-        .saturating_add(usize::try_from(quantum).unwrap_or(usize::MAX))
+    let resumed_at = usize::try_from(prefill.cached_tokens).unwrap_or(usize::MAX);
+    let first_position = resumed_at.saturating_add(start);
+    let chunk_tokens = usize::try_from(quantum).unwrap_or(usize::MAX);
+    // Chunks end on multiples of the quantum, so the checkpoint positions
+    // (multiples of a multiple of the chunk size) fall on chunk boundaries and
+    // pausing for them adds no forward pass.
+    let chunk_end = (first_position / chunk_tokens)
+        .saturating_add(1)
+        .saturating_mul(chunk_tokens);
+    let mut end = chunk_end
+        .saturating_sub(resumed_at)
         .min(prefill.tokens.len());
-    let snapshot_now = prefill
-        .snapshot_at
-        .filter(|boundary| (start + 1..=end).contains(boundary));
-    if let Some(boundary) = snapshot_now {
-        end = boundary;
+    if let Some(stop) = prefill.checkpoints.next_stop(first_position) {
+        end = end.min(stop - resumed_at);
     }
     let is_complete = end == prefill.tokens.len();
 
@@ -1424,9 +1460,16 @@ fn advance_prefill(
                 prefill.cached_tokens,
                 prefill.prompt_len,
             );
-            if snapshot_now.is_some() {
-                prompt_cache.remember(&prefill.req.prompt_tokens, &prefill.cache);
-                prefill.snapshot_at = None;
+            let arrival = prefill
+                .checkpoints
+                .arrive(resumed_at + end, &prefill.cache)
+                .map_err(EngineError::Mlx)?;
+            if arrival == Arrival::EntryEnd {
+                prompt_cache.remember(
+                    &prefill.req.prompt_tokens,
+                    &prefill.cache,
+                    &prefill.checkpoints,
+                );
             }
             return Ok(PrefillAdvance::InFlight(prefill));
         }
@@ -1438,6 +1481,7 @@ fn advance_prefill(
             prefill.req,
             prefill.prompt_len,
             prefill.cache,
+            &prefill.checkpoints,
             last_logits,
         )
         .map(PrefillAdvance::Complete)
@@ -1471,7 +1515,7 @@ fn prefill_request(
 }
 
 /// Finish a prefill after its final forward pass has produced logits.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn complete_prefill(
     prompt_cache: &mut PromptCache,
     tokenizer: &Tokenizer,
@@ -1479,6 +1523,7 @@ fn complete_prefill(
     mut req: BatchRequest,
     prompt_len: u32,
     cache: AnyCache,
+    checkpoints: &PrefillCheckpoints,
     last_logits: Array,
 ) -> Result<Option<ActiveRequest>, EngineError> {
     {
@@ -1518,7 +1563,7 @@ fn complete_prefill(
         }
 
         // Cache the post-prefill state
-        prompt_cache.remember(&req.prompt_tokens, &cache);
+        prompt_cache.remember(&req.prompt_tokens, &cache, checkpoints);
         crate::simple::maybe_clear_mlx_cache(
             crate::simple::should_clear_mlx_cache_after_prefill(),
             "batch_post_prefill",
@@ -2039,26 +2084,26 @@ mod tests {
     fn prompt_cache_ignores_the_generation_suffix_in_its_key() {
         let mut prompt_cache = PromptCache::new(4, 3);
         let prompt: Vec<u32> = (0..99).collect();
-        prompt_cache.remember(&prompt, &dense_cache(99));
+        prompt_cache.remember(&prompt, &dense_cache(99), &PrefillCheckpoints::default());
 
         let mut repeat = prompt;
         repeat.truncate(96);
         repeat.extend([900, 901, 902]);
         assert_eq!(prompt_cache.covered_tokens(&repeat), 96);
 
-        let (resume_at, _) = prompt_cache
+        let resumed = prompt_cache
             .resume(&repeat, || {
                 Err(EngineError::Generation("expected a hit".to_owned()))
             })
             .unwrap();
-        assert_eq!(resume_at, 96);
+        assert_eq!(resumed.resume_at, 96);
     }
 
     #[test]
     fn prompt_cache_reuses_the_start_of_a_diverging_prompt() {
         let mut prompt_cache = PromptCache::new(4, 3);
         let stored: Vec<u32> = (0..131).collect();
-        prompt_cache.remember(&stored, &dense_cache(131));
+        prompt_cache.remember(&stored, &dense_cache(131), &PrefillCheckpoints::default());
 
         let mut diverging: Vec<u32> = (0..100).collect();
         diverging.extend(500..540);
@@ -2066,32 +2111,35 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_snapshot_pauses_at_the_cache_key() {
+    fn hybrid_prefill_pauses_at_the_cache_key() {
         let prompt_cache = PromptCache::new(4, 4);
         let prompt: Vec<u32> = (0..50).collect();
         let hybrid = AnyCache::Hybrid(Vec::new());
+        let stop = |resume_at| {
+            prompt_cache
+                .plan_checkpoints(&prompt, resume_at, &hybrid, Vec::new())
+                .next_stop(resume_at)
+        };
 
+        assert_eq!(stop(0), Some(46));
+        assert_eq!(stop(10), Some(46));
+        assert_eq!(stop(46), None);
         assert_eq!(
-            prompt_cache.snapshot_boundary(&prompt, 0, &hybrid),
-            Some(46)
-        );
-        assert_eq!(
-            prompt_cache.snapshot_boundary(&prompt, 10, &hybrid),
-            Some(36)
-        );
-        assert_eq!(prompt_cache.snapshot_boundary(&prompt, 46, &hybrid), None);
-        assert_eq!(
-            prompt_cache.snapshot_boundary(&prompt, 0, &dense_cache(0)),
+            prompt_cache
+                .plan_checkpoints(&prompt, 0, &dense_cache(0), Vec::new())
+                .next_stop(0),
             None
         );
     }
 
     #[test]
-    fn hybrid_snapshot_is_unneeded_without_a_generation_suffix() {
+    fn hybrid_prefill_needs_no_pause_without_a_generation_suffix() {
         let prompt_cache = PromptCache::new(4, 0);
         let prompt: Vec<u32> = (0..50).collect();
         assert_eq!(
-            prompt_cache.snapshot_boundary(&prompt, 0, &AnyCache::Hybrid(Vec::new())),
+            prompt_cache
+                .plan_checkpoints(&prompt, 0, &AnyCache::Hybrid(Vec::new()), Vec::new())
+                .next_stop(0),
             None
         );
     }
