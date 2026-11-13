@@ -47,7 +47,7 @@ pub fn validate_thinking_budget(
 /// Whether a tool-aware request renders its prompt in thinking mode. A forced
 /// call is the whole answer, so there is no room to think first.
 pub fn thinking_enabled_for_request(
-    engine: &crate::state::Engine,
+    engine: &dyn crate::backend::Engine,
     tool_policy: &crate::tool_policy::ToolPolicy,
     request_model: &str,
     reasoning: Option<&ReasoningConfig>,

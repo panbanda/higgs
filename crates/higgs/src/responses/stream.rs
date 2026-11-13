@@ -1,81 +1,11 @@
-//! Converts the chat chunk stream into the Responses event protocol.
-
-use serde::Deserialize;
+//! Converts generation events into the Responses event protocol.
 
 use super::translate::{Outcome, ResponseContext, generate_item_id, status_for_finish_reason};
+use crate::generation::{GeneratedToolCall, GenerationEvent};
 use crate::types::responses::{
     ContentPart, InputTokensDetails, OutputItem, OutputTokensDetails, ResponseError,
     ResponseObject, ResponseStatus, ResponseUsage, StreamEvent, StreamEventBody,
 };
-
-#[derive(Deserialize)]
-struct Chunk {
-    #[serde(default)]
-    choices: Vec<ChunkChoice>,
-    #[serde(default)]
-    usage: Option<ChunkUsage>,
-    #[serde(default)]
-    prompt_progress: Option<PromptProgress>,
-}
-
-#[derive(Deserialize)]
-struct ChunkChoice {
-    #[serde(default)]
-    delta: Delta,
-    #[serde(default)]
-    finish_reason: Option<String>,
-}
-
-#[derive(Deserialize, Default)]
-struct Delta {
-    #[serde(default)]
-    content: Option<String>,
-    #[serde(default)]
-    reasoning_content: Option<String>,
-    #[serde(default)]
-    tool_calls: Option<Vec<ToolCallDelta>>,
-}
-
-#[derive(Deserialize)]
-struct ToolCallDelta {
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    function: Option<ToolFunctionDelta>,
-}
-
-#[derive(Deserialize)]
-struct ToolFunctionDelta {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    arguments: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ChunkUsage {
-    prompt_tokens: u32,
-    completion_tokens: u32,
-    #[serde(default)]
-    prompt_tokens_details: Option<ChunkPromptDetails>,
-    #[serde(default)]
-    completion_tokens_details: Option<ChunkCompletionDetails>,
-}
-
-#[derive(Deserialize)]
-struct ChunkPromptDetails {
-    cached_tokens: u32,
-}
-
-#[derive(Deserialize)]
-struct ChunkCompletionDetails {
-    reasoning_tokens: u32,
-}
-
-#[derive(Deserialize)]
-struct PromptProgress {
-    cache: u32,
-}
 
 /// The item currently receiving text deltas.
 enum OpenItem {
@@ -89,10 +19,10 @@ pub struct StreamFinish {
     pub response: ResponseObject,
 }
 
-/// Stateful translator from chat chunks to ordered Responses events.
+/// Stateful translator from generation events to ordered Responses events.
 ///
 /// Text and reasoning stream as deltas into an open item; a tool call
-/// arrives complete from the chat path, so it is emitted as a whole item.
+/// arrives complete from the engine, so it is emitted as a whole item.
 /// Switching kinds closes the open item first, so `output_index` always
 /// equals the number of items closed before it.
 pub struct ResponseStreamBuilder {
@@ -102,7 +32,7 @@ pub struct ResponseStreamBuilder {
     open: Option<OpenItem>,
     finish_reason: Option<String>,
     usage: Option<(u32, u32)>,
-    /// From `prompt_progress` chunks; superseded by the usage chunk's figure.
+    /// From prefill progress; superseded by the usage figure.
     cached_tokens: Option<u32>,
     reasoning_tokens: Option<u32>,
 }
@@ -146,42 +76,37 @@ impl ResponseStreamBuilder {
         events
     }
 
-    /// Feed one chat SSE `data` payload. Payloads that are not chunk JSON
-    /// (the `[DONE]` sentinel) produce no events.
-    pub fn ingest(&mut self, data: &str) -> Vec<StreamEvent> {
+    /// Feed one generation event.
+    pub fn ingest(&mut self, event: GenerationEvent) -> Vec<StreamEvent> {
         let mut events = Vec::new();
-        let Ok(chunk) = serde_json::from_str::<Chunk>(data) else {
-            return events;
-        };
-        if let Some(progress) = chunk.prompt_progress {
-            self.cached_tokens = Some(progress.cache);
-        }
-        if let Some(usage) = chunk.usage {
-            self.usage = Some((usage.prompt_tokens, usage.completion_tokens));
-            if let Some(details) = usage.prompt_tokens_details {
-                self.cached_tokens = Some(details.cached_tokens);
+        match event {
+            GenerationEvent::PrefillProgress(progress) => {
+                self.cached_tokens = Some(progress.cached);
             }
-            self.reasoning_tokens = usage
-                .completion_tokens_details
-                .map(|details| details.reasoning_tokens);
-        }
-        for choice in chunk.choices {
-            if let Some(text) = choice
-                .delta
-                .reasoning_content
-                .filter(|text| !text.is_empty())
-            {
-                self.reasoning_delta(&mut events, text);
+            GenerationEvent::Usage(usage) => {
+                self.usage = Some((usage.prompt_tokens, usage.completion_tokens));
+                if let Some(details) = usage.prompt_tokens_details {
+                    self.cached_tokens = Some(details.cached_tokens);
+                }
+                self.reasoning_tokens = usage
+                    .completion_tokens_details
+                    .map(|details| details.reasoning_tokens);
             }
-            for call in choice.delta.tool_calls.unwrap_or_default() {
-                self.tool_call(&mut events, call);
+            GenerationEvent::ReasoningDelta(text) => {
+                if !text.is_empty() {
+                    self.reasoning_delta(&mut events, text);
+                }
             }
-            if let Some(text) = choice.delta.content.filter(|text| !text.is_empty()) {
-                self.message_delta(&mut events, text);
+            GenerationEvent::ToolCall(call) => self.tool_call(&mut events, &call),
+            GenerationEvent::TextDelta { text, .. } => {
+                if !text.is_empty() {
+                    self.message_delta(&mut events, text);
+                }
             }
-            if let Some(reason) = choice.finish_reason {
-                self.finish_reason = Some(reason);
-            }
+            GenerationEvent::Finish { reason, .. } => self.finish_reason = Some(reason),
+            GenerationEvent::Started { .. }
+            | GenerationEvent::ToolLoop(_)
+            | GenerationEvent::Error(_) => {}
         }
         events
     }
@@ -287,15 +212,12 @@ impl ResponseStreamBuilder {
         });
     }
 
-    fn tool_call(&mut self, events: &mut Vec<StreamEvent>, call: ToolCallDelta) {
-        let Some(function) = call.function else {
-            return;
-        };
+    fn tool_call(&mut self, events: &mut Vec<StreamEvent>, call: &GeneratedToolCall) {
         self.close_open(events, ResponseStatus::Completed);
         let id = generate_item_id("fc");
-        let call_id = call.id.unwrap_or_else(|| generate_item_id("call"));
-        let name = function.name.unwrap_or_default();
-        let arguments = function.arguments.unwrap_or_default();
+        let call_id = call.id.clone();
+        let name = call.name.clone();
+        let arguments = call.arguments.to_string();
         let output_index = self.output_index();
 
         self.push(
@@ -481,6 +403,8 @@ impl ResponseStreamBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::openai::{CompletionTokensDetails, CompletionUsage, PromptTokensDetails};
+    use higgs_engine::engine::PrefillProgress;
     use serde_json::json;
 
     fn context() -> ResponseContext {
@@ -490,41 +414,51 @@ mod tests {
         )
     }
 
-    fn delta_chunk(delta: &serde_json::Value, finish: Option<&str>) -> String {
-        json!({
-            "id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 0, "model": "m",
-            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]
-        })
-        .to_string()
-    }
-
-    fn usage_chunk(prompt: u32, completion: u32) -> String {
-        json!({
-            "id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 0, "model": "m",
-            "choices": [],
-            "usage": {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
-        })
-        .to_string()
-    }
-
-    fn progress_chunk(cache: u32) -> String {
-        json!({
-            "id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 0, "model": "m",
-            "choices": [],
-            "prompt_progress": {"total": 20, "cache": cache, "processed": 20, "time_ms": 3}
-        })
-        .to_string()
-    }
-
-    fn run(chunks: &[String]) -> (Vec<StreamEvent>, ResponseObject) {
-        let mut builder = ResponseStreamBuilder::new(context());
-        let mut events = builder.start();
-        for chunk in chunks {
-            events.extend(builder.ingest(chunk));
+    fn text(text: &str) -> GenerationEvent {
+        GenerationEvent::TextDelta {
+            text: text.to_owned(),
+            logprobs: None,
         }
-        let finish = builder.finish();
-        events.extend(finish.events);
-        (events, finish.response)
+    }
+
+    fn reasoning(text: &str) -> GenerationEvent {
+        GenerationEvent::ReasoningDelta(text.to_owned())
+    }
+
+    fn finish(reason: &str) -> GenerationEvent {
+        GenerationEvent::Finish {
+            reason: reason.to_owned(),
+            logprobs: None,
+        }
+    }
+
+    fn usage(prompt: u32, completion: u32) -> GenerationEvent {
+        GenerationEvent::Usage(CompletionUsage::new(prompt, completion))
+    }
+
+    fn progress(cached: u32) -> GenerationEvent {
+        GenerationEvent::PrefillProgress(PrefillProgress {
+            processed: 20,
+            cached,
+            total: 20,
+        })
+    }
+
+    fn call(id: &str, name: &str, arguments: serde_json::Value) -> GenerationEvent {
+        let mut generated = GeneratedToolCall::new(0, name.to_owned(), arguments);
+        generated.id = id.to_owned();
+        GenerationEvent::ToolCall(generated)
+    }
+
+    fn run(events: Vec<GenerationEvent>) -> (Vec<StreamEvent>, ResponseObject) {
+        let mut builder = ResponseStreamBuilder::new(context());
+        let mut emitted = builder.start();
+        for event in events {
+            emitted.extend(builder.ingest(event));
+        }
+        let finished = builder.finish();
+        emitted.extend(finished.events);
+        (emitted, finished.response)
     }
 
     fn names(events: &[StreamEvent]) -> Vec<&'static str> {
@@ -542,19 +476,14 @@ mod tests {
     }
 
     #[test]
-    fn usage_chunk_details_set_cached_and_reasoning_tokens() {
-        let detailed_usage = json!({
-            "id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 0, "model": "m",
-            "choices": [],
-            "usage": {
-                "prompt_tokens": 20, "completion_tokens": 9, "total_tokens": 29,
-                "prompt_tokens_details": {"cached_tokens": 16},
-                "completion_tokens_details": {"reasoning_tokens": 4}
-            }
-        })
-        .to_string();
+    fn usage_details_set_cached_and_reasoning_tokens() {
+        let mut detailed = CompletionUsage::new(20, 9);
+        detailed.prompt_tokens_details = Some(PromptTokensDetails { cached_tokens: 16 });
+        detailed.completion_tokens_details = Some(CompletionTokensDetails {
+            reasoning_tokens: 4,
+        });
 
-        let (_events, response) = run(&[progress_chunk(2), detailed_usage]);
+        let (_events, response) = run(vec![progress(2), GenerationEvent::Usage(detailed)]);
 
         let usage = response.usage.unwrap();
         assert_eq!(usage.input_tokens_details.unwrap().cached_tokens, 16);
@@ -563,14 +492,12 @@ mod tests {
 
     #[test]
     fn text_only_stream_has_the_exact_event_order() {
-        let (events, response) = run(&[
-            progress_chunk(4),
-            delta_chunk(&json!({"role": "assistant"}), None),
-            delta_chunk(&json!({"content": "Hel"}), None),
-            delta_chunk(&json!({"content": "lo"}), None),
-            delta_chunk(&json!({}), Some("stop")),
-            usage_chunk(12, 2),
-            "[DONE]".to_owned(),
+        let (events, response) = run(vec![
+            progress(4),
+            text("Hel"),
+            text("lo"),
+            finish("stop"),
+            usage(12, 2),
         ]);
 
         assert_eq!(
@@ -609,10 +536,7 @@ mod tests {
 
     #[test]
     fn text_deltas_carry_item_ids_and_the_done_event_the_full_text() {
-        let (events, _) = run(&[
-            delta_chunk(&json!({"content": "Hi"}), None),
-            delta_chunk(&json!({}), Some("stop")),
-        ]);
+        let (events, _) = run(vec![text("Hi"), finish("stop")]);
         let item_id = match &events[2].body {
             StreamEventBody::OutputItemAdded { item, output_index } => {
                 assert_eq!(*output_index, 0);
@@ -639,19 +563,12 @@ mod tests {
 
     #[test]
     fn reasoning_then_tool_call_stream_has_the_exact_event_order() {
-        let (events, response) = run(&[
-            delta_chunk(&json!({"role": "assistant"}), None),
-            delta_chunk(&json!({"reasoning_content": "need "}), None),
-            delta_chunk(&json!({"reasoning_content": "weather"}), None),
-            delta_chunk(
-                &json!({"tool_calls": [{
-                    "index": 0, "id": "call_0_abc", "type": "function",
-                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
-                }]}),
-                None,
-            ),
-            delta_chunk(&json!({}), Some("tool_calls")),
-            usage_chunk(30, 9),
+        let (events, response) = run(vec![
+            reasoning("need "),
+            reasoning("weather"),
+            call("call_0_abc", "get_weather", json!({"city": "Paris"})),
+            finish("tool_calls"),
+            usage(30, 9),
         ]);
 
         assert_eq!(
@@ -709,14 +626,10 @@ mod tests {
 
     #[test]
     fn text_then_tool_call_closes_the_message_before_the_call() {
-        let (events, response) = run(&[
-            delta_chunk(&json!({"content": "Checking."}), None),
-            delta_chunk(
-                &json!({"tool_calls": [{"index": 0, "id": "c1", "type": "function",
-                    "function": {"name": "f", "arguments": "{}"}}]}),
-                None,
-            ),
-            delta_chunk(&json!({}), Some("tool_calls")),
+        let (events, response) = run(vec![
+            text("Checking."),
+            call("c1", "f", json!({})),
+            finish("tool_calls"),
         ]);
         assert_eq!(
             names(&events)[2..],
@@ -740,17 +653,10 @@ mod tests {
 
     #[test]
     fn two_tool_calls_get_consecutive_output_indices() {
-        let call = |id: &str| {
-            delta_chunk(
-                &json!({"tool_calls": [{"index": 0, "id": id, "type": "function",
-                    "function": {"name": "f", "arguments": "{}"}}]}),
-                None,
-            )
-        };
-        let (events, response) = run(&[
-            call("c1"),
-            call("c2"),
-            delta_chunk(&json!({}), Some("tool_calls")),
+        let (events, response) = run(vec![
+            call("c1", "f", json!({})),
+            call("c2", "f", json!({})),
+            finish("tool_calls"),
         ]);
         let indices: Vec<u32> = events
             .iter()
@@ -765,11 +671,7 @@ mod tests {
 
     #[test]
     fn length_finish_ends_with_response_incomplete() {
-        let (events, response) = run(&[
-            delta_chunk(&json!({"content": "cut off"}), None),
-            delta_chunk(&json!({}), Some("length")),
-            usage_chunk(5, 7),
-        ]);
+        let (events, response) = run(vec![text("cut off"), finish("length"), usage(5, 7)]);
         assert_eq!(*names(&events).last().unwrap(), "response.incomplete");
         assert_eq!(response.status, ResponseStatus::Incomplete);
         assert_eq!(
@@ -784,7 +686,7 @@ mod tests {
 
     #[test]
     fn stream_without_a_finish_reason_fails() {
-        let (events, response) = run(&[delta_chunk(&json!({"content": "partial"}), None)]);
+        let (events, response) = run(vec![text("partial")]);
         assert_eq!(*names(&events).last().unwrap(), "response.failed");
         assert_eq!(response.status, ResponseStatus::Failed);
         assert_eq!(response.error.unwrap().code, "server_error");
@@ -793,7 +695,7 @@ mod tests {
 
     #[test]
     fn empty_generation_still_emits_one_empty_message() {
-        let (events, response) = run(&[delta_chunk(&json!({}), Some("stop"))]);
+        let (events, response) = run(vec![finish("stop")]);
         assert_eq!(
             names(&events),
             vec![
@@ -811,16 +713,24 @@ mod tests {
     }
 
     #[test]
-    fn malformed_and_sentinel_chunks_are_ignored() {
+    fn events_without_output_are_ignored() {
         let mut builder = ResponseStreamBuilder::new(context());
         builder.start();
-        assert!(builder.ingest("[DONE]").is_empty());
-        assert!(builder.ingest("not json").is_empty());
+        assert!(
+            builder
+                .ingest(GenerationEvent::Started { prompt_tokens: 3 })
+                .is_empty()
+        );
+        assert!(
+            builder
+                .ingest(GenerationEvent::Error("tool loop failed".to_owned()))
+                .is_empty()
+        );
     }
 
     #[test]
     fn created_and_in_progress_carry_an_in_progress_response() {
-        let (events, _) = run(&[delta_chunk(&json!({}), Some("stop"))]);
+        let (events, _) = run(vec![finish("stop")]);
         for event in &events[..2] {
             match &event.body {
                 StreamEventBody::Created { response }

@@ -2,14 +2,19 @@
 
 #![allow(clippy::unreachable)]
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use higgs_engine::engine::{GenerationOutput, StreamingOutput};
+use higgs_engine::chat_template::ChatMessage;
+use higgs_engine::constrained::ConstrainedGenerator;
+use higgs_engine::engine::{GenerationOutput, StreamingOutput, ThinkingMode};
 use higgs_engine::error::EngineError;
 use higgs_engine::tokenizers::Tokenizer;
 use higgs_engine::tool_format::ToolCallFormat;
 
+use crate::backend::{Engine, EngineJob, LoadedEngine};
+
 /// Canned behavior for a [`StubEngine`].
+#[derive(Clone)]
 pub struct StubScript {
     pub prompt_tokens: Vec<u32>,
     pub enable_thinking: bool,
@@ -55,27 +60,38 @@ pub struct StubCall {
     pub thinking_budget: Option<u32>,
 }
 
+/// What a stub saw, shared between its clones.
+type Recorded<T> = Arc<Mutex<Vec<T>>>;
+
+/// The scripted engine every test serves models from. Clones share their
+/// recorded calls, so a test keeps a handle after giving one to the pool.
+#[derive(Clone)]
 pub struct StubEngine {
     pub name: String,
-    pub tokenizer: Option<Tokenizer>,
+    /// A word-level tokenizer unless a test supplies another.
+    pub tokenizer: Tokenizer,
     pub script: StubScript,
-    pub calls: Mutex<Vec<StubCall>>,
+    calls: Recorded<StubCall>,
     /// Tool count passed to each prompt rendering (`None` when no tools).
-    pub prompt_tools: Mutex<Vec<Option<usize>>>,
+    prompt_tools: Recorded<Option<usize>>,
     /// Role and text of every message in each rendered prompt.
-    pub prompt_messages: Mutex<Vec<Vec<(String, String)>>>,
+    prompt_messages: Recorded<Vec<(String, String)>>,
 }
 
 impl StubEngine {
     pub fn named(name: &str) -> Self {
         Self {
             name: name.to_owned(),
-            tokenizer: None,
+            tokenizer: word_tokenizer(),
             script: StubScript::default(),
-            calls: Mutex::new(Vec::new()),
-            prompt_tools: Mutex::new(Vec::new()),
-            prompt_messages: Mutex::new(Vec::new()),
+            calls: Arc::default(),
+            prompt_tools: Arc::default(),
+            prompt_messages: Arc::default(),
         }
+    }
+
+    pub fn into_loaded(self) -> LoadedEngine {
+        Box::new(self)
     }
 
     pub fn recorded_calls(&self) -> Vec<StubCall> {
@@ -85,17 +101,24 @@ impl StubEngine {
             .unwrap_or_default()
     }
 
+    pub fn recorded_prompt_tools(&self) -> Vec<Option<usize>> {
+        self.prompt_tools
+            .lock()
+            .map(|prompts| prompts.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn recorded_prompt_messages(&self) -> Vec<Vec<(String, String)>> {
+        self.prompt_messages
+            .lock()
+            .map(|rendered| rendered.clone())
+            .unwrap_or_default()
+    }
+
     /// Whether `constraint` accepts `text` when each character is one token.
-    pub fn constraint_accepts(
-        &self,
-        mut constraint: higgs_engine::constrained::ConstrainedGenerator,
-        text: &str,
-    ) -> bool {
-        let Some(tokenizer) = &self.tokenizer else {
-            return false;
-        };
+    fn constraint_accepts(&self, mut constraint: ConstrainedGenerator, text: &str) -> bool {
         for character in text.chars() {
-            let Some(id) = tokenizer.token_to_id(&character.to_string()) else {
+            let Some(id) = self.tokenizer.token_to_id(&character.to_string()) else {
                 return false;
             };
             if !constraint.advance(id) {
@@ -105,25 +128,95 @@ impl StubEngine {
         constraint.is_finished()
     }
 
-    /// The scripted output a streaming call will send, as one string.
-    pub fn scripted_stream_text(&self) -> String {
-        self.script
-            .stream
-            .iter()
-            .map(|output| output.new_text.as_str())
-            .collect()
+    fn call_for(&self, job: EngineJob, scripted_text: &str) -> StubCall {
+        let has_constraint = job.constraint.is_some();
+        let constraint_accepts_output = job
+            .constraint
+            .map(|constraint| self.constraint_accepts(constraint, scripted_text));
+        StubCall {
+            max_tokens: job.max_tokens,
+            thinking_enabled: job.thinking.is_on(),
+            has_constraint,
+            constraint_accepts_output,
+            thinking_budget: match job.thinking {
+                ThinkingMode::On { budget } => budget,
+                ThinkingMode::Off => None,
+            },
+        }
     }
 
-    pub fn scripted_generation_text(&self) -> String {
-        self.script
+    /// Record a generation call and return how many came before it.
+    fn record(&self, call: StubCall) -> usize {
+        self.calls.lock().map_or(0, |mut calls| {
+            calls.push(call);
+            calls.len() - 1
+        })
+    }
+}
+
+impl Engine for StubEngine {
+    fn model_name(&self) -> &str {
+        &self.name
+    }
+
+    fn tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
+
+    fn eos_token_ids(&self) -> &[u32] {
+        &[]
+    }
+
+    fn enable_thinking(&self) -> bool {
+        self.script.enable_thinking
+    }
+
+    fn tool_call_format(&self) -> ToolCallFormat {
+        self.script.tool_call_format
+    }
+
+    fn decode_kind(&self) -> &'static str {
+        "sequential"
+    }
+
+    fn is_vlm(&self) -> bool {
+        false
+    }
+
+    fn vlm_image_size(&self) -> Option<i32> {
+        None
+    }
+
+    fn replace_image_tokens(&self, _tokens: &mut [u32]) {}
+
+    fn prepare_chat_prompt(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        _enable_thinking: bool,
+    ) -> Result<Vec<u32>, EngineError> {
+        if let Ok(mut rendered) = self.prompt_messages.lock() {
+            rendered.push(
+                messages
+                    .iter()
+                    .map(|message| (message.role.clone(), message.content.clone()))
+                    .collect(),
+            );
+        }
+        if let Ok(mut prompts) = self.prompt_tools.lock() {
+            prompts.push(tools.map(<[_]>::len));
+        }
+        Ok(self.script.prompt_tokens.clone())
+    }
+
+    fn generate(&self, job: EngineJob) -> Result<GenerationOutput, EngineError> {
+        let scripted_text = self
+            .script
             .generation
             .as_ref()
             .map(|output| output.text.clone())
-            .unwrap_or_default()
-    }
-
-    pub fn generate(&self, call: StubCall) -> Result<GenerationOutput, EngineError> {
-        let index = self.record(call);
+            .unwrap_or_default();
+        let index = self.record(self.call_for(job, &scripted_text));
         let mut output = self
             .script
             .generations
@@ -140,12 +233,18 @@ impl StubEngine {
         Ok(output)
     }
 
-    pub fn generate_streaming(
+    fn generate_streaming(
         &self,
-        call: StubCall,
+        job: EngineJob,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
     ) -> Result<(), EngineError> {
-        let index = self.record(call);
+        let scripted_text: String = self
+            .script
+            .stream
+            .iter()
+            .map(|output| output.new_text.as_str())
+            .collect();
+        let index = self.record(self.call_for(job, &scripted_text));
         let events = self
             .script
             .streams
@@ -162,50 +261,11 @@ impl StubEngine {
         Ok(())
     }
 
-    pub fn render_prompt(&self, tool_count: Option<usize>) -> Vec<u32> {
-        if let Ok(mut prompts) = self.prompt_tools.lock() {
-            prompts.push(tool_count);
-        }
-        self.script.prompt_tokens.clone()
+    fn embed(&self, _token_ids: &[u32]) -> Result<Vec<f32>, EngineError> {
+        Ok(Vec::new())
     }
 
-    pub fn recorded_prompt_tools(&self) -> Vec<Option<usize>> {
-        self.prompt_tools
-            .lock()
-            .map(|prompts| prompts.clone())
-            .unwrap_or_default()
-    }
-
-    pub fn render_prompt_for(
-        &self,
-        messages: &[higgs_engine::chat_template::ChatMessage],
-        tool_count: Option<usize>,
-    ) -> Vec<u32> {
-        if let Ok(mut rendered) = self.prompt_messages.lock() {
-            rendered.push(
-                messages
-                    .iter()
-                    .map(|message| (message.role.clone(), message.content.clone()))
-                    .collect(),
-            );
-        }
-        self.render_prompt(tool_count)
-    }
-
-    pub fn recorded_prompt_messages(&self) -> Vec<Vec<(String, String)>> {
-        self.prompt_messages
-            .lock()
-            .map(|rendered| rendered.clone())
-            .unwrap_or_default()
-    }
-
-    /// Record a generation call and return how many came before it.
-    fn record(&self, call: StubCall) -> usize {
-        self.calls.lock().map_or(0, |mut calls| {
-            calls.push(call);
-            calls.len() - 1
-        })
-    }
+    fn shutdown(self: Box<Self>) {}
 }
 
 /// Minimal word-level tokenizer: each whitespace-separated word is one token.
@@ -255,7 +315,7 @@ pub fn char_tokenizer() -> Tokenizer {
 }
 
 /// Router serving one scripted local model named `stub`.
-pub fn app_with_stub(stub: StubEngine) -> (axum::Router, std::sync::Arc<crate::state::Engine>) {
+pub fn app_with_stub(stub: StubEngine) -> (axum::Router, StubEngine) {
     app_with_stub_and_config(stub, "")
 }
 
@@ -263,7 +323,7 @@ pub fn app_with_stub(stub: StubEngine) -> (axum::Router, std::sync::Arc<crate::s
 pub fn app_with_stub_and_config(
     stub: StubEngine,
     extra_config: &str,
-) -> (axum::Router, std::sync::Arc<crate::state::Engine>) {
+) -> (axum::Router, StubEngine) {
     app_with_stub_config_and_tools(stub, extra_config, crate::tools::ToolHub::disabled())
 }
 
@@ -272,7 +332,7 @@ pub fn app_with_stub_config_and_tools(
     stub: StubEngine,
     extra_config: &str,
     tools: crate::tools::ToolHub,
-) -> (axum::Router, std::sync::Arc<crate::state::Engine>) {
+) -> (axum::Router, StubEngine) {
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -286,9 +346,9 @@ pub fn app_with_stub_config_and_tools(
     let config = crate::config::load_config_file(&config_path, None)
         .unwrap_or_else(|error| unreachable!("load config: {error}"));
 
-    let engine = Arc::new(crate::state::Engine::scripted_stub(stub));
+    let engine = stub.clone();
     let mut engines = HashMap::new();
-    engines.insert("stub".to_owned(), Arc::clone(&engine));
+    engines.insert("stub".to_owned(), Arc::new(stub.into_loaded()));
     let router = crate::router::Router::from_config(&config, engines)
         .unwrap_or_else(|error| unreachable!("build router: {error}"));
 
@@ -327,7 +387,7 @@ pub fn app_with_tools(
     let mut engines = HashMap::new();
     engines.insert(
         "stub".to_owned(),
-        Arc::new(crate::state::Engine::test_stub("stub")),
+        Arc::new(StubEngine::named("stub").into_loaded()),
     );
     let router = crate::router::Router::from_config(&config, engines)
         .unwrap_or_else(|error| unreachable!("build router: {error}"));

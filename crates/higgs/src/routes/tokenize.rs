@@ -10,11 +10,12 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    backend::EngineLease,
     error::ServerError,
+    generation::messages::convert_messages,
     metrics::RequestMetricsContext,
     router::ResolvedRoute,
-    routes::chat::convert_messages,
-    state::{EngineLease, SharedState},
+    state::SharedState,
     types::openai::{ChatCompletionMessage, ReasoningConfig},
 };
 
@@ -104,7 +105,7 @@ pub async fn tokenize(
                 req.reasoning.as_ref(),
             );
             engine
-                .prepare_chat_prompt_with_thinking(&engine_messages, tools, thinking_enabled)
+                .prepare_chat_prompt(&engine_messages, tools, thinking_enabled)
                 .map_err(ServerError::Engine)?
         }
         (None, None) => Vec::new(),
@@ -165,11 +166,10 @@ async fn local_engine(
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
-    use crate::test_support::{StubEngine, app_with_stub, post_json, word_tokenizer};
+    use crate::test_support::{StubEngine, app_with_stub, post_json};
 
     fn stub() -> StubEngine {
         let mut stub = StubEngine::named("stub");
-        stub.tokenizer = Some(word_tokenizer());
         stub.script.prompt_tokens = vec![9, 8, 7, 6];
         stub
     }

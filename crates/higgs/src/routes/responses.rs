@@ -15,20 +15,21 @@ use bytes::Bytes;
 use tokio_stream::{Stream, StreamExt};
 
 use crate::{
+    backend::EngineLease,
     config::ApiFormat,
-    constraint::ConstraintSpec,
     error::{ErrorDetail, ErrorResponse, ServerError},
+    generation::{EventStream, StreamMetrics},
     metrics::{RequestMetricsContext, RequestRecord, RequestTiming},
     responses::{
         store::{ResponseStore, StoredResponse},
         stream::ResponseStreamBuilder,
         translate::{
-            ResponseContext, build_chat_request, outcome_from_chat, output_to_input_items,
-            parse_input, reject_unsupported_fields, routing_messages,
+            ResponseContext, build_generation_request, outcome_from_completed,
+            output_to_input_items, parse_input, reject_unsupported_fields, routing_messages,
         },
     },
     router::ResolvedRoute,
-    state::{EngineLease, SharedState},
+    state::SharedState,
     types::responses::{
         CreateResponseRequest, DeletedResponse, InputItem, ResponseObject, ResponseStatus,
         StreamEvent,
@@ -218,42 +219,41 @@ async fn create_local_response(
         );
     }
 
-    let chat = build_chat_request(&request, &model_name, &conversation)?;
-    let constraint_spec = ConstraintSpec::from_request(chat.response_format.as_ref(), None, None)?;
+    let generation = build_generation_request(
+        &request,
+        &model_name,
+        &conversation,
+        state.config.server.max_tokens,
+    )?;
     let context = ResponseContext::from_request(&request, model_name);
     let store_response = request.store.unwrap_or(true).then(|| Arc::clone(&store));
 
     if request.stream == Some(true) {
-        let chunks = crate::tool_loop::chunk_stream(
+        let events = crate::generation::stream(
             Arc::clone(&state),
-            chat,
+            generation,
             engine,
-            constraint_spec,
-            state.metrics.clone(),
-            routing_method,
+            state.metrics.clone().map(|metrics_store| StreamMetrics {
+                store: metrics_store,
+                routing_method,
+            }),
             received_at,
         )?;
-        let events = response_event_stream(chunks, context, store_response, conversation);
+        let responses = response_event_stream(events, context, store_response, conversation);
         if state.metrics.is_some() {
             request_metrics.mark_recorded();
         }
-        return Ok(Sse::new(events)
+        return Ok(Sse::new(responses)
             .keep_alive(KeepAlive::default())
             .into_response());
     }
 
     let start = Instant::now();
-    let chat_response = crate::tool_loop::complete(
-        Arc::clone(&state),
-        chat,
-        engine,
-        constraint_spec,
-        received_at,
-    )
-    .await?;
-    let input_tokens = u64::from(chat_response.usage.prompt_tokens);
-    let output_tokens = u64::from(chat_response.usage.completion_tokens);
-    let object = context.object(outcome_from_chat(chat_response));
+    let completed =
+        crate::generation::complete(Arc::clone(&state), generation, engine, received_at).await?;
+    let input_tokens = u64::from(completed.usage.prompt_tokens);
+    let output_tokens = u64::from(completed.usage.completion_tokens);
+    let object = context.object(outcome_from_completed(completed));
     if let Some(response_store) = store_response {
         store_completed(&response_store, &object, conversation);
     }
@@ -327,10 +327,11 @@ fn sse_event(event: &StreamEvent) -> Option<Event> {
     }
 }
 
-/// Re-frame chat chunks as Responses events, storing the finished response
-/// before the terminal event goes out so a client can chain immediately.
+/// Render generation events as Responses events, storing the finished
+/// response before the terminal event goes out so a client can chain
+/// immediately.
 fn response_event_stream(
-    chunk_source: impl Stream<Item = String>,
+    mut generated: EventStream,
     context: ResponseContext,
     store: Option<Arc<ResponseStore>>,
     conversation: Vec<InputItem>,
@@ -343,9 +344,8 @@ fn response_event_stream(
             }
         }
 
-        let mut chunks = std::pin::pin!(chunk_source);
-        while let Some(data) = chunks.next().await {
-            for event in builder.ingest(&data) {
+        while let Some(generation_event) = generated.next().await {
+            for event in builder.ingest(generation_event) {
                 if let Some(frame) = sse_event(&event) {
                     yield Ok(frame);
                 }
@@ -380,7 +380,7 @@ mod tests {
     use crate::metrics::MetricsStore;
     use crate::router::Router;
     use crate::state::AppState;
-    use crate::state::Engine;
+    use crate::test_support::StubEngine;
     use crate::types::responses::ContentPart;
 
     const STUB_MODEL: &str = "stub-model";
@@ -397,7 +397,7 @@ mod tests {
         let mut engines = HashMap::new();
         engines.insert(
             STUB_MODEL.to_owned(),
-            Arc::new(Engine::test_stub(STUB_MODEL)),
+            Arc::new(StubEngine::named(STUB_MODEL).into_loaded()),
         );
         let router = Router::from_config(&config, engines).unwrap();
         Arc::new(AppState {

@@ -73,7 +73,7 @@ pub struct ChatCompletionRequest {
     /// built-in web tools) on the server and continue the generation with
     /// their results. See `docs/mcp.md`.
     #[serde(default)]
-    pub mcp: Option<crate::tool_loop::McpOptions>,
+    pub mcp: Option<crate::generation::tool_loop::McpOptions>,
 }
 
 /// Optional request-level controls for streaming responses.
