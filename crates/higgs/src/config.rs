@@ -250,6 +250,10 @@ pub struct ServeArgs {
     /// Keep at most this many models loaded, evicting the least recently used.
     #[arg(long, value_name = "N")]
     pub max_loaded_models: Option<usize>,
+
+    /// JSON file of MCP servers in the common `{"mcpServers": {...}}` format.
+    #[arg(long, value_name = "PATH")]
+    pub mcp_config: Option<PathBuf>,
 }
 
 impl ServeArgs {
@@ -293,6 +297,12 @@ pub struct HiggsConfig {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
+    /// Model Context Protocol servers whose tools Higgs can run.
+    #[serde(default)]
+    pub mcp: crate::mcp::config::McpConfig,
+    /// Web search and fetch endpoints (off by default).
+    #[serde(default)]
+    pub web: crate::web::config::WebConfig,
 }
 
 // -- Server section ---------------------------------------------------------
@@ -1021,6 +1031,9 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
     config.server = server;
     args.apply_lifecycle_to(&mut config.local);
     apply_requested_mlx_profile(&mut config, args.mlx_profile)?;
+    if let Some(ref path) = args.mcp_config {
+        config.mcp.merge_file(path)?;
+    }
 
     validate_config(&config, true)?;
     ensure_auto_router_model(&mut config);
@@ -1120,6 +1133,9 @@ fn extract_config(
         .map_err(|e| format!("failed to load config from {source}: {e}"))?;
     if let Some(serve_args) = args {
         serve_args.apply_lifecycle_to(&mut config.local);
+        if let Some(ref path) = serve_args.mcp_config {
+            config.mcp.merge_file(path)?;
+        }
     }
     apply_requested_mlx_profile(
         &mut config,
@@ -1492,6 +1508,7 @@ mod tests {
             idle_ttl: None,
             memory_guard: None,
             max_loaded_models: None,
+            mcp_config: None,
         };
         let config = build_simple_config(&args).unwrap();
         assert_eq!(config.models.len(), 2);
@@ -1526,6 +1543,7 @@ mod tests {
             idle_ttl: None,
             memory_guard: None,
             max_loaded_models: None,
+            mcp_config: None,
         };
         let config = build_simple_config(&args).unwrap();
         assert_eq!(config.server.host, "127.0.0.1");
@@ -1560,6 +1578,7 @@ mod tests {
             idle_ttl: None,
             memory_guard: None,
             max_loaded_models: None,
+            mcp_config: None,
         };
         let config = build_simple_config(&args).unwrap();
         let model = config.models.first().unwrap();
@@ -1592,6 +1611,7 @@ mod tests {
             idle_ttl: None,
             memory_guard: None,
             max_loaded_models: None,
+            mcp_config: None,
         };
         assert!(build_simple_config(&args).is_err());
     }
@@ -1620,6 +1640,7 @@ mod tests {
             idle_ttl: None,
             memory_guard: None,
             max_loaded_models: None,
+            mcp_config: None,
         };
         assert!(build_simple_config(&args).is_err());
     }
@@ -1648,6 +1669,7 @@ mod tests {
             idle_ttl: None,
             memory_guard: None,
             max_loaded_models: None,
+            mcp_config: None,
         };
         assert!(build_simple_config(&args).is_err());
     }
@@ -1676,6 +1698,7 @@ mod tests {
             idle_ttl: None,
             memory_guard: None,
             max_loaded_models: None,
+            mcp_config: None,
         };
         let error = build_simple_config(&args).unwrap_err();
         assert!(error.contains("TurboQuant"));
@@ -1997,6 +2020,7 @@ mod tests {
             idle_ttl: None,
             memory_guard: None,
             max_loaded_models: None,
+            mcp_config: None,
         };
         assert!(build_simple_config(&args).is_err());
     }
@@ -2040,6 +2064,7 @@ mod tests {
             idle_ttl: None,
             memory_guard: None,
             max_loaded_models: None,
+            mcp_config: None,
         };
 
         let config = load_config_file(&path, Some(&args)).unwrap();
@@ -2681,6 +2706,7 @@ mod tests {
             idle_ttl: Some(90),
             memory_guard: Some(MemoryGuard::Safe),
             max_loaded_models: Some(3),
+            mcp_config: None,
             ..ServeArgs::default()
         };
         let config = build_simple_config(&args).unwrap();
@@ -2703,6 +2729,7 @@ mod tests {
         let args = ServeArgs {
             load: Some(LoadMode::OnDemand),
             max_loaded_models: Some(1),
+            mcp_config: None,
             ..ServeArgs::default()
         };
 
@@ -2853,5 +2880,197 @@ mod tests {
         .unwrap();
         let config = build_simple_config(&args).unwrap();
         assert_eq!(config.models.first().unwrap().batch, BatchMode::Auto);
+    }
+}
+
+#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+#[cfg(test)]
+mod integration_section_tests {
+    use super::*;
+
+    fn write_and_load(toml: &str) -> HiggsConfig {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, toml).unwrap();
+        load_config_file(&path, None).unwrap()
+    }
+
+    // -- MCP section and --mcp-config --
+
+    #[test]
+    fn mcp_section_defaults_to_no_servers() {
+        let config = write_and_load("[[models]]\npath = \"org/model\"\n");
+        assert!(config.mcp.servers.is_empty());
+        assert_eq!(config.mcp.max_result_bytes, 262_144);
+    }
+
+    #[test]
+    fn mcp_servers_parse_from_toml_tables() {
+        let config = write_and_load(
+            r#"
+            [[models]]
+            path = "org/model"
+
+            [mcp]
+            max_result_bytes = 4096
+
+            [mcp.servers.files]
+            command = "npx"
+            args = ["-y", "server"]
+            env = { TOKEN = "${TOKEN}" }
+            cwd = "/tmp"
+            timeout_seconds = 12.5
+            enabled = false
+
+            [mcp.servers.remote]
+            transport = "http"
+            url = "https://example.com/mcp"
+            headers = { Authorization = "Bearer ${TOKEN}" }
+            "#,
+        );
+        assert_eq!(config.mcp.max_result_bytes, 4096);
+        let files = &config.mcp.servers["files"];
+        assert_eq!(files.command.as_deref(), Some("npx"));
+        assert_eq!(files.args, vec!["-y", "server"]);
+        assert_eq!(files.env["TOKEN"], "${TOKEN}");
+        assert_eq!(files.cwd.as_deref(), Some("/tmp"));
+        assert!(!files.enabled);
+        assert!((files.timeout_seconds - 12.5).abs() < f64::EPSILON);
+        let remote = &config.mcp.servers["remote"];
+        assert_eq!(remote.url.as_deref(), Some("https://example.com/mcp"));
+        assert_eq!(remote.headers["Authorization"], "Bearer ${TOKEN}");
+    }
+
+    fn write_mcp_json(dir: &Path, contents: &str) -> PathBuf {
+        let path = dir.join("mcp.json");
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn mcp_config_file_is_merged_in_config_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[[models]]\npath = \"org/model\"\n[mcp.servers.local]\ncommand = \"a\"\n",
+        )
+        .unwrap();
+        let json = write_mcp_json(
+            dir.path(),
+            r#"{"mcpServers": {"fs": {"command": "npx", "args": ["x"], "env": {"A": "b"}}}}"#,
+        );
+        let args = ServeArgs {
+            mcp_config: Some(json),
+            ..ServeArgs::default()
+        };
+        let config = load_config_file(&config_path, Some(&args)).unwrap();
+        assert_eq!(
+            config
+                .mcp
+                .servers
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["fs", "local"]
+        );
+        assert_eq!(config.mcp.servers["fs"].env["A"], "b");
+
+        std::fs::write(
+            &config_path,
+            "[[models]]\npath = \"org/model\"\n[mcp.servers.fs]\ncommand = \"a\"\n",
+        )
+        .unwrap();
+        let error = load_config_file(&config_path, Some(&args)).unwrap_err();
+        assert!(error.contains("already defined"), "{error}");
+    }
+
+    #[test]
+    fn mcp_config_file_is_merged_in_simple_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = write_mcp_json(
+            dir.path(),
+            r#"{"mcpServers": {"remote": {"type": "http", "url": "http://localhost:9/mcp"}}}"#,
+        );
+        let args = ServeArgs {
+            models: vec!["org/model".to_owned()],
+            mcp_config: Some(json),
+            ..ServeArgs::default()
+        };
+        let config = build_simple_config(&args).unwrap();
+        assert_eq!(config.mcp.servers.len(), 1);
+        assert_eq!(
+            config.mcp.servers["remote"].transport_kind().unwrap(),
+            crate::mcp::config::TransportKind::Http
+        );
+    }
+
+    #[test]
+    fn unreadable_or_invalid_mcp_config_file_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = ServeArgs {
+            models: vec!["org/model".to_owned()],
+            mcp_config: Some(dir.path().join("missing.json")),
+            ..ServeArgs::default()
+        };
+        assert!(
+            build_simple_config(&args)
+                .unwrap_err()
+                .contains("cannot read MCP config")
+        );
+        let bad = write_mcp_json(dir.path(), "{not json");
+        let bad_args = ServeArgs {
+            models: vec!["org/model".to_owned()],
+            mcp_config: Some(bad),
+            ..ServeArgs::default()
+        };
+        assert!(
+            build_simple_config(&bad_args)
+                .unwrap_err()
+                .contains("invalid MCP config")
+        );
+    }
+
+    #[test]
+    fn mcp_config_flag_parses_on_serve() {
+        let cli = Cli::try_parse_from(["higgs", "serve", "--mcp-config", "/tmp/mcp.json"]).unwrap();
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve");
+        };
+        assert_eq!(args.mcp_config, Some(PathBuf::from("/tmp/mcp.json")));
+    }
+
+    // -- Web section --
+
+    #[test]
+    fn web_section_defaults_off_and_parses_every_field() {
+        let defaults = write_and_load("[[models]]\npath = \"org/model\"\n");
+        assert!(!defaults.web.enabled);
+        assert!(!defaults.web.allow_private_addresses);
+        assert!(!defaults.web.expose_as_tools);
+
+        let config = write_and_load(
+            r#"
+            [[models]]
+            path = "org/model"
+            [web]
+            enabled = true
+            search_provider = "searxng"
+            searxng_url = "http://localhost:8888"
+            allow_private_addresses = true
+            expose_as_tools = true
+            timeout_seconds = 7
+            "#,
+        );
+        assert!(
+            config.web.enabled && config.web.allow_private_addresses && config.web.expose_as_tools
+        );
+        assert_eq!(config.web.search_provider, "searxng");
+        assert_eq!(
+            config.web.searxng_url.as_deref(),
+            Some("http://localhost:8888")
+        );
+        assert!((config.web.timeout_seconds - 7.0).abs() < f64::EPSILON);
+        assert!(config.web.problems().is_empty());
     }
 }

@@ -69,6 +69,11 @@ pub struct ChatCompletionRequest {
     /// processed, time_ms}`). Ignored for non-streaming requests.
     #[serde(default)]
     pub return_progress: Option<bool>,
+    /// Higgs extension: run tools from configured MCP servers (and the
+    /// built-in web tools) on the server and continue the generation with
+    /// their results. See `docs/mcp.md`.
+    #[serde(default)]
+    pub mcp: Option<crate::tool_loop::McpOptions>,
 }
 
 /// Optional request-level controls for streaming responses.
@@ -224,6 +229,9 @@ pub struct ChatCompletionResponse {
     pub model: String,
     pub choices: Vec<ChatCompletionChoice>,
     pub usage: CompletionUsage,
+    /// Higgs extension: what the server-side tool loop executed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<serde_json::Value>,
 }
 
 /// A choice in a chat completion response.
@@ -646,6 +654,7 @@ mod tests {
                 logprobs: None,
             }],
             usage: make_usage(5, 1),
+            mcp: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("chat.completion"));
@@ -1012,6 +1021,7 @@ mod tests {
                 logprobs: None,
             }],
             usage: make_usage(10, 5),
+            mcp: None,
         };
         let json_val: serde_json::Value = serde_json::to_value(&resp).unwrap();
         assert_eq!(json_val["choices"][0]["finish_reason"], "tool_calls");

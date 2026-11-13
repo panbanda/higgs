@@ -17,6 +17,11 @@ pub struct StubScript {
     pub tool_call_format: ToolCallFormat,
     pub generation: Option<GenerationOutput>,
     pub stream: Vec<StreamingOutput>,
+    /// Per-call outputs, consulted before `generation`; the Nth call uses the
+    /// Nth entry and later calls fall back to `generation`.
+    pub generations: Vec<GenerationOutput>,
+    /// Per-call streams, consulted before `stream`, indexed like `generations`.
+    pub streams: Vec<Vec<StreamingOutput>>,
     /// Stamp the non-streaming output's missing timestamps at call time, as a
     /// real engine would, so durations are measured against the request.
     pub stamp_times: bool,
@@ -30,6 +35,8 @@ impl Default for StubScript {
             tool_call_format: ToolCallFormat::Qwen,
             generation: None,
             stream: Vec::new(),
+            generations: Vec::new(),
+            streams: Vec::new(),
             stamp_times: false,
         }
     }
@@ -55,6 +62,8 @@ pub struct StubEngine {
     pub calls: Mutex<Vec<StubCall>>,
     /// Tool count passed to each prompt rendering (`None` when no tools).
     pub prompt_tools: Mutex<Vec<Option<usize>>>,
+    /// Role and text of every message in each rendered prompt.
+    pub prompt_messages: Mutex<Vec<Vec<(String, String)>>>,
 }
 
 impl StubEngine {
@@ -65,6 +74,7 @@ impl StubEngine {
             script: StubScript::default(),
             calls: Mutex::new(Vec::new()),
             prompt_tools: Mutex::new(Vec::new()),
+            prompt_messages: Mutex::new(Vec::new()),
         }
     }
 
@@ -113,11 +123,13 @@ impl StubEngine {
     }
 
     pub fn generate(&self, call: StubCall) -> Result<GenerationOutput, EngineError> {
-        self.record(call);
+        let index = self.record(call);
         let mut output = self
             .script
-            .generation
-            .clone()
+            .generations
+            .get(index)
+            .or(self.script.generation.as_ref())
+            .cloned()
             .ok_or_else(|| EngineError::Generation("test stub".to_owned()))?;
         if self.script.stamp_times {
             let now = std::time::Instant::now();
@@ -133,11 +145,16 @@ impl StubEngine {
         call: StubCall,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
     ) -> Result<(), EngineError> {
-        self.record(call);
-        if self.script.stream.is_empty() {
+        let index = self.record(call);
+        let events = self
+            .script
+            .streams
+            .get(index)
+            .unwrap_or(&self.script.stream);
+        if events.is_empty() {
             return Err(EngineError::Generation("test stub".to_owned()));
         }
-        for output in &self.script.stream {
+        for output in events {
             if sender.blocking_send(output.clone()).is_err() {
                 break;
             }
@@ -159,10 +176,35 @@ impl StubEngine {
             .unwrap_or_default()
     }
 
-    fn record(&self, call: StubCall) {
-        if let Ok(mut calls) = self.calls.lock() {
-            calls.push(call);
+    pub fn render_prompt_for(
+        &self,
+        messages: &[higgs_engine::chat_template::ChatMessage],
+        tool_count: Option<usize>,
+    ) -> Vec<u32> {
+        if let Ok(mut rendered) = self.prompt_messages.lock() {
+            rendered.push(
+                messages
+                    .iter()
+                    .map(|message| (message.role.clone(), message.content.clone()))
+                    .collect(),
+            );
         }
+        self.render_prompt(tool_count)
+    }
+
+    pub fn recorded_prompt_messages(&self) -> Vec<Vec<(String, String)>> {
+        self.prompt_messages
+            .lock()
+            .map(|rendered| rendered.clone())
+            .unwrap_or_default()
+    }
+
+    /// Record a generation call and return how many came before it.
+    fn record(&self, call: StubCall) -> usize {
+        self.calls.lock().map_or(0, |mut calls| {
+            calls.push(call);
+            calls.len() - 1
+        })
     }
 }
 
@@ -222,6 +264,15 @@ pub fn app_with_stub_and_config(
     stub: StubEngine,
     extra_config: &str,
 ) -> (axum::Router, std::sync::Arc<crate::state::Engine>) {
+    app_with_stub_config_and_tools(stub, extra_config, crate::tools::ToolHub::disabled())
+}
+
+/// Like [`app_with_stub_and_config`], with a tool hub for server-side tools.
+pub fn app_with_stub_config_and_tools(
+    stub: StubEngine,
+    extra_config: &str,
+    tools: crate::tools::ToolHub,
+) -> (axum::Router, std::sync::Arc<crate::state::Engine>) {
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -246,11 +297,95 @@ pub fn app_with_stub_and_config(
         config,
         http_client: reqwest::Client::new(),
         metrics: None,
+        tools: Arc::new(tools),
     });
     (
         crate::build_router(state, 30.0, None, 0, 1024 * 1024, None),
         engine,
     )
+}
+
+/// Router over a stub model with the given tool hub, optional API key and
+/// metrics store, for exercising tool endpoints.
+pub fn app_with_tools(
+    tools: crate::tools::ToolHub,
+    api_key: Option<&str>,
+    metrics: Option<std::sync::Arc<crate::metrics::MetricsStore>>,
+) -> axum::Router {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap_or_else(|error| unreachable!("tempdir: {error}"));
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "[[models]]\npath = \"test/stub\"\nname = \"stub\"\n",
+    )
+    .unwrap_or_else(|error| unreachable!("write config: {error}"));
+    let config = crate::config::load_config_file(&config_path, None)
+        .unwrap_or_else(|error| unreachable!("load config: {error}"));
+    let mut engines = HashMap::new();
+    engines.insert(
+        "stub".to_owned(),
+        Arc::new(crate::state::Engine::test_stub("stub")),
+    );
+    let router = crate::router::Router::from_config(&config, engines)
+        .unwrap_or_else(|error| unreachable!("build router: {error}"));
+    let state = Arc::new(crate::state::AppState {
+        router,
+        config,
+        http_client: reqwest::Client::new(),
+        metrics,
+        tools: Arc::new(tools),
+    });
+    crate::build_router(
+        state,
+        30.0,
+        api_key.map(str::to_owned),
+        0,
+        1024 * 1024,
+        None,
+    )
+}
+
+/// Send a request with an optional JSON body and bearer token.
+pub async fn send_request(
+    app: &axum::Router,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+    bearer: Option<&str>,
+) -> (http::StatusCode, serde_json::Value) {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let mut builder = http::Request::builder().method(method).uri(path);
+    if let Some(token) = bearer {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    let request = match body {
+        Some(value) => builder
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(value.to_string())),
+        None => builder.body(axum::body::Body::empty()),
+    }
+    .unwrap_or_else(|error| unreachable!("request: {error}"));
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .unwrap_or_else(|error| unreachable!("oneshot: {error}"));
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .map(http_body_util::Collected::to_bytes)
+        .unwrap_or_default();
+    let parsed = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+        serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned())
+    });
+    (status, parsed)
 }
 
 /// POST a JSON body and return the status with the raw response text.

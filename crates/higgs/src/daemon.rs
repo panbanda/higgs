@@ -266,6 +266,43 @@ provider = "higgs"
 # path = "{metrics_path_example}"
 # max_size_mb = 50
 # max_files = 5
+
+# --- MCP servers ---
+# Model Context Protocol servers whose tools Higgs can run for you. They
+# connect in the background; see GET /v1/mcp/servers, GET /v1/mcp/tools and
+# POST /v1/mcp/execute, and docs/mcp.md. Tool names are namespaced
+# "<server>__<tool>". `${{VAR}}` in env and headers reads the Higgs process
+# environment; an unset variable is an error. A desktop-client JSON file
+# ({{"mcpServers": ...}}) can be loaded with `higgs serve --mcp-config <file>`.
+
+# [mcp]
+# max_result_bytes = 262144    # larger tool results are truncated
+
+# [mcp.servers.filesystem]
+# command = "npx"              # run directly, never through a shell
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/dir"]
+# env = {{ EXAMPLE_TOKEN = "${{EXAMPLE_TOKEN}}" }}
+# cwd = "/path/to/workdir"
+# timeout_seconds = 30         # connect, list and each tool call
+# enabled = true
+
+# [mcp.servers.remote]
+# url = "https://mcp.example.com/mcp"    # Streamable HTTP
+# headers = {{ Authorization = "Bearer ${{MCP_TOKEN}}" }}
+
+# --- Web search and fetch ---
+# POST /v1/web/search and POST /v1/web/fetch. Off by default: both answer 404
+# until enabled. Fetch refuses non-http(s) URLs and, by default, loopback,
+# private and link-local addresses (checked after DNS resolution and on every
+# redirect). See docs/mcp.md.
+
+# [web]
+# enabled = true
+# search_provider = "duckduckgo"       # keyless, or "searxng"
+# searxng_url = "http://localhost:8888" # required for searxng; JSON format must be enabled
+# allow_private_addresses = false      # true lets fetch reach loopback/private ranges
+# expose_as_tools = false              # offer web_search and web_fetch under the built-in "higgs" server
+# timeout_seconds = 15
 "#
     );
 
@@ -936,6 +973,59 @@ mod tests {
             cmd_init(None);
             let template = std::fs::read_to_string(dir.join("config.toml")).unwrap();
             assert_eq!(template.matches("# thinking_budget = 256").count(), 2);
+        });
+    }
+
+    /// The commented lines of the template section that starts at `heading`,
+    /// uncommented, up to the next `# ---` heading.
+    fn uncommented_section(template: &str, first_line: &str) -> String {
+        template
+            .lines()
+            .skip_while(|line| *line != first_line)
+            .take_while(|line| !line.starts_with("# ---"))
+            .map(|line| line.strip_prefix("# ").unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn cmd_init_template_mcp_examples_are_valid_when_uncommented() {
+        use figment::providers::Format;
+
+        with_temp_config_dir(|dir| {
+            std::fs::create_dir_all(dir).unwrap();
+            cmd_init(None);
+            let template = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+            assert!(template.contains("--mcp-config"));
+            let section = uncommented_section(&template, "# [mcp]");
+            let config: crate::config::HiggsConfig = figment::Figment::new()
+                .merge(figment::providers::Toml::string(&section))
+                .extract()
+                .unwrap();
+            assert_eq!(config.mcp.servers.len(), 2);
+            let lookup = |name: &str| {
+                (name == "EXAMPLE_TOKEN" || name == "MCP_TOKEN").then(|| "x".to_owned())
+            };
+            assert!(config.mcp.problems(&lookup).is_empty());
+        });
+    }
+
+    #[test]
+    fn cmd_init_template_web_examples_are_valid_when_uncommented() {
+        use figment::providers::Format;
+
+        with_temp_config_dir(|dir| {
+            std::fs::create_dir_all(dir).unwrap();
+            cmd_init(None);
+            let template = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+            let section = uncommented_section(&template, "# [web]");
+            let config: crate::config::HiggsConfig = figment::Figment::new()
+                .merge(figment::providers::Toml::string(&section))
+                .extract()
+                .unwrap();
+            assert!(config.web.enabled);
+            assert!(config.web.problems().is_empty());
+            assert_eq!(config.web.search_provider, "duckduckgo");
         });
     }
 

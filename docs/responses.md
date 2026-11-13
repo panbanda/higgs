@@ -126,3 +126,11 @@ produced it are kept in memory. Failed responses are not stored.
 These limits are constants in `crates/higgs/src/responses/store.rs`, not
 configuration. A response can only be named in `previous_response_id` if it
 was stored, so leave `store` true on turns you want to continue from.
+
+## Server-side MCP tools
+
+Higgs extension: `"mcp": {"enabled": true, "servers": [...], "max_iterations": 5}`
+makes Higgs run tools from configured MCP servers (and the built-in web tools)
+itself and continue the generation with the results, as on chat completions.
+Only the final answer appears in `output`; `function_call` items are produced
+only for tools you supplied in `tools`. Details: [docs/mcp.md](mcp.md#server-side-tool-loop).

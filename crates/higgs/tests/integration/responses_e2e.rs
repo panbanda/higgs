@@ -61,6 +61,7 @@ fn build_state(mock_url: &str, format: ApiFormat, metrics: Arc<MetricsStore>) ->
         config,
         http_client: reqwest::Client::new(),
         metrics: Some(metrics),
+        tools: Arc::new(higgs::tools::ToolHub::disabled()),
     })
 }
 

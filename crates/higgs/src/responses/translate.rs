@@ -424,6 +424,7 @@ pub fn build_chat_request(
         response_format: convert_text_format(request.text.as_ref())?,
         reasoning: request.reasoning.clone(),
         return_progress: streaming.then_some(true),
+        mcp: request.mcp.clone(),
         ..ChatCompletionRequest::default()
     })
 }
@@ -1143,6 +1144,7 @@ mod tests {
                 logprobs: None,
             }],
             usage: CompletionUsage::new(usage.0, usage.1),
+            mcp: None,
         }
     }
 

@@ -107,6 +107,14 @@ impl Engine {
     }
 
     #[cfg(test)]
+    pub fn stub_prompt_messages(&self) -> Vec<Vec<(String, String)>> {
+        match self {
+            Self::Stub(stub) => stub.recorded_prompt_messages(),
+            Self::Simple(_) | Self::Batch(_) => Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
     pub fn stub_prompt_tools(&self) -> Vec<Option<usize>> {
         match self {
             Self::Stub(stub) => stub.recorded_prompt_tools(),
@@ -235,7 +243,7 @@ impl Engine {
             }
             Self::Batch(e) => e.prepare_chat_prompt_with_thinking(messages, tools, enable_thinking),
             #[cfg(test)]
-            Self::Stub(stub) => Ok(stub.render_prompt(tools.map(<[_]>::len))),
+            Self::Stub(stub) => Ok(stub.render_prompt_for(messages, tools.map(<[_]>::len))),
         }
     }
 
@@ -428,6 +436,8 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     /// Request metrics (present in config mode, absent in simple mode).
     pub metrics: Option<Arc<MetricsStore>>,
+    /// Tools the server can run for a model (MCP servers).
+    pub tools: Arc<crate::tools::ToolHub>,
 }
 
 /// Type alias for the shared state used by Axum handlers.
@@ -519,6 +529,7 @@ pub(crate) mod test_support {
             config,
             http_client: reqwest::Client::new(),
             metrics,
+            tools: Arc::new(crate::tools::ToolHub::disabled()),
         });
         (state, loader)
     }

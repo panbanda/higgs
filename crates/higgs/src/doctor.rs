@@ -62,6 +62,7 @@ pub async fn run_doctor(
     check_auto_router(config, &mut result);
     check_port_availability(config, &mut result);
     check_orphaned_providers(config, &mut result);
+    check_tool_integrations(config, &mut result);
 
     eprintln!(
         "\n{} passed, {} warnings, {} failures",
@@ -69,6 +70,18 @@ pub async fn run_doctor(
     );
 
     result
+}
+
+fn check_tool_integrations(config: &HiggsConfig, result: &mut DoctorResult) {
+    use crate::mcp::doctor::{Level, tool_integration_findings};
+
+    for finding in tool_integration_findings(config) {
+        match finding.level {
+            Level::Pass => pass(&finding.message, result),
+            Level::Warn => warn(&finding.message, result),
+            Level::Fail => fail(&finding.message, result),
+        }
+    }
 }
 
 fn check_config_valid(result: &mut DoctorResult) {
@@ -2178,6 +2191,49 @@ mod tests {
         config.auto_router.model = "router".to_owned();
 
         assert_eq!(run_lifecycle_check(&config, None, &[]).warnings, 1);
+    }
+    // -- MCP and web integrations --
+
+    #[test]
+    fn tool_integrations_add_no_checks_when_nothing_is_configured() {
+        let mut result = empty_result();
+        check_tool_integrations(&HiggsConfig::default(), &mut result);
+        assert_eq!((result.passes, result.warnings, result.failures), (0, 0, 0));
+    }
+
+    #[test]
+    fn tool_integrations_report_mcp_servers_and_failures() {
+        let mut config = HiggsConfig::default();
+        config.mcp.servers.insert(
+            "good".to_owned(),
+            crate::mcp::config::McpServerConfig {
+                command: Some("sh".to_owned()),
+                ..crate::mcp::config::McpServerConfig::default()
+            },
+        );
+        config.mcp.servers.insert(
+            "broken".to_owned(),
+            crate::mcp::config::McpServerConfig::default(),
+        );
+        let mut result = empty_result();
+        check_tool_integrations(&config, &mut result);
+        assert_eq!(result.passes, 1);
+        assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn tool_integrations_validate_the_web_section() {
+        let mut config = HiggsConfig::default();
+        config.web.enabled = true;
+        config.web.search_provider = "searxng".to_owned();
+        let mut result = empty_result();
+        check_tool_integrations(&config, &mut result);
+        assert_eq!(result.failures, 1);
+
+        config.web.searxng_url = Some("http://localhost:8888".to_owned());
+        let mut fixed = empty_result();
+        check_tool_integrations(&config, &mut fixed);
+        assert_eq!((fixed.passes, fixed.failures), (1, 0));
     }
 
     // -- batch engine reporting --

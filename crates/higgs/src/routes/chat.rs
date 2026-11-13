@@ -98,7 +98,7 @@ pub async fn chat_completions(
                 Ok(sse.into_response())
             } else {
                 let start = Instant::now();
-                let response = chat_completions_non_streaming(
+                let response = crate::tool_loop::complete(
                     Arc::clone(&state),
                     req,
                     engine,
@@ -467,6 +467,7 @@ pub(crate) async fn chat_completions_non_streaming(
             &output.stats,
             received_at,
         ),
+        mcp: None,
     })
 }
 
@@ -479,7 +480,7 @@ fn chat_completions_stream(
     routing_method: crate::router::RoutingMethod,
     received_at: Instant,
 ) -> Result<impl Stream<Item = Result<Event, Infallible>>, ServerError> {
-    let chunks = chat_completions_chunk_stream(
+    let chunks = crate::tool_loop::chunk_stream(
         state,
         req,
         engine,
