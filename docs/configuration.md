@@ -13,7 +13,7 @@ This document collects the full CLI, environment, and config-file reference for 
 
 | CLI Flag | Env Variable | Default | Description |
 |---|---|---|---|
-| `--model` | `HIGGS_MODELS` | *(required)* | Model path or HF ID (repeatable) |
+| `--model` | -- | *(required)* | Model path or HF ID (repeatable) |
 | `--host` | `HIGGS_HOST` | `127.0.0.1` | Bind address (set `0.0.0.0` to expose on the network; pair with `--api-key`) |
 | `--port` | `HIGGS_PORT` | `8000` | Bind port |
 | `--max-tokens` | `HIGGS_MAX_TOKENS` | `32768` | Max generation tokens |
@@ -34,130 +34,318 @@ This document collects the full CLI, environment, and config-file reference for 
 | `--idle-ttl` | -- | *(none)* | Unload a model after this many idle seconds (`0` never unloads) |
 | `--memory-guard` | -- | `off` | Memory ceiling tier: `off`, `safe`, `balanced`, or `aggressive` (see [Model lifecycle](#model-lifecycle)) |
 | `--max-loaded-models` | -- | *(none)* | Keep at most N models loaded, evicting the least recently used |
+| `--mcp-config` | -- | *(none)* | JSON file of MCP servers in the common `{"mcpServers": {...}}` format |
 
 `auto` resolves to `balanced` for small and medium models, and `throughput` for large and huge models.
 
-### Additional environment toggles
-
-- `HIGGS_ENABLE_THINKING=0|1` forces Qwen thinking on or off.
-- `HIGGS_CHUNKED_PREFILL_THRESHOLD` enables chunked prefill above a token threshold.
-- `HIGGS_CHUNKED_PREFILL_CHUNK_SIZE` controls chunk size during chunked prefill.
-- `HIGGS_MTP=0|1` overrides the tuning profile's speculative decode choice when conditions allow.
-- `HIGGS_MTP_DRAFT_N_MAX` controls the maximum MTP draft tokens per speculative cycle. The default is `2` for huge checkpoints and `1` otherwise, clamped to `1..=8`.
-- `HIGGS_MTP_ADAPTIVE_DRAFT=1` lets the decode loop increase or decrease the MTP draft window based on recent verifier acceptance.
-- `HIGGS_MTP_PROMPT_LOOKUP=1` enables a hybrid MTP loop that tries verified prompt-lookup drafts when the prompt/history has a repeated suffix, then keeps the MTP cache synchronized for later MTP-head cycles.
-- `HIGGS_CLEAR_CACHE_AFTER_PREFILL` overrides the selected MLX profile behavior for cache clearing.
-- `HIGGS_TURBOQUANT_MIN_TOKENS` overrides the TurboQuant activation threshold. The default is `2048`.
-- `HIGGS_EXPERIMENTAL_PAGED_KV=1` enables the experimental paged-KV path.
-- Qwen thinking budget is currently fixed at `256` tokens and is not currently configurable.
+The flags apply to a config file too: `higgs serve --config ...` accepts every flag above. The `--kv-*`,
+`--batch` and `--no-batch` flags describe the models given with `--model`; the server and lifecycle flags
+override the matching config keys.
 
 ## Gateway Mode
 
-Run `higgs init` to create `~/.config/higgs/config.toml`:
+Run `higgs init` to create `~/.config/higgs/config.toml`. Every section of the file is optional and
+documented in the generated template. A minimal file:
 
 ```toml
 [server]
-# Bind to loopback by default. To expose on the network, set host = "0.0.0.0"
-# and set an api_key.
 host = "127.0.0.1"
 port = 8000
-# max_tokens = 32768
-# timeout = 300.0
-# max_body_size = 10485760
-# api_key = "sk-..."
-# rate_limit = 0
-# CORS origin allow-list for browser clients. Unset = no CORS headers;
-# ["*"] allows any origin.
-# cors_origins = ["https://app.example.com"]
+api_key = "${HIGGS_API_KEY}"        # environment reference; a missing variable is a startup error
+request_timeout = "5m"
+max_body_size = "10MB"
 
-# --- Local defaults ---
-[local]
-mlx_profile = "auto"
-raise_wired_limit = false
-# thinking_budget = 256 # reasoning tokens before </think> is forced; minimum 1
-# load = "on_demand"
-# idle_ttl_seconds = 900
-# max_loaded_models = 2
-# memory_guard = "balanced"
-# memory_limit_gb = 48
+[memory]
+guard = "balanced"                  # off | safe | balanced | aggressive
+max_loaded_models = 3
 
-# --- Local models ---
+[defaults]                          # applies to every model; a [[models]] entry overrides it
+load = "on_demand"
+idle_ttl = "15m"
+profile = "auto"
+thinking_budget = 256
+
 [[models]]
-path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
-# name = "llama"
-# load = "startup"
-# idle_ttl_seconds = 600
-# pinned = true
-# mlx_profile = "throughput"
-# batch = "auto"            # true | false | "auto" (default); see Engine selection
-# prefill_yield_tokens = 512 # 0 or omitted keeps synchronous prefill
-# thinking_budget = 256 # overrides [local].thinking_budget for this model
-# kv_cache = "turboquant"
-# kv_bits = 3
-# kv_key_bits = 2
-# kv_value_bits = 3
-# kv_norm_correction = true
-# kv_adaptive_dense_layers = 0
-# kv_seed = 0
+path = "mlx-community/Qwen3.6-35B-A3B-4bit"
+name = "qwen"
+aliases = ["default"]               # extra request names that resolve to this model
+pinned = true
 
-# --- Remote providers ---
-[provider.anthropic]
+[models.kv_cache]
+mode = "turboquant"
+bits = 3
+
+[providers.anthropic]
 url = "https://api.anthropic.com"
 format = "anthropic"
+api_key = "${ANTHROPIC_API_KEY}"
 
-[provider.openai]
-url = "https://api.openai.com"
-format = "openai"
-
-[provider.ollama]
-url = "http://localhost:11434"
-strip_auth = true
-
-# --- Routes ---
 [[routes]]
-pattern = "claude-.*"
+match = "claude-.*"
 provider = "anthropic"
 
-[[routes]]
-pattern = "gpt-.*"
-provider = "openai"
+[routing]
+default = "higgs"
 
-# [[routes]]
-# pattern = "my-alias"
-# provider = "openai"
-# model = "gpt-4o"
+[observability]
+retention = "60m"
 
-# --- Default route ---
-[default]
-provider = "higgs"
-
-# --- Auto router ---
-# [auto_router]
-# enabled = true
-# model = "llama"
-# timeout_ms = 2000
-
-# --- Metrics & dashboard ---
-[retention]
-enabled = true
-minutes = 60
-
-[logging.metrics]
-enabled = true
-# path = "~/.config/higgs/logs/metrics.jsonl"
-# max_size_mb = 50
-# max_files = 5
+[observability.metrics_log]
+path = "~/.config/higgs/logs/metrics.jsonl"
+max_size = "50MB"
+max_files = 5
 ```
 
-### Profile precedence for local models
+### Conventions
 
-Order of precedence:
+- **Durations** are strings: `"500ms"`, `"90s"`, `"5m"`, `"1h30m"`. Units are `ns`, `us`, `ms`, `s`, `m`, `h`, `d`.
+  A bare `0` is allowed where zero is meaningful (`idle_ttl = "0"` never unloads); any other bare number
+  is an error that asks for a unit.
+- **Sizes** are strings: `"512MB"`, `"4GB"`, `"64KB"`. The multiples are 1024-based (`MB` is a mebibyte; `MiB` is
+  accepted as a synonym). A bare integer is a number of bytes.
+- **Environment references.** String values that can hold a secret or a path (`server.host`, `server.api_key`,
+  `server.cors_origins`, `models[].path`, `prefix_cache.disk_dir`, `providers.*.url`, `providers.*.api_key`,
+  `observability.metrics_log.path`, `web.searxng_url`, `include` entries, and the `env` and `headers` of MCP
+  servers) may contain `${VAR}` or `${VAR:-default}`. A variable that is not set and has no default is an error
+  that names the key and its line. Write `$${` for a literal `${`. Resolved values are never logged;
+  `higgs doctor` and `higgs config explain` print references as written and mask literal secrets.
+- **`~/`** at the start of a path key expands to the home directory.
+- **Strict keys.** A key Higgs does not know is an error that names the key, its section and the closest valid key,
+  with the file and line: `config.toml:12: unknown key `idel_ttl` in [defaults]; did you mean `idle_ttl`?`.
+- **Deprecated keys** from earlier versions keep working. Each one prints a single warning at startup (and in
+  `higgs doctor`) naming the key that replaces it. Setting an old and a new spelling of the same thing in one file
+  is an error that names both. See [Migrating an existing file](#migrating-an-existing-file).
 
-1. `[[models]].mlx_profile`
-2. `--mlx-profile`
-3. `HIGGS_MLX_PROFILE`
-4. `[local].mlx_profile`
-5. built-in default `auto`
+### Includes
+
+```toml
+include = ["providers.toml", "models.toml"]
+```
+
+Each path is relative to the file that lists it (and may use `${VAR}` and `~/`). Included files are merged first,
+in order, and the including file on top: tables merge key by key, later files override scalars and plain arrays, and
+`[[models]]` and `[[routes]]` entries are appended. Included files may include others. A missing file or a cycle is an
+error.
+
+### Inheritance and precedence
+
+`[defaults]` accepts every per-model key (`load`, `idle_ttl`, `batch`, `profile`, `thinking_budget`, `pinned`,
+`kv_cache.*`, `prefix_cache.*`, `prefill.*`). A `[[models]]` entry overrides it key by key, including inside the
+`kv_cache`, `prefix_cache` and `prefill` tables. For a per-model key the order is:
+
+1. `higgs serve` flag (for `--model` entries: `--batch`, `--no-batch`, `--kv-*`)
+2. the model entry
+3. `--load`, `--idle-ttl`, `--mlx-profile`
+4. `HIGGS_MLX_PROFILE` (for `profile`)
+5. `[defaults]`
+6. the built-in default
+
+Server keys follow flag > environment variable > file > built-in. The `[experimental]` keys follow environment
+variable > file > built-in (they have no flag and no per-model level). Any key can also be set with a
+`HIGGS_<SECTION>__<KEY>` variable such as `HIGGS_SERVER__PORT=9000`, which overrides the file. Use
+`higgs config explain [model]` to see the winning source of every value.
+
+### Commands
+
+| Command | Description |
+|---|---|
+| `higgs config check` | Parse and validate the file: strict keys, units, references, includes, names. No model or network probes. Exits non-zero on errors; suitable for CI. |
+| `higgs config explain [model]` | Print every resolved setting for the server, or for one model (name, alias or path), and where each value comes from: built-in default, `[defaults]`, the model entry, an environment variable, or a flag. Accepts the `serve` flags. |
+| `higgs config migrate [--write]` | Print the file rewritten in the current schema. `--write` replaces the file and keeps the original as `<file>.bak`. Comments and key order are preserved where the structure allows; `${VAR}` references are never expanded; an unknown key is an error, not dropped. |
+| `higgs config get <key>` / `set <key> <value>` / `path` | Read or write one value (current or deprecated key names). |
+| `higgs doctor` | Everything `check` does plus model, provider and port probes, deprecation and environment-override reports. |
+
+## Configuration reference
+
+### `[server]`
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `host` | string | `"127.0.0.1"` | Bind address. A non-loopback host without `api_key` is flagged by `higgs doctor` |
+| `port` | integer | `8000` | Bind port |
+| `api_key` | string | *(none)* | Bearer token required on API routes. Use `"${HIGGS_API_KEY}"` |
+| `request_timeout` | duration | `"5m"` | Per-request timeout; must be longer than zero |
+| `max_body_size` | size | `"10MB"` | Largest request body |
+| `max_tokens` | integer | `32768` | Default maximum generation tokens |
+| `rate_limit` | integer | `0` | Requests per minute per client; `0` turns it off |
+| `cors_origins` | array of strings | *(unset)* | CORS allow-list; unset sends no CORS headers, `["*"]` allows any origin |
+
+### `[memory]`
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `guard` | `"off"`, `"safe"`, `"balanced"`, `"aggressive"` | `"off"` | Derive the ceiling from total unified memory by reserving 20%, 8%, or 2% for the system |
+| `limit` | size | *(none)* | Explicit ceiling on MLX active memory; wins over `guard`; must be above zero |
+| `max_loaded_models` | integer >= 1 | *(none)* | Most models allowed in memory at once |
+| `raise_wired_limit` | bool | `false` | Raise MLX's wired memory limit to the device-recommended maximum |
+
+### `[defaults]` and `[[models]]`
+
+Keys valid in both. A `[[models]]` entry additionally needs `path` and may set `name` and `aliases`.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `path` | string | *(required, models only)* | Filesystem path or Hugging Face reference |
+| `name` | string | *(derived)* | Name exposed to API clients (models only) |
+| `aliases` | array of strings | `[]` | Extra request names that resolve to this model; must not collide with another model's name or alias (models only) |
+| `load` | `"startup"`, `"on_demand"` | `"startup"` | When the model is loaded |
+| `idle_ttl` | duration | *(none)* | Unload after this long with no in-flight request. `"0"` or unset never unloads; a model-level `"0"` opts one model out of a `[defaults]` value |
+| `pinned` | bool | `false` | Never evicted or unloaded on idle. An explicit `/unload` still works |
+| `batch` | `true`, `false`, `"auto"` | `"auto"` | Engine selection, see [Engine selection](#engine-selection) |
+| `profile` | `"auto"`, `"latency"`, `"balanced"`, `"throughput"` | `"auto"` | MLX tuning preset for the simple engine |
+| `thinking_budget` | integer >= 1 | `256` | Reasoning tokens the model may spend before `</think>` is forced |
+
+`[models.kv_cache]` (and `[defaults.kv_cache]`):
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `mode` | `"off"`, `"turboquant"` | `"off"` | KV-cache storage mode |
+| `bits` | integer | `3` | Default TurboQuant bit width |
+| `key_bits` | integer | `bits - 1` | Key-code bit width |
+| `value_bits` | integer | `bits` | Value-code bit width |
+| `norm_correction` | bool | `true` | Norm correction after TurboQuant reconstruction |
+| `adaptive_dense_layers` | integer | `0` | Final layers that stay dense when TurboQuant is on |
+| `seed` | integer | `0` | Seed for the TurboQuant rotation and QJL matrices |
+| `mla_latent` | bool | `false` | Store DeepSeek-V2 MLA caches as compressed latent rows; cannot be combined with `mode = "turboquant"`; a no-op for other architectures. The `HIGGS_MLA_LATENT_CACHE` variable overrides it either way |
+
+`[models.prefix_cache]`:
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `disk_dir` | path | *(none)* | Directory for durable, disk-backed prefix KV entries, retained across restarts |
+| `disk_budget` | size | `"4GB"` | LRU budget of the disk tier; at least `64MB` |
+
+`[models.prefill]`:
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `yield_tokens` | integer | *(none)* | Maximum prompt tokens to prefill per batch-loop iteration; `0` or unset keeps synchronous prefill. Values from 1 to 127 are rejected by `higgs doctor` |
+
+### `[providers.<name>]`
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `url` | string | *(required)* | Base URL of the upstream API |
+| `format` | `"openai"`, `"anthropic"` | `"openai"` | API format the provider speaks |
+| `api_key` | string | *(none)* | API key to inject into proxied requests. Use `"${NAME_API_KEY}"` |
+| `strip_auth` | bool | `false` | Remove the client's `Authorization` header before proxying |
+| `stub_count_tokens` | bool | `false` | Return a stub for `/v1/messages/count_tokens` |
+
+### `[[routes]]`
+
+| Key | Type | Description |
+|---|---|---|
+| `match` | regex | Match against the `model` field in requests |
+| `provider` | string | Provider name to forward to (`higgs` for the local models) |
+| `model` | string | Rewrite the model field before forwarding |
+| `name` | string | Human label used by the auto-router |
+| `description` | string | Route description used for auto-router classification |
+
+A route needs `match` or `description`; a description needs a `name`.
+
+### `[routing]`
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `default` | string | `"higgs"` | Where a request goes when no model or route matches |
+| `auto.enabled` | bool | `false` | Classify `model = "auto"` requests with a local model |
+| `auto.model` | string | `"katanemo/Arch-Router-1.5B"` | The classifier: a `[[models]]` name or path (added when missing) |
+| `auto.timeout` | duration | `"2s"` | Bound on one classification |
+| `auto.force` | bool | `false` | Classify every request |
+
+### `[observability]`
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `retention` | duration or `false` | `"60m"` | How long metrics stay in memory for the dashboard. `"0"` or `false` turns the window off; `true` is the default window |
+| `metrics_log.enabled` | bool | `true` | Append request metrics to a JSONL file for `attach` history |
+| `metrics_log.path` | path | `~/.config/higgs/logs/metrics.jsonl` | Log file (a named profile gets its own default) |
+| `metrics_log.max_size` | size | `"50MB"` | Rotate the file past this size |
+| `metrics_log.max_files` | integer | `5` | Rotated files to keep; `0` never rotates |
+
+### `[experimental]`
+
+Config equivalents of engine environment variables. The variable, when set, wins over the file;
+`higgs doctor` reports every one that is set.
+
+| Key | Type | Default | Environment variable | Description |
+|---|---|---|---|---|
+| `mtp` | `"auto"`, `"on"`, `"off"` | `"auto"` | `HIGGS_MTP` | Use the checkpoint's multi-token-prediction head. `auto` lets the MLX profile decide |
+| `mtp_draft_tokens` | integer 1-8 | `2` for huge checkpoints, else `1` | `HIGGS_MTP_DRAFT_N_MAX` | Draft tokens per speculative cycle |
+| `chunked_prefill.threshold` | integer | from the profile | `HIGGS_CHUNKED_PREFILL_THRESHOLD` | Prompts longer than this prefill in chunks |
+| `chunked_prefill.chunk` | integer | from the profile | `HIGGS_CHUNKED_PREFILL_CHUNK_SIZE` | Tokens per prefill chunk |
+| `clear_cache_after_prefill` | bool | from the profile | `HIGGS_CLEAR_CACHE_AFTER_PREFILL` | Clear the MLX allocator cache after prefill (simple engine; the batch engine reads only the variable) |
+| `prompt_lookup` | bool | `false` | `HIGGS_PROMPT_LOOKUP` | Prompt-lookup decoding (simple engine only) |
+| `mtp_adaptive_draft` | bool | `false` | `HIGGS_MTP_ADAPTIVE_DRAFT` | Grow or shrink the MTP draft window from recent acceptance |
+| `mtp_prompt_lookup` | bool | `false` | `HIGGS_MTP_PROMPT_LOOKUP` | Hybrid MTP loop that also tries verified prompt-lookup drafts |
+
+Other `HIGGS_*` variables that change behavior and have no config key: `HIGGS_ENABLE_THINKING`
+(`0|1` forces Qwen thinking off or on), `HIGGS_TURBOQUANT_MIN_TOKENS` (TurboQuant activation threshold, default
+`2048`), `HIGGS_EXPERIMENTAL_PAGED_KV` (`1` enables the experimental paged-KV path). The rest are debugging or
+profiling switches for the model kernels.
+
+### `[mcp]` and `[web]`
+
+Keep their previous shape; see [docs/mcp.md](mcp.md). Their durations and sizes follow the conventions above.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `mcp.max_result_size` | size | `"256KB"` | Larger tool results are truncated |
+| `mcp.servers.<name>.timeout` | duration | `"30s"` | Bound on connecting, listing and each tool call |
+| `web.timeout` | duration | `"15s"` | Bound on one search or fetch, redirects included |
+
+## Migrating an existing file
+
+Every key from earlier versions still loads; use `higgs config migrate` to rewrite them. The table lists each
+old key and what replaced it.
+
+| Old key | New key | Notes |
+|---|---|---|
+| `[server] timeout` | `[server] request_timeout` | seconds (number) becomes a duration string |
+| `[server] max_body_size` | `[server] max_body_size` | same key; a bare integer is still bytes, strings like `"10MB"` also work |
+| `[local] mlx_profile` | `[defaults] profile` | |
+| `[local] raise_wired_limit` | `[memory] raise_wired_limit` | |
+| `[local] thinking_budget` | `[defaults] thinking_budget` | |
+| `[local] load` | `[defaults] load` | |
+| `[local] idle_ttl_seconds` | `[defaults] idle_ttl` | seconds become a duration |
+| `[local] max_loaded_models` | `[memory] max_loaded_models` | |
+| `[local] memory_limit_gb` | `[memory] limit` | GiB become a size, e.g. `48` becomes `"48GB"` |
+| `[local] memory_guard` | `[memory] guard` | |
+| `[[models]] mlx_profile` | `[[models]] profile` | |
+| `[[models]] idle_ttl_seconds` | `[[models]] idle_ttl` | |
+| `[[models]] kv_cache = "turboquant"` | `[models.kv_cache] mode` | |
+| `[[models]] kv_bits` | `[models.kv_cache] bits` | |
+| `[[models]] kv_key_bits` | `[models.kv_cache] key_bits` | |
+| `[[models]] kv_value_bits` | `[models.kv_cache] value_bits` | |
+| `[[models]] kv_norm_correction` | `[models.kv_cache] norm_correction` | |
+| `[[models]] kv_adaptive_dense_layers` | `[models.kv_cache] adaptive_dense_layers` | |
+| `[[models]] kv_seed` | `[models.kv_cache] seed` | |
+| `[[models]] mla_latent_cache` | `[models.kv_cache] mla_latent` | |
+| `[[models]] kv_disk_dir` | `[models.prefix_cache] disk_dir` | |
+| `[[models]] kv_disk_space_mb` | `[models.prefix_cache] disk_budget` | MiB become a size |
+| `[[models]] prefill_yield_tokens` | `[models.prefill] yield_tokens` | |
+| `[provider.<name>]` | `[providers.<name>]` | every key keeps its name |
+| `[[routes]] pattern` | `[[routes]] match` | |
+| `[default] provider` | `[routing] default` | |
+| `[auto_router] enabled`, `force`, `model` | `[routing.auto] enabled`, `force`, `model` | |
+| `[auto_router] timeout_ms` | `[routing.auto] timeout` | milliseconds become a duration |
+| `[logging.metrics] enabled`, `path`, `max_files` | `[observability.metrics_log] enabled`, `path`, `max_files` | |
+| `[logging.metrics] max_size_mb` | `[observability.metrics_log] max_size` | MiB become a size |
+| `[retention] enabled`, `minutes` | `[observability] retention` | `minutes = 30` becomes `"30m"`; `enabled = false` becomes `false` |
+| `[mcp] max_result_bytes` | `[mcp] max_result_size` | |
+| `[mcp.servers.<name>] timeout_seconds` | `[mcp.servers.<name>] timeout` | |
+| `[web] timeout_seconds` | `[web] timeout` | |
+
+Behavior notes:
+
+- Settings that used to apply only to `[local]` now also apply through `[defaults]` to the `kv_cache`, `prefix_cache`
+  and `prefill` groups and to `batch` and `pinned`.
+- `~/` in `models[].path`, `prefix_cache.disk_dir`, `metrics_log.path` and `include` entries now expands to the home
+  directory (the old template suggested `~/...` for the log path, which was previously used literally).
+- `retention = "0"` (or `false`) turns the in-memory window off. The old `[retention] enabled = true, minutes = 0`
+  kept a zero-length window.
+- The old server-side environment overlay `HIGGS_SERVER__PORT` (and the other `HIGGS_<SECTION>__<KEY>` names, in
+  either the old or the new spelling) keeps working.
 
 ## Model lifecycle
 
@@ -165,27 +353,27 @@ By default every `[[models]]` entry loads at startup and stays resident until th
 
 ### Fields
 
-`[local]` sets defaults; the same-named `[[models]]` field overrides it for one model.
+`[defaults]` sets values for every model; the same-named `[[models]]` key overrides it for one model.
 
 | Field | Where | Type | Default | Description |
 |---|---|---|---|---|
-| `load` | `[local]`, `[[models]]` | `"startup"` or `"on_demand"` | `"startup"` | When the model is loaded |
-| `idle_ttl_seconds` | `[local]`, `[[models]]` | integer | *(none)* | Unload after this many seconds with no in-flight request. `0` or unset never unloads on idle; a model-level `0` opts one model out of a `[local]` default |
-| `pinned` | `[[models]]` | bool | `false` | Never evicted or unloaded on idle. An explicit `/unload` still works |
-| `max_loaded_models` | `[local]` | integer >= 1 | *(none)* | Most models allowed in memory at once |
-| `memory_limit_gb` | `[local]` | number > 0 | *(none)* | Ceiling on MLX active memory, in GiB. Wins over `memory_guard` |
-| `memory_guard` | `[local]` | `"off"`, `"safe"`, `"balanced"`, `"aggressive"` | `"off"` | Derive the ceiling from total unified memory by reserving 20%, 8%, or 2% for the rest of the system |
+| `load` | `[defaults]`, `[[models]]` | `"startup"` or `"on_demand"` | `"startup"` | When the model is loaded |
+| `idle_ttl` | `[defaults]`, `[[models]]` | duration | *(none)* | Unload after this long with no in-flight request. `"0"` or unset never unloads on idle; a model-level `"0"` opts one model out of a `[defaults]` value |
+| `pinned` | `[defaults]`, `[[models]]` | bool | `false` | Never evicted or unloaded on idle. An explicit `/unload` still works |
+| `max_loaded_models` | `[memory]` | integer >= 1 | *(none)* | Most models allowed in memory at once |
+| `limit` | `[memory]` | size > 0 | *(none)* | Ceiling on MLX active memory. Wins over `guard` |
+| `guard` | `[memory]` | `"off"`, `"safe"`, `"balanced"`, `"aggressive"` | `"off"` | Derive the ceiling from total unified memory by reserving 20%, 8%, or 2% for the rest of the system |
 
 `higgs doctor` rejects out-of-range values and warns when pinned models alone exceed the ceiling (by weight size on disk), when more models load at startup than `max_loaded_models` allows, and when `on_demand` is used with a single model, which only delays the first request.
 
 ### Rules
 
 - **Lazy loading.** A request for an unloaded model loads it first. Concurrent first requests share one load. If it fails, every waiting request gets a `503` and the next request tries again; a failed load is never cached.
-- **Startup models.** Models that resolve to `startup` load before the server binds, as before. The `auto_router` classifier always loads at startup and is never evicted or expired, whatever its `load`.
+- **Startup models.** Models that resolve to `startup` load before the server binds, as before. The `routing.auto` classifier always loads at startup and is never evicted or expired, whatever its `load`.
 - **Eviction.** Before a load that would exceed `max_loaded_models` or the memory ceiling, Higgs unloads the least recently used model that is idle and not pinned, repeating until the model fits. Models with requests in flight and pinned models are never evicted.
 - **Memory accounting.** The size of a model before loading is estimated from its weight files on disk. After loading, the growth in MLX active memory is recorded as the measured size, which includes any other model generating at that moment, so treat it as approximate. The ceiling is compared with MLX active memory (weights plus KV caches), not process RSS or MLX's reusable buffer cache.
 - **Refusal.** If the model still does not fit once nothing more can be evicted, or the model alone exceeds the ceiling, the load is refused with `503` and `code = "insufficient_memory"`. The message names the model, its estimated size, the ceiling, and each loaded model with the reason it could not be evicted (pinned or in use). A model that turns out larger than estimated is checked again after loading and unloaded if it breaks the ceiling.
-- **Idle expiry.** A model with `idle_ttl_seconds` is unloaded once it has had no in-flight request for that long. A request that is still streaming keeps its model alive; the idle clock starts when the last request finishes.
+- **Idle expiry.** A model with `idle_ttl` is unloaded once it has had no in-flight request for that long. A request that is still streaming keeps its model alive; the idle clock starts when the last request finishes.
 - **Unloading frees memory.** The engine is shut down on the thread that owns its MLX state, Higgs waits for that to finish, and then clears the MLX buffer cache, so the memory is back by the time the unload returns.
 - **Reloading.** An unloaded model, however it was unloaded, loads again on its next request.
 
@@ -221,50 +409,40 @@ Unloading a model that is already unloaded succeeds. Unloading a model that is l
 | `engine` | `simple`, `batch`, or `auto` while a `batch = "auto"` model's checkpoint cannot be inspected yet (not downloaded) |
 | `idle_ttl_seconds` | Effective idle timeout, or `null` |
 
-## Provider Options
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `url` | string | *(required)* | Base URL of the upstream API |
-| `format` | `"openai"` or `"anthropic"` | `"openai"` | API format the provider speaks |
-| `api_key` | string | *(none)* | API key to inject into proxied requests |
-| `strip_auth` | bool | `false` | Remove the client's `Authorization` header before proxying |
-| `stub_count_tokens` | bool | `false` | Return a stub for `/v1/messages/count_tokens` |
-
-## Route Options
-
-| Field | Type | Description |
-|---|---|---|
-| `pattern` | regex | Match against the `model` field in requests |
-| `provider` | string | Provider name to forward to |
-| `model` | string | Rewrite the model field before forwarding |
-| `name` | string | Human label used by the auto-router |
-| `description` | string | Route description used for auto-router classification |
-
 ## Routing Behavior
 
 Higgs resolves requests in this order:
 
 1. Auto-router when `model == "auto"` or force mode is enabled
-2. Direct local engine lookup by model name
-3. Regex pattern routing, first match wins
-4. Default route fallback
+2. Direct local engine lookup by model name or alias
+3. Regex route (`match`), first match wins
+4. `routing.default` fallback
 
 That means Higgs supports:
 
-- direct local model selection
+- direct local model selection, under the model's name or any of its `aliases`
 - pattern routing to local or remote targets
 - model alias rewriting before forwarding
 - auto-routing with a local classifier model
 - a default target when nothing else matches
+
+A local model name or alias always wins over a route, so a route whose `match` also matches a local name
+is never used for that name; `higgs doctor` warns about it.
 
 ## Local Model Notes
 
 - `batch` is `true`, `false`, or `"auto"` (the default); see [Engine selection](#engine-selection).
 - `batch = true` is only supported for transformer families with true batched decode support: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen3_moe`, `qwen3_5`, `qwen3_5_moe`, `phi3`, and `starcoder2`.
 - `higgs doctor` and server startup reject unsupported `batch = true` combinations instead of silently degrading.
-- `[local].raise_wired_limit` defaults to `false`. Turn it on only when you explicitly want MLX to raise the process wired-memory limit.
-- With several resident models, consider `max_loaded_models`, `memory_guard`, or `load = "on_demand"`; see [Model lifecycle](#model-lifecycle).
+- `[memory] raise_wired_limit` defaults to `false`. Turn it on only when you explicitly want MLX to raise the process wired-memory limit.
+- With several resident models, consider `max_loaded_models`, `guard`, or `load = "on_demand"`; see [Model lifecycle](#model-lifecycle).
+- For a local model, set `prefix_cache.disk_dir` to retain block-aligned prefix KV state across restarts.
+  `prefix_cache.disk_budget` controls its on-disk LRU budget (default `4GB`, minimum `64MB`). The disk tier is
+  model, quantization, configuration, tokenizer, and chat-template bound; incompatible entries are ignored.
+- For DeepSeek-V2 models, set `kv_cache.mla_latent = true` to store the MLA KV cache as compressed latent rows
+  instead of dense per-head tensors (default off). It cannot be combined with `kv_cache.mode = "turboquant"`, and
+  is a no-op for non-DeepSeek-V2 architectures. The `HIGGS_MLA_LATENT_CACHE` env var, when set to a recognized
+  value (`1`/`0`, `true`/`false`, `on`/`off`, `yes`/`no`), overrides the config value either way.
 - Source builds on macOS require `mlx.metallib`. Higgs restores it from Cargo build output when possible and fails startup if it still cannot be resolved.
 
 ## Shell Integration
@@ -299,6 +477,9 @@ higgs exec -- aider --model openai/gpt-4o
 | `higgs config get <key>` | Read a config value |
 | `higgs config set <key> <value>` | Write a config value |
 | `higgs config path` | Print the resolved config file path |
+| `higgs config check` | Parse and validate the config file |
+| `higgs config explain [model]` | Show every resolved setting and its source |
+| `higgs config migrate [--write]` | Rewrite deprecated keys in the current schema |
 | `higgs doctor` | Validate config, model paths, and providers |
 
 ### Global flags
@@ -382,7 +563,7 @@ order, first match wins:
 1. Per request: `reasoning.max_tokens` on `/v1/chat/completions`, or
    `thinking.budget_tokens` on `/v1/messages`.
 2. `thinking_budget` in the model's `[[models]]` entry.
-3. `thinking_budget` under `[local]`.
+3. `thinking_budget` under `[defaults]`.
 4. The built-in default, 256.
 
 A budget must be at least 1, in config (`higgs doctor` fails on `0`) and in requests (`400`).
@@ -415,12 +596,12 @@ order; the server logs one info line naming the rule, and `higgs doctor` reports
 each model will get:
 
 1. The architecture has no batched decode (see [docs/models.md](models.md)).
-2. `kv_cache = "turboquant"` is configured.
-3. A disk prefix store (`kv_disk_dir`) is configured.
+2. `kv_cache.mode = "turboquant"` is configured.
+3. A disk prefix store (`prefix_cache.disk_dir`) is configured.
 4. The model takes image inputs (LLaVA).
 5. The checkpoint ships an MTP head and the MLX profile enables speculative decode
-   (`HIGGS_MTP` and the profile decide; `mlx_profile = "baseline"` or `HIGGS_MTP=0` turns it off).
-6. `HIGGS_PROMPT_LOOKUP` is on.
+   (`experimental.mtp` or `HIGGS_MTP`, and the profile, decide; `experimental.mtp = "off"` or `HIGGS_MTP=0` turns it off).
+6. `experimental.prompt_lookup` (or `HIGGS_PROMPT_LOOKUP`) is on.
 
 Both engines share the prefix cache semantics (block-paged, keyed without the chat template's
 generation prompt, so repeated prompts and multi-turn conversations reuse everything but that
@@ -451,28 +632,10 @@ special tokens unless `"add_special_tokens": true`, matching `/v1/completions`.
 to `/v1/detokenize` returns `{"text": "Hello"}`. Special tokens are kept unless
 `"skip_special_tokens": true`. Token ids missing from the vocabulary are rejected with `400`.
 
-## Migration Notes
+## Other migration notes
 
 - `higgs start` no longer accepts serve-style flags like `--model`, `--port`, or `--batch`.
-- `higgs attach` now fails fast unless the daemon is alive, `/health` passes, and metrics logging is enabled.
 - `/metrics` is available and `server.max_body_size` is enforced on API routes.
-
-## Local model options
-
-For a local model, set `kv_disk_dir` in its `[[models]]` entry to retain block-aligned
-prefix KV state across restarts. `kv_disk_space_mb` controls its on-disk LRU budget
-(default `4096`, minimum `64`). The disk tier is model, quantization, configuration,
-tokenizer, and chat-template bound; incompatible entries are ignored.
-
-For DeepSeek-V2 models, set `mla_latent_cache = true` in its `[[models]]` entry to store
-the MLA KV cache as compressed latent rows instead of dense per-head tensors (default
-off). It cannot be combined with `kv_cache = "turboquant"`, and is a no-op for
-non-DeepSeek-V2 architectures. The `HIGGS_MLA_LATENT_CACHE` env var, when set to a
-recognized value (`1`/`0`, `true`/`false`, `on`/`off`, `yes`/`no`), overrides the config
-value either way.
-
-## Migration notes
-
 - Replace old `higgs start --model ...` usage with `higgs serve --model ...`.
 - `higgs attach` fails fast when the daemon is down or metrics logging is disabled; it is a
   metrics dashboard, not a best-effort log viewer.

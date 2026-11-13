@@ -66,10 +66,10 @@ Qwen3.5 hybrid models (`qwen3_5`, `qwen3_5_moe`) batch decode only: each prompt 
 | Chunked prefill for long prompts (MLX profile thresholds) | yes | yes |
 | Models without a chat template (`/v1/completions` only) | yes | yes |
 | Vision inputs (LLaVA) | yes | no, rejected |
-| Disk prefix store (`kv_disk_dir`) | yes | no, ignored |
+| Disk prefix store (`prefix_cache.disk_dir`) | yes | no, ignored |
 | MTP speculative decode | yes | no, ignored |
 | TurboQuant KV cache | yes | no, rejected |
-| Prompt-lookup decoding (`HIGGS_PROMPT_LOOKUP`) | yes | no, ignored |
+| Prompt-lookup decoding (`experimental.prompt_lookup`) | yes | no, ignored |
 | MLX profile settings other than the chunked-prefill thresholds | yes | no |
 
 The rows marked "no" are what `batch = "auto"` checks; see [Engine selection](configuration.md#engine-selection).
