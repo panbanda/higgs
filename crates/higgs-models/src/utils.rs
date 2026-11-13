@@ -25,6 +25,30 @@ pub(crate) fn apply_rope(x: &Array, rope: &nn::Rope, offset: i32) -> Result<Arra
     )
 }
 
+/// Rotate `x` at one shared `offset`, or at one position per row when
+/// `positions` (`[B]`) is given.
+pub(crate) fn apply_rope_at(
+    x: &Array,
+    rope: &nn::Rope,
+    offset: i32,
+    positions: Option<&Array>,
+) -> Result<Array, Exception> {
+    positions.map_or_else(
+        || apply_rope(x, rope, offset),
+        |row_positions| {
+            mlx_rs::fast::rope_dynamic(
+                x,
+                rope.dimensions,
+                rope.traditional,
+                rope.base,
+                rope.scale,
+                row_positions,
+                None,
+            )
+        },
+    )
+}
+
 /// Rotate `x` at the position its cache is at: one shared offset normally,
 /// or one position per row for a batched cache whose rows differ in length.
 pub(crate) fn apply_rope_at_cache<C: KeyValueCache>(
@@ -32,20 +56,7 @@ pub(crate) fn apply_rope_at_cache<C: KeyValueCache>(
     rope: &nn::Rope,
     cache: &C,
 ) -> Result<Array, Exception> {
-    cache.rope_positions().map_or_else(
-        || apply_rope(x, rope, cache.offset()),
-        |positions| {
-            mlx_rs::fast::rope_dynamic(
-                x,
-                rope.dimensions,
-                rope.traditional,
-                rope.base,
-                rope.scale,
-                &positions,
-                None,
-            )
-        },
-    )
+    apply_rope_at(x, rope, cache.offset(), cache.rope_positions().as_ref())
 }
 
 /// Attention mask variant.

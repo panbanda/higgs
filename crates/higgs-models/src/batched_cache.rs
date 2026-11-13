@@ -529,11 +529,20 @@ fn padding_attention_mask(
 
 /// Merge one layer's per-row caches into a left-padded batched layer.
 /// `lengths` are the rows' true token counts and `padding` their left padding.
+///
+/// A layer that holds nothing in every row (a Gemma 4 layer that reuses an
+/// earlier layer's keys never writes its own) stays empty.
 fn merge_kv_layer(
     caches: &[&SteppingKeyValueCache],
     lengths: &[i32],
     padding: &[i32],
 ) -> Result<BatchedLayerCache, Exception> {
+    if caches.iter().all(|cache| cache.keys().is_none()) {
+        return Ok(BatchedLayerCache {
+            storage: SteppingKeyValueCache::new(),
+            padding: padding.to_vec(),
+        });
+    }
     let mut row_keys = Vec::with_capacity(caches.len());
     let mut row_values = Vec::with_capacity(caches.len());
     for ((cache, &length), &row_padding) in caches.iter().zip(lengths).zip(padding) {
@@ -556,6 +565,12 @@ fn split_kv_layer(
     padding: &[i32],
     padded_len: i32,
 ) -> Result<Vec<SteppingKeyValueCache>, Exception> {
+    if layer.storage.keys().is_none() {
+        return Ok(padding
+            .iter()
+            .map(|_| SteppingKeyValueCache::new())
+            .collect());
+    }
     let keys = layer
         .storage
         .keys()
@@ -726,6 +741,29 @@ mod tests {
         assert_eq!(short.shape(), &[1, HEADS, 2, DIM]);
         let first_head: Vec<f32> = short.as_slice::<f32>()[..8].to_vec();
         assert_eq!(first_head, vec![1.0, 1.0, 1.0, 1.0, 9.0, 9.0, 9.0, 9.0]);
+    }
+
+    #[test]
+    fn layers_that_hold_nothing_stay_empty_through_a_round_trip() {
+        let rows: Vec<KvRow> = [(2, 1.0), (4, 2.0)]
+            .into_iter()
+            .map(|(length, fill)| {
+                let mut with_unused_layer = row(length, fill);
+                with_unused_layer.push(Some(SteppingKeyValueCache::new()));
+                with_unused_layer
+            })
+            .collect();
+        let mut batch = BatchedKvCache::from_rows(rows).unwrap();
+        assert_eq!(batch.lengths(), vec![2, 4]);
+        let unused = batch.layers_mut()[1].as_ref().unwrap();
+        assert_eq!(unused.offset(), 0);
+        assert!(unused.eval_targets().is_empty());
+
+        let split = batch.into_rows().unwrap();
+        for (r, length) in split.iter().zip([2, 4]) {
+            assert_eq!(r[0].as_ref().unwrap().offset(), length);
+            assert!(r[1].as_ref().unwrap().keys().is_none());
+        }
     }
 
     #[test]

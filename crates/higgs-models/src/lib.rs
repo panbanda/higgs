@@ -1,4 +1,5 @@
 pub mod adapter;
+mod attention;
 pub mod batched_cache;
 pub mod bonsai_q1;
 pub mod cache;
@@ -546,7 +547,7 @@ impl AnyModel {
         let layers = cache.layers_mut();
         match self {
             Self::Transformer(m) => m.forward(inputs, mask, layers),
-            Self::Qwen3Moe(m) => m.forward_with_cache(inputs, mask, layers),
+            Self::Qwen3Moe(m) => m.forward(inputs, mask, layers),
             Self::Phi3(m) => m.forward(inputs, mask, layers),
             Self::Starcoder2(m) => m.forward(inputs, mask, layers),
             // Gemma 2 attends over grouped `[B, kv_heads, groups, T, S]`

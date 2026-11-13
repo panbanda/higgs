@@ -9,6 +9,7 @@ use mlx_rs::{
     Array,
     builder::Builder,
     error::Exception,
+    fast::ScaledDotProductAttentionMask,
     macros::{ModuleParameters, Quantizable},
     module::Module,
     nn,
@@ -19,13 +20,11 @@ use serde::Deserialize;
 
 use crate::qwen3_next::{QEmbedding, QLinear};
 use crate::{
+    attention::{DecodeKernel, HeadCounts, HeadNorms, Projections, SelfAttention},
     batched_cache::BatchedKvCache,
     cache::KeyValueCache,
     error::ModelError,
-    utils::{
-        AttentionMask, apply_rope, apply_rope_at_cache, cached_scaled_dot_product_attention,
-        create_attention_mask, scaled_dot_product_attention,
-    },
+    utils::{AttentionMask, create_attention_mask},
 };
 
 const fn default_rope_theta() -> f32 {
@@ -261,56 +260,33 @@ where
     type Output = Array;
     type Error = Exception;
 
-    #[allow(non_snake_case)]
     fn forward(&mut self, input: AttentionInput<'_, C>) -> Result<Self::Output, Self::Error> {
-        let AttentionInput { x, mask, mut cache } = input;
+        let AttentionInput { x, mask, cache } = input;
 
-        let shape = x.shape();
-        let B = *shape
-            .first()
-            .ok_or_else(|| Exception::custom("Input must have at least 2 dimensions"))?;
-        let L = *shape
-            .get(1)
-            .ok_or_else(|| Exception::custom("Input must have at least 2 dimensions"))?;
-
-        let q_raw = self.q_proj.forward(x)?;
-        let k_raw = self.k_proj.forward(x)?;
-        let v_raw = self.v_proj.forward(x)?;
-
-        let mut queries = q_raw.reshape(&[B, L, self.n_heads, -1])?;
-        let mut keys = k_raw.reshape(&[B, L, self.n_kv_heads, -1])?;
-
-        if let Some(ref mut qn) = self.q_norm {
-            queries = qn.forward(&queries)?;
+        let projections = Projections {
+            queries: self.q_proj.forward(x)?,
+            keys: self.k_proj.forward(x)?,
+            values: self.v_proj.forward(x)?,
+        };
+        let output = SelfAttention {
+            head_counts: HeadCounts {
+                query: self.n_heads,
+                key_value: self.n_kv_heads,
+            },
+            scale: self.scale,
+            rope: &self.rope,
+            norms: HeadNorms {
+                query: self.q_norm.as_mut(),
+                key: self.k_norm.as_mut(),
+                value: None,
+            },
+            decode: DecodeKernel::CacheNative,
         }
-        if let Some(ref mut kn) = self.k_norm {
-            keys = kn.forward(&keys)?;
-        }
-
-        queries = queries.transpose_axes(&[0, 2, 1, 3])?;
-        keys = keys.transpose_axes(&[0, 2, 1, 3])?;
-        let values = v_raw
-            .reshape(&[B, L, self.n_kv_heads, -1])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-
-        if let Some(ref mut kv_cache) = cache {
-            queries = apply_rope_at_cache(&queries, &self.rope, kv_cache)?;
-            keys = apply_rope_at_cache(&keys, &self.rope, kv_cache)?;
-
-            let output = cached_scaled_dot_product_attention(
-                queries, kv_cache, keys, values, self.scale, mask,
-            )?
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[B, L, -1])?;
-
-            return self.o_proj.forward(&output);
-        }
-        queries = apply_rope(&queries, &self.rope, 0)?;
-        keys = apply_rope(&keys, &self.rope, 0)?;
-
-        let output = scaled_dot_product_attention(queries, keys, values, self.scale, mask)?
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[B, L, -1])?;
+        .forward(
+            &projections,
+            mask.map(ScaledDotProductAttentionMask::Array),
+            cache,
+        )?;
 
         self.o_proj.forward(&output)
     }

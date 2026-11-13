@@ -10,6 +10,7 @@ use mlx_rs::{
     Array,
     builder::Builder,
     error::Exception,
+    fast::ScaledDotProductAttentionMask,
     macros::{ModuleParameters, Quantizable},
     module::Module,
     nn,
@@ -19,12 +20,10 @@ use mlx_rs::{
 use serde::Deserialize;
 
 use crate::{
+    attention::{DecodeKernel, HeadCounts, HeadNorms, Projections, SelfAttention},
     cache::KeyValueCache,
     error::ModelError,
-    utils::{
-        AttentionMask, apply_rope, apply_rope_at_cache, cached_scaled_dot_product_attention,
-        create_attention_mask, scaled_dot_product_attention,
-    },
+    utils::{AttentionMask, create_attention_mask},
 };
 
 // ---------------------------------------------------------------------------
@@ -161,55 +160,32 @@ where
     type Output = Array;
     type Error = Exception;
 
-    #[allow(non_snake_case)]
     fn forward(&mut self, input: Phi3AttentionInput<'_, C>) -> Result<Self::Output, Self::Error> {
-        let Phi3AttentionInput { x, mask, mut cache } = input;
+        let Phi3AttentionInput { x, mask, cache } = input;
 
-        let shape = x.shape();
-        let B = *shape
-            .first()
-            .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
-        let L = *shape
-            .get(1)
-            .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
-
-        // Combined QKV projection, then slice along last axis
         let qkv = self.qkv_proj.forward(x)?;
-
-        let q_end = self.n_heads * self.head_dim;
-        let k_end = q_end + self.n_kv_heads * self.head_dim;
-
-        let mut queries = qkv
-            .index((.., .., ..q_end))
-            .reshape(&[B, L, self.n_heads, -1])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let mut keys = qkv
-            .index((.., .., q_end..k_end))
-            .reshape(&[B, L, self.n_kv_heads, -1])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let values = qkv
-            .index((.., .., k_end..))
-            .reshape(&[B, L, self.n_kv_heads, -1])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-
-        if let Some(ref mut kv_cache) = cache {
-            queries = apply_rope_at_cache(&queries, &self.rope, kv_cache)?;
-            keys = apply_rope_at_cache(&keys, &self.rope, kv_cache)?;
-
-            let output = cached_scaled_dot_product_attention(
-                queries, kv_cache, keys, values, self.scale, mask,
-            )?
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[B, L, -1])?;
-
-            return self.o_proj.forward(&output);
+        let query_end = self.n_heads * self.head_dim;
+        let key_end = query_end + self.n_kv_heads * self.head_dim;
+        let projections = Projections {
+            queries: qkv.index((.., .., ..query_end)),
+            keys: qkv.index((.., .., query_end..key_end)),
+            values: qkv.index((.., .., key_end..)),
+        };
+        let output = SelfAttention {
+            head_counts: HeadCounts {
+                query: self.n_heads,
+                key_value: self.n_kv_heads,
+            },
+            scale: self.scale,
+            rope: &self.rope,
+            norms: HeadNorms::default(),
+            decode: DecodeKernel::CacheNative,
         }
-        queries = apply_rope(&queries, &self.rope, 0)?;
-        keys = apply_rope(&keys, &self.rope, 0)?;
-
-        let output = scaled_dot_product_attention(queries, keys, values, self.scale, mask)?
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[B, L, -1])?;
+        .forward(
+            &projections,
+            mask.map(ScaledDotProductAttentionMask::Array),
+            cache,
+        )?;
 
         self.o_proj.forward(&output)
     }
