@@ -46,6 +46,9 @@ The batch engine decodes only these `model_type` values:
 - `qwen3_5` (dense) and `qwen3_5_moe`
 - `phi3`
 - `starcoder2`
+- `gemma2`
+- `gemma3` (`gemma3_text`)
+- `gemma4` (`gemma4_text`, `gemma4_unified`), except the mixture-of-experts variant (`enable_moe_block`, e.g. 26B-A4B), which the batch engine serves one request at a time
 
 `batch = "auto"` (the default) serves these with the batch engine and every other architecture
 with the simple engine. `batch = true` on an architecture outside this list is rejected during

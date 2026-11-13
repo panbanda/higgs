@@ -77,7 +77,7 @@ What changed in Higgs:
 
 - The batch engine keeps one left-padded batched KV cache across decode steps instead of re-stacking every request's cache per layer per token, rotates each row at its own position with one dynamic RoPE call, and builds step N+1 while the GPU is still computing step N.
 - Short prompts that arrive together are prefilled in one padded forward pass.
-- Batched decode now covers Phi-3, Starcoder2, Qwen3 MoE, and the Qwen3.5/3.6 hybrid models (dense and MoE), in addition to Llama, Mistral, Qwen2 and Qwen3 dense. Hybrid models batch decode only; each prompt is prefilled on its own, then joins the batch.
+- Batched decode now covers Phi-3, Starcoder2, Qwen3 MoE, Gemma 2, Gemma 3, Gemma 4 (all but the MoE variant), and the Qwen3.5/3.6 hybrid models (dense and MoE), in addition to Llama, Mistral, Qwen2 and Qwen3 dense. Hybrid models batch decode only; each prompt is prefilled on its own, then joins the batch.
 
 Where oMLX still leads: an 8-way simultaneous burst on a 1 to 2B model. Higgs's decode step at batch 8 costs the same as mlx-lm's (5.37 ms vs 5.36 ms per round on Llama-1B), so the remaining difference is in how prefill and decode are interleaved during the burst, not in the decode kernel path.
 
@@ -137,7 +137,7 @@ Loading the 27B and 35B checkpoints on `main` intermittently aborted with a Meta
 
 ## Features
 
-Higgs features added on this branch to close gaps with oMLX: the OpenAI Responses API (`/v1/responses`, stored responses, `previous_response_id`), on-demand model loading with LRU and idle-TTL eviction, pinning, a memory guard and load/unload/status endpoints, cached-token and timing fields in `usage`, `/v1/tokenize` and `/v1/detokenize`, regex and `guided_json` constrained output, a configurable thinking budget, tool-call parsers for the Qwen, Mistral, Llama, Gemma, GLM and MiniMax formats with forced `tool_choice` where the format allows it, Anthropic `tool_use` output on `/v1/messages`, an MCP client (stdio and Streamable HTTP) with web search/fetch endpoints and an opt-in server-side tool loop, batching as the automatic default, and batched decode for five more architectures.
+Higgs features added on this branch to close gaps with oMLX: the OpenAI Responses API (`/v1/responses`, stored responses, `previous_response_id`), on-demand model loading with LRU and idle-TTL eviction, pinning, a memory guard and load/unload/status endpoints, cached-token and timing fields in `usage`, `/v1/tokenize` and `/v1/detokenize`, regex and `guided_json` constrained output, a configurable thinking budget, tool-call parsers for the Qwen, Mistral, Llama, Gemma, GLM and MiniMax formats with forced `tool_choice` where the format allows it, Anthropic `tool_use` output on `/v1/messages`, an MCP client (stdio and Streamable HTTP) with web search/fetch endpoints and an opt-in server-side tool loop, batching as the automatic default, and batched decode for eight more architectures.
 
 | Capability | Higgs | oMLX |
 |---|---|---|

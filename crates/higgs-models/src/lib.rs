@@ -550,18 +550,15 @@ impl AnyModel {
             Self::Qwen3Moe(m) => m.forward(inputs, mask, layers),
             Self::Phi3(m) => m.forward(inputs, mask, layers),
             Self::Starcoder2(m) => m.forward(inputs, mask, layers),
-            // Gemma 2 attends over grouped `[B, kv_heads, groups, T, S]`
-            // scores, which the 4D padding mask does not broadcast against.
+            Self::Gemma2(m) => m.forward(inputs, mask, layers),
+            Self::Gemma3(m) => m.forward(inputs, mask, layers),
+            Self::Gemma4(m) => m.forward(inputs, mask, layers),
             // The hybrid architecture batches through its own cache type.
-            Self::Qwen3Next(_)
-            | Self::Gemma2(_)
-            | Self::Gemma3(_)
-            | Self::Gemma4(_)
-            | Self::LlavaQwen2(_)
-            | Self::DeepSeekV2(_)
-            | Self::BonsaiQ1(_) => Err(Exception::custom(
-                "Batched decode is not supported for this model architecture",
-            )),
+            Self::Qwen3Next(_) | Self::LlavaQwen2(_) | Self::DeepSeekV2(_) | Self::BonsaiQ1(_) => {
+                Err(Exception::custom(
+                    "Batched decode is not supported for this model architecture",
+                ))
+            }
         }
     }
 
@@ -578,17 +575,19 @@ impl AnyModel {
     /// on real weights for each architecture listed here.
     ///
     /// A hybrid model with an MTP head stays unbatched: speculative decode
-    /// drafts and rolls back one sequence at a time.
+    /// drafts and rolls back one sequence at a time. So does the Gemma 4
+    /// mixture-of-experts variant, which has not been verified.
     pub const fn supports_batched_decode(&self) -> bool {
         match self {
-            Self::Transformer(_) | Self::Qwen3Moe(_) | Self::Phi3(_) | Self::Starcoder2(_) => true,
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::Gemma2(_)
+            | Self::Gemma3(_) => true,
+            Self::Gemma4(m) => !m.args.enable_moe_block,
             Self::Qwen3Next(m) => !m.has_mtp(),
-            Self::Gemma2(_)
-            | Self::Gemma3(_)
-            | Self::Gemma4(_)
-            | Self::LlavaQwen2(_)
-            | Self::DeepSeekV2(_)
-            | Self::BonsaiQ1(_) => false,
+            Self::LlavaQwen2(_) | Self::DeepSeekV2(_) | Self::BonsaiQ1(_) => false,
         }
     }
 
@@ -596,10 +595,18 @@ impl AnyModel {
     /// ([`Self::prefill_batched`]). Recurrent layers have no way to skip
     /// padding tokens, so the hybrid architecture prefills one at a time.
     pub const fn supports_batched_prefill(&self) -> bool {
-        matches!(
-            self,
-            Self::Transformer(_) | Self::Qwen3Moe(_) | Self::Phi3(_) | Self::Starcoder2(_)
-        )
+        match self {
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::Gemma2(_)
+            | Self::Gemma3(_) => true,
+            Self::Gemma4(m) => !m.args.enable_moe_block,
+            Self::Qwen3Next(_) | Self::LlavaQwen2(_) | Self::DeepSeekV2(_) | Self::BonsaiQ1(_) => {
+                false
+            }
+        }
     }
 
     /// Whether this model has a loaded MTP head for speculative decode.
