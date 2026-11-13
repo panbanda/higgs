@@ -70,7 +70,7 @@ impl SpeculationSettings {
 }
 
 fn flag(name: &str) -> Option<bool> {
-    crate::simple::parse_enabled_flag(std::env::var(name).ok().as_deref())
+    crate::mlx_tuning::parse_enabled_flag(std::env::var(name).ok().as_deref())
 }
 
 fn env_usize(name: &str, default: usize) -> usize {

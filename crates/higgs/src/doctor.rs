@@ -8,7 +8,7 @@ use crate::config::explain::Provenance;
 use crate::config::load::LoadOptions;
 use crate::config::units::HumanDuration;
 use crate::config::{BatchMode, Environment, HiggsConfig, ServeArgs};
-use crate::engine_selection::{BatchFacts, EngineChoice, choose_engine};
+use crate::decode_strategy::{DecodeFacts, DecodeStrategy, decode_strategy};
 use crate::model_resolver;
 
 pub struct DoctorResult {
@@ -520,14 +520,13 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                 continue;
             }
         }
-        if model.batch == BatchMode::On && kv_cache_config.is_turboquant() {
-            fail(
+        if model.batch == BatchMode::On {
+            warn(
                 &format!(
-                    "model {label} enables unsupported combination: TurboQuant with batch=true"
+                    "model {label} sets batch=true, which has no effect: every model decodes requests together whenever it can; remove it"
                 ),
                 result,
             );
-            continue;
         }
         match model_resolver::resolve(&model.path) {
             Ok(resolved) => {
@@ -541,34 +540,16 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                         continue;
                     }
                 };
-                if model.batch == BatchMode::On && !inspected.capabilities.batch_engine {
-                    fail(
-                        &format!(
-                            "model {label} enables unsupported batch=true; adapter '{}' does not support true batched decode",
-                            inspected.adapter_id
-                        ),
-                        result,
-                    );
-                    continue;
-                }
                 if higgs_models::cache::resolve_mla_latent_cache(kv_cache_config.mla_latent) {
                     check_mla_latent_cache_adapter(&label, &inspected, result);
                 }
                 let requested_profile = model.profile;
-                let batch_facts = BatchFacts::inspect(model, &config.experimental, &resolved).ok();
-                if model.batch == BatchMode::On {
-                    for ignored in batch_facts.into_iter().flat_map(batch_ignored_features) {
-                        warn(
-                            &format!("model {label} batch=true ignores {ignored}"),
-                            result,
-                        );
-                    }
-                }
-                let engine = batch_facts.map(|found| choose_engine(model.batch, &found));
+                let facts = DecodeFacts::inspect(model, &config.experimental, &resolved).ok();
                 let effective_profile = resolve_effective_mlx_profile(&resolved, requested_profile);
-                let profile_msg = engine_summary(
-                    model.batch,
-                    engine,
+                let profile_msg = decode_summary(
+                    facts.as_ref(),
+                    config.experimental.prompt_lookup,
+                    model.prefix_cache.disk_dir.is_some(),
                     effective_profile.as_str(),
                     requested_profile.as_str(),
                 );
@@ -588,27 +569,12 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
     }
 }
 
-/// Simple-engine-only features that `batch = true` configured but the batch
-/// engine does not provide, for the doctor to warn about.
-fn batch_ignored_features(facts: BatchFacts) -> Vec<&'static str> {
-    let mut ignored = Vec::new();
-    if facts.disk_prefix_store {
-        ignored.push("prefix_cache.disk_dir (the disk prefix store is simple-engine only)");
-    }
-    if facts.mtp_speculative_decode {
-        ignored.push("the checkpoint's MTP head (speculative decode is simple-engine only)");
-    }
-    if facts.prompt_lookup {
-        ignored.push("experimental.prompt_lookup (prompt-lookup decoding is simple-engine only)");
-    }
-    ignored
-}
-
-/// The engine a model will get and the settings that matter for it, as the
-/// doctor reports them. `engine` is `None` when the facts could not be read.
-fn engine_summary(
-    mode: BatchMode,
-    engine: Option<EngineChoice>,
+/// How the model's requests are decoded and the settings that matter for it, as
+/// the doctor reports them. `facts` is `None` when the checkpoint could not be inspected.
+fn decode_summary(
+    facts: Option<&DecodeFacts>,
+    prompt_lookup: bool,
+    disk_prefix_store: bool,
     effective_profile: &str,
     requested_profile: &str,
 ) -> String {
@@ -617,15 +583,24 @@ fn engine_summary(
     } else {
         format!("profile={effective_profile} (requested {requested_profile})")
     };
-    match (mode, engine) {
-        (BatchMode::On, _) => "batch=true; batched decode supported".to_owned(),
-        (BatchMode::Auto, Some(EngineChoice::Batch)) => "batch=auto; batch engine".to_owned(),
-        (BatchMode::Auto, Some(EngineChoice::Simple(reason))) => {
-            format!("batch=auto; simple engine because {reason}; {profile}")
+    let mut parts = vec![match facts.map(decode_strategy) {
+        Some(DecodeStrategy::Batched) => "decode=batched".to_owned(),
+        Some(DecodeStrategy::Sequential(reason)) => {
+            format!("decode=one request at a time because {reason}")
         }
-        (BatchMode::Auto, None) => format!("batch=auto; engine chosen at load; {profile}"),
-        (BatchMode::Off, _) => format!("batch=false; simple engine; {profile}"),
+        None => "decode=chosen at load".to_owned(),
+    }];
+    if facts.is_some_and(|found| found.mtp_speculative_decode) {
+        parts.push("MTP speculative decode for a lone request".to_owned());
     }
+    if prompt_lookup {
+        parts.push("prompt-lookup decode for a lone request".to_owned());
+    }
+    if disk_prefix_store {
+        parts.push("disk prefix store".to_owned());
+    }
+    parts.push(profile);
+    parts.join("; ")
 }
 
 fn is_auto_router_model(config: &HiggsConfig, model: &crate::config::ModelConfig) -> bool {
@@ -2377,60 +2352,57 @@ mod tests {
         assert_eq!((fixed.passes, fixed.failures), (1, 0));
     }
 
-    // -- batch engine reporting --
+    // -- decode strategy reporting --
 
-    use crate::engine_selection::SimpleReason;
+    use crate::decode_strategy::SequentialReason;
 
-    const NO_FEATURES: BatchFacts = BatchFacts {
+    const BATCHABLE: DecodeFacts = DecodeFacts {
         architecture_batches: true,
         turboquant_kv: false,
-        disk_prefix_store: false,
-        vision: false,
+        serialized_by_config: false,
         mtp_speculative_decode: false,
-        prompt_lookup: false,
     };
 
     #[test]
-    fn engine_summary_names_the_engine_each_mode_gets() {
-        let summary = |mode, engine| engine_summary(mode, engine, "balanced", "auto");
+    fn decode_summary_names_how_requests_are_decoded() {
+        let summary = |facts: Option<&DecodeFacts>, lookup, disk| {
+            decode_summary(facts, lookup, disk, "balanced", "auto")
+        };
         assert_eq!(
-            summary(BatchMode::On, Some(EngineChoice::Batch)),
-            "batch=true; batched decode supported"
-        );
-        assert_eq!(
-            summary(BatchMode::Auto, Some(EngineChoice::Batch)),
-            "batch=auto; batch engine"
-        );
-        assert_eq!(
-            summary(
-                BatchMode::Auto,
-                Some(EngineChoice::Simple(SimpleReason::TurboQuantKv))
-            ),
-            "batch=auto; simple engine because TurboQuant KV cache is configured (simple engine only); profile=balanced (requested auto)"
-        );
-        assert_eq!(
-            summary(BatchMode::Auto, None),
-            "batch=auto; engine chosen at load; profile=balanced (requested auto)"
+            summary(Some(&BATCHABLE), false, false),
+            "decode=batched; profile=balanced (requested auto)"
         );
         assert_eq!(
             summary(
-                BatchMode::Off,
-                Some(EngineChoice::Simple(SimpleReason::Requested))
+                Some(&DecodeFacts {
+                    turboquant_kv: true,
+                    ..BATCHABLE
+                }),
+                false,
+                false
             ),
-            "batch=false; simple engine; profile=balanced (requested auto)"
+            format!(
+                "decode=one request at a time because {}; profile=balanced (requested auto)",
+                SequentialReason::TurboQuantKv
+            )
+        );
+        assert_eq!(
+            summary(None, false, false),
+            "decode=chosen at load; profile=balanced (requested auto)"
         );
     }
 
     #[test]
-    fn explicit_batch_warns_about_each_ignored_simple_only_feature() {
-        assert!(batch_ignored_features(NO_FEATURES).is_empty());
-        let facts = BatchFacts {
-            disk_prefix_store: true,
+    fn decode_summary_lists_the_features_a_lone_request_uses() {
+        let facts = DecodeFacts {
             mtp_speculative_decode: true,
-            prompt_lookup: true,
-            ..NO_FEATURES
+            ..BATCHABLE
         };
-        assert_eq!(batch_ignored_features(facts).len(), 3);
+        let summary = decode_summary(Some(&facts), true, true, "balanced", "balanced");
+        assert_eq!(
+            summary,
+            "decode=batched; MTP speculative decode for a lone request; prompt-lookup decode for a lone request; disk prefix store; profile=balanced"
+        );
     }
 
     fn check_one_model(model: ModelConfig) -> DoctorResult {
@@ -2450,10 +2422,9 @@ mod tests {
     }
 
     #[test]
-    fn thinking_budget_with_batch_no_longer_warns() {
+    fn a_thinking_budget_does_not_warn() {
         let dir = llama_checkpoint();
         let result = check_one_model(ModelConfig {
-            batch: BatchMode::On,
             thinking_budget: 64,
             ..model_with_path(dir.path().display().to_string())
         });
@@ -2471,7 +2442,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_batch_with_turboquant_is_fine_but_explicit_batch_fails() {
+    fn a_turboquant_model_passes_and_batch_true_only_warns_it_has_no_effect() {
         let dir = llama_checkpoint();
         let turboquant = |batch| ModelConfig {
             batch,
@@ -2481,34 +2452,35 @@ mod tests {
             },
             ..model_with_path(dir.path().display().to_string())
         };
-        assert_eq!(check_one_model(turboquant(BatchMode::Auto)).failures, 0);
-        assert_eq!(check_one_model(turboquant(BatchMode::On)).failures, 1);
+        let auto = check_one_model(turboquant(BatchMode::Auto));
+        assert_eq!((auto.warnings, auto.failures), (0, 0));
+        let forced = check_one_model(turboquant(BatchMode::On));
+        assert_eq!((forced.warnings, forced.failures), (1, 0));
     }
 
     #[test]
-    fn explicit_batch_with_a_disk_prefix_store_warns() {
+    fn a_disk_prefix_store_is_not_a_warning() {
         let dir = llama_checkpoint();
         let store = tempfile::tempdir().unwrap();
         let result = check_one_model(ModelConfig {
-            batch: BatchMode::On,
             prefix_cache: crate::config::PrefixCacheConfig {
                 disk_dir: Some(store.path().display().to_string()),
                 ..crate::config::PrefixCacheConfig::default()
             },
             ..model_with_path(dir.path().display().to_string())
         });
-        assert_eq!((result.warnings, result.failures), (1, 0));
+        assert_eq!((result.warnings, result.failures), (0, 0));
     }
 
     #[test]
-    fn explicit_batch_on_an_unbatchable_architecture_fails() {
+    fn an_architecture_without_batched_decode_passes() {
         let dir = tempfile::tempdir().unwrap();
         write_model_config_json(dir.path(), "deepseek_v2");
         let result = check_one_model(ModelConfig {
-            batch: BatchMode::On,
+            batch: BatchMode::Auto,
             ..model_with_path(dir.path().display().to_string())
         });
-        assert_eq!(result.failures, 1);
+        assert_eq!((result.warnings, result.failures), (0, 0));
     }
 
     // -- Deprecations, environment overrides and the new sections --

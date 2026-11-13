@@ -454,7 +454,7 @@ mod tests {
         resumed_at: usize,
     }
 
-    /// The prefill the simple engine runs for a chat prompt with no generation
+    /// The prefill the engine runs for a chat prompt with no generation
     /// suffix: look up, resume, pause at the planned checkpoints, store.
     fn prefill_through_cache(
         model: &mut higgs_models::AnyModel,

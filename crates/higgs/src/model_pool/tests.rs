@@ -123,7 +123,7 @@ impl FakeClock {
 fn spec(name: &str) -> ModelSpec {
     ModelSpec {
         name: name.to_owned(),
-        engine_kind: "simple",
+        decode: "sequential",
         load: LoadMode::OnDemand,
         pinned: false,
         idle_ttl: None,
@@ -857,7 +857,7 @@ async fn status_reports_lifecycle_facts() {
     assert_eq!(before.state, ModelState::Unloaded);
     assert_eq!(before.last_used_at, None);
     assert_eq!(before.idle_ttl_seconds, Some(30));
-    assert_eq!(before.engine, "simple");
+    assert_eq!(before.engine, "sequential");
     assert!(fx.pool.status("b").unwrap().pinned);
 
     let lease = fx.pool.acquire("a").await.unwrap();

@@ -29,6 +29,7 @@ use crate::{
         RequestShape, RoundFacts, RoundPlan, concurrency_limit, free_slots, plan_round,
         speculation_must_yield,
     },
+    detokenizer::{IncrementalDetok, find_stop_in_tail},
     disk_prefix_store::{DiskPrefixStore, StoreIdentity},
     engine::{GenerationOutput, GenerationStats, PrefillProgress, StreamingOutput, ThinkingMode},
     error::EngineError,
@@ -40,7 +41,6 @@ use crate::{
     model_loader,
     paged_prefix_cache::{DEFAULT_BLOCK_SIZE, PagedPrefixCache},
     prefix_checkpoints::{Arrival, CheckpointPolicy, PrefillCheckpoints, RecurrentCheckpoint},
-    simple::{IncrementalDetok, find_stop_in_tail},
     speculative::{
         CycleBudget, Speculation, SpeculationKind, SpeculationRequest, SpeculationSettings,
         choose_speculation,
@@ -71,8 +71,8 @@ static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 // Request types
 // ---------------------------------------------------------------------------
 
-/// A generation request submitted to the batch engine.
-struct BatchRequest {
+/// A generation request submitted to the engine.
+struct GenerationRequest {
     prompt_tokens: Vec<u32>,
     max_tokens: u32,
     params: SamplingParams,
@@ -88,7 +88,7 @@ struct BatchRequest {
     response_tx: tokio::sync::mpsc::Sender<StreamingOutput>,
 }
 
-impl BatchRequest {
+impl GenerationRequest {
     fn speculation_request(&self) -> SpeculationRequest {
         #[allow(clippy::float_cmp)]
         let plain_greedy = self.params.temperature == 0.0 && !self.params.has_penalties();
@@ -109,7 +109,7 @@ struct EmbedRequest {
 
 /// Work submitted to the worker thread.
 enum WorkItem {
-    Generate(Box<BatchRequest>),
+    Generate(Box<GenerationRequest>),
     Embed(EmbedRequest),
 }
 
@@ -179,6 +179,7 @@ struct WorkerSettings {
 /// What the worker reports once the model is loaded.
 struct ModelFacts {
     hidden_size: i32,
+    decodes_in_batches: bool,
     is_vlm: bool,
     image_size: Option<i32>,
 }
@@ -355,7 +356,7 @@ impl BatchThinking {
 /// of the worker loop.
 struct PendingPrefill {
     request_id: u64,
-    req: BatchRequest,
+    req: GenerationRequest,
     prompt_len: u32,
     /// Prompt tokens served from the prefix cache, so `tokens` starts after them.
     cached_tokens: u32,
@@ -390,14 +391,14 @@ enum PrefillAdvance {
 }
 
 // ---------------------------------------------------------------------------
-// BatchEngine
+// InferenceEngine
 // ---------------------------------------------------------------------------
 
 /// Inference engine with interleaved request processing.
 ///
 /// All inference runs on a dedicated background thread that owns the model.
 /// Concurrent requests are interleaved at the token level.
-pub struct BatchEngine {
+pub struct InferenceEngine {
     request_tx: tokio::sync::mpsc::Sender<WorkItem>,
     worker: std::thread::JoinHandle<()>,
     tokenizer: Tokenizer,
@@ -407,12 +408,13 @@ pub struct BatchEngine {
     hidden_size: AtomicI32,
     is_vlm: bool,
     image_size: Option<i32>,
+    decodes_in_batches: bool,
     enable_thinking: bool,
     think_close_token: Option<u32>,
     default_thinking_budget: u32,
 }
 
-impl BatchEngine {
+impl InferenceEngine {
     /// Load a model and start the background processing loop.
     pub fn load<P: AsRef<Path>>(dir: P, options: EngineOptions) -> Result<Self, EngineError> {
         let EngineOptions {
@@ -425,7 +427,7 @@ impl BatchEngine {
             max_concurrent_requests,
         } = options;
         let model_dir = dir.as_ref();
-        let model_name = crate::simple::derive_model_name(model_dir);
+        let model_name = model_loader::derive_model_name(model_dir);
 
         tracing::info!(model_dir = %model_dir.display(), "Loading model");
 
@@ -434,7 +436,7 @@ impl BatchEngine {
         if template.is_none() {
             tracing::warn!("No chat template found; /v1/chat/completions will be unavailable");
         }
-        let eos_token_ids = crate::simple::extract_eos_tokens(model_dir);
+        let eos_token_ids = model_loader::extract_eos_tokens(model_dir);
         let thinking = ThinkingSupport::resolve(model_dir, &tokenizer);
         let settings = WorkerSettings {
             prefill_yield_tokens: prefill_yield_tokens.unwrap_or(0),
@@ -475,8 +477,13 @@ impl BatchEngine {
                     let _ = loaded_tx.send(Err(EngineError::Mlx(error)));
                     return;
                 }
+                let batched_decode = batched_decode_available(&model, settings.kv_cache_config);
                 let facts = ModelFacts {
                     hidden_size: model.hidden_size(),
+                    decodes_in_batches: concurrency_limit(
+                        batched_decode,
+                        settings.max_concurrent_requests,
+                    ) > 1,
                     is_vlm: model.is_vlm(),
                     image_size: model.image_size(),
                 };
@@ -491,20 +498,9 @@ impl BatchEngine {
             EngineError::Generation("engine worker exited while loading the model".to_owned())
         })??;
 
-        crate::simple::set_wired_limit_to_max(raise_wired_limit);
+        crate::mlx_memory::raise_wired_limit_if(raise_wired_limit);
 
-        tracing::info!(
-            model_name = %model_name,
-            eos_tokens = ?eos_token_ids,
-            requested_mlx_profile = tuning.requested_profile().as_str(),
-            effective_mlx_profile = tuning.resolved_profile().as_str(),
-            chunked_prefill_threshold = tuning.chunked_prefill_threshold(),
-            chunked_prefill_chunk_size = tuning.chunked_prefill_chunk_size(),
-            clear_cache_after_prefill = tuning.clear_cache_after_prefill(),
-            mtp_enabled = tuning.enable_mtp(),
-            mtp_draft_n_max = tuning.mtp_draft_n_max(),
-            "Engine ready"
-        );
+        log_ready(&model_name, &eos_token_ids, &tuning);
 
         Ok(Self {
             request_tx,
@@ -516,6 +512,7 @@ impl BatchEngine {
             hidden_size: AtomicI32::new(facts.hidden_size),
             is_vlm: facts.is_vlm,
             image_size: facts.image_size,
+            decodes_in_batches: facts.decodes_in_batches,
             enable_thinking: thinking.enabled,
             think_close_token: thinking.close_token,
             default_thinking_budget,
@@ -561,6 +558,11 @@ impl BatchEngine {
     /// Whether the model reasons inside `<think>` tags by default.
     pub const fn enable_thinking(&self) -> bool {
         self.enable_thinking
+    }
+
+    /// Whether concurrent requests decode together in batched forward passes.
+    pub const fn decodes_in_batches(&self) -> bool {
+        self.decodes_in_batches
     }
 
     /// Whether the loaded model is a vision-language model.
@@ -662,7 +664,7 @@ impl BatchEngine {
         let (internal_tx, mut internal_rx) = tokio::sync::mpsc::channel(32);
 
         self.request_tx
-            .blocking_send(WorkItem::Generate(Box::new(BatchRequest {
+            .blocking_send(WorkItem::Generate(Box::new(GenerationRequest {
                 prompt_tokens: prompt_tokens.to_vec(),
                 max_tokens,
                 params: params.clone(),
@@ -753,7 +755,7 @@ impl BatchEngine {
         let (internal_tx, mut internal_rx) = tokio::sync::mpsc::channel(32);
 
         self.request_tx
-            .blocking_send(WorkItem::Generate(Box::new(BatchRequest {
+            .blocking_send(WorkItem::Generate(Box::new(GenerationRequest {
                 prompt_tokens: prompt_tokens.to_vec(),
                 max_tokens,
                 params: params.clone(),
@@ -994,6 +996,27 @@ fn open_disk_store(settings: &WorkerSettings) -> Option<DiskPrefixStore> {
     }
 }
 
+fn log_ready(model_name: &str, eos_token_ids: &[u32], tuning: &MlxRuntimeTuning) {
+    tracing::info!(
+        model_name,
+        eos_tokens = ?eos_token_ids,
+        requested_mlx_profile = tuning.requested_profile().as_str(),
+        effective_mlx_profile = tuning.resolved_profile().as_str(),
+        chunked_prefill_threshold = tuning.chunked_prefill_threshold(),
+        chunked_prefill_chunk_size = tuning.chunked_prefill_chunk_size(),
+        clear_cache_after_prefill = tuning.clear_cache_after_prefill(),
+        mtp_enabled = tuning.enable_mtp(),
+        mtp_draft_n_max = tuning.mtp_draft_n_max(),
+        "Engine ready"
+    );
+}
+
+/// Whether requests can share a batched decode pass. `TurboQuant` caches quantize per
+/// request and cannot be stacked into a batched cache.
+const fn batched_decode_available(model: &AnyModel, kv_cache_config: KvCacheConfig) -> bool {
+    model.supports_batched_decode() && !kv_cache_config.is_turboquant()
+}
+
 /// Every MLX array the worker holds, owned by the worker thread.
 struct Worker {
     model: AnyModel,
@@ -1017,7 +1040,7 @@ fn worker_loop(
 ) {
     let prefill_yield_tokens = settings.prefill_yield_tokens;
     let turboquant = settings.kv_cache_config.is_turboquant();
-    let batched_decode = model.supports_batched_decode() && !turboquant;
+    let batched_decode = batched_decode_available(&model, settings.kv_cache_config);
     if !batched_decode {
         tracing::info!(
             "This model decodes one request at a time (no batched decode for its architecture or KV cache); requests queue"
@@ -1038,7 +1061,8 @@ fn worker_loop(
         shapes: Vec::new(),
     };
     let mut pending_prefill: Option<PendingPrefill> = None;
-    let mut waiting: std::collections::VecDeque<BatchRequest> = std::collections::VecDeque::new();
+    let mut waiting: std::collections::VecDeque<GenerationRequest> =
+        std::collections::VecDeque::new();
 
     loop {
         // 1. Admit queued requests, blocking only when there is nothing to do.
@@ -1123,7 +1147,7 @@ impl Worker {
         tokenizer: &Tokenizer,
         eos_token_ids: &[u32],
         settings: &WorkerSettings,
-        waiting: &mut std::collections::VecDeque<BatchRequest>,
+        waiting: &mut std::collections::VecDeque<GenerationRequest>,
         slots: usize,
     ) {
         let group = if self.grouped_prefill {
@@ -1288,7 +1312,7 @@ fn admit(
     item: WorkItem,
     model: &mut AnyModel,
     settings: &WorkerSettings,
-    waiting: &mut std::collections::VecDeque<BatchRequest>,
+    waiting: &mut std::collections::VecDeque<GenerationRequest>,
 ) {
     match item {
         WorkItem::Generate(request) => waiting.push_back(*request),
@@ -1720,14 +1744,14 @@ fn disband_decode_batch(
 /// one batched pass beats prefilling each request separately. Requests left
 /// behind keep their order. A request with images always prefills alone.
 fn take_prefill_group(
-    waiting: &mut std::collections::VecDeque<BatchRequest>,
+    waiting: &mut std::collections::VecDeque<GenerationRequest>,
     prompt_cache: &PromptCache,
     slots: usize,
-) -> Vec<BatchRequest> {
+) -> Vec<GenerationRequest> {
     if waiting.len() < 2 || slots < 2 {
         return Vec::new();
     }
-    let mut group: Vec<BatchRequest> = Vec::new();
+    let mut group: Vec<GenerationRequest> = Vec::new();
     let mut longest = 0;
     let mut left_behind = std::collections::VecDeque::with_capacity(waiting.len());
     for req in waiting.drain(..) {
@@ -1757,7 +1781,7 @@ fn prefill_group(
     tokenizer: &Tokenizer,
     eos_token_ids: &[u32],
     settings: &WorkerSettings,
-    group: Vec<BatchRequest>,
+    group: Vec<GenerationRequest>,
 ) {
     let started = std::time::Instant::now();
     for req in &group {
@@ -1867,7 +1891,7 @@ fn prefill_group(
 /// Tell the caller that prompt evaluation is starting and how much of the
 /// prompt the prefix cache already covers. Never blocks the worker: a full
 /// channel only loses this notification.
-fn announce_prefill(req: &BatchRequest, processed: u32, cached_tokens: u32, prompt_len: u32) {
+fn announce_prefill(req: &GenerationRequest, processed: u32, cached_tokens: u32, prompt_len: u32) {
     let _ = req.response_tx.try_send(StreamingOutput {
         new_text: String::new(),
         finished: false,
@@ -1888,7 +1912,7 @@ fn start_prefill(
     model: &AnyModel,
     prompt_cache: &mut PromptCache,
     settings: &WorkerSettings,
-    req: BatchRequest,
+    req: GenerationRequest,
 ) -> Result<PendingPrefill, EngineError> {
     let prompt_len = req
         .prompt_tokens
@@ -2103,7 +2127,7 @@ fn prefill_request(
     tokenizer: &Tokenizer,
     eos_token_ids: &[u32],
     settings: &WorkerSettings,
-    req: BatchRequest,
+    req: GenerationRequest,
 ) -> Result<Option<ActiveRequest>, EngineError> {
     let mut prefill = start_prefill(model, prompt_cache, settings, req)?;
     let quantum = settings.chunking.quantum(prefill.tokens.len());
@@ -2133,7 +2157,7 @@ fn complete_prefill(
     tokenizer: &Tokenizer,
     eos_token_ids: &[u32],
     settings: &WorkerSettings,
-    mut req: BatchRequest,
+    mut req: GenerationRequest,
     prompt_len: u32,
     mut done: PrefillDone,
 ) -> Result<Option<ActiveRequest>, EngineError> {
@@ -2183,7 +2207,7 @@ fn complete_prefill(
             done.disk_loaded,
         );
     }
-    crate::simple::maybe_clear_mlx_cache(settings.clear_cache_after_prefill, "post_prefill");
+    crate::mlx_memory::clear_allocator_cache_if(settings.clear_cache_after_prefill, "post_prefill");
 
     let first_token_id: u32 = current_token.item_cast();
     if let Some(constraint) = req.constraint.as_mut() {
@@ -2200,7 +2224,7 @@ fn complete_prefill(
     // so partial UTF-8 is held back and prefix-before-stop is correctly emitted).
     // Preserve content-bearing special tokens (e.g. MiniCPM tool-call markup)
     // while stripping control tokens.
-    let skip_ids = std::sync::Arc::new(crate::simple::content_preserving_skip_ids(
+    let skip_ids = std::sync::Arc::new(crate::detokenizer::content_preserving_skip_ids(
         tokenizer,
         eos_token_ids,
     ));
@@ -2520,7 +2544,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = BatchEngine::load(
+        let result = InferenceEngine::load(
             dir.path(),
             EngineOptions {
                 kv_cache: KvCacheConfig::default(),
@@ -2668,6 +2692,25 @@ mod tests {
     fn batch_thinking_is_absent_when_no_row_thinks() {
         let rows = [make_row(None, 1), make_row(None, 4)];
         assert!(BatchThinking::for_rows(&rows).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_lookahead_decode_emits_the_forced_close_exactly_once() {
+        let mut gate = ThinkingGate::new(CLOSE, 4);
+        gate.observe(1);
+        let mut emitted = vec![1];
+        let mut forced = None;
+        for sampled in [2, 3, 4, 5, 6] {
+            let token = forced.take().unwrap_or(sampled);
+            emitted.push(token);
+            gate.observe(token);
+            let next_position = u32::try_from(emitted.len() + 1).unwrap();
+            if gate.forces(next_position) {
+                forced = Some(CLOSE);
+            }
+        }
+        assert_eq!(emitted.iter().filter(|&&token| token == CLOSE).count(), 1);
+        assert_eq!(emitted.iter().position(|&token| token == CLOSE), Some(3));
     }
 
     #[test]
