@@ -55,7 +55,6 @@ pub const ENV_ONLY_BEHAVIOR: &[&str] = &[
     "HIGGS_ENABLE_THINKING",
     "HIGGS_TURBOQUANT_MIN_TOKENS",
     "HIGGS_TURBOQUANT_ACTIVATE_AT",
-    "HIGGS_EXPERIMENTAL_PAGED_KV",
     "HIGGS_WIRED_LIMIT_MODE",
     "HIGGS_NO_MEM_LIMIT",
     "HIGGS_MTP_PRIME_PREFILL",
@@ -151,6 +150,8 @@ pub struct ModelConfig {
     /// Other request names that resolve to this model.
     pub aliases: Vec<String>,
     pub profile: RequestedMlxProfile,
+    /// `false` serves one request at a time; otherwise concurrent requests decode together
+    /// whenever the model can.
     pub batch: BatchMode,
     pub load: LoadMode,
     /// Unload after this long with no in-flight request; `None` never unloads on idle.

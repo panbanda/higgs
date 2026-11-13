@@ -98,14 +98,18 @@ impl MemoryGuard {
 }
 
 /// The per-model `batch` setting: `true`, `false`, or `"auto"`.
+///
+/// Every model is served by one engine that decodes concurrent requests together
+/// whenever the model can, so only `false` changes anything: it limits the model to
+/// one request at a time. `true` and `"auto"` are accepted for old configuration files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BatchMode {
-    /// Batch engine unless a configured feature needs the simple engine.
+    /// No limit on concurrent requests.
     #[default]
     Auto,
-    /// Always the batch engine; fails to load if the model cannot batch.
+    /// Same as [`Self::Auto`]; `higgs doctor` says it has no effect.
     On,
-    /// Always the simple engine.
+    /// One request at a time.
     Off,
 }
 

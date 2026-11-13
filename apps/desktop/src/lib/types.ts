@@ -227,7 +227,7 @@ export interface SystemInfo {
   models: Array<{
     name: string;
     path: string | null;
-    engine: "simple" | "batch" | string;
+    engine: "batched" | "sequential" | "unknown" | string;
     mlx_profile: string | null;
     kv_cache: string | null;
   }>;

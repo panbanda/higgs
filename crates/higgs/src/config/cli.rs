@@ -205,15 +205,15 @@ pub struct ServeArgs {
     #[arg(long)]
     pub timeout: Option<f64>,
 
-    /// MLX tuning profile for local simple-engine models.
+    /// MLX tuning profile for local models.
     #[arg(long, value_name = "PROFILE")]
     pub mlx_profile: Option<MlxProfile>,
 
-    /// Force the batch engine for all models (the default picks per model).
+    /// Deprecated, has no effect: models decode concurrent requests together whenever they can.
     #[arg(long)]
     pub batch: bool,
 
-    /// Force the simple engine for all models.
+    /// Serve one request at a time per model.
     #[arg(long, conflicts_with = "batch")]
     pub no_batch: bool,
 

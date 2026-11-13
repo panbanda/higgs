@@ -49,7 +49,7 @@ Higgs keeps prefix KV state in memory in 32-token blocks and reuses everything u
 
 ### Concurrent throughput
 
-Aggregate tokens per second across N simultaneous streaming requests of 256 tokens each (distinct prompts), with mean time to first token in parentheses. Higgs is run with `batch = true`.
+Aggregate tokens per second across N simultaneous streaming requests of 256 tokens each (distinct prompts), with mean time to first token in parentheses. Higgs is run with its default settings (batched decode).
 
 | Model | Clients | Higgs before | Higgs now | oMLX |
 |---|---|---|---|---|
@@ -75,7 +75,7 @@ Aggregate tokens per second across N simultaneous streaming requests of 256 toke
 
 What changed in Higgs:
 
-- The batch engine keeps one left-padded batched KV cache across decode steps instead of re-stacking every request's cache per layer per token, rotates each row at its own position with one dynamic RoPE call, and builds step N+1 while the GPU is still computing step N.
+- The engine keeps one left-padded batched KV cache across decode steps instead of re-stacking every request's cache per layer per token, rotates each row at its own position with one dynamic RoPE call, and builds step N+1 while the GPU is still computing step N.
 - Short prompts that arrive together are prefilled in one padded forward pass.
 - Batched decode now covers Phi-3, Starcoder2, Qwen3 MoE, and the Qwen3.5/3.6 hybrid models (dense and MoE), in addition to Llama, Mistral, Qwen2 and Qwen3 dense. Hybrid models batch decode only; each prompt is prefilled on its own, then joins the batch.
 
@@ -150,7 +150,7 @@ Higgs features added on this branch to close gaps with oMLX: the OpenAI Response
 | Tool calling | Qwen, Mistral, Llama, Gemma, GLM, MiniMax formats | many model formats |
 | Forced `tool_choice` (`required`, named) | Qwen, Mistral, Llama formats | yes |
 | On-demand load, LRU/TTL eviction, pinning, memory guard | yes | yes |
-| Continuous batching | on by default (`batch = "auto"`) | on by default |
+| Continuous batching | on by default | on by default |
 | In-memory prefix cache | yes | optional (off by default) |
 | Disk prefix cache | opt-in | on by default |
 | KV cache quantization | TurboQuant | TurboQuant, affine 4/8-bit |
@@ -173,7 +173,7 @@ Still missing in Higgs relative to oMLX: grammar (EBNF) constrained output, audi
 ```bash
 # Higgs
 cargo build --release -p higgs -p higgs-bench
-./target/release/higgs serve --model <model dir> --port 8897 [--batch] &
+./target/release/higgs serve --model <model dir> --port 8897 &
 ./target/release/bench_compare --base-url http://127.0.0.1:8897 \
   --model <model name> --label higgs --pid <server pid> \
   --extra-body '{"reasoning":{"effort":"none"}}' \
