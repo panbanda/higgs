@@ -580,6 +580,73 @@ mod tests {
         }
     }
 
+    /// Greedy-decodes 48 tokens from a fixed prompt and writes the token ids
+    /// and the final-step logits (raw little-endian f32) into
+    /// `HIGGS_REFERENCE_OUT`. Run before and after a change to the forward
+    /// computation and compare the files byte for byte:
+    /// `HIGGS_MODEL_PATH=<dir> HIGGS_REFERENCE_OUT=<out dir> cargo test -p higgs-engine --lib -- --ignored record_greedy_reference --nocapture`
+    #[test]
+    #[ignore = "requires real model weights (set HIGGS_MODEL_PATH and HIGGS_REFERENCE_OUT)"]
+    fn record_greedy_reference() {
+        use mlx_rs::{
+            Array,
+            ops::indexing::{IndexOp, argmax_axis},
+        };
+
+        const GENERATED_TOKENS: usize = 48;
+        let (Ok(model_path), Ok(output_dir)) = (
+            std::env::var("HIGGS_MODEL_PATH"),
+            std::env::var("HIGGS_REFERENCE_OUT"),
+        ) else {
+            println!("HIGGS_MODEL_PATH or HIGGS_REFERENCE_OUT not set, skipping");
+            return;
+        };
+        let mut model = load_model(&model_path).unwrap();
+        let tokenizer = load_tokenizer(&model_path).unwrap();
+        let prompt = tokenizer
+            .encode("The history of the Roman Empire begins with", true)
+            .unwrap();
+        let prompt_ids = prompt.get_ids();
+        let mut cache = model.make_cache().unwrap();
+
+        let mut input =
+            Array::from_slice(prompt_ids, &[1, i32::try_from(prompt_ids.len()).unwrap()]);
+        let mut generated: Vec<u32> = Vec::new();
+        let mut final_logits = Vec::new();
+        for _ in 0..GENERATED_TOKENS {
+            let logits = model.forward(&input, None, &mut cache).unwrap();
+            let last = logits.index((.., -1, ..));
+            let next = argmax_axis(&last, -1, None).unwrap();
+            next.eval().unwrap();
+            let token = next.item_cast::<u32>();
+            generated.push(token);
+            final_logits = last
+                .as_dtype(mlx_rs::Dtype::Float32)
+                .unwrap()
+                .as_slice::<f32>()
+                .to_vec();
+            input = Array::from_slice(&[token], &[1, 1]);
+        }
+
+        std::fs::create_dir_all(&output_dir).unwrap();
+        let tokens_text: Vec<String> = generated.iter().map(u32::to_string).collect();
+        std::fs::write(
+            std::path::Path::new(&output_dir).join("tokens.txt"),
+            tokens_text.join("\n"),
+        )
+        .unwrap();
+        let logit_bytes: Vec<u8> = final_logits
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        std::fs::write(
+            std::path::Path::new(&output_dir).join("final_logits.f32"),
+            logit_bytes,
+        )
+        .unwrap();
+        println!("tokens: {generated:?}");
+    }
+
     /// Create a temp dir with a config.json containing the given `model_type` and
     /// return the `ModelConfig` result.
     fn config_for_model(model_type: &str) -> (tempfile::TempDir, Result<ModelConfig, EngineError>) {

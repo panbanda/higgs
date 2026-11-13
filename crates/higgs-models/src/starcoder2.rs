@@ -13,6 +13,7 @@ use mlx_rs::{
     Array, array,
     builder::Builder,
     error::Exception,
+    fast::ScaledDotProductAttentionMask,
     macros::{ModuleParameters, Quantizable},
     module::Module,
     nn, ops,
@@ -22,12 +23,10 @@ use mlx_rs::{
 use serde::Deserialize;
 
 use crate::{
+    attention::{DecodeKernel, HeadCounts, HeadNorms, Projections, SelfAttention},
     cache::KeyValueCache,
     error::ModelError,
-    utils::{
-        apply_rope, apply_rope_at_cache, cached_scaled_dot_product_attention, create_causal_mask,
-        scaled_dot_product_attention,
-    },
+    utils::create_causal_mask,
 };
 
 // ---------------------------------------------------------------------------
@@ -136,7 +135,6 @@ fn create_sliding_causal_mask(
 struct Starcoder2Attention {
     n_heads: i32,
     n_kv_heads: i32,
-    head_dim: i32,
     scale: f32,
 
     #[quantizable]
@@ -191,7 +189,6 @@ impl Starcoder2Attention {
         Ok(Self {
             n_heads,
             n_kv_heads,
-            head_dim,
             scale,
             q_proj: MaybeQuantized::Original(q_proj),
             k_proj: MaybeQuantized::Original(k_proj),
@@ -215,55 +212,32 @@ where
     type Output = Array;
     type Error = Exception;
 
-    #[allow(non_snake_case)]
     fn forward(
         &mut self,
         input: Starcoder2AttentionInput<'_, C>,
     ) -> Result<Self::Output, Self::Error> {
-        let Starcoder2AttentionInput { x, mask, mut cache } = input;
+        let Starcoder2AttentionInput { x, mask, cache } = input;
 
-        let shape = x.shape();
-        let B = *shape
-            .first()
-            .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
-        let L = *shape
-            .get(1)
-            .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
-
-        let mut queries = self
-            .q_proj
-            .forward(x)?
-            .reshape(&[B, L, self.n_heads, -1])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let mut keys = self
-            .k_proj
-            .forward(x)?
-            .reshape(&[B, L, self.n_kv_heads, -1])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let values = self
-            .v_proj
-            .forward(x)?
-            .reshape(&[B, L, self.n_kv_heads, -1])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-
-        if let Some(ref mut kv_cache) = cache {
-            queries = apply_rope_at_cache(&queries, &self.rope, kv_cache)?;
-            keys = apply_rope_at_cache(&keys, &self.rope, kv_cache)?;
-
-            let output = cached_scaled_dot_product_attention(
-                queries, kv_cache, keys, values, self.scale, mask,
-            )?
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[B, L, -1])?;
-
-            return self.o_proj.forward(&output);
+        let projections = Projections {
+            queries: self.q_proj.forward(x)?,
+            keys: self.k_proj.forward(x)?,
+            values: self.v_proj.forward(x)?,
+        };
+        let output = SelfAttention {
+            head_counts: HeadCounts {
+                query: self.n_heads,
+                key_value: self.n_kv_heads,
+            },
+            scale: self.scale,
+            rope: &self.rope,
+            norms: HeadNorms::default(),
+            decode: DecodeKernel::CacheNative,
         }
-        queries = apply_rope(&queries, &self.rope, 0)?;
-        keys = apply_rope(&keys, &self.rope, 0)?;
-
-        let output = scaled_dot_product_attention(queries, keys, values, self.scale, mask)?
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[B, L, -1])?;
+        .forward(
+            &projections,
+            mask.map(ScaledDotProductAttentionMask::Array),
+            cache,
+        )?;
 
         self.o_proj.forward(&output)
     }

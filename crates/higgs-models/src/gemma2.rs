@@ -24,9 +24,10 @@ use mlx_rs::{
 use serde::Deserialize;
 
 use crate::{
-    cache::{KeyValueCache, KvCacheView},
+    attention::{GroupedScoreAttention, HeadCounts, HeadNorms, Projections, split_heads},
+    cache::KeyValueCache,
     error::ModelError,
-    utils::{AttentionMask, apply_rope, apply_rope_at_cache, create_attention_mask},
+    utils::{AttentionMask, create_attention_mask},
 };
 
 // ---------------------------------------------------------------------------
@@ -115,18 +116,8 @@ impl Gemma2ModelArgs {
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
 struct Gemma2Attention {
-    n_heads: i32,
-    n_kv_heads: i32,
-    n_rep: i32,
-    scale: f32,
-    attn_logit_softcapping: Option<f32>,
-    sliding_window: Option<i32>,
-
-    // Pre-cast scalars to avoid f32 dtype promotion in bfloat16 models
-    cached_scale: Option<Array>,
-    cached_inv_cap: Option<Array>,
-    cached_cap: Option<Array>,
-    cached_neg_inf: Option<Array>,
+    head_counts: HeadCounts,
+    scores: GroupedScoreAttention,
 
     #[quantizable]
     #[param]
@@ -179,16 +170,11 @@ impl Gemma2Attention {
         };
 
         Ok(Self {
-            n_heads,
-            n_kv_heads,
-            n_rep: n_heads / n_kv_heads,
-            scale,
-            attn_logit_softcapping: args.attn_logit_softcapping,
-            sliding_window: window,
-            cached_scale: None,
-            cached_inv_cap: None,
-            cached_cap: None,
-            cached_neg_inf: None,
+            head_counts: HeadCounts {
+                query: n_heads,
+                key_value: n_kv_heads,
+            },
+            scores: GroupedScoreAttention::new(scale, args.attn_logit_softcapping, window),
             q_proj: MaybeQuantized::Original(q_proj),
             k_proj: MaybeQuantized::Original(k_proj),
             v_proj: MaybeQuantized::Original(v_proj),
@@ -211,239 +197,21 @@ where
     type Output = Array;
     type Error = Exception;
 
-    #[allow(non_snake_case, clippy::too_many_lines)]
     fn forward(&mut self, input: Gemma2AttentionInput<'_, C>) -> Result<Self::Output, Self::Error> {
-        let Gemma2AttentionInput { x, mask, mut cache } = input;
+        let Gemma2AttentionInput { x, mask, cache } = input;
 
-        let shape = x.shape();
-        let B = *shape
-            .first()
-            .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
-        let L = *shape
-            .get(1)
-            .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
-
-        let mut queries = self
-            .q_proj
-            .forward(x)?
-            .reshape(&[B, L, self.n_heads, -1])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let mut keys = self
-            .k_proj
-            .forward(x)?
-            .reshape(&[B, L, self.n_kv_heads, -1])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let mut values = self
-            .v_proj
-            .forward(x)?
-            .reshape(&[B, L, self.n_kv_heads, -1])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-
-        if let Some(ref mut kv_cache) = cache {
-            queries = apply_rope_at_cache(&queries, &self.rope, kv_cache)?;
-            keys = apply_rope_at_cache(&keys, &self.rope, kv_cache)?;
-
-            match kv_cache.update_and_view(keys, values)? {
-                KvCacheView::TurboQuant(view) if is_single_token_decode(&queries) => {
-                    let mut scores = view.decode_scores(&queries, self.n_heads)?;
-
-                    if self
-                        .cached_scale
-                        .as_ref()
-                        .is_none_or(|cached| cached.dtype() != scores.dtype())
-                    {
-                        self.cached_scale = Some(array!(self.scale).as_dtype(scores.dtype())?);
-                    }
-                    let scale = self
-                        .cached_scale
-                        .as_ref()
-                        .ok_or_else(|| Exception::custom("cached_scale not initialized"))?;
-                    scores = scores.multiply(scale)?;
-
-                    if let Some(cap) = self.attn_logit_softcapping {
-                        let needs_cap_cache = self
-                            .cached_inv_cap
-                            .as_ref()
-                            .is_none_or(|cached| cached.dtype() != scores.dtype())
-                            || self
-                                .cached_cap
-                                .as_ref()
-                                .is_none_or(|cached| cached.dtype() != scores.dtype());
-                        if needs_cap_cache {
-                            self.cached_inv_cap = Some(array!(1.0 / cap).as_dtype(scores.dtype())?);
-                            self.cached_cap = Some(array!(cap).as_dtype(scores.dtype())?);
-                        }
-                        let inv_cap = self
-                            .cached_inv_cap
-                            .as_ref()
-                            .ok_or_else(|| Exception::custom("cached_inv_cap not initialized"))?;
-                        let cap_arr = self
-                            .cached_cap
-                            .as_ref()
-                            .ok_or_else(|| Exception::custom("cached_cap not initialized"))?;
-                        scores = ops::tanh(&scores.multiply(inv_cap)?)?.multiply(cap_arr)?;
-                    }
-
-                    if let Some(window) = self.sliding_window {
-                        let s_len = *scores
-                            .shape()
-                            .last()
-                            .ok_or_else(|| Exception::custom("scores must have >= 1 dim"))?;
-                        if s_len > window {
-                            if self
-                                .cached_neg_inf
-                                .as_ref()
-                                .is_none_or(|cached| cached.dtype() != scores.dtype())
-                            {
-                                self.cached_neg_inf =
-                                    Some(array!(f32::NEG_INFINITY).as_dtype(scores.dtype())?);
-                            }
-                            let window_mask = create_sliding_window_mask(L, s_len, window)?;
-                            let neg_inf = self.cached_neg_inf.as_ref().ok_or_else(|| {
-                                Exception::custom("cached_neg_inf not initialized")
-                            })?;
-                            scores = ops::select(&window_mask, &scores, neg_inf)?;
-                        }
-                    }
-
-                    if let Some(m) = mask {
-                        if self
-                            .cached_neg_inf
-                            .as_ref()
-                            .is_none_or(|cached| cached.dtype() != scores.dtype())
-                        {
-                            self.cached_neg_inf =
-                                Some(array!(f32::NEG_INFINITY).as_dtype(scores.dtype())?);
-                        }
-                        let neg_inf = self
-                            .cached_neg_inf
-                            .as_ref()
-                            .ok_or_else(|| Exception::custom("cached_neg_inf not initialized"))?;
-                        scores = ops::select(m, &scores, neg_inf)?;
-                    }
-
-                    let weights = ops::softmax_axis(&scores, -1, None)?;
-                    let output = view
-                        .decode_values(&weights, self.n_heads)?
-                        .transpose_axes(&[0, 2, 1, 3])?
-                        .reshape(&[B, L, -1])?;
-
-                    return self.o_proj.forward(&output);
-                }
-                other @ (KvCacheView::Dense { .. } | KvCacheView::TurboQuant(_)) => {
-                    let (cached_keys, cached_values) = other.into_dense()?;
-                    keys = cached_keys;
-                    values = cached_values;
-                }
-            }
-        } else {
-            queries = apply_rope(&queries, &self.rope, 0)?;
-            keys = apply_rope(&keys, &self.rope, 0)?;
-        }
-
-        // GQA via 5D broadcast: avoids physically copying KV heads.
-        // queries: [B, n_heads, L, D] -> [B, n_kv, n_rep, L, D]
-        // keys/values: [B, n_kv, S, D] -> [B, n_kv, 1, S, D]
-        let kv_s = *keys
-            .shape()
-            .get(2)
-            .ok_or_else(|| Exception::custom("keys must be 4D"))?;
-        let head_d = *queries
-            .shape()
-            .get(3)
-            .ok_or_else(|| Exception::custom("queries must be 4D"))?;
-        let q5 = queries.reshape(&[B, self.n_kv_heads, self.n_rep, L, head_d])?;
-        let k5 = keys.reshape(&[B, self.n_kv_heads, 1, kv_s, head_d])?;
-        let v5 = values.reshape(&[B, self.n_kv_heads, 1, kv_s, head_d])?;
-
-        // Manual attention with soft-capping
-        // scores: [B, n_kv, n_rep, L, S]
-        if self
-            .cached_scale
-            .as_ref()
-            .is_none_or(|cached| cached.dtype() != q5.dtype())
-        {
-            self.cached_scale = Some(array!(self.scale).as_dtype(q5.dtype())?);
-        }
-        let scale = self
-            .cached_scale
-            .as_ref()
-            .ok_or_else(|| Exception::custom("cached_scale not initialized"))?;
-        let mut scores = q5
-            .matmul(&k5.transpose_axes(&[0, 1, 2, 4, 3])?)?
-            .multiply(scale)?;
-
-        // Soft-capping: tanh(scores / cap) * cap
-        if let Some(cap) = self.attn_logit_softcapping {
-            let needs_cap_cache = self
-                .cached_inv_cap
-                .as_ref()
-                .is_none_or(|cached| cached.dtype() != scores.dtype())
-                || self
-                    .cached_cap
-                    .as_ref()
-                    .is_none_or(|cached| cached.dtype() != scores.dtype());
-            if needs_cap_cache {
-                self.cached_inv_cap = Some(array!(1.0 / cap).as_dtype(scores.dtype())?);
-                self.cached_cap = Some(array!(cap).as_dtype(scores.dtype())?);
-            }
-            let inv_cap = self
-                .cached_inv_cap
-                .as_ref()
-                .ok_or_else(|| Exception::custom("cached_inv_cap not initialized"))?;
-            let cap_arr = self
-                .cached_cap
-                .as_ref()
-                .ok_or_else(|| Exception::custom("cached_cap not initialized"))?;
-            scores = ops::tanh(&scores.multiply(inv_cap)?)?.multiply(cap_arr)?;
-        }
-
-        // Apply sliding window mask (additive: -inf for out-of-window positions)
-        if let Some(window) = self.sliding_window {
-            let s_len = *scores
-                .shape()
-                .last()
-                .ok_or_else(|| Exception::custom("scores must have >= 1 dim"))?;
-            if s_len > window {
-                if self
-                    .cached_neg_inf
-                    .as_ref()
-                    .is_none_or(|cached| cached.dtype() != scores.dtype())
-                {
-                    self.cached_neg_inf = Some(array!(f32::NEG_INFINITY).as_dtype(scores.dtype())?);
-                }
-                let window_mask = create_sliding_window_mask(L, s_len, window)?;
-                let neg_inf = self
-                    .cached_neg_inf
-                    .as_ref()
-                    .ok_or_else(|| Exception::custom("cached_neg_inf not initialized"))?;
-                scores = ops::select(&window_mask, &scores, neg_inf)?;
-            }
-        }
-
-        // Apply causal mask (boolean: true = attend, false = mask out)
-        if let Some(m) = mask {
-            if self
-                .cached_neg_inf
-                .as_ref()
-                .is_none_or(|cached| cached.dtype() != scores.dtype())
-            {
-                self.cached_neg_inf = Some(array!(f32::NEG_INFINITY).as_dtype(scores.dtype())?);
-            }
-            let neg_inf = self
-                .cached_neg_inf
-                .as_ref()
-                .ok_or_else(|| Exception::custom("cached_neg_inf not initialized"))?;
-            scores = ops::select(m, &scores, neg_inf)?;
-        }
-
-        let weights = ops::softmax_axis(&scores, -1, None)?;
-        // [B, n_kv, n_rep, L, D] -> [B, n_heads, L, D] -> [B, L, n_heads*D]
-        let output = weights
-            .matmul(&v5)?
-            .reshape(&[B, self.n_heads, L, head_d])?
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[B, L, -1])?;
+        let heads = split_heads(
+            &Projections {
+                queries: self.q_proj.forward(x)?,
+                keys: self.k_proj.forward(x)?,
+                values: self.v_proj.forward(x)?,
+            },
+            self.head_counts,
+            HeadNorms::default(),
+        )?;
+        let output = self
+            .scores
+            .forward(heads, self.head_counts, &self.rope, mask, cache)?;
 
         self.o_proj.forward(&output)
     }
@@ -455,38 +223,6 @@ where
         self.o_proj.training_mode(mode);
         <nn::Rope as Module<nn::RopeInput>>::training_mode(&mut self.rope, mode);
     }
-}
-
-fn is_single_token_decode(queries: &Array) -> bool {
-    let shape = queries.shape();
-    matches!(shape, [1, _, 1, _])
-}
-
-/// Create a boolean mask for sliding window attention.
-///
-/// For each query position q (with absolute position = offset + `q_local`),
-/// only keys within `[q_abs - window + 1, q_abs]` are visible.
-#[allow(non_snake_case)]
-fn create_sliding_window_mask(L: i32, S: i32, window: i32) -> Result<Array, Exception> {
-    // Query positions: last L of the S total positions
-    // offset = S - L
-    let offset = S - L;
-    // For query at local index i (absolute position = offset + i),
-    // key at index j is visible if j >= (offset + i) - window + 1 AND j <= (offset + i)
-    // The causal mask already handles j <= (offset + i).
-    // The remaining constraint: j >= (offset + i) - window + 1
-
-    let query_positions = mlx_rs::ops::arange::<_, f32>(offset, offset + L, None)?;
-    let key_positions = mlx_rs::ops::arange::<_, f32>(None, S, None)?;
-
-    // lower_bound[i] = query_pos[i] - window + 1
-    let lower_bounds = query_positions.subtract(array!(window - 1))?;
-    // Reshape for broadcasting: [L, 1] vs [1, S]
-    let lower_expanded = lower_bounds.reshape(&[L, 1])?;
-    let key_expanded = key_positions.reshape(&[1, S])?;
-
-    // mask[i, j] = key_positions[j] >= lower_bound[i]
-    key_expanded.ge(&lower_expanded)
 }
 
 // ---------------------------------------------------------------------------
@@ -1004,6 +740,7 @@ fn apply_rmsnorm_plus_one(model: &mut Gemma2CausalLM) -> Result<(), Exception> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{ForwardOverCache, worst_batched_difference};
     use crate::{
         cache::SteppingKeyValueCache,
         turboquant::{KvCacheConfig, KvCacheMode},
@@ -1127,30 +864,35 @@ mod tests {
         assert!(Gemma2CausalLM::new(args).is_err());
     }
 
-    #[test]
-    fn sliding_window_mask_shape() {
-        let mask = create_sliding_window_mask(4, 10, 3).unwrap();
-        assert_eq!(mask.shape(), &[4, 10]);
+    struct BatchCheck(Gemma2CausalLM);
+
+    impl ForwardOverCache for BatchCheck {
+        fn num_layers(&self) -> usize {
+            usize::try_from(self.0.args.num_hidden_layers).unwrap()
+        }
+
+        fn forward_over<C: KeyValueCache>(
+            &mut self,
+            inputs: &Array,
+            mask: Option<&Array>,
+            cache: &mut Vec<Option<C>>,
+        ) -> Result<Array, Exception> {
+            self.0.forward(inputs, mask, cache)
+        }
     }
 
     #[test]
-    fn sliding_window_mask_values() {
-        // L=3, S=5, window=2
-        // Query positions (absolute): 2, 3, 4 (offset = S-L = 2)
-        // Key positions: 0, 1, 2, 3, 4
-        // The mask only enforces the lower bound (j >= q - window + 1).
-        // The causal mask separately enforces the upper bound (j <= q).
-        // q=2: j >= 1 -> [F, T, T, T, T]
-        // q=3: j >= 2 -> [F, F, T, T, T]
-        // q=4: j >= 3 -> [F, F, F, T, T]
-        let mask = create_sliding_window_mask(3, 5, 2).unwrap();
-        mlx_rs::transforms::eval([&mask]).unwrap();
-        let flat: Vec<bool> = mask.as_slice().to_vec();
-        let expected = [
-            false, true, true, true, true, false, false, true, true, true, false, false, false,
-            true, true,
-        ];
-        assert_eq!(flat, expected);
+    fn batched_forward_matches_unbatched_past_the_sliding_window() {
+        let mut args = default_gemma2_args();
+        args.sliding_window = Some(4);
+        let mut model = BatchCheck(Gemma2CausalLM::new(args).unwrap());
+        let worst = worst_batched_difference(
+            &mut model,
+            &[&[3, 5, 7, 11, 13, 17, 19], &[23, 29, 31]],
+            &[37, 41, 43, 47],
+        )
+        .unwrap();
+        assert!(worst < 1e-3, "batched logits differ by {worst}");
     }
 
     #[test]

@@ -283,7 +283,7 @@ static GEMMA2: BuiltinAdapter = BuiltinAdapter {
     id: "gemma2",
     family: gemma,
     version_range: "Gemma 2.x",
-    capabilities: caps(false, false, false, false, false),
+    capabilities: caps(false, false, false, false, true),
     notes: "Gemma 2 text model",
     kind: LoadKind::Gemma2,
 };
@@ -291,7 +291,7 @@ static GEMMA3: BuiltinAdapter = BuiltinAdapter {
     id: "gemma3-text",
     family: gemma,
     version_range: "Gemma 3+ text",
-    capabilities: caps(false, false, false, false, false),
+    capabilities: caps(false, false, false, false, true),
     notes: "Gemma 3 text backbone",
     kind: LoadKind::Gemma3,
 };
@@ -299,7 +299,7 @@ static GEMMA4: BuiltinAdapter = BuiltinAdapter {
     id: "gemma4-text",
     family: gemma,
     version_range: "Gemma 4+ text/unified",
-    capabilities: caps(false, false, true, false, false),
+    capabilities: caps(false, false, true, false, true),
     notes: "Gemma 4 text backbone with optional MoE",
     kind: LoadKind::Gemma4,
 };

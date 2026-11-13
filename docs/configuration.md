@@ -432,7 +432,7 @@ is never used for that name; `higgs doctor` warns about it.
 ## Local Model Notes
 
 - `batch` is `true`, `false`, or `"auto"` (the default); see [Engine selection](#engine-selection).
-- `batch = true` is only supported for transformer families with true batched decode support: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen3_moe`, `qwen3_5`, `qwen3_5_moe`, `phi3`, and `starcoder2`.
+- `batch = true` is only supported for transformer families with true batched decode support: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen3_moe`, `qwen3_5`, `qwen3_5_moe`, `phi3`, `starcoder2`, `gemma2`, `gemma3`, and `gemma4`.
 - `higgs doctor` and server startup reject unsupported `batch = true` combinations instead of silently degrading.
 - `[memory] raise_wired_limit` defaults to `false`. Turn it on only when you explicitly want MLX to raise the process wired-memory limit.
 - With several resident models, consider `max_loaded_models`, `guard`, or `load = "on_demand"`; see [Model lifecycle](#model-lifecycle).

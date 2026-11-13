@@ -11,7 +11,7 @@ use super::types::BatchMode;
 
 pub fn batch_unsupported_message(model_path: &str) -> String {
     format!(
-        "batch=true is only supported for models with batched decode (llama, mistral, qwen2, qwen3, qwen3_moe, qwen3_5, qwen3_5_moe, phi3, starcoder2); {model_path} is not supported"
+        "batch=true is only supported for models with batched decode (llama, mistral, qwen2, qwen3, qwen3_moe, qwen3_5, qwen3_5_moe, phi3, starcoder2, gemma2, gemma3, gemma4); {model_path} is not supported"
     )
 }
 
