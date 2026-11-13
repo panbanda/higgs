@@ -10,3 +10,6 @@ pub mod responses;
 pub mod system;
 pub mod tokenize;
 pub mod web;
+
+#[cfg(test)]
+mod tool_choice_tests;

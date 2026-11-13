@@ -14,7 +14,7 @@ use higgs_models::{
     siglip::PixelValues, turboquant::KvCacheConfig,
 };
 use mlx_rs::{
-    Array, Dtype, Stream,
+    Array, Stream,
     ops::indexing::{IndexOp, NewAxis},
     transforms::{async_eval, eval},
     with_stream,
@@ -28,6 +28,10 @@ use crate::{
     engine::{GenerationOutput, GenerationStats, StreamingOutput, ThinkingMode},
     engine_thread::EngineThread,
     error::EngineError,
+    generation_support::{
+        ThinkingBudgetGate, ThinkingSupport, embed_tokens, generation_prompt_suffix_len,
+        prefix_cache_key, resume_from_prefix, snapshot_boundary, tokenize_chat_prompt,
+    },
     mlx_tuning::MlxRuntimeTuning,
     model_loader,
     paged_prefix_cache::{DEFAULT_BLOCK_SIZE, PagedPrefixCache},
@@ -45,7 +49,7 @@ fn lock_or_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn parse_enabled_flag(raw: Option<&str>) -> Option<bool> {
+pub(crate) fn parse_enabled_flag(raw: Option<&str>) -> Option<bool> {
     match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("1" | "true" | "on" | "yes") => Some(true),
         Some("0" | "false" | "off" | "no") => Some(false),
@@ -58,7 +62,9 @@ fn experimental_paged_kv_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn prompt_lookup_enabled() -> bool {
+/// Whether the experimental prompt-lookup decoder is switched on with
+/// `HIGGS_PROMPT_LOOKUP`; only the simple engine implements it.
+pub fn prompt_lookup_enabled() -> bool {
     parse_enabled_flag(std::env::var("HIGGS_PROMPT_LOOKUP").ok().as_deref()).unwrap_or(false)
 }
 
@@ -366,6 +372,15 @@ impl SimpleEngine {
         &self.model_name
     }
 
+    /// How this model writes tool calls.
+    pub fn tool_call_format(&self) -> crate::tool_format::ToolCallFormat {
+        self.template
+            .as_ref()
+            .map_or(crate::tool_format::ToolCallFormat::Auto, |template| {
+                template.tool_call_format()
+            })
+    }
+
     /// Get a reference to the tokenizer.
     pub fn tokenizer(&self) -> &Tokenizer {
         &self.tokenizer
@@ -403,17 +418,13 @@ impl SimpleEngine {
         tools: Option<&[serde_json::Value]>,
         enable_thinking: bool,
     ) -> Result<Vec<u32>, EngineError> {
-        let renderer = self.template.as_ref().ok_or_else(|| {
-            EngineError::Template(
-                "This model has no chat template; use /v1/completions instead".to_owned(),
-            )
-        })?;
-        let prompt = renderer.apply_with_thinking(messages, tools, true, enable_thinking)?;
-        let encoding = self
-            .tokenizer
-            .encode(prompt.as_str(), false)
-            .map_err(|e| EngineError::Tokenization(e.to_string()))?;
-        Ok(encoding.get_ids().to_vec())
+        tokenize_chat_prompt(
+            self.template.as_deref(),
+            &self.tokenizer,
+            messages,
+            tools,
+            enable_thinking,
+        )
     }
 
     /// Apply chat template and tokenize messages.
@@ -681,72 +692,15 @@ impl SimpleEngineCore {
         let decode_skip_ids =
             std::sync::Arc::new(content_preserving_skip_ids(&tokenizer, &eos_token_ids));
 
-        // Auto-detect thinking mode: Qwen3.5 models support <think> tags.
-        // Override with HIGGS_ENABLE_THINKING=0/1, off/true, yes/no etc.
-        let mut enable_thinking = std::env::var("HIGGS_ENABLE_THINKING")
-            .ok()
-            .as_deref()
-            .map_or_else(
-                || detect_thinking_support(model_dir),
-                |v| {
-                    parse_enabled_flag(Some(v))
-                        .unwrap_or_else(|| detect_thinking_support(model_dir))
-                },
-            );
-
-        // Resolve </think> token ID from the tokenizer. If the tokenizer
-        // doesn't know this token, disable thinking to avoid injecting
-        // out-of-vocab IDs into the embedding lookup.
-        let think_close_token = tokenizer.encode("</think>", false).ok().and_then(|enc| {
-            let ids = enc.get_ids();
-            // Must encode to exactly one token to be usable as a forced stop.
-            if let [single] = ids {
-                Some(*single)
-            } else {
-                None
-            }
-        });
-        if enable_thinking && think_close_token.is_none() {
-            tracing::warn!("Tokenizer has no single </think> token; disabling thinking mode");
-            enable_thinking = false;
-        }
-        if enable_thinking {
-            tracing::info!(think_close_token, "Thinking mode enabled");
-        }
+        let ThinkingSupport {
+            enabled: enable_thinking,
+            close_token: think_close_token,
+        } = ThinkingSupport::resolve(model_dir, &tokenizer);
 
         set_wired_limit_to_max(raise_wired_limit);
 
-        // Compute the generation prompt suffix length: tokens added by
-        // `add_generation_prompt=true` (e.g., `<|im_start|>assistant\n<think>\n`).
-        // We strip these from the prefix cache key so multi-turn conversations
-        // share their common history prefix.
-        let gen_prompt_suffix_len = template
-            .as_ref()
-            .and_then(|tmpl| {
-                let test_msg = vec![crate::chat_template::ChatMessage {
-                    role: "user".to_owned(),
-                    content: "x".to_owned(),
-                    tool_calls: None,
-                }];
-                let with_gen = tmpl
-                    .apply_with_thinking(&test_msg, None, true, enable_thinking)
-                    .ok()?;
-                let without_gen = tmpl
-                    .apply_with_thinking(&test_msg, None, false, enable_thinking)
-                    .ok()?;
-                let toks_with = tokenizer.encode(with_gen.as_str(), false).ok()?;
-                let toks_without = tokenizer.encode(without_gen.as_str(), false).ok()?;
-                let suffix = toks_with
-                    .get_ids()
-                    .len()
-                    .saturating_sub(toks_without.get_ids().len());
-                tracing::info!(
-                    gen_prompt_suffix_len = suffix,
-                    "Computed generation prompt suffix length for prefix cache"
-                );
-                Some(suffix)
-            })
-            .unwrap_or(0);
+        let gen_prompt_suffix_len =
+            generation_prompt_suffix_len(template.as_ref(), &tokenizer, enable_thinking);
 
         let experimental_paged_kv = experimental_paged_kv_enabled();
         if experimental_paged_kv {
@@ -933,36 +887,12 @@ impl SimpleEngineCore {
             }
         }
 
-        let (actual_prompt_tokens, cache) = if let Some(matched) = prefix_match {
-            tracing::debug!(
-                prefix_len = matched.prefix_len,
-                total_len = prompt_tokens.len(),
-                suffix_len = prompt_tokens.len() - matched.prefix_len,
-                "Prefix cache hit — reusing cached prefix"
-            );
-            let suffix = prompt_tokens.get(matched.prefix_len..).unwrap_or_default();
-            if suffix.is_empty() {
-                tracing::debug!(
-                    prompt_len = prompt_tokens.len(),
-                    "Full prefix hit requires cached logits; falling back to fresh prefill"
-                );
-                (
-                    prompt_tokens.to_vec(),
-                    model
-                        .make_cache_with_config(self.kv_cache_config)
-                        .map_err(EngineError::Mlx)?,
-                )
-            } else {
-                (suffix.to_vec(), matched.cache)
-            }
-        } else {
-            (
-                prompt_tokens.to_vec(),
-                model
-                    .make_cache_with_config(self.kv_cache_config)
-                    .map_err(EngineError::Mlx)?,
-            )
-        };
+        let (resume_at, cache) = resume_from_prefix(prefix_match, prompt_tokens, || {
+            model
+                .make_cache_with_config(self.kv_cache_config)
+                .map_err(EngineError::Mlx)
+        })?;
+        let actual_prompt_tokens = prompt_tokens.get(resume_at..).unwrap_or_default().to_vec();
 
         let prompt_array = Array::from(actual_prompt_tokens.as_slice()).index(NewAxis);
 
@@ -975,6 +905,55 @@ impl SimpleEngineCore {
             pixel_values,
             disk_loaded,
         })
+    }
+
+    /// Index into the prompt being prefilled at which the cache holds exactly
+    /// the prefix-cache key, for caches that can only be captured there.
+    fn snapshot_boundary(
+        &self,
+        prompt_tokens: &[u32],
+        prepared: &PreparedGeneration<'_>,
+    ) -> Option<i32> {
+        let resumed_at = prompt_tokens.len() - prepared.actual_prompt_tokens.len();
+        snapshot_boundary(
+            prompt_tokens,
+            resumed_at,
+            self.gen_prompt_suffix_len,
+            &prepared.cache,
+        )
+        .and_then(|boundary| i32::try_from(boundary).ok())
+    }
+
+    /// Feed prompt tokens through the model, chunked when long to bound peak
+    /// memory, returning the logits and (when asked for) the hidden states.
+    fn forward_prompt(
+        &self,
+        prepared: &mut PreparedGeneration<'_>,
+        input: &Array,
+        capture_hidden: bool,
+    ) -> Result<(Array, Option<Array>), EngineError> {
+        let seq_len = input.shape().get(1).copied().unwrap_or(0);
+        let chunked_threshold = self.tuning.chunked_prefill_threshold();
+        let chunked_size = self.tuning.chunked_prefill_chunk_size();
+        if capture_hidden && seq_len <= chunked_threshold {
+            let (hidden, logits) = prepared
+                .model
+                .forward_with_hidden(input, None, &mut prepared.cache)
+                .map_err(EngineError::Mlx)?;
+            Ok((logits, Some(hidden)))
+        } else if seq_len > chunked_threshold {
+            prepared
+                .model
+                .forward_chunked(input, &mut prepared.cache, chunked_size)
+                .map(|logits| (logits, None))
+                .map_err(EngineError::Mlx)
+        } else {
+            prepared
+                .model
+                .forward_last_token(input, None, &mut prepared.cache)
+                .map(|logits| (logits, None))
+                .map_err(EngineError::Mlx)
+        }
     }
 
     /// Run the prefill forward pass and sample the first token. Stores the
@@ -997,28 +976,25 @@ impl SimpleEngineCore {
                 .forward_multimodal(&prepared.prompt_array, pixel_values, &mut prepared.cache)
                 .map_err(EngineError::Mlx)?
         } else {
-            // Text-only prefill: use chunked prefill for long sequences to bound
-            // peak memory, otherwise single-pass with last-token-only LM head.
-            let seq_len = prepared.prompt_array.shape().get(1).copied().unwrap_or(0);
-            let chunked_threshold = self.tuning.chunked_prefill_threshold();
-            let chunked_size = self.tuning.chunked_prefill_chunk_size();
-            if capture_hidden && seq_len <= chunked_threshold {
-                let (hidden, logits) = prepared
-                    .model
-                    .forward_with_hidden(&prepared.prompt_array, None, &mut prepared.cache)
-                    .map_err(EngineError::Mlx)?;
-                prefill_hidden = Some(hidden);
+            let prompt_array = prepared.prompt_array.clone();
+            let snapshot_at = (!capture_hidden)
+                .then(|| self.snapshot_boundary(prompt_tokens, prepared))
+                .flatten();
+            if let Some(boundary) = snapshot_at {
+                // Recurrent state cannot be cut back to the key later, so
+                // capture it here, before the generation suffix runs.
+                let head = prompt_array.index((.., ..boundary));
+                self.forward_prompt(prepared, &head, false)?;
+                let key = prefix_cache_key(prompt_tokens, self.gen_prompt_suffix_len);
+                lock_or_recover(&self.prefix_cache).store(key, &prepared.cache);
+                let tail = prompt_array.index((.., boundary..));
+                let (logits, _) = self.forward_prompt(prepared, &tail, false)?;
                 logits
-            } else if seq_len > chunked_threshold {
-                prepared
-                    .model
-                    .forward_chunked(&prepared.prompt_array, &mut prepared.cache, chunked_size)
-                    .map_err(EngineError::Mlx)?
             } else {
-                prepared
-                    .model
-                    .forward_last_token(&prepared.prompt_array, None, &mut prepared.cache)
-                    .map_err(EngineError::Mlx)?
+                let (logits, hidden) =
+                    self.forward_prompt(prepared, &prompt_array, capture_hidden)?;
+                prefill_hidden = hidden;
+                logits
             }
         };
         let last_logits = logits.index((.., -1, ..));
@@ -1064,18 +1040,16 @@ impl SimpleEngineCore {
                 .prefix_cache
                 .lock()
                 .map_err(|e| EngineError::Generation(format!("Cache lock poisoned: {e}")))?;
-            // Strip generation prompt suffix so multi-turn conversations
-            // share their common history prefix. The suffix tokens
-            // (`<|im_start|>assistant\n<think>\n`) change between turns.
-            let cache_key = prompt_tokens
-                .get(
-                    ..prompt_tokens
-                        .len()
-                        .saturating_sub(self.gen_prompt_suffix_len),
-                )
-                .unwrap_or(prompt_tokens);
+            let cache_key = prefix_cache_key(prompt_tokens, self.gen_prompt_suffix_len);
             pc.store(cache_key, &prepared.cache);
-            if !prepared.disk_loaded && cache_key.len() >= 8 * DEFAULT_BLOCK_SIZE {
+            // A hybrid cache that ran the generation suffix holds more tokens
+            // than its key, and the disk format cannot cut recurrent state back.
+            let cache_matches_key = !matches!(prepared.cache, AnyCache::Hybrid(_))
+                || cache_key.len() == prompt_tokens.len();
+            if !prepared.disk_loaded
+                && cache_matches_key
+                && cache_key.len() >= 8 * DEFAULT_BLOCK_SIZE
+            {
                 if let Some(store) = &self.disk_prefix_store {
                     if let Err(error) = store.store_cache(
                         cache_key,
@@ -1186,43 +1160,12 @@ impl SimpleEngineCore {
     ///
     /// Runs a single forward pass through the model to get hidden states,
     /// mean-pools across the sequence dimension, and L2-normalizes.
-    #[allow(clippy::significant_drop_tightening)]
     pub fn embed(&self, token_ids: &[u32]) -> Result<Vec<f32>, EngineError> {
-        if token_ids.is_empty() {
-            return Err(EngineError::Generation("Input is empty".to_owned()));
-        }
-
-        with_stream(&Stream::new(), || {
-            let input = Array::from(token_ids).index(NewAxis);
-            let mut model = self
-                .model
-                .lock()
-                .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
-            let mut cache = model
-                .make_cache_with_config(self.kv_cache_config)
-                .map_err(EngineError::Mlx)?;
-
-            // Forward pass to get hidden states [1, seq_len, hidden_size]
-            let hidden = model
-                .forward_hidden(&input, None, &mut cache)
-                .map_err(EngineError::Mlx)?;
-
-            // Mean-pool across seq_len (axis 1), producing [1, hidden_size]
-            let pooled = hidden.mean_axes(&[1], false).map_err(EngineError::Mlx)?;
-
-            // Cast to f32 before extracting values (model may use bfloat16)
-            let pooled_f32 = pooled.as_dtype(Dtype::Float32).map_err(EngineError::Mlx)?;
-            eval([&pooled_f32]).map_err(EngineError::Mlx)?;
-
-            // L2-normalize on CPU
-            let values = pooled_f32.as_slice::<f32>().to_vec();
-            let norm = values.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > 0.0 {
-                Ok(values.iter().map(|x| x / norm).collect())
-            } else {
-                Ok(values)
-            }
-        })
+        let mut model = self
+            .model
+            .lock()
+            .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
+        embed_tokens(&mut model, self.kv_cache_config, token_ids)
     }
 
     /// Convert a token count to u32, with an overflow error.
@@ -1499,9 +1442,8 @@ impl SimpleEngineCore {
             None
         };
         // Seed thinking state from the first token (already emitted above).
-        let mut thinking_tokens: u32 = u32::from(think_close_token.is_some());
-        let mut seen_think_close =
-            think_close_token.is_some_and(|close_id| first_token_id == close_id);
+        let mut thinking_gate = think_close_token
+            .map(|close_id| ThinkingBudgetGate::new(close_id, thinking_budget, first_token_id));
 
         loop {
             let t0 = std::time::Instant::now();
@@ -1541,30 +1483,18 @@ impl SimpleEngineCore {
             let t2 = std::time::Instant::now();
 
             // In the unconstrained pipeline, extract the token here (after building following).
-            let mut token_id: u32 = constrained_token_id.unwrap_or_else(|| next_token.item_cast());
+            let token_id: u32 = constrained_token_id.unwrap_or_else(|| next_token.item_cast());
 
-            // Thinking budget: force </think> after N tokens if model hasn't closed it.
-            // NOTE: when the budget fires, token_id is overwritten but the KV cache
-            // already reflects the originally-sampled token.  The next forward pass
-            // feeds close_id as input while the cache holds a different token at this
-            // position — a one-entry discontinuity.  Re-running forward to fix the
-            // cache is expensive for negligible quality impact after 256+ tokens.
-            if let Some(close_id) = think_close_token {
-                if !seen_think_close {
-                    if token_id == close_id {
-                        seen_think_close = true;
-                    } else {
-                        thinking_tokens += 1;
-                        if thinking_tokens >= thinking_budget {
-                            token_id = close_id;
-                            seen_think_close = true;
-                            tracing::info!(
-                                budget = thinking_budget,
-                                "Thinking budget reached, forcing </think>"
-                            );
-                        }
-                    }
-                }
+            // Thinking budget: once the next token would reach the budget, feed
+            // </think> as the following token instead of the pipelined sample.
+            let forced_close_token = thinking_gate
+                .as_mut()
+                .and_then(|gate| gate.observe(token_id));
+            if forced_close_token.is_some() {
+                tracing::info!(
+                    budget = thinking_budget,
+                    "Thinking budget reached, forcing </think>"
+                );
             }
 
             // Materialize logprobs for the token we just extracted
@@ -1663,16 +1593,8 @@ impl SimpleEngineCore {
                 });
             }
 
-            // If thinking budget was just reached, override the pipelined token
-            // so the next decode step gets </think> as input.
-            if seen_think_close && thinking_tokens == thinking_budget {
-                if let Some(close_id) = think_close_token {
-                    next_token = Array::from_slice(&[close_id], &[1]);
-                }
-                thinking_tokens += 1; // prevent re-triggering
-            } else {
-                next_token = following;
-            }
+            next_token = forced_close_token
+                .map_or(following, |close_id| Array::from_slice(&[close_id], &[1]));
             next_logprob_data = following_logprob_data;
         }
     }
@@ -2690,9 +2612,8 @@ impl SimpleEngineCore {
             None
         };
         // Seed thinking state from the first token (already emitted above).
-        let mut thinking_tokens: u32 = u32::from(think_close_token.is_some());
-        let mut seen_think_close =
-            think_close_token.is_some_and(|close_id| first_token_id == close_id);
+        let mut thinking_gate = think_close_token
+            .map(|close_id| ThinkingBudgetGate::new(close_id, thinking_budget, first_token_id));
 
         // Pipelined decode loop: build step N+2 while GPU computes step N+1
         let (mut next_token, mut next_logprob_data) = Self::decode_step(
@@ -2745,26 +2666,18 @@ impl SimpleEngineCore {
                 }
             }
 
-            let mut token_id: u32 = constrained_token_id.unwrap_or_else(|| next_token.item_cast());
+            let token_id: u32 = constrained_token_id.unwrap_or_else(|| next_token.item_cast());
 
-            // Thinking budget: force </think> after N tokens if model hasn't closed it.
-            // NOTE: same KV-cache discontinuity caveat as the non-streaming path.
-            if let Some(close_id) = think_close_token {
-                if !seen_think_close {
-                    if token_id == close_id {
-                        seen_think_close = true;
-                    } else {
-                        thinking_tokens += 1;
-                        if thinking_tokens >= thinking_budget {
-                            token_id = close_id;
-                            seen_think_close = true;
-                            tracing::info!(
-                                budget = thinking_budget,
-                                "Thinking budget reached, forcing </think>"
-                            );
-                        }
-                    }
-                }
+            // Thinking budget: once the next token would reach the budget, feed
+            // </think> as the following token instead of the pipelined sample.
+            let forced_close_token = thinking_gate
+                .as_mut()
+                .and_then(|gate| gate.observe(token_id));
+            if forced_close_token.is_some() {
+                tracing::info!(
+                    budget = thinking_budget,
+                    "Thinking budget reached, forcing </think>"
+                );
             }
 
             let token_logprob = next_logprob_data
@@ -2832,16 +2745,8 @@ impl SimpleEngineCore {
                 break;
             }
 
-            // If thinking budget was just reached, override the pipelined token
-            // so the next decode step gets </think> as input.
-            if seen_think_close && thinking_tokens == thinking_budget {
-                if let Some(close_id) = think_close_token {
-                    next_token = Array::from_slice(&[close_id], &[1]);
-                }
-                thinking_tokens += 1; // prevent re-triggering
-            } else {
-                next_token = following;
-            }
+            next_token = forced_close_token
+                .map_or(following, |close_id| Array::from_slice(&[close_id], &[1]));
             next_logprob_data = following_logprob_data;
         }
 
@@ -2854,21 +2759,17 @@ impl SimpleEngineCore {
 /// undecodable tokens from growing the window without bound.
 const MAX_DETOK_WINDOW: usize = 64;
 
-/// Incremental streaming detokenizer.
-///
-/// Re-decoding the full completion on every generated token is O(n^2) in
-/// completion length. Instead, decode only `tokens[prefix_offset..]` and emit
-/// the difference against `tokens[prefix_offset..read_offset]`; both windows
-/// start at the same token, so tokenizer boundary effects cancel out. Text
-/// ending in an incomplete UTF-8 sequence (trailing replacement char) is held
-/// back until a later token completes it.
+/// Special tokens shaped like control delimiters that carry tool-call content.
+const CONTENT_BEARING_DELIMITERS: [&str; 1] = ["<|\"|>"];
+
 /// Token IDs that must never surface in decoded output text.
 ///
 /// Seeded with the model's EOS ids, plus every added *control* special token:
 /// the `<|…|>` chat-control delimiters and the classic `<s>`/`</s>`/`<pad>`/
 /// `<unk>`/`<mask>` sentinels. Content-bearing special tokens (`<think>`,
-/// `<tool_call>`, `MiniCPM`'s `<function>`/`<param>`) deliberately do NOT match,
-/// so they survive decoding and reach the tool-call / reasoning parsers. Shared
+/// `<tool_call>`, `MiniCPM`'s `<function>`/`<param>`, and Gemma 4's `<|"|>`
+/// string delimiter, which has the control-token shape) deliberately do NOT
+/// match, so they survive decoding and reach the tool-call / reasoning parsers. Shared
 /// by the non-streaming decode path ([`SimpleEngine::decode_tokens`]) and the
 /// streaming detokenizer ([`IncrementalDetok`]) so the two strip identically.
 pub(crate) fn content_preserving_skip_ids(
@@ -2878,7 +2779,9 @@ pub(crate) fn content_preserving_skip_ids(
     let mut ids: std::collections::HashSet<u32> = eos_token_ids.iter().copied().collect();
     for (id, added) in tokenizer.get_added_tokens_decoder() {
         let content = added.content.as_str();
-        let is_control = (content.starts_with("<|") && content.ends_with("|>"))
+        let is_control = (content.starts_with("<|")
+            && content.ends_with("|>")
+            && !CONTENT_BEARING_DELIMITERS.contains(&content))
             || matches!(content, "<s>" | "</s>" | "<pad>" | "<unk>" | "<mask>");
         if is_control {
             ids.insert(id);
@@ -2887,6 +2790,14 @@ pub(crate) fn content_preserving_skip_ids(
     ids
 }
 
+/// Incremental streaming detokenizer.
+///
+/// Re-decoding the full completion on every generated token is O(n^2) in
+/// completion length. Instead, decode only `tokens[prefix_offset..]` and emit
+/// the difference against `tokens[prefix_offset..read_offset]`; both windows
+/// start at the same token, so tokenizer boundary effects cancel out. Text
+/// ending in an incomplete UTF-8 sequence (trailing replacement char) is held
+/// back until a later token completes it.
 pub(crate) struct IncrementalDetok {
     /// Start of the decode window; advanced whenever text is emitted.
     prefix_offset: usize,
@@ -3169,81 +3080,15 @@ fn special_token_id(model_dir: &Path, content: &str) -> Option<u32> {
     })
 }
 
-/// Detect whether a model supports thinking mode based on `model_type`.
-/// Whether the model *supports* a thinking toggle (capability, not default).
-///
-/// The per-request default — e.g. Qwen3.6 reasons off unless asked — is decided
-/// separately by `model_defaults_to_non_thinking` in the router; this only
-/// answers "can it think at all".
-///
-/// Signals, in order:
-/// 1. the chat template exposes an `enable_thinking` switch — the model
-///    author's own marker, which covers Qwen3.5/3.6, `MiniCPM5`, and future
-///    reasoning models without hardcoding model types; or
-/// 2. a known reasoning `model_type`.
-///
-/// The caller additionally requires a single-token `</think>`, so a stray
-/// mention can't enable thinking for a model that wasn't trained for it.
-fn detect_thinking_support(model_dir: &Path) -> bool {
-    if chat_template_mentions_enable_thinking(model_dir) {
-        return true;
-    }
-    let Ok(config_str) = std::fs::read_to_string(model_dir.join("config.json")) else {
-        return false;
-    };
-    let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str) else {
-        return false;
-    };
-    // Check both top-level and nested text_config (VLM wrappers).
-    let model_type = config
-        .get("model_type")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            config
-                .get("text_config")
-                .and_then(|tc| tc.get("model_type"))
-                .and_then(|v| v.as_str())
-        });
-    matches!(model_type, Some("qwen3_5" | "qwen3_5_moe"))
-}
-
-/// Whether the model's chat template references the `enable_thinking` toggle,
-/// read from `chat_template.jinja` or `tokenizer_config.json`'s `chat_template`
-/// (a string, or a `{name, template}` array).
-fn chat_template_mentions_enable_thinking(model_dir: &Path) -> bool {
-    const MARKER: &str = "enable_thinking";
-    if let Ok(jinja) = std::fs::read_to_string(model_dir.join("chat_template.jinja")) {
-        return jinja.contains(MARKER);
-    }
-    let Ok(cfg_str) = std::fs::read_to_string(model_dir.join("tokenizer_config.json")) else {
-        return false;
-    };
-    let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&cfg_str) else {
-        return false;
-    };
-    let template = cfg.get("chat_template");
-    if let Some(s) = template.and_then(|v| v.as_str()) {
-        return s.contains(MARKER);
-    }
-    if let Some(arr) = template.and_then(|v| v.as_array()) {
-        return arr.iter().any(|entry| {
-            entry
-                .get("template")
-                .and_then(|t| t.as_str())
-                .is_some_and(|t| t.contains(MARKER))
-        });
-    }
-    false
-}
-
 #[allow(clippy::panic, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::{
         IncrementalDetok, Tokenizer, adaptive_draft_depth_for_cap, check_stop_sequences,
-        derive_model_name, detect_thinking_support, estimate_paged_kv_blocks, extract_eos_tokens,
-        find_stop_in_tail, parse_enabled_flag,
+        derive_model_name, estimate_paged_kv_blocks, extract_eos_tokens, find_stop_in_tail,
+        parse_enabled_flag,
     };
+    use crate::generation_support::detect_thinking_support;
     use std::path::Path;
 
     /// Write a config.json file into the given directory with the provided JSON content.
@@ -3715,6 +3560,8 @@ mod tests {
             tokenizers::AddedToken::from("</s>", true),
             tokenizers::AddedToken::from("<function>", true),
             tokenizers::AddedToken::from("<tool_call>", true),
+            tokenizers::AddedToken::from("<|\"|>", true),
+            tokenizers::AddedToken::from("<|endoftext|>", true),
         ]);
         let im_end = tok.token_to_id("<|im_end|>").unwrap();
         let skip = super::content_preserving_skip_ids(&tok, &[im_end, 7]);
@@ -3734,6 +3581,34 @@ mod tests {
         assert!(
             !skip.contains(&tok.token_to_id("<tool_call>").unwrap()),
             "<tool_call> preserved"
+        );
+        assert!(
+            !skip.contains(&tok.token_to_id("<|\"|>").unwrap()),
+            "Gemma 4 string delimiter preserved for the tool-call parser"
+        );
+        assert!(
+            skip.contains(&tok.token_to_id("<|endoftext|>").unwrap()),
+            "other <|…|> tokens stay control tokens"
+        );
+    }
+
+    #[test]
+    fn detok_keeps_the_gemma_string_delimiter_and_drops_end_of_text() {
+        let mut tokenizer = Tokenizer::new(tokenizers::models::bpe::BPE::default());
+        let _ = tokenizer.add_special_tokens([
+            tokenizers::AddedToken::from("<|\"|>", true),
+            tokenizers::AddedToken::from("<|endoftext|>", true),
+        ]);
+        let quote = tokenizer.token_to_id("<|\"|>").unwrap();
+        let end_of_text = tokenizer.token_to_id("<|endoftext|>").unwrap();
+        let skip = std::sync::Arc::new(super::content_preserving_skip_ids(&tokenizer, &[]));
+
+        let tokens = [quote, end_of_text, quote];
+        let mut detok = IncrementalDetok::new(String::new(), 0, skip);
+        let text = detok.append(&tokenizer, &tokens).unwrap();
+        assert_eq!(
+            text.split_whitespace().collect::<Vec<_>>(),
+            ["<|\"|>", "<|\"|>"]
         );
     }
 

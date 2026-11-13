@@ -44,6 +44,17 @@ impl ModelConfig {
     }
 }
 
+/// Whether loading `model_dir` would attach a multi-token-prediction head, which the
+/// simple engine uses for speculative decode.
+///
+/// Reads the config and weight index only; the model is not loaded.
+pub fn checkpoint_has_mtp_head<P: AsRef<Path>>(model_dir: P) -> bool {
+    let Ok(config) = ModelConfig::from_dir(model_dir.as_ref()) else {
+        return false;
+    };
+    config.capabilities.mtp && higgs_models::qwen3_next::checkpoint_has_mtp_head(model_dir)
+}
+
 /// Load a model from a directory, auto-detecting the architecture.
 pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError> {
     let detected = adapter::detect(model_dir.as_ref()).map_err(EngineError::Model)?;

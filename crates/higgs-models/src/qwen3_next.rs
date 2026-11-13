@@ -4692,6 +4692,19 @@ fn checkpoint_has_mtp_weights(model_path: &Path) -> Result<bool, ModelError> {
     Ok(checkpoint_mtp_weight_layout(model_path)? != MtpWeightLayout::None)
 }
 
+/// Whether loading this checkpoint attaches an MTP head: the config asks for
+/// one and the weights are present. Mirrors the decision `load` makes, without
+/// loading the model.
+#[must_use]
+pub fn checkpoint_has_mtp_head<P: AsRef<Path>>(model_dir: P) -> bool {
+    let model_path = model_dir.as_ref();
+    load_model_args(model_path).is_ok_and(|args| {
+        args.mtp_num_hidden_layers > 0
+            && checkpoint_mtp_weight_layout(model_path)
+                .is_ok_and(|layout| layout != MtpWeightLayout::None)
+    })
+}
+
 fn maybe_disable_mtp_without_checkpoint_weights(
     args: &mut Qwen3NextModelArgs,
     model_path: &Path,

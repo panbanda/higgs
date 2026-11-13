@@ -21,7 +21,8 @@ This document collects the full CLI, environment, and config-file reference for 
 | `--rate-limit` | `HIGGS_RATE_LIMIT` | `0` | Requests/min per client |
 | `--timeout` | `HIGGS_TIMEOUT` | `300` | Request timeout in seconds |
 | `--mlx-profile` | `HIGGS_MLX_PROFILE` | `auto` | MLX tuning profile: `auto`, `latency`, `balanced`, or `throughput` |
-| `--batch` | -- | `false` | Enable continuous batching |
+| `--batch` | -- | *(auto)* | Force the continuous-batching engine for every model |
+| `--no-batch` | -- | *(auto)* | Force the simple (one request at a time) engine for every model |
 | `--kv-cache` | -- | `off` | KV cache mode: `off` or `turboquant` |
 | `--kv-bits` | -- | `3` | Default TurboQuant KV bit width |
 | `--kv-key-bits` | -- | `kv-bits - 1` | Override TurboQuant key bit width |
@@ -88,7 +89,7 @@ path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
 # idle_ttl_seconds = 600
 # pinned = true
 # mlx_profile = "throughput"
-# batch = false
+# batch = "auto"            # true | false | "auto" (default); see Engine selection
 # prefill_yield_tokens = 512 # 0 or omitted keeps synchronous prefill
 # thinking_budget = 256 # overrides [local].thinking_budget for this model
 # kv_cache = "turboquant"
@@ -217,7 +218,7 @@ Unloading a model that is already unloaded succeeds. Unloading a model that is l
 | `load_duration_ms` | How long the current load took, while loaded |
 | `estimated_bytes` | Size predicted from weight files before loading |
 | `measured_bytes` | Growth in MLX active memory while loading, while loaded |
-| `engine` | `simple` or `batch` |
+| `engine` | `simple`, `batch`, or `auto` while a `batch = "auto"` model's checkpoint cannot be inspected yet (not downloaded) |
 | `idle_ttl_seconds` | Effective idle timeout, or `null` |
 
 ## Provider Options
@@ -259,8 +260,9 @@ That means Higgs supports:
 
 ## Local Model Notes
 
-- `batch=true` is only supported for transformer families with true batched decode support: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen3_moe`, `qwen3_5`, `qwen3_5_moe`, `phi3`, and `starcoder2`.
-- `higgs doctor` and server startup now reject unsupported `batch=true` combinations instead of silently degrading.
+- `batch` is `true`, `false`, or `"auto"` (the default); see [Engine selection](#engine-selection).
+- `batch = true` is only supported for transformer families with true batched decode support: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen3_moe`, `qwen3_5`, `qwen3_5_moe`, `phi3`, and `starcoder2`.
+- `higgs doctor` and server startup reject unsupported `batch = true` combinations instead of silently degrading.
 - `[local].raise_wired_limit` defaults to `false`. Turn it on only when you explicitly want MLX to raise the process wired-memory limit.
 - With several resident models, consider `max_loaded_models`, `memory_guard`, or `load = "on_demand"`; see [Model lifecycle](#model-lifecycle).
 - Source builds on macOS require `mlx.metallib`. Higgs restores it from Cargo build output when possible and fails startup if it still cannot be resolved.
@@ -386,9 +388,44 @@ order, first match wins:
 A budget must be at least 1, in config (`higgs doctor` fails on `0`) and in requests (`400`).
 To turn thinking off use reasoning effort `"none"`; a zero budget is not a way to do that.
 `higgs doctor` warns when a budget is not below `server.max_tokens`, since reasoning could
-then consume the whole response. The budget only applies to the simple engine; models with
-`batch = true` do not reason, and `thinking_budget` has no effect on them. On `/v1/messages`
-only `budget_tokens` is read from `thinking`; `type` is ignored.
+then consume the whole response. Both engines enforce the budget. The simple engine forces
+`</think>` in place of the next token; the batch engine forces it when it samples that token, so
+its KV cache always matches the text the client receives. On `/v1/messages` only
+`budget_tokens` is read from `thinking`; `type` is ignored.
+
+### Engine selection
+
+Each model is served by one of two engines. The simple engine runs one request at a time;
+the batch engine decodes every active request in one batched forward pass, so concurrent
+requests share the GPU instead of queueing (measured on an M4 Max: Phi-3 at 8 clients
+164 to 461 tok/s, a 27B Qwen3.5 model at 4 clients 27 to 69 tok/s).
+
+The per-model `batch` setting chooses between them:
+
+| `batch` | Engine |
+|---|---|
+| `"auto"` (default) | Batch, unless one of the rules below applies, in which case simple |
+| `true` | Always batch. A model or configuration the batch engine cannot serve fails to load |
+| `false` | Always simple |
+
+`higgs serve --batch` forces `true` and `--no-batch` forces `false` for every `--model`.
+
+Under `"auto"`, a model falls back to the simple engine when any of these hold, checked in this
+order; the server logs one info line naming the rule, and `higgs doctor` reports the engine
+each model will get:
+
+1. The architecture has no batched decode (see [docs/models.md](models.md)).
+2. `kv_cache = "turboquant"` is configured.
+3. A disk prefix store (`kv_disk_dir`) is configured.
+4. The model takes image inputs (LLaVA).
+5. The checkpoint ships an MTP head and the MLX profile enables speculative decode
+   (`HIGGS_MTP` and the profile decide; `mlx_profile = "baseline"` or `HIGGS_MTP=0` turns it off).
+6. `HIGGS_PROMPT_LOOKUP` is on.
+
+Both engines share the prefix cache semantics (block-paged, keyed without the chat template's
+generation prompt, so repeated prompts and multi-turn conversations reuse everything but that
+suffix, and a prompt that diverges mid-way reuses the shared leading blocks), the thinking
+budget, logprobs, stop sequences, structured output, `return_progress`, and embeddings.
 
 ### Tokenizer endpoints
 

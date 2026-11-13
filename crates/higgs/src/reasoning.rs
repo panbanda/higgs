@@ -44,6 +44,22 @@ pub fn validate_thinking_budget(
     Ok(budget)
 }
 
+/// Whether a tool-aware request renders its prompt in thinking mode. A forced
+/// call is the whole answer, so there is no room to think first.
+pub fn thinking_enabled_for_request(
+    engine: &crate::state::Engine,
+    tool_policy: &crate::tool_policy::ToolPolicy,
+    request_model: &str,
+    reasoning: Option<&ReasoningConfig>,
+) -> bool {
+    !tool_policy.forces_call()
+        && effective_thinking_enabled(
+            engine.enable_thinking(),
+            &[engine.model_name(), request_model],
+            reasoning,
+        )
+}
+
 pub fn effective_thinking_enabled(
     engine_default: bool,
     model_names: &[&str],

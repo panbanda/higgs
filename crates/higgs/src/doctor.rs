@@ -3,7 +3,8 @@ use std::time::Instant;
 
 use higgs_engine::{mlx_tuning::resolve_effective_mlx_profile, model_loader};
 
-use crate::config::HiggsConfig;
+use crate::config::{BatchMode, HiggsConfig};
+use crate::engine_selection::{BatchFacts, EngineChoice, choose_engine};
 use crate::model_resolver;
 
 pub struct DoctorResult {
@@ -428,12 +429,6 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
         ) {
             continue;
         }
-        if model.batch && model.thinking_budget.is_some() {
-            warn(
-                &format!("model {label} thinking_budget has no effect with batch=true"),
-                result,
-            );
-        }
         let kv_cache_config = model.kv_cache_config();
         match kv_cache_config.validate() {
             Ok(()) => {
@@ -462,7 +457,7 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                 continue;
             }
         }
-        if model.batch && kv_cache_config.is_turboquant() {
+        if model.batch == BatchMode::On && kv_cache_config.is_turboquant() {
             fail(
                 &format!(
                     "model {label} enables unsupported combination: TurboQuant with batch=true"
@@ -483,7 +478,7 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                         continue;
                     }
                 };
-                if model.batch && !inspected.capabilities.batch_engine {
+                if model.batch == BatchMode::On && !inspected.capabilities.batch_engine {
                     fail(
                         &format!(
                             "model {label} enables unsupported batch=true; adapter '{}' does not support true batched decode",
@@ -497,21 +492,23 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                     check_mla_latent_cache_adapter(&label, &inspected, result);
                 }
                 let requested_profile = model.requested_mlx_profile(&config.local);
-                let profile_msg = if model.batch {
-                    "batch=true; batched decode supported".to_owned()
-                } else {
-                    let effective_profile =
-                        resolve_effective_mlx_profile(&resolved, requested_profile);
-                    if effective_profile.as_str() == requested_profile.as_str() {
-                        format!("mlx_profile={}", effective_profile.as_str())
-                    } else {
-                        format!(
-                            "mlx_profile={} (requested {})",
-                            effective_profile.as_str(),
-                            requested_profile.as_str()
-                        )
+                let batch_facts = BatchFacts::inspect(model, &config.local, &resolved).ok();
+                if model.batch == BatchMode::On {
+                    for ignored in batch_facts.into_iter().flat_map(batch_ignored_features) {
+                        warn(
+                            &format!("model {label} batch=true ignores {ignored}"),
+                            result,
+                        );
                     }
-                };
+                }
+                let engine = batch_facts.map(|found| choose_engine(model.batch, &found));
+                let effective_profile = resolve_effective_mlx_profile(&resolved, requested_profile);
+                let profile_msg = engine_summary(
+                    model.batch,
+                    engine,
+                    effective_profile.as_str(),
+                    requested_profile.as_str(),
+                );
                 let version = inspected
                     .version
                     .map_or_else(|| "unknown".to_owned(), |version| version.to_string());
@@ -525,6 +522,46 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
             }
             Err(err) => fail(&format!("model {label} not found: {err}"), result),
         }
+    }
+}
+
+/// Simple-engine-only features that `batch = true` configured but the batch
+/// engine does not provide, for the doctor to warn about.
+fn batch_ignored_features(facts: BatchFacts) -> Vec<&'static str> {
+    let mut ignored = Vec::new();
+    if facts.disk_prefix_store {
+        ignored.push("kv_disk_dir (the disk prefix store is simple-engine only)");
+    }
+    if facts.mtp_speculative_decode {
+        ignored.push("the checkpoint's MTP head (speculative decode is simple-engine only)");
+    }
+    if facts.prompt_lookup {
+        ignored.push("HIGGS_PROMPT_LOOKUP (prompt-lookup decoding is simple-engine only)");
+    }
+    ignored
+}
+
+/// The engine a model will get and the settings that matter for it, as the
+/// doctor reports them. `engine` is `None` when the facts could not be read.
+fn engine_summary(
+    mode: BatchMode,
+    engine: Option<EngineChoice>,
+    effective_profile: &str,
+    requested_profile: &str,
+) -> String {
+    let profile = if effective_profile == requested_profile {
+        format!("mlx_profile={effective_profile}")
+    } else {
+        format!("mlx_profile={effective_profile} (requested {requested_profile})")
+    };
+    match (mode, engine) {
+        (BatchMode::On, _) => "batch=true; batched decode supported".to_owned(),
+        (BatchMode::Auto, Some(EngineChoice::Batch)) => "batch=auto; batch engine".to_owned(),
+        (BatchMode::Auto, Some(EngineChoice::Simple(reason))) => {
+            format!("batch=auto; simple engine because {reason}; {profile}")
+        }
+        (BatchMode::Auto, None) => format!("batch=auto; engine chosen at load; {profile}"),
+        (BatchMode::Off, _) => format!("batch=false; simple engine; {profile}"),
     }
 }
 
@@ -1037,7 +1074,7 @@ mod tests {
                     path: "org/model-a".to_owned(),
                     name: None,
                     mlx_profile: None,
-                    batch: false,
+                    batch: BatchMode::Off,
                     prefill_yield_tokens: None,
                     thinking_budget: None,
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
@@ -1058,7 +1095,7 @@ mod tests {
                     path: "org/model-b".to_owned(),
                     name: None,
                     mlx_profile: None,
-                    batch: false,
+                    batch: BatchMode::Off,
                     prefill_yield_tokens: None,
                     thinking_budget: None,
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
@@ -1092,7 +1129,7 @@ mod tests {
                     path: "org/model-a".to_owned(),
                     name: None,
                     mlx_profile: None,
-                    batch: false,
+                    batch: BatchMode::Off,
                     prefill_yield_tokens: None,
                     thinking_budget: None,
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
@@ -1113,7 +1150,7 @@ mod tests {
                     path: "org/model-a".to_owned(),
                     name: None,
                     mlx_profile: None,
-                    batch: false,
+                    batch: BatchMode::Off,
                     prefill_yield_tokens: None,
                     thinking_budget: None,
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
@@ -1596,7 +1633,7 @@ mod tests {
                 path: "org/other-model".to_owned(),
                 name: None,
                 mlx_profile: None,
-                batch: false,
+                batch: BatchMode::Off,
                 prefill_yield_tokens: None,
                 thinking_budget: None,
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
@@ -1634,7 +1671,7 @@ mod tests {
                 path: "org/router-model".to_owned(),
                 name: None,
                 mlx_profile: None,
-                batch: false,
+                batch: BatchMode::Off,
                 prefill_yield_tokens: None,
                 thinking_budget: None,
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
@@ -1674,7 +1711,7 @@ mod tests {
                 path: "org/router-model".to_owned(),
                 name: None,
                 mlx_profile: None,
-                batch: false,
+                batch: BatchMode::Off,
                 prefill_yield_tokens: None,
                 thinking_budget: None,
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
@@ -1739,7 +1776,7 @@ mod tests {
             path,
             name: None,
             mlx_profile: None,
-            batch: false,
+            batch: BatchMode::Off,
             prefill_yield_tokens: None,
             thinking_budget: None,
             kv_cache: higgs_models::turboquant::KvCacheMode::Off,
@@ -2197,5 +2234,133 @@ mod tests {
         let mut fixed = empty_result();
         check_tool_integrations(&config, &mut fixed);
         assert_eq!((fixed.passes, fixed.failures), (1, 0));
+    }
+
+    // -- batch engine reporting --
+
+    use crate::engine_selection::SimpleReason;
+
+    const NO_FEATURES: BatchFacts = BatchFacts {
+        architecture_batches: true,
+        turboquant_kv: false,
+        disk_prefix_store: false,
+        vision: false,
+        mtp_speculative_decode: false,
+        prompt_lookup: false,
+    };
+
+    #[test]
+    fn engine_summary_names_the_engine_each_mode_gets() {
+        let summary = |mode, engine| engine_summary(mode, engine, "balanced", "auto");
+        assert_eq!(
+            summary(BatchMode::On, Some(EngineChoice::Batch)),
+            "batch=true; batched decode supported"
+        );
+        assert_eq!(
+            summary(BatchMode::Auto, Some(EngineChoice::Batch)),
+            "batch=auto; batch engine"
+        );
+        assert_eq!(
+            summary(
+                BatchMode::Auto,
+                Some(EngineChoice::Simple(SimpleReason::TurboQuantKv))
+            ),
+            "batch=auto; simple engine because TurboQuant KV cache is configured (simple engine only); mlx_profile=balanced (requested auto)"
+        );
+        assert_eq!(
+            summary(BatchMode::Auto, None),
+            "batch=auto; engine chosen at load; mlx_profile=balanced (requested auto)"
+        );
+        assert_eq!(
+            summary(
+                BatchMode::Off,
+                Some(EngineChoice::Simple(SimpleReason::Requested))
+            ),
+            "batch=false; simple engine; mlx_profile=balanced (requested auto)"
+        );
+    }
+
+    #[test]
+    fn explicit_batch_warns_about_each_ignored_simple_only_feature() {
+        assert!(batch_ignored_features(NO_FEATURES).is_empty());
+        let facts = BatchFacts {
+            disk_prefix_store: true,
+            mtp_speculative_decode: true,
+            prompt_lookup: true,
+            ..NO_FEATURES
+        };
+        assert_eq!(batch_ignored_features(facts).len(), 3);
+    }
+
+    fn check_one_model(model: ModelConfig) -> DoctorResult {
+        let config = HiggsConfig {
+            models: vec![model],
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_models(&config, &mut result);
+        result
+    }
+
+    fn llama_checkpoint() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        write_model_config_json(dir.path(), "llama");
+        dir
+    }
+
+    #[test]
+    fn thinking_budget_with_batch_no_longer_warns() {
+        let dir = llama_checkpoint();
+        let result = check_one_model(ModelConfig {
+            batch: BatchMode::On,
+            thinking_budget: Some(64),
+            ..model_with_path(dir.path().display().to_string())
+        });
+        assert_eq!((result.warnings, result.failures), (0, 0));
+    }
+
+    #[test]
+    fn auto_batch_model_passes_cleanly() {
+        let dir = llama_checkpoint();
+        let result = check_one_model(ModelConfig {
+            batch: BatchMode::Auto,
+            ..model_with_path(dir.path().display().to_string())
+        });
+        assert_eq!((result.warnings, result.failures), (0, 0));
+    }
+
+    #[test]
+    fn auto_batch_with_turboquant_is_fine_but_explicit_batch_fails() {
+        let dir = llama_checkpoint();
+        let turboquant = |batch| ModelConfig {
+            batch,
+            kv_cache: higgs_models::turboquant::KvCacheMode::Turboquant,
+            ..model_with_path(dir.path().display().to_string())
+        };
+        assert_eq!(check_one_model(turboquant(BatchMode::Auto)).failures, 0);
+        assert_eq!(check_one_model(turboquant(BatchMode::On)).failures, 1);
+    }
+
+    #[test]
+    fn explicit_batch_with_a_disk_prefix_store_warns() {
+        let dir = llama_checkpoint();
+        let store = tempfile::tempdir().unwrap();
+        let result = check_one_model(ModelConfig {
+            batch: BatchMode::On,
+            kv_disk_dir: Some(store.path().display().to_string()),
+            ..model_with_path(dir.path().display().to_string())
+        });
+        assert_eq!((result.warnings, result.failures), (1, 0));
+    }
+
+    #[test]
+    fn explicit_batch_on_an_unbatchable_architecture_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model_config_json(dir.path(), "deepseek_v2");
+        let result = check_one_model(ModelConfig {
+            batch: BatchMode::On,
+            ..model_with_path(dir.path().display().to_string())
+        });
+        assert_eq!(result.failures, 1);
     }
 }

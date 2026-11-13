@@ -6,7 +6,10 @@ use std::sync::Arc;
 
 use higgs_engine::mlx_tuning::resolve_runtime_tuning;
 
-use crate::config::{self, HiggsConfig, LoadMode, LocalConfig, ModelConfig};
+use crate::config::{self, BatchMode, HiggsConfig, LoadMode, LocalConfig, ModelConfig};
+use crate::engine_selection::{
+    BatchFacts, EngineChoice, SimpleReason, choose_engine, planned_engine,
+};
 use crate::model_pool::{ModelLoader, ModelPool, ModelSpec, PoolLimits};
 use crate::model_resolver;
 use crate::state::Engine;
@@ -74,23 +77,40 @@ pub fn load_engine(
     resolved: &Path,
 ) -> Result<Engine, String> {
     tracing::info!(model = %model.path, resolved = %resolved.display(), "Loading model");
-    if model.batch && !config::resolved_model_supports_batch(resolved)? {
-        return Err(format!(
-            "batch=true is only supported for models with batched decode (llama, mistral, qwen2, qwen3, qwen3_moe, qwen3_5, qwen3_5_moe, phi3, starcoder2); {} is not supported",
-            model.path
-        ));
-    }
+    let choice = match model.batch {
+        BatchMode::On => {
+            if !config::resolved_model_supports_batch(resolved)? {
+                return Err(config::batch_unsupported_message(&model.path));
+            }
+            EngineChoice::Batch
+        }
+        BatchMode::Off => EngineChoice::Simple(SimpleReason::Requested),
+        BatchMode::Auto => {
+            let facts = BatchFacts::inspect(model, local, resolved)?;
+            let choice = choose_engine(BatchMode::Auto, &facts);
+            match choice {
+                EngineChoice::Batch => {
+                    tracing::info!(model = %model.path, "batch = auto: using the batch engine");
+                }
+                EngineChoice::Simple(reason) => {
+                    tracing::info!(model = %model.path, %reason, "batch = auto: using the simple engine");
+                }
+            }
+            choice
+        }
+    };
     let kv_cache_config = model.kv_cache_config();
-    let engine = if model.batch {
-        Engine::load_batch(
+    let tuning = resolve_runtime_tuning(resolved, model.requested_mlx_profile(local));
+    let engine = match choice {
+        EngineChoice::Batch => Engine::load_batch(
             resolved,
             kv_cache_config,
+            &tuning,
             local.raise_wired_limit,
             model.prefill_yield_tokens,
-        )
-    } else {
-        let tuning = resolve_runtime_tuning(resolved, model.requested_mlx_profile(local));
-        Engine::load_simple(
+            model.effective_thinking_budget(local),
+        ),
+        EngineChoice::Simple(_) => Engine::load_simple(
             resolved,
             kv_cache_config,
             tuning,
@@ -98,7 +118,7 @@ pub fn load_engine(
             model.kv_disk_dir.as_deref().map(Path::new),
             model.kv_disk_space_mb.saturating_mul(1024 * 1024),
             model.effective_thinking_budget(local),
-        )
+        ),
     }
     .map_err(|error| error.to_string())?;
     tracing::info!(model_name = %engine.model_name(), "Model loaded");
@@ -124,7 +144,7 @@ pub fn served_name(model: &ModelConfig) -> String {
 pub fn model_spec(config: &HiggsConfig, model: &ModelConfig, name: String) -> ModelSpec {
     let is_classifier = config.auto_router.enabled && config.auto_router.model == name;
     ModelSpec {
-        engine_kind: if model.batch { "batch" } else { "simple" },
+        engine_kind: planned_engine(model, &config.local).map_or("auto", EngineChoice::kind),
         load: if is_classifier {
             LoadMode::Startup
         } else {
@@ -325,19 +345,25 @@ mod tests {
             [[models]]
             path = "org/two"
             name = "two"
+            batch = false
+
+            [[models]]
+            path = "org/three-never-downloaded"
+            name = "three"
             "#,
         );
 
         let pool = build_pool(&config).unwrap();
         let statuses = pool.statuses();
 
-        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses.len(), 3);
         assert!(statuses.iter().all(|status| {
             status.state == crate::model_pool::ModelState::Unloaded
                 && status.load == LoadMode::OnDemand
         }));
         assert_eq!(pool.status("one").unwrap().engine, "batch");
         assert_eq!(pool.status("two").unwrap().engine, "simple");
+        assert_eq!(pool.status("three").unwrap().engine, "auto");
     }
 
     #[test]

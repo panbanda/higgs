@@ -21,7 +21,7 @@ use crate::{
     metrics::{MetricsStore, RequestMetricsContext, RequestRecord, RequestTiming},
     router::ResolvedRoute,
     state::{EngineLease, SharedState},
-    tool_choice::ToolChoice,
+    tool_policy::{ToolPolicy, combine_constraints},
     types::openai::{
         ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessage, ChatCompletionRequest,
         ChatCompletionResponse, ChoiceLogprobs, MessageContent, StopSequence, TokenLogprob,
@@ -71,7 +71,9 @@ pub async fn chat_completions(
             routing_method,
         } => {
             req.model = model_name;
-            if ToolChoice::from_request(req.tool_choice.as_ref())? == ToolChoice::Disabled {
+            if !ToolPolicy::from_chat(req.tool_choice.as_ref(), req.parallel_tool_calls)?
+                .exposes_tools()
+            {
                 req.tools = None;
             }
             let constraint_spec = ConstraintSpec::from_request(
@@ -311,10 +313,17 @@ pub(crate) async fn chat_completions_non_streaming(
     // Treat an empty `tools: []` as absent (mirrors the streaming path) so it
     // doesn't define `tools` in the template context or trigger tool parsing.
     let tools = req.tools.as_deref().filter(|t| !t.is_empty());
+    let tool_policy = ToolPolicy::from_chat(req.tool_choice.as_ref(), req.parallel_tool_calls)?;
+    let tool_format = engine.tool_call_format();
+    let effective_constraint = combine_constraints(
+        constraint_spec,
+        tool_policy.forced_constraint(tools.unwrap_or_default(), tool_format)?,
+    )?;
     let thinking_budget = crate::reasoning::requested_thinking_budget(req.reasoning.as_ref())?;
-    let thinking_enabled = crate::reasoning::effective_thinking_enabled(
-        engine.enable_thinking(),
-        &[engine.model_name(), req.model.as_str()],
+    let thinking_enabled = crate::reasoning::thinking_enabled_for_request(
+        &engine,
+        &tool_policy,
+        &req.model,
         req.reasoning.as_ref(),
     );
 
@@ -339,7 +348,7 @@ pub(crate) async fn chat_completions_non_streaming(
         None
     };
 
-    let constraint = build_constraint(constraint_spec.as_ref(), &engine)?;
+    let constraint = build_constraint(effective_constraint.as_ref(), &engine)?;
 
     let tokenizer = engine.tokenizer().clone();
     let output = tokio::task::spawn_blocking(move || {
@@ -392,8 +401,7 @@ pub(crate) async fn chat_completions_non_streaming(
     };
 
     let (content, tool_calls, finish_reason) = if has_tools {
-        let schema = higgs_engine::tool_parser::ToolSchema::from_tools(tools);
-        let parsed = higgs_engine::tool_parser::parse_tool_calls(&raw_text, schema.as_ref());
+        let parsed = tool_policy.parser(tool_format, tools).parse(&raw_text);
         if parsed.tool_calls.is_empty() {
             (
                 Some(MessageContent::Text(raw_text)),
@@ -502,7 +510,13 @@ pub(crate) fn chat_completions_chunk_stream(
     // Built here (before the `async_stream::stream!` block, which captures by
     // move) so the tracker can coerce XML-format tool-call values to their
     // declared JSON types.
-    let tool_schema = higgs_engine::tool_parser::ToolSchema::from_tools(req.tools.as_deref());
+    let tool_policy = ToolPolicy::from_chat(req.tool_choice.as_ref(), req.parallel_tool_calls)?;
+    let tool_format = engine.tool_call_format();
+    let tool_parser = tool_policy.parser(tool_format, req.tools.as_deref());
+    let effective_constraint = combine_constraints(
+        constraint_spec,
+        tool_policy.forced_constraint(req.tools.as_deref().unwrap_or_default(), tool_format)?,
+    )?;
 
     if stream_includes_tools {
         tracing::debug!(
@@ -528,9 +542,10 @@ pub(crate) fn chat_completions_chunk_stream(
 
     let messages = convert_messages(&effective_messages);
     let thinking_budget = crate::reasoning::requested_thinking_budget(req.reasoning.as_ref())?;
-    let thinking_enabled_stream = crate::reasoning::effective_thinking_enabled(
-        engine.enable_thinking(),
-        &[engine.model_name(), req.model.as_str()],
+    let thinking_enabled_stream = crate::reasoning::thinking_enabled_for_request(
+        &engine,
+        &tool_policy,
+        &req.model,
         req.reasoning.as_ref(),
     );
 
@@ -561,7 +576,7 @@ pub(crate) fn chat_completions_chunk_stream(
         None
     };
 
-    let constraint = build_constraint(constraint_spec.as_ref(), &engine)?;
+    let constraint = build_constraint(effective_constraint.as_ref(), &engine)?;
 
     let request_id = generate_request_id();
     let include_usage = req
@@ -644,10 +659,7 @@ pub(crate) fn chat_completions_chunk_stream(
         // Streaming tool-call extractor — passthrough when no tools were
         // requested, otherwise watches for `<tool_call>…</tool_call>`
         // blocks and emits structured `ToolCallDelta` events.
-        let mut tool_tracker = higgs_engine::tool_parser::StreamingToolCallTracker::new(
-            stream_includes_tools,
-            tool_schema,
-        );
+        let mut tool_tracker = tool_parser.tracker(stream_includes_tools);
 
         // Closure that turns a `ParsedToolCall` into the OpenAI streaming
         // delta shape. Index is the running zero-based position of the
@@ -792,6 +804,19 @@ pub(crate) fn chat_completions_chunk_stream(
             emit_delta!(&d, None, None);
         }
         let final_tool_out = tool_tracker.flush();
+        let final_base_index = tool_tracker
+            .completed_count()
+            .saturating_sub(final_tool_out.new_tool_calls.len());
+        for (i, parsed) in final_tool_out.new_tool_calls.iter().enumerate() {
+            let idx = u32::try_from(final_base_index + i).unwrap_or(u32::MAX);
+            let d = ChatCompletionDelta {
+                role: None,
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![make_tool_delta(idx, parsed)]),
+            };
+            emit_delta!(&d, None, None);
+        }
         if !final_tool_out.visible.is_empty() {
             let d = ChatCompletionDelta {
                 role: None,
@@ -957,7 +982,7 @@ fn build_sampling_params(req: &ChatCompletionRequest) -> SamplingParams {
 /// A pattern or schema the grammar compiler rejects is the client's fault, so
 /// those failures are reported as `400`; failing to build the vocabulary is a
 /// server error.
-fn build_constraint(
+pub(crate) fn build_constraint(
     requested: Option<&ConstraintSpec>,
     engine: &crate::state::Engine,
 ) -> Result<Option<higgs_engine::constrained::ConstrainedGenerator>, ServerError> {
@@ -1565,34 +1590,6 @@ mod tests {
             assert_eq!(engine.stub_prompt_tools(), vec![None]);
             assert!(!body.contains("tool_calls"), "{body}");
             assert!(body.contains("get_weather"), "text stays visible: {body}");
-        }
-
-        #[tokio::test]
-        async fn tool_choice_required_is_rejected_before_generation() {
-            let extra = serde_json::json!({"tools": tools_json(), "tool_choice": "required"});
-            let (status, body, engine) = post_chat(tool_stub(), &extra).await;
-            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
-            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-            assert!(
-                json["error"]["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("\"required\" is not supported yet"),
-                "{body}"
-            );
-            assert!(engine.stub_calls().is_empty());
-        }
-
-        #[tokio::test]
-        async fn named_tool_choice_is_rejected_before_generation() {
-            let extra = serde_json::json!({
-                "tools": tools_json(),
-                "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
-            });
-            let (status, body, engine) = post_chat(tool_stub(), &extra).await;
-            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
-            assert!(body.contains("not supported yet"), "{body}");
-            assert!(engine.stub_calls().is_empty());
         }
 
         #[tokio::test]

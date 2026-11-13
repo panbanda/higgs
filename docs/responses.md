@@ -29,8 +29,8 @@ served by the provider, not by Higgs. A model that routes to an
 | `max_output_tokens` | Falls back to `server.max_tokens` |
 | `temperature`, `top_p` | |
 | `tools` | `{"type": "function", "name", "description", "parameters"}` only |
-| `tool_choice` | `auto` (default) and `none`; `none` removes the tools from the prompt |
-| `parallel_tool_calls` | Echoed; the model decides how many calls to emit |
+| `tool_choice` | `auto` (default), `none` (removes the tools from the prompt), `required`, or `{"type": "function", "name"}`; the last two force a call as described in [Tool calling](tool-calling.md) |
+| `parallel_tool_calls` | Echoed; `false` limits the response to one call |
 | `reasoning` | `{"effort": ...}` with the same semantics as on chat completions |
 | `text.format` | `text`, `json_object`, or `json_schema` (`name`, `schema`), mapped to constrained decoding |
 | `stream` | Server-sent events (below) |
@@ -65,8 +65,9 @@ dropping it:
   (`input_file`, `refusal`, ...); `input_image` on a model that is not a
   vision model; images that are not base64 data URIs (`file_id` or `http(s)`
   URLs).
-- `tool_choice` of `required`, or one that names a tool. The engine cannot
-  force or restrict a call.
+- `tool_choice` of any other type (`allowed_tools`, hosted tools, ...), and
+  forcing a call for a model whose tool-call format cannot be constrained
+  (see [Tool calling](tool-calling.md)).
 - `background: true` and `conversation`.
 - `text.format` types other than the three above, or `json_schema` without a
   schema.

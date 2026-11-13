@@ -14,8 +14,12 @@ use axum::{
 use bytes::Bytes;
 use tokio_stream::Stream;
 
+use super::chat::build_constraint;
 use crate::{
-    anthropic_adapter::{anthropic_messages_to_engine, openai_finish_to_anthropic_stop},
+    anthropic_adapter::openai_finish_to_anthropic_stop,
+    anthropic_tools::{
+        ToolPlan, messages_with_tool_history, openai_tools, tool_use_block, tool_use_stream_events,
+    },
     config::ApiFormat,
     error::ServerError,
     metrics::{MetricsStore, RequestMetricsContext, RequestTiming},
@@ -25,7 +29,7 @@ use crate::{
         AnthropicUsage, ContentBlockResponse, ContentBlockStartEvent, ContentBlockStartPayload,
         ContentBlockStopEvent, CountTokensRequest, CountTokensResponse, CreateMessageRequest,
         CreateMessageResponse, MessageDelta, MessageDeltaEvent, MessageStartEvent,
-        MessageStartPayload, MessageStopEvent, TextDelta,
+        MessageStartPayload, MessageStopEvent, ResponseContentBlock, TextDelta,
     },
 };
 use higgs_engine::engine::ThinkingMode;
@@ -248,6 +252,7 @@ pub async fn create_message(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn create_message_non_streaming(
     req: CreateMessageRequest,
     engine: EngineLease,
@@ -261,18 +266,21 @@ async fn create_message_non_streaming(
     };
     let stop_sequences = req.stop_sequences.unwrap_or_default();
 
-    let engine_messages = anthropic_messages_to_engine(&req.messages, req.system.as_ref());
-    let tools = req.tools.as_deref();
+    let engine_messages = messages_with_tool_history(&req.messages, req.system.as_ref());
+    let plan = ToolPlan::for_request(
+        req.tools.as_deref(),
+        req.tool_choice.as_ref(),
+        engine.tool_call_format(),
+    )?;
+    let tools = plan.tools.as_deref();
     let thinking_budget = requested_thinking_budget(req.thinking.as_ref())?;
-    let thinking_enabled = crate::reasoning::effective_thinking_enabled(
-        engine.enable_thinking(),
-        &[engine.model_name(), req.model.as_str()],
-        None,
-    );
+    let thinking_enabled =
+        crate::reasoning::thinking_enabled_for_request(&engine, &plan.policy, &req.model, None);
 
     let prompt_tokens = engine
         .prepare_chat_prompt_with_thinking(&engine_messages, tools, thinking_enabled)
         .map_err(ServerError::Engine)?;
+    let constraint = build_constraint(plan.constraint.as_ref(), &engine)?;
 
     let output = tokio::task::spawn_blocking(move || {
         engine.generate_with_thinking(
@@ -283,7 +291,7 @@ async fn create_message_non_streaming(
             false,
             None,
             ThinkingMode::new(thinking_enabled, thinking_budget),
-            None,
+            constraint,
             None,
         )
     })
@@ -315,16 +323,45 @@ async fn create_message_non_streaming(
         output_text
     };
 
+    let with_calls = plan
+        .tools
+        .as_ref()
+        .map(|_| plan.parser.parse(&visible_text))
+        .filter(|parsed_output| !parsed_output.tool_calls.is_empty());
+    let (content, response_stop_reason) = if let Some(parsed_output) = with_calls {
+        let text_block = (!parsed_output.text.is_empty()).then(|| {
+            ResponseContentBlock::Text(ContentBlockResponse {
+                block_type: "text",
+                text: parsed_output.text.clone(),
+            })
+        });
+        let blocks = text_block
+            .into_iter()
+            .chain(
+                parsed_output
+                    .tool_calls
+                    .iter()
+                    .map(|call| ResponseContentBlock::ToolUse(tool_use_block(call))),
+            )
+            .collect();
+        (blocks, "tool_use".to_owned())
+    } else {
+        (
+            vec![ResponseContentBlock::Text(ContentBlockResponse {
+                block_type: "text",
+                text: visible_text,
+            })],
+            stop_reason,
+        )
+    };
+
     Ok(CreateMessageResponse {
         id: msg_id,
         message_type: "message",
         role: "assistant",
-        content: vec![ContentBlockResponse {
-            block_type: "text",
-            text: visible_text,
-        }],
+        content,
         model: req.model,
-        stop_reason: Some(stop_reason),
+        stop_reason: Some(response_stop_reason),
         usage: AnthropicUsage {
             input_tokens: output.prompt_tokens,
             output_tokens: output.completion_tokens,
@@ -350,18 +387,22 @@ fn create_message_stream(
     };
     let stop_sequences = req.stop_sequences.unwrap_or_default();
 
-    let engine_messages = anthropic_messages_to_engine(&req.messages, req.system.as_ref());
-    let tools = req.tools.as_deref();
+    let engine_messages = messages_with_tool_history(&req.messages, req.system.as_ref());
+    let plan = ToolPlan::for_request(
+        req.tools.as_deref(),
+        req.tool_choice.as_ref(),
+        engine.tool_call_format(),
+    )?;
+    let tools = plan.tools.as_deref();
     let thinking_budget = requested_thinking_budget(req.thinking.as_ref())?;
-    let thinking_enabled = crate::reasoning::effective_thinking_enabled(
-        engine.enable_thinking(),
-        &[engine.model_name(), req.model.as_str()],
-        None,
-    );
+    let thinking_enabled =
+        crate::reasoning::thinking_enabled_for_request(&engine, &plan.policy, &req.model, None);
 
     let prompt_tokens = engine
         .prepare_chat_prompt_with_thinking(&engine_messages, tools, thinking_enabled)
         .map_err(ServerError::Engine)?;
+    let constraint = build_constraint(plan.constraint.as_ref(), &engine)?;
+    let mut tool_tracker = plan.parser.tracker(plan.tools.is_some());
 
     let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
     let model = req.model;
@@ -384,7 +425,7 @@ fn create_message_stream(
             // Progress events are consumed for metrics only; the Anthropic
             // stream never surfaces them.
             true,
-            None,
+            constraint,
             None,
         );
         if let Err(e) = result {
@@ -457,6 +498,7 @@ fn create_message_stream(
         };
 
         let mut delta_writer = crate::sse::AnthropicDeltaWriter::new();
+        let mut tool_calls = Vec::new();
         let mut timing = RequestTiming::default();
         while let Some(output) = rx.recv().await {
             if let Some(p) = output.prefill_progress {
@@ -466,12 +508,14 @@ fn create_message_stream(
             if timing.ttft_ms.is_none() {
                 timing.ttft_ms = Some(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
             }
-            let (visible, _reasoning) = reasoning_tracker.process(&output.new_text);
+            let (reasoning_visible, _reasoning) = reasoning_tracker.process(&output.new_text);
+            let tool_out = tool_tracker.process(&reasoning_visible);
+            tool_calls.extend(tool_out.new_tool_calls);
 
-            if !visible.is_empty() {
+            if !tool_out.visible.is_empty() {
                 let td = TextDelta {
                     delta_type: "text_delta",
-                    text: visible,
+                    text: tool_out.visible,
                 };
                 match delta_writer.write(&td) {
                     Ok(json) => yield Ok(Event::default().event("content_block_delta").data(json)),
@@ -486,10 +530,17 @@ fn create_message_stream(
 
         // Flush any remaining visible text buffered by the reasoning tracker
         let (flush_visible, _flush_reasoning) = reasoning_tracker.flush();
-        if !flush_visible.is_empty() {
+        let flush_tool_out = tool_tracker.process(&flush_visible);
+        let final_tool_out = tool_tracker.flush();
+        tool_calls.extend(flush_tool_out.new_tool_calls);
+        tool_calls.extend(final_tool_out.new_tool_calls);
+        for remaining_text in [flush_tool_out.visible, final_tool_out.visible] {
+            if remaining_text.is_empty() {
+                continue;
+            }
             let td = TextDelta {
                 delta_type: "text_delta",
-                text: flush_visible,
+                text: remaining_text,
             };
             match delta_writer.write(&td) {
                 Ok(json) => yield Ok(Event::default().event("content_block_delta").data(json)),
@@ -513,6 +564,17 @@ fn create_message_stream(
         match serde_json::to_string(&block_stop) {
             Ok(json) => yield Ok(Event::default().event("content_block_stop").data(json)),
             Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
+        }
+
+        // 4b. tool_use blocks follow the text block.
+        for (offset, call) in tool_calls.iter().enumerate() {
+            let index = u32::try_from(offset + 1).unwrap_or(u32::MAX);
+            for (event_name, data) in tool_use_stream_events(index, call) {
+                yield Ok(Event::default().event(event_name).data(data));
+            }
+        }
+        if !tool_calls.is_empty() {
+            final_stop_reason = Some("tool_use".to_owned());
         }
 
         // 5. message_delta
@@ -571,8 +633,9 @@ pub async fn count_tokens(
         ResolvedRoute::Higgs {
             engine, model_name, ..
         } => {
-            let engine_messages = anthropic_messages_to_engine(&req.messages, req.system.as_ref());
-            let tools = req.tools.as_deref();
+            let engine_messages = messages_with_tool_history(&req.messages, req.system.as_ref());
+            let converted_tools = req.tools.as_deref().map(openai_tools);
+            let tools = converted_tools.as_deref();
             let thinking_enabled = crate::reasoning::effective_thinking_enabled(
                 engine.enable_thinking(),
                 &[engine.model_name(), model_name.as_str()],

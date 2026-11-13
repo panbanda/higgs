@@ -21,6 +21,7 @@ Higgs is a Rust binary (plus its Metal shader library) built on [MLX](https://gi
 - **Fast on Apple Silicon.** Native MLX inference with prefix caching, continuous batching for transformer families, quantized KV cache, and MoE prefill tuning. See [Performance](#performance).
 - **One endpoint for everything.** Local models and remote providers behind one URL, with regex routes, aliases, and an optional auto-router that picks a model per prompt.
 - **Memory you can manage.** Load models on first use, unload them after an idle timeout, cap how many stay resident or how much memory they use, and pin the ones that must stay. Least-recently-used eviction and load, unload, and status endpoints included.
+- **Tool calling across model families.** Qwen, Mistral, Llama 3.x, Gemma, GLM and MiniMax tool calls are parsed into structured `tool_calls` (streaming included), and `tool_choice: "required"` or a named function forces a valid call through constrained decoding. See [Tool calling](docs/tool-calling.md).
 - **Drop-in for your tools.** `higgs shellenv` exports `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL`; Claude Code, Aider, and any OpenAI or Anthropic client just work.
 - **Tools without client code.** Connect [Model Context Protocol](docs/mcp.md) servers (stdio or Streamable HTTP) and call their tools through `/v1/mcp/*`, with servers that start in the background, restart when they crash, and namespace every tool as `server__tool`.
 - **Web search and fetch.** Optional `/v1/web/search` and `/v1/web/fetch` endpoints (SearXNG or keyless DuckDuckGo, SSRF-protected fetch), off by default and usable as tools by the server-side tool loop.
@@ -159,9 +160,15 @@ Requests for `qwen` run locally; anything matching `claude-.*` is proxied to Ant
     Anthropic `thinking.budget_tokens` does the same on `/v1/messages`.
     Defaults come from `[[models]].thinking_budget`, then `[local].thinking_budget`,
     then 256. See [Thinking budget](docs/configuration.md#thinking-budget).
-  - `tool_choice`: `"auto"` (default) and `"none"` (tools are not shown to the
-    model and tool calls are not parsed) are supported; `"required"` and a
-    named function return 400 until they are implemented.
+  - `tool_choice`: `"auto"` (default), `"none"` (tools are not shown to the
+    model and tool calls are not parsed), `"required"`, and
+    `{"type": "function", "function": {"name": "..."}}`. The last two force a
+    call with constrained decoding for models whose tool-call format allows
+    it, and return 400 for the others. `parallel_tool_calls: false` limits a
+    response to one call. The same fields work on `/v1/responses` and, as
+    `tool_choice` `any`/`tool`/`none` and `disable_parallel_tool_use`, on
+    `/v1/messages`. See [Tool calling](docs/tool-calling.md) for the format
+    each model family uses and which ones support forcing.
   - `seed` is accepted for client compatibility but does not make sampling
     reproducible yet.
   - Unrecognized request fields are ignored.
@@ -233,13 +240,16 @@ traffic in metrics. The read-only ones never load a model.
 - Source builds also require `mlx.metallib` next to the executable. Higgs now restores it automatically from Cargo build output when possible, then fails loudly if it still cannot be found.
 - `[local].raise_wired_limit` defaults to `false`. Enable it only when you explicitly want MLX to raise the process wired-memory limit.
 - With several large models, `load = "on_demand"` plus `max_loaded_models`, `memory_guard`, or `idle_ttl_seconds` keeps unified memory from filling up; unloading shuts the engine down and clears the MLX buffer cache.
-- `batch=true` is only supported for transformer families with true batched decode support.
+- `batch` is `true`, `false`, or `"auto"` (the default). `auto` uses the continuous-batching engine whenever the model supports it and nothing configured needs a simple-engine-only feature (TurboQuant KV, `kv_disk_dir`, vision, MTP speculative decode, `HIGGS_PROMPT_LOOKUP`); `higgs serve --batch` / `--no-batch` force it either way. See [docs/configuration.md](docs/configuration.md#engine-selection).
+- `batch = true` is only supported for transformer families with true batched decode support.
 - For batch models, `prefill_yield_tokens` can interleave long prompt prefills with decode; use `0` or omit it for the synchronous default.
 
 
 ## Performance
 
 Benchmarks below were run on M4 Max 128GB. Methodology, harness details, and benchmark-driven defaults are documented in [docs/benchmarking.md](docs/benchmarking.md).
+
+A head-to-head comparison with oMLX (where Higgs is ahead, level, and behind, with reproduction steps) is in [docs/omlx-comparison.md](docs/omlx-comparison.md).
 
 ### Decode Throughput (tok/s)
 

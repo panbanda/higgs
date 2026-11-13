@@ -4,6 +4,7 @@
 use serde_json::{Value, json};
 
 use crate::error::ServerError;
+use crate::tool_choice::ToolChoice;
 use crate::types::openai::{
     ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse, ContentPart as ChatPart,
     ImageUrl, MessageContent, ResponseFormat, StreamOptions, ToolCall, ToolCallFunction,
@@ -236,34 +237,6 @@ pub fn convert_tools(tools: &[Value]) -> Result<Vec<Value>, ServerError> {
         .collect()
 }
 
-/// Whether the model may call tools.
-///
-/// Only `auto` and `none` can be honored: the engine has no way to force or
-/// restrict a call, so `required` and named-tool choices are rejected rather
-/// than silently downgraded.
-pub fn tools_enabled(tool_choice: Option<&Value>) -> Result<bool, ServerError> {
-    match tool_choice {
-        None | Some(Value::Null) => Ok(true),
-        Some(Value::String(choice)) => match choice.as_str() {
-            "auto" => Ok(true),
-            "none" => Ok(false),
-            "required" => Err(bad_request(
-                "tool_choice 'required' is not supported; use 'auto' or 'none'".to_owned(),
-            )),
-            other => Err(bad_request(format!("Unknown tool_choice '{other}'"))),
-        },
-        Some(other) => {
-            let kind = other
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("object");
-            Err(bad_request(format!(
-                "tool_choice of type '{kind}' is not supported; use 'auto' or 'none'"
-            )))
-        }
-    }
-}
-
 pub fn convert_text_format(
     text: Option<&TextConfig>,
 ) -> Result<Option<ResponseFormat>, ServerError> {
@@ -426,13 +399,14 @@ pub fn build_chat_request(
     conversation: &[InputItem],
 ) -> Result<ChatCompletionRequest, ServerError> {
     let streaming = request.stream == Some(true);
-    let tools = if tools_enabled(request.tool_choice.as_ref())? {
+    let tool_choice = ToolChoice::from_responses(request.tool_choice.as_ref())?;
+    let tools = if tool_choice == ToolChoice::Disabled {
+        None
+    } else {
         match request.tools.as_deref() {
             Some(tools) if !tools.is_empty() => Some(convert_tools(tools)?),
             Some(_) | None => None,
         }
-    } else {
-        None
     };
     Ok(ChatCompletionRequest {
         model: model.to_owned(),
@@ -445,6 +419,8 @@ pub fn build_chat_request(
             include_usage: Some(true),
         }),
         tools,
+        tool_choice: Some(tool_choice.to_chat_value()),
+        parallel_tool_calls: request.parallel_tool_calls,
         response_format: convert_text_format(request.text.as_ref())?,
         reasoning: request.reasoning.clone(),
         return_progress: streaming.then_some(true),
@@ -1009,14 +985,51 @@ mod tests {
         }
     }
 
+    fn chat_for(extra: &Value) -> Result<ChatCompletionRequest, ServerError> {
+        let mut body = json!({
+            "model": "m", "input": "hi",
+            "tools": [{"type": "function", "name": "f", "parameters": {"type": "object"}}]
+        });
+        if let (Some(target), Some(fields)) = (body.as_object_mut(), extra.as_object()) {
+            target.extend(fields.clone());
+        }
+        build_chat_request(&request(body), "m", &[])
+    }
+
     #[test]
-    fn tool_choice_support_matches_what_the_engine_can_honor() {
-        assert!(tools_enabled(None).unwrap());
-        assert!(tools_enabled(Some(&json!("auto"))).unwrap());
-        assert!(!tools_enabled(Some(&json!("none"))).unwrap());
-        assert!(tools_enabled(Some(&json!("required"))).is_err());
-        assert!(tools_enabled(Some(&json!({"type": "function", "name": "f"}))).is_err());
-        assert!(tools_enabled(Some(&json!("bogus"))).is_err());
+    fn tool_choice_is_forwarded_in_chat_spelling() {
+        let cases = [
+            (json!({}), json!("auto")),
+            (json!({"tool_choice": "auto"}), json!("auto")),
+            (json!({"tool_choice": "required"}), json!("required")),
+            (
+                json!({"tool_choice": {"type": "function", "name": "f"}}),
+                json!({"type": "function", "function": {"name": "f"}}),
+            ),
+        ];
+        for (extra, expected) in cases {
+            let chat = chat_for(&extra).unwrap();
+            assert_eq!(chat.tool_choice, Some(expected), "{extra}");
+            assert_eq!(chat.tools.as_ref().map(Vec::len), Some(1), "{extra}");
+        }
+    }
+
+    #[test]
+    fn parallel_tool_calls_is_forwarded() {
+        let chat = chat_for(&json!({"parallel_tool_calls": false})).unwrap();
+        assert_eq!(chat.parallel_tool_calls, Some(false));
+        assert_eq!(chat_for(&json!({})).unwrap().parallel_tool_calls, None);
+    }
+
+    #[test]
+    fn invalid_tool_choices_are_rejected() {
+        for bad in [
+            json!("bogus"),
+            json!({"type": "function"}),
+            json!({"type": "web_search"}),
+        ] {
+            assert!(chat_for(&json!({"tool_choice": bad})).is_err(), "{bad}");
+        }
     }
 
     #[test]

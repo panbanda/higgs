@@ -29,7 +29,7 @@ use crate::{
     router::{ResolvedRoute, RoutingMethod},
     routes::chat::{chat_completions_chunk_stream, chat_completions_non_streaming},
     state::{AppState, EngineLease, SharedState},
-    tool_choice::ToolChoice,
+    tool_policy::ToolPolicy,
     tools::openai_tool,
     types::openai::{
         ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse, MessageContent,
@@ -97,7 +97,7 @@ fn plan(state: &AppState, req: &ChatCompletionRequest) -> Result<Option<LoopPlan
     let Some(options) = req.mcp.as_ref().filter(|options| options.enabled) else {
         return Ok(None);
     };
-    if ToolChoice::from_request(req.tool_choice.as_ref())? == ToolChoice::Disabled {
+    if !ToolPolicy::from_chat(req.tool_choice.as_ref(), req.parallel_tool_calls)?.exposes_tools() {
         return Ok(None);
     }
     let max_iterations = options.max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS);
@@ -364,6 +364,9 @@ pub(crate) async fn complete(
         }
 
         trace.rounds += 1;
+        // A forced tool_choice applies to the first generation only; later
+        // rounds must be free to answer.
+        conversation.tool_choice = None;
         conversation.messages.push(assistant_message(
             assistant.and_then(|reply| reply.content),
             server_calls.clone(),
@@ -650,6 +653,7 @@ pub(crate) fn chunk_stream(
             }
 
             round += 1;
+            conversation.tool_choice = None;
             trace.rounds = round;
             let calls = std::mem::take(&mut state_of_round.server_calls);
             let text = std::mem::take(&mut state_of_round.text);
@@ -833,6 +837,50 @@ mod tests {
         let roles: Vec<_> = prompts[1].iter().map(|(role, _)| role.as_str()).collect();
         assert_eq!(roles, vec!["user", "assistant", "tool"]);
         assert_eq!(prompts[1][2].1, "pong");
+    }
+
+    #[tokio::test]
+    async fn loop_uses_the_engines_tool_call_format() {
+        let fake = echo_fake();
+        let hub = files_hub(&fake, Duration::from_secs(2)).await;
+        let mut llama = stub(vec![
+            (
+                r#"{"name": "files__echo", "parameters": {"text": "hi"}}"#,
+                5,
+                10,
+            ),
+            ("done", 1, 1),
+        ]);
+        llama.script.tool_call_format = higgs_engine::tool_format::ToolCallFormat::Llama;
+        let (status, body, _) = chat(llama, hub, &request(json!({"mcp": {}}))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["choices"][0]["message"]["content"], "done");
+        assert_eq!(fake.received_calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_forced_tool_choice_applies_to_the_first_round_only() {
+        let fake = echo_fake();
+        let hub = files_hub(&fake, Duration::from_secs(2)).await;
+        let mut forced = stub(vec![(CALL_ECHO, 5, 10), ("done", 1, 1)]);
+        forced.tokenizer = Some(crate::test_support::char_tokenizer());
+        let (status, body, engine) = chat(
+            forced,
+            hub,
+            &request(json!({
+                "mcp": {},
+                "tool_choice": {"type": "function", "function": {"name": "files__echo"}}
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["choices"][0]["message"]["content"], "done");
+        let constrained: Vec<_> = engine
+            .stub_calls()
+            .iter()
+            .map(|c| c.has_constraint)
+            .collect();
+        assert_eq!(constrained, vec![true, false]);
     }
 
     #[tokio::test]

@@ -197,8 +197,8 @@ impl ModelMetadata {
 #[derive(Debug, Clone)]
 /// Tunable MLX runtime settings derived from a requested profile and model metadata.
 ///
-/// These settings are consumed only by the local simple-engine path and are resolved
-/// before model load. Advanced `HIGGS_*` env overrides may further mutate these
+/// These settings are consumed by the local engines and are resolved before model load.
+/// The batch engine reads only the chunked-prefill thresholds. Advanced `HIGGS_*` env overrides may further mutate these
 /// settings in `from_model_dir`.
 pub struct MlxRuntimeTuning {
     requested_profile: RequestedMlxProfile,

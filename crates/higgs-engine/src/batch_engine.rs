@@ -25,8 +25,13 @@ use crate::{
     chat_template::{ChatMessage, ChatTemplateRenderer},
     engine::{GenerationOutput, GenerationStats, PrefillProgress, StreamingOutput, ThinkingMode},
     error::EngineError,
+    generation_support::{
+        ThinkingSupport, embed_tokens, generation_prompt_suffix_len, prefix_cache_key,
+        resume_from_prefix, snapshot_boundary, tokenize_chat_prompt,
+    },
+    mlx_tuning::MlxRuntimeTuning,
     model_loader,
-    prompt_cache::PrefixCache,
+    paged_prefix_cache::{DEFAULT_BLOCK_SIZE, PagedPrefixCache},
     simple::{IncrementalDetok, find_stop_in_tail},
 };
 
@@ -63,7 +68,57 @@ struct BatchRequest {
     logprobs: bool,
     top_logprobs: Option<u32>,
     constraint: Option<crate::constrained::ConstrainedGenerator>,
+    /// `None` when the request does not think.
+    thinking: Option<ThinkingGate>,
     response_tx: tokio::sync::mpsc::Sender<StreamingOutput>,
+}
+
+/// An embedding request, answered from the worker thread that owns the model.
+struct EmbedRequest {
+    token_ids: Vec<u32>,
+    reply: std::sync::mpsc::SyncSender<Result<Vec<f32>, EngineError>>,
+}
+
+/// Work submitted to the worker thread.
+enum WorkItem {
+    Generate(BatchRequest),
+    Embed(EmbedRequest),
+}
+
+/// How a prompt too long for one forward pass is split, matching the simple
+/// engine's chunked prefill so peak memory stays bounded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrefillChunking {
+    /// Prompts longer than this are split.
+    threshold: usize,
+    chunk_tokens: u32,
+}
+
+impl PrefillChunking {
+    fn new(tuning: &MlxRuntimeTuning) -> Self {
+        Self {
+            threshold: usize::try_from(tuning.chunked_prefill_threshold()).unwrap_or(usize::MAX),
+            chunk_tokens: u32::try_from(tuning.chunked_prefill_chunk_size()).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// Most tokens to feed per forward pass for a prefill of `prompt_tokens`.
+    fn quantum(self, prompt_tokens: usize) -> u32 {
+        if prompt_tokens > self.threshold {
+            self.chunk_tokens.max(1)
+        } else {
+            u32::MAX
+        }
+    }
+}
+
+/// Settings the worker needs that are fixed when the engine loads.
+struct WorkerSettings {
+    prefill_yield_tokens: u32,
+    chunking: PrefillChunking,
+    kv_cache_config: KvCacheConfig,
+    /// Trailing chat-template tokens left out of prefix-cache keys.
+    generation_suffix_len: usize,
 }
 
 /// An in-flight request being actively decoded.
@@ -78,9 +133,41 @@ struct ActiveRequest {
     stop_sequences: Vec<String>,
     logprob_top_n: Option<u32>,
     constraint: Option<crate::constrained::ConstrainedGenerator>,
+    thinking: Option<ThinkingGate>,
     response_tx: tokio::sync::mpsc::Sender<StreamingOutput>,
     prompt_len: u32,
     detok: IncrementalDetok,
+}
+
+/// Tracks one request's reasoning block so `</think>` can be forced once the
+/// budget is spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ThinkingGate {
+    close_token: u32,
+    budget: u32,
+    closed: bool,
+}
+
+impl ThinkingGate {
+    const fn new(close_token: u32, budget: u32) -> Self {
+        Self {
+            close_token,
+            budget,
+            closed: false,
+        }
+    }
+
+    /// Whether the token at 1-based `position` of the completion must be
+    /// `</think>`. The first token is sampled during prefill and is never forced.
+    const fn forces(&self, position: u32) -> bool {
+        !self.closed && position >= 2 && position >= self.budget
+    }
+
+    const fn observe(&mut self, token_id: u32) {
+        if token_id == self.close_token {
+            self.closed = true;
+        }
+    }
 }
 
 /// Requests decoding together through one batched KV cache.
@@ -92,10 +179,87 @@ struct DecodeBatch {
     cache: AnyBatchedCache,
     /// `[B]` most recent token of each row, fed to the next step.
     tokens: Array,
+    thinking: Option<BatchThinking>,
     /// `tokens` came from a step whose results clients have not received yet.
     /// Keeping one step in flight lets the next graph be built while the GPU
     /// is still computing this one.
     undelivered: bool,
+}
+
+/// The per-row [`ThinkingGate`] state of a [`DecodeBatch`], kept on the GPU.
+///
+/// Decode is pipelined: the next step is sampled before this step's tokens
+/// are read back, so whether a row has just closed its reasoning block is not
+/// known on the host. These arrays carry that state through the sampling
+/// graph, which swaps in `</think>` for rows that are out of budget.
+struct BatchThinking {
+    close_token: Array,
+    /// `[B]` i32 reasoning budget; `i32::MAX` for rows that do not think.
+    budgets: Array,
+    /// `[B]` i32 completion tokens sampled so far, including the in-flight step.
+    positions: Array,
+    /// `[B]` bool: the row has emitted `</think>`.
+    closed: Array,
+}
+
+impl BatchThinking {
+    fn for_rows(active: &[ActiveRequest]) -> Result<Option<Self>, EngineError> {
+        let Some(close_token) = active
+            .iter()
+            .find_map(|ar| ar.thinking.map(|gate| gate.close_token))
+        else {
+            return Ok(None);
+        };
+        let rows = i32::try_from(active.len())
+            .map_err(|_| EngineError::Generation("Too many batched requests".to_owned()))?;
+        let budgets: Vec<i32> = active
+            .iter()
+            .map(|ar| {
+                ar.thinking.map_or(i32::MAX, |gate| {
+                    i32::try_from(gate.budget).unwrap_or(i32::MAX)
+                })
+            })
+            .collect();
+        let positions: Vec<i32> = active
+            .iter()
+            .map(|ar| i32::try_from(ar.generated_tokens.len()).unwrap_or(i32::MAX))
+            .collect();
+        let closed: Vec<bool> = active
+            .iter()
+            .map(|ar| ar.thinking.is_none_or(|gate| gate.closed))
+            .collect();
+        Ok(Some(Self {
+            close_token: Array::from_slice(&[close_token], &[1]),
+            budgets: Array::from_slice(&budgets, &[rows]),
+            positions: Array::from_slice(&positions, &[rows]),
+            closed: Array::from_slice(&closed, &[rows]),
+        }))
+    }
+
+    /// Replace the sampled token of every row that is out of reasoning budget
+    /// with `</think>`, and advance the per-row state.
+    fn apply(&mut self, sampled: &Array) -> Result<Array, EngineError> {
+        let mlx = EngineError::Mlx;
+        let positions = self.positions.add(Array::from_int(1)).map_err(mlx)?;
+        let past_first = positions.ge(Array::from_int(2)).map_err(mlx)?;
+        let over_budget = positions.ge(&self.budgets).map_err(mlx)?;
+        let still_open = self.closed.logical_not().map_err(mlx)?;
+        let forced = over_budget
+            .logical_and(&past_first)
+            .and_then(|due| due.logical_and(&still_open))
+            .map_err(mlx)?;
+        let tokens = mlx_rs::ops::select(&forced, &self.close_token, sampled).map_err(mlx)?;
+        self.closed = tokens
+            .eq(&self.close_token)
+            .and_then(|is_close| self.closed.logical_or(&is_close))
+            .map_err(mlx)?;
+        self.positions = positions;
+        Ok(tokens)
+    }
+
+    const fn eval_targets(&self) -> [&Array; 2] {
+        [&self.positions, &self.closed]
+    }
 }
 
 /// A request whose prompt is being fed through the model over multiple turns
@@ -104,26 +268,18 @@ struct PendingPrefill {
     request_id: u64,
     req: BatchRequest,
     prompt_len: u32,
+    /// Prompt tokens served from the prefix cache, so `tokens` starts after them.
+    cached_tokens: u32,
     tokens: Vec<u32>,
     offset: usize,
     cache: AnyCache,
+    /// Index into `tokens` at which to pause and keep a prefix-cache snapshot.
+    snapshot_at: Option<usize>,
 }
 
 enum PrefillAdvance {
     InFlight(PendingPrefill),
     Complete(Option<ActiveRequest>),
-}
-
-#[cfg(test)]
-fn prefill_chunk_ranges(token_count: usize, quantum: usize) -> Vec<std::ops::Range<usize>> {
-    let mut ranges = Vec::new();
-    let mut start = 0;
-    while start < token_count {
-        let end = start.saturating_add(quantum).min(token_count);
-        ranges.push(start..end);
-        start = end;
-    }
-    ranges
 }
 
 // ---------------------------------------------------------------------------
@@ -136,13 +292,16 @@ fn prefill_chunk_ranges(token_count: usize, quantum: usize) -> Vec<std::ops::Ran
 /// dedicated background thread. Concurrent requests are interleaved at the
 /// token level instead of being fully serialized.
 pub struct BatchEngine {
-    request_tx: tokio::sync::mpsc::Sender<BatchRequest>,
+    request_tx: tokio::sync::mpsc::Sender<WorkItem>,
     worker: std::thread::JoinHandle<()>,
     tokenizer: Tokenizer,
-    template: ChatTemplateRenderer,
+    template: Option<ChatTemplateRenderer>,
     model_name: String,
     eos_token_ids: Vec<u32>,
     hidden_size: AtomicI32,
+    enable_thinking: bool,
+    think_close_token: Option<u32>,
+    default_thinking_budget: u32,
 }
 
 impl BatchEngine {
@@ -150,8 +309,10 @@ impl BatchEngine {
     pub fn load<P: AsRef<Path>>(
         dir: P,
         kv_cache_config: KvCacheConfig,
+        tuning: &MlxRuntimeTuning,
         raise_wired_limit: bool,
         prefill_yield_tokens: Option<u32>,
+        default_thinking_budget: u32,
     ) -> Result<Self, EngineError> {
         if kv_cache_config.is_turboquant() {
             return Err(EngineError::Generation(
@@ -164,8 +325,22 @@ impl BatchEngine {
         tracing::info!(model_dir = %model_dir.display(), "Loading model (batch engine)");
 
         let tokenizer = model_loader::load_tokenizer(model_dir)?;
-        let template = ChatTemplateRenderer::from_model_dir(model_dir)?;
+        let template = ChatTemplateRenderer::try_from_model_dir(model_dir)?;
+        if template.is_none() {
+            tracing::warn!("No chat template found; /v1/chat/completions will be unavailable");
+        }
         let eos_token_ids = crate::simple::extract_eos_tokens(model_dir);
+        let thinking = ThinkingSupport::resolve(model_dir, &tokenizer);
+        let settings = WorkerSettings {
+            prefill_yield_tokens: prefill_yield_tokens.unwrap_or(0),
+            chunking: PrefillChunking::new(tuning),
+            kv_cache_config,
+            generation_suffix_len: generation_prompt_suffix_len(
+                template.as_ref(),
+                &tokenizer,
+                thinking.enabled,
+            ),
+        };
 
         let (request_tx, request_rx) = tokio::sync::mpsc::channel(REQUEST_QUEUE_CAPACITY);
         let eos_ids = eos_token_ids.clone();
@@ -188,13 +363,7 @@ impl BatchEngine {
                 if loaded_tx.send(Ok(model.hidden_size())).is_err() {
                     return;
                 }
-                worker_loop(
-                    model,
-                    &tok,
-                    &eos_ids,
-                    request_rx,
-                    prefill_yield_tokens.unwrap_or(0),
-                );
+                worker_loop(model, &tok, &eos_ids, request_rx, &settings);
             })
             .map_err(|e| EngineError::Generation(format!("Failed to spawn worker: {e}")))?;
 
@@ -218,6 +387,9 @@ impl BatchEngine {
             model_name,
             eos_token_ids,
             hidden_size: AtomicI32::new(hidden_size),
+            enable_thinking: thinking.enabled,
+            think_close_token: thinking.close_token,
+            default_thinking_budget,
         })
     }
 
@@ -236,6 +408,15 @@ impl BatchEngine {
         &self.model_name
     }
 
+    /// How this model writes tool calls.
+    pub fn tool_call_format(&self) -> crate::tool_format::ToolCallFormat {
+        self.template
+            .as_ref()
+            .map_or(crate::tool_format::ToolCallFormat::Auto, |template| {
+                template.tool_call_format()
+            })
+    }
+
     pub const fn tokenizer(&self) -> &Tokenizer {
         &self.tokenizer
     }
@@ -248,14 +429,25 @@ impl BatchEngine {
         self.hidden_size.load(Ordering::Relaxed)
     }
 
-    /// Apply chat template and tokenize messages.
+    /// Whether the model reasons inside `<think>` tags by default.
+    pub const fn enable_thinking(&self) -> bool {
+        self.enable_thinking
+    }
+
+    /// Apply chat template and tokenize messages with explicit thinking control.
     pub fn prepare_chat_prompt_with_thinking(
         &self,
         messages: &[ChatMessage],
         tools: Option<&[serde_json::Value]>,
-        _enable_thinking: bool,
+        enable_thinking: bool,
     ) -> Result<Vec<u32>, EngineError> {
-        self.prepare_chat_prompt(messages, tools)
+        tokenize_chat_prompt(
+            self.template.as_ref(),
+            &self.tokenizer,
+            messages,
+            tools,
+            enable_thinking,
+        )
     }
 
     /// Apply chat template and tokenize messages.
@@ -264,12 +456,19 @@ impl BatchEngine {
         messages: &[ChatMessage],
         tools: Option<&[serde_json::Value]>,
     ) -> Result<Vec<u32>, EngineError> {
-        let prompt = self.template.apply(messages, tools, true)?;
-        let encoding = self
-            .tokenizer
-            .encode(prompt.as_str(), false)
-            .map_err(|e| EngineError::Tokenization(e.to_string()))?;
-        Ok(encoding.get_ids().to_vec())
+        self.prepare_chat_prompt_with_thinking(messages, tools, self.enable_thinking)
+    }
+
+    /// The gate that enforces a request's reasoning budget, or `None` when
+    /// it does not think.
+    fn thinking_gate(&self, thinking: ThinkingMode) -> Option<ThinkingGate> {
+        let close_token = self.think_close_token?;
+        thinking.is_on().then(|| {
+            ThinkingGate::new(
+                close_token,
+                thinking.budget_or(self.default_thinking_budget),
+            )
+        })
     }
 
     /// Generate a complete (non-streaming) response.
@@ -307,7 +506,7 @@ impl BatchEngine {
         stop_sequences: &[String],
         logprobs: bool,
         top_logprobs: Option<u32>,
-        _thinking: ThinkingMode,
+        thinking: ThinkingMode,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<higgs_models::siglip::PixelValues>,
     ) -> Result<GenerationOutput, EngineError> {
@@ -340,7 +539,7 @@ impl BatchEngine {
         let (internal_tx, mut internal_rx) = tokio::sync::mpsc::channel(32);
 
         self.request_tx
-            .blocking_send(BatchRequest {
+            .blocking_send(WorkItem::Generate(BatchRequest {
                 prompt_tokens: prompt_tokens.to_vec(),
                 max_tokens,
                 params: params.clone(),
@@ -348,8 +547,9 @@ impl BatchEngine {
                 logprobs,
                 top_logprobs,
                 constraint,
+                thinking: self.thinking_gate(thinking),
                 response_tx: internal_tx,
-            })
+            }))
             .map_err(|_| EngineError::Generation("Engine shut down".to_owned()))?;
 
         let mut full_text = String::new();
@@ -425,7 +625,7 @@ impl BatchEngine {
         logprobs: bool,
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
-        _thinking: ThinkingMode,
+        thinking: ThinkingMode,
         return_progress: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<higgs_models::siglip::PixelValues>,
@@ -462,7 +662,7 @@ impl BatchEngine {
         let (internal_tx, mut internal_rx) = tokio::sync::mpsc::channel(32);
 
         self.request_tx
-            .blocking_send(BatchRequest {
+            .blocking_send(WorkItem::Generate(BatchRequest {
                 prompt_tokens: prompt_tokens.to_vec(),
                 max_tokens,
                 params: params.clone(),
@@ -470,8 +670,9 @@ impl BatchEngine {
                 logprobs,
                 top_logprobs,
                 constraint,
+                thinking: self.thinking_gate(thinking),
                 response_tx: internal_tx,
-            })
+            }))
             .map_err(|_| EngineError::Generation("Engine shut down".to_owned()))?;
 
         while let Some(output) = internal_rx.blocking_recv() {
@@ -490,13 +691,21 @@ impl BatchEngine {
         Ok(())
     }
 
-    /// Compute embeddings (delegates to a single forward pass).
-    pub fn embed(&self, _token_ids: &[u32]) -> Result<Vec<f32>, EngineError> {
-        // Embeddings require direct model access. For now, return an error.
-        // A proper implementation would submit an embed request to the worker.
-        Err(EngineError::Generation(
-            "Embeddings not yet supported in batch engine".to_owned(),
-        ))
+    /// Compute an embedding on the worker thread, which owns the model.
+    ///
+    /// The worker runs it between decode rounds on a cache of its own, so
+    /// requests already generating keep their state.
+    pub fn embed(&self, token_ids: &[u32]) -> Result<Vec<f32>, EngineError> {
+        let (reply, response) = std::sync::mpsc::sync_channel(1);
+        self.request_tx
+            .blocking_send(WorkItem::Embed(EmbedRequest {
+                token_ids: token_ids.to_vec(),
+                reply,
+            }))
+            .map_err(|_| EngineError::Generation("Engine shut down".to_owned()))?;
+        response
+            .recv()
+            .map_err(|_| EngineError::Generation("Engine shut down".to_owned()))?
     }
 }
 
@@ -504,18 +713,69 @@ impl BatchEngine {
 // Background worker loop
 // ---------------------------------------------------------------------------
 
+/// Prefix cache plus the key convention shared with the simple engine.
+struct PromptCache {
+    entries: PagedPrefixCache,
+    generation_suffix_len: usize,
+}
+
+impl PromptCache {
+    fn new(max_entries: usize, generation_suffix_len: usize) -> Self {
+        Self {
+            entries: PagedPrefixCache::new(max_entries, DEFAULT_BLOCK_SIZE),
+            generation_suffix_len,
+        }
+    }
+
+    /// Where prefill of `prompt` resumes and the cache to resume from.
+    fn resume(
+        &mut self,
+        prompt: &[u32],
+        fresh_cache: impl FnOnce() -> Result<AnyCache, EngineError>,
+    ) -> Result<(usize, AnyCache), EngineError> {
+        resume_from_prefix(
+            self.entries.find_longest_prefix(prompt),
+            prompt,
+            fresh_cache,
+        )
+    }
+
+    /// Leading tokens of `prompt` the cache would serve.
+    fn covered_tokens(&self, prompt: &[u32]) -> usize {
+        self.entries.longest_prefix_len(prompt)
+    }
+
+    fn snapshot_boundary(
+        &self,
+        prompt: &[u32],
+        resume_at: usize,
+        cache: &AnyCache,
+    ) -> Option<usize> {
+        snapshot_boundary(prompt, resume_at, self.generation_suffix_len, cache)
+    }
+
+    /// Keep the state a finished prefill left behind, keyed without the
+    /// chat template's generation suffix.
+    fn remember(&mut self, prompt: &[u32], cache: &AnyCache) {
+        self.entries
+            .store(prefix_cache_key(prompt, self.generation_suffix_len), cache);
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn worker_loop(
     mut model: AnyModel,
     tokenizer: &Tokenizer,
     eos_token_ids: &[u32],
-    mut request_rx: tokio::sync::mpsc::Receiver<BatchRequest>,
-    prefill_yield_tokens: u32,
+    mut request_rx: tokio::sync::mpsc::Receiver<WorkItem>,
+    settings: &WorkerSettings,
 ) {
+    let prefill_yield_tokens = settings.prefill_yield_tokens;
     if !model.supports_batched_decode() {
         tracing::warn!("This model cannot batch decode; requests will decode one at a time");
     }
-    let mut prefix_cache = PrefixCache::new(DEFAULT_PREFIX_CACHE_SIZE);
+    let mut prompt_cache =
+        PromptCache::new(DEFAULT_PREFIX_CACHE_SIZE, settings.generation_suffix_len);
     let mut active: Vec<ActiveRequest> = Vec::new();
     let mut pending_prefill: Option<PendingPrefill> = None;
     let mut decode_batch: Option<DecodeBatch> = None;
@@ -525,16 +785,16 @@ fn worker_loop(
         // 1. Admit queued requests, blocking only when there is nothing to do.
         while waiting.len() < REQUEST_QUEUE_CAPACITY {
             match request_rx.try_recv() {
-                Ok(req) => waiting.push_back(req),
+                Ok(item) => admit(item, &mut model, settings, &mut waiting),
                 Err(_) => break,
             }
         }
         if active.is_empty() && pending_prefill.is_none() && waiting.is_empty() {
-            let Some(req) = request_rx.blocking_recv() else {
+            let Some(item) = request_rx.blocking_recv() else {
                 tracing::info!("Request channel closed, worker shutting down");
                 return;
             };
-            waiting.push_back(req);
+            admit(item, &mut model, settings, &mut waiting);
         }
 
         // 2. Prefill. Each iteration prefills at most one request (or one
@@ -542,22 +802,29 @@ fn worker_loop(
         //    interleaved with decode steps for requests already in flight.
         if prefill_yield_tokens == 0 {
             let group = if model.supports_batched_prefill() {
-                take_prefill_group(&mut waiting, &mut prefix_cache)
+                take_prefill_group(&mut waiting, &prompt_cache)
             } else {
                 Vec::new()
             };
             if group.len() > 1 {
                 prefill_group(
                     &mut model,
-                    &mut prefix_cache,
+                    &mut prompt_cache,
                     tokenizer,
                     eos_token_ids,
+                    settings.chunking,
                     group,
                     &mut active,
                 );
             } else if let Some(req) = group.into_iter().next().or_else(|| waiting.pop_front()) {
-                match prefill_request(&mut model, &mut prefix_cache, tokenizer, eos_token_ids, req)
-                {
+                match prefill_request(
+                    &mut model,
+                    &mut prompt_cache,
+                    tokenizer,
+                    eos_token_ids,
+                    settings.chunking,
+                    req,
+                ) {
                     Ok(Some(ar)) => active.push(ar),
                     Ok(None) => {}
                     Err(e) => tracing::error!(error = %e, "Prefill failed"),
@@ -566,7 +833,7 @@ fn worker_loop(
         } else {
             if pending_prefill.is_none() {
                 if let Some(req) = waiting.pop_front() {
-                    match start_prefill(&model, &mut prefix_cache, req) {
+                    match start_prefill(&model, &mut prompt_cache, req) {
                         Ok(prefill) => pending_prefill = Some(prefill),
                         Err(e) => tracing::error!(error = %e, "Prefill failed"),
                     }
@@ -575,7 +842,7 @@ fn worker_loop(
             if let Some(prefill) = pending_prefill.take() {
                 match advance_prefill(
                     &mut model,
-                    &mut prefix_cache,
+                    &mut prompt_cache,
                     tokenizer,
                     eos_token_ids,
                     prefill,
@@ -655,6 +922,25 @@ fn worker_loop(
         }
         if active.is_empty() {
             decode_batch = None;
+        }
+    }
+}
+
+/// Queue a generation request, or answer an embedding right away.
+///
+/// An embedding runs on its own cache, so it leaves requests that are already
+/// decoding untouched.
+fn admit(
+    item: WorkItem,
+    model: &mut AnyModel,
+    settings: &WorkerSettings,
+    waiting: &mut std::collections::VecDeque<BatchRequest>,
+) {
+    match item {
+        WorkItem::Generate(request) => waiting.push_back(request),
+        WorkItem::Embed(request) => {
+            let embedding = embed_tokens(model, settings.kv_cache_config, &request.token_ids);
+            let _ = request.reply.send(embedding);
         }
     }
 }
@@ -776,8 +1062,16 @@ fn run_batched_decode_round(
         .forward_batched(&input, &mut batch.cache)
         .map_err(EngineError::Mlx)?;
     let last_logits = logits.index((.., -1, ..));
-    let next_tokens = sample_batch(&last_logits, active)?;
-    async_eval([&next_tokens]).map_err(EngineError::Mlx)?;
+    let sampled = sample_batch(&last_logits, active)?;
+    let next_tokens = match batch.thinking.as_mut() {
+        Some(thinking) => thinking.apply(&sampled)?,
+        None => sampled,
+    };
+    let mut eval_targets = vec![&next_tokens];
+    if let Some(thinking) = batch.thinking.as_ref() {
+        eval_targets.extend(thinking.eval_targets());
+    }
+    async_eval(eval_targets).map_err(EngineError::Mlx)?;
 
     deliver_batch_tokens(batch, active, tokenizer, eos_token_ids, finished_indices)?;
     batch.tokens = next_tokens;
@@ -825,6 +1119,7 @@ fn form_decode_batch(active: &mut [ActiveRequest]) -> Result<DecodeBatch, Engine
         ids: active.iter().map(|ar| ar.id).collect(),
         cache: AnyBatchedCache::from_rows(rows).map_err(EngineError::Mlx)?,
         tokens: Array::from_slice(&last_tokens, &[rows_len]),
+        thinking: BatchThinking::for_rows(active)?,
         undelivered: false,
     })
 }
@@ -897,7 +1192,7 @@ fn disband_decode_batch(
 /// behind keep their order.
 fn take_prefill_group(
     waiting: &mut std::collections::VecDeque<BatchRequest>,
-    prefix_cache: &mut PrefixCache,
+    prompt_cache: &PromptCache,
 ) -> Vec<BatchRequest> {
     if waiting.len() < 2 {
         return Vec::new();
@@ -911,9 +1206,7 @@ fn take_prefill_group(
         let fits = group.len() < PREFILL_GROUP_MAX_ROWS
             && tokens <= PREFILL_GROUP_MAX_PROMPT_TOKENS
             && padded_longest * (group.len() + 1) <= PREFILL_GROUP_TOKEN_BUDGET
-            && prefix_cache
-                .find_longest_prefix(&req.prompt_tokens)
-                .is_none_or(|cached| cached.prefix_len * 2 < tokens);
+            && prompt_cache.covered_tokens(&req.prompt_tokens) * 2 < tokens;
         if fits {
             longest = padded_longest;
             group.push(req);
@@ -929,16 +1222,17 @@ fn take_prefill_group(
 /// to `active`. Falls back to one-at-a-time prefill if the batched pass fails.
 fn prefill_group(
     model: &mut AnyModel,
-    prefix_cache: &mut PrefixCache,
+    prompt_cache: &mut PromptCache,
     tokenizer: &Tokenizer,
     eos_token_ids: &[u32],
+    chunking: PrefillChunking,
     group: Vec<BatchRequest>,
     active: &mut Vec<ActiveRequest>,
 ) {
     let started = std::time::Instant::now();
     for req in &group {
         let prompt_len = u32::try_from(req.prompt_tokens.len()).unwrap_or(u32::MAX);
-        announce_prefill(req, 0, prompt_len);
+        announce_prefill(req, 0, 0, prompt_len);
     }
     let batched = with_stream(&Stream::new(), || {
         let longest = group
@@ -980,7 +1274,8 @@ fn prefill_group(
         Err(e) => {
             tracing::warn!(error = %e, "Grouped prefill failed; prefilling requests one at a time");
             for req in group {
-                match prefill_request(model, prefix_cache, tokenizer, eos_token_ids, req) {
+                match prefill_request(model, prompt_cache, tokenizer, eos_token_ids, chunking, req)
+                {
                     Ok(Some(ar)) => active.push(ar),
                     Ok(None) => {}
                     Err(prefill_error) => {
@@ -1002,7 +1297,7 @@ fn prefill_group(
         let row_logits = last_logits.index((row_index..row_index + 1, ..));
         let completed = with_stream(&Stream::new(), || {
             complete_prefill(
-                prefix_cache,
+                prompt_cache,
                 tokenizer,
                 eos_token_ids,
                 req,
@@ -1026,7 +1321,7 @@ fn prefill_group(
 /// Tell the caller that prompt evaluation is starting and how much of the
 /// prompt the prefix cache already covers. Never blocks the worker: a full
 /// channel only loses this notification.
-fn announce_prefill(req: &BatchRequest, cached_tokens: u32, prompt_len: u32) {
+fn announce_prefill(req: &BatchRequest, processed: u32, cached_tokens: u32, prompt_len: u32) {
     let _ = req.response_tx.try_send(StreamingOutput {
         new_text: String::new(),
         finished: false,
@@ -1035,7 +1330,7 @@ fn announce_prefill(req: &BatchRequest, cached_tokens: u32, prompt_len: u32) {
         completion_tokens: 0,
         token_logprob: None,
         prefill_progress: Some(PrefillProgress {
-            processed: cached_tokens,
+            processed,
             cached: cached_tokens,
             total: prompt_len,
         }),
@@ -1045,7 +1340,7 @@ fn announce_prefill(req: &BatchRequest, cached_tokens: u32, prompt_len: u32) {
 /// Set up cache reuse once, before the prompt begins advancing through chunks.
 fn start_prefill(
     model: &AnyModel,
-    prefix_cache: &mut PrefixCache,
+    prompt_cache: &mut PromptCache,
     req: BatchRequest,
 ) -> Result<PendingPrefill, EngineError> {
     let prompt_len = req
@@ -1053,53 +1348,50 @@ fn start_prefill(
         .len()
         .try_into()
         .map_err(|_| EngineError::Generation("Prompt too long".to_owned()))?;
-    let prefix_match = prefix_cache.find_longest_prefix(&req.prompt_tokens);
-    let (tokens, cache) = if let Some(matched) = prefix_match {
-        let suffix = req
-            .prompt_tokens
-            .get(matched.prefix_len..)
-            .unwrap_or_default();
-        if suffix.is_empty() {
-            // We don't cache logits, so an exact match must be replayed.
-            (
-                req.prompt_tokens.clone(),
-                model.make_cache().map_err(EngineError::Mlx)?,
-            )
-        } else {
-            (suffix.to_vec(), matched.cache)
-        }
-    } else {
-        (
-            req.prompt_tokens.clone(),
-            model.make_cache().map_err(EngineError::Mlx)?,
-        )
-    };
+    let (resume_at, cache) = prompt_cache.resume(&req.prompt_tokens, || {
+        model.make_cache().map_err(EngineError::Mlx)
+    })?;
+    let tokens = req
+        .prompt_tokens
+        .get(resume_at..)
+        .unwrap_or_default()
+        .to_vec();
 
-    let cached_tokens = prompt_len - u32::try_from(tokens.len()).unwrap_or(prompt_len);
-    announce_prefill(&req, cached_tokens, prompt_len);
+    let snapshot_at = prompt_cache.snapshot_boundary(&req.prompt_tokens, resume_at, &cache);
+
+    let cached_tokens = u32::try_from(resume_at).unwrap_or(prompt_len);
+    announce_prefill(&req, cached_tokens, cached_tokens, prompt_len);
 
     Ok(PendingPrefill {
         request_id: NEXT_PREFILL_ID.fetch_add(1, Ordering::Relaxed),
         req,
         prompt_len,
+        cached_tokens,
         tokens,
         offset: 0,
         cache,
+        snapshot_at,
     })
 }
 
 fn advance_prefill(
     model: &mut AnyModel,
-    prefix_cache: &mut PrefixCache,
+    prompt_cache: &mut PromptCache,
     tokenizer: &Tokenizer,
     eos_token_ids: &[u32],
     mut prefill: PendingPrefill,
     quantum: u32,
 ) -> Result<PrefillAdvance, EngineError> {
     let start = prefill.offset;
-    let end = start
+    let mut end = start
         .saturating_add(usize::try_from(quantum).unwrap_or(usize::MAX))
         .min(prefill.tokens.len());
+    let snapshot_now = prefill
+        .snapshot_at
+        .filter(|boundary| (start + 1..=end).contains(boundary));
+    if let Some(boundary) = snapshot_now {
+        end = boundary;
+    }
     let is_complete = end == prefill.tokens.len();
 
     with_stream(&Stream::new(), || {
@@ -1123,11 +1415,24 @@ fn advance_prefill(
 
         if !is_complete {
             eval([&last_logits]).map_err(EngineError::Mlx)?;
+            let processed = prefill
+                .cached_tokens
+                .saturating_add(u32::try_from(end).unwrap_or(u32::MAX));
+            announce_prefill(
+                &prefill.req,
+                processed,
+                prefill.cached_tokens,
+                prefill.prompt_len,
+            );
+            if snapshot_now.is_some() {
+                prompt_cache.remember(&prefill.req.prompt_tokens, &prefill.cache);
+                prefill.snapshot_at = None;
+            }
             return Ok(PrefillAdvance::InFlight(prefill));
         }
 
         complete_prefill(
-            prefix_cache,
+            prompt_cache,
             tokenizer,
             eos_token_ids,
             prefill.req,
@@ -1142,31 +1447,33 @@ fn advance_prefill(
 /// Prefill synchronously when yielding is disabled.
 fn prefill_request(
     model: &mut AnyModel,
-    prefix_cache: &mut PrefixCache,
+    prompt_cache: &mut PromptCache,
     tokenizer: &Tokenizer,
     eos_token_ids: &[u32],
+    chunking: PrefillChunking,
     req: BatchRequest,
 ) -> Result<Option<ActiveRequest>, EngineError> {
-    let prefill = start_prefill(model, prefix_cache, req)?;
-    match advance_prefill(
-        model,
-        prefix_cache,
-        tokenizer,
-        eos_token_ids,
-        prefill,
-        u32::MAX,
-    )? {
-        PrefillAdvance::Complete(active) => Ok(active),
-        PrefillAdvance::InFlight(_) => Err(EngineError::Generation(
-            "Synchronous prefill did not complete".to_owned(),
-        )),
+    let mut prefill = start_prefill(model, prompt_cache, req)?;
+    let quantum = chunking.quantum(prefill.tokens.len());
+    loop {
+        match advance_prefill(
+            model,
+            prompt_cache,
+            tokenizer,
+            eos_token_ids,
+            prefill,
+            quantum,
+        )? {
+            PrefillAdvance::Complete(active) => return Ok(active),
+            PrefillAdvance::InFlight(resumed) => prefill = resumed,
+        }
     }
 }
 
 /// Finish a prefill after its final forward pass has produced logits.
 #[allow(clippy::too_many_lines)]
 fn complete_prefill(
-    prefix_cache: &mut PrefixCache,
+    prompt_cache: &mut PromptCache,
     tokenizer: &Tokenizer,
     eos_token_ids: &[u32],
     mut req: BatchRequest,
@@ -1211,7 +1518,7 @@ fn complete_prefill(
         }
 
         // Cache the post-prefill state
-        prefix_cache.store(&req.prompt_tokens, cache.clone());
+        prompt_cache.remember(&req.prompt_tokens, &cache);
         crate::simple::maybe_clear_mlx_cache(
             crate::simple::should_clear_mlx_cache_after_prefill(),
             "batch_post_prefill",
@@ -1220,6 +1527,9 @@ fn complete_prefill(
         let first_token_id: u32 = current_token.item_cast();
         if let Some(constraint) = req.constraint.as_mut() {
             constraint.advance(first_token_id);
+        }
+        if let Some(gate) = req.thinking.as_mut() {
+            gate.observe(first_token_id);
         }
         let first_token_logprob = first_logprob_data
             .as_ref()
@@ -1302,6 +1612,7 @@ fn complete_prefill(
             stop_sequences: req.stop_sequences,
             logprob_top_n,
             constraint: req.constraint,
+            thinking: req.thinking,
             response_tx: req.response_tx,
             prompt_len,
             detok,
@@ -1337,7 +1648,18 @@ fn build_decode_graph(
         penalized
     };
 
-    let next_token = sample(&constrained, &ar.params).map_err(EngineError::Mlx)?;
+    let sampled = sample(&constrained, &ar.params).map_err(EngineError::Mlx)?;
+    let next_position = u32::try_from(ar.generated_tokens.len())
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
+    let next_token = match ar.thinking {
+        Some(gate) if gate.forces(next_position) => {
+            Array::from_slice(&[gate.close_token], sampled.shape())
+                .as_dtype(sampled.dtype())
+                .map_err(EngineError::Mlx)?
+        }
+        _ => sampled,
+    };
 
     let logprob_data = if let Some(top_n) = ar.logprob_top_n {
         let scaled = if ar.params.temperature <= f32::EPSILON {
@@ -1386,6 +1708,9 @@ fn deliver_token(
 ) -> bool {
     if let Some(ref mut cg) = ar.constraint {
         cg.advance(token_id);
+    }
+    if let Some(gate) = ar.thinking.as_mut() {
+        gate.observe(token_id);
     }
 
     ar.generated_tokens.push(token_id);
@@ -1477,6 +1802,7 @@ mod tests {
             stop_sequences,
             logprob_top_n: None,
             constraint: None,
+            thinking: None,
             response_tx: tx,
             prompt_len: 5,
             detok: IncrementalDetok::new(
@@ -1510,7 +1836,17 @@ mod tests {
         )
         .unwrap();
 
-        let result = BatchEngine::load(dir.path(), KvCacheConfig::default(), false, None);
+        let result = BatchEngine::load(
+            dir.path(),
+            KvCacheConfig::default(),
+            &MlxRuntimeTuning::from_model_dir(
+                dir.path(),
+                crate::mlx_tuning::RequestedMlxProfile::Auto,
+            ),
+            false,
+            None,
+            256,
+        );
 
         assert!(
             matches!(result, Err(EngineError::Model(_))),
@@ -1597,9 +1933,177 @@ mod tests {
         assert!(use_batched);
     }
 
+    // -----------------------------------------------------------------------
+    // Thinking budget
+    // -----------------------------------------------------------------------
+
+    const CLOSE: u32 = 99;
+
     #[test]
-    fn prefill_chunk_ranges_cover_each_token_once() {
-        let ranges = prefill_chunk_ranges(10, 4);
-        assert_eq!(ranges, vec![0..4, 4..8, 8..10]);
+    fn gate_never_forces_the_first_token() {
+        let gate = ThinkingGate::new(CLOSE, 1);
+        assert!(!gate.forces(1));
+        assert!(gate.forces(2));
+    }
+
+    #[test]
+    fn gate_forces_from_the_budgeted_position_on() {
+        let gate = ThinkingGate::new(CLOSE, 20);
+        assert!(!gate.forces(19));
+        assert!(gate.forces(20));
+        assert!(gate.forces(21));
+    }
+
+    #[test]
+    fn gate_stops_forcing_once_the_block_is_closed() {
+        let mut gate = ThinkingGate::new(CLOSE, 5);
+        gate.observe(7);
+        assert!(gate.forces(5));
+        gate.observe(CLOSE);
+        assert!(!gate.forces(5));
+        assert!(!gate.forces(50));
+    }
+
+    fn make_row(gate: Option<ThinkingGate>, generated: usize) -> ActiveRequest {
+        let (mut ar, _rx) = make_active_request(100, vec![]);
+        ar.thinking = gate;
+        ar.generated_tokens = vec![1; generated];
+        ar
+    }
+
+    fn apply_thinking(thinking: &mut BatchThinking, sampled: &[u32]) -> Vec<u32> {
+        let rows = i32::try_from(sampled.len()).unwrap();
+        let tokens = thinking
+            .apply(&Array::from_slice(sampled, &[rows]))
+            .unwrap();
+        tokens.eval().unwrap();
+        tokens.as_slice::<u32>().to_vec()
+    }
+
+    #[test]
+    fn batch_thinking_forces_close_for_rows_over_budget_only() {
+        let rows = [
+            make_row(Some(ThinkingGate::new(CLOSE, 3)), 1),
+            make_row(None, 1),
+            make_row(Some(ThinkingGate::new(CLOSE, 100)), 1),
+        ];
+        let mut thinking = BatchThinking::for_rows(&rows).unwrap().unwrap();
+
+        assert_eq!(apply_thinking(&mut thinking, &[10, 11, 12]), [10, 11, 12]);
+        assert_eq!(
+            apply_thinking(&mut thinking, &[20, 21, 22]),
+            [CLOSE, 21, 22]
+        );
+        assert_eq!(apply_thinking(&mut thinking, &[30, 31, 32]), [30, 31, 32]);
+    }
+
+    #[test]
+    fn batch_thinking_notices_a_natural_close_without_a_readback() {
+        let rows = [make_row(Some(ThinkingGate::new(CLOSE, 3)), 1)];
+        let mut thinking = BatchThinking::for_rows(&rows).unwrap().unwrap();
+
+        assert_eq!(apply_thinking(&mut thinking, &[CLOSE]), [CLOSE]);
+        assert_eq!(apply_thinking(&mut thinking, &[50]), [50]);
+        assert_eq!(apply_thinking(&mut thinking, &[51]), [51]);
+    }
+
+    #[test]
+    fn batch_thinking_respects_rows_that_already_closed() {
+        let mut closed_gate = ThinkingGate::new(CLOSE, 2);
+        closed_gate.observe(CLOSE);
+        let rows = [make_row(Some(closed_gate), 6)];
+        let mut thinking = BatchThinking::for_rows(&rows).unwrap().unwrap();
+
+        assert_eq!(apply_thinking(&mut thinking, &[60]), [60]);
+    }
+
+    #[test]
+    fn batch_thinking_is_absent_when_no_row_thinks() {
+        let rows = [make_row(None, 1), make_row(None, 4)];
+        assert!(BatchThinking::for_rows(&rows).unwrap().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Prompt cache
+    // -----------------------------------------------------------------------
+
+    fn dense_cache(tokens: i32) -> AnyCache {
+        let keys = Array::zeros::<f32>(&[1, 2, tokens, 8]).unwrap();
+        let values = Array::zeros::<f32>(&[1, 2, tokens, 8]).unwrap();
+        AnyCache::KV(vec![Some(
+            higgs_models::cache::SteppingKeyValueCache::from_arrays(keys, values).unwrap(),
+        )])
+    }
+
+    #[test]
+    fn prompt_cache_ignores_the_generation_suffix_in_its_key() {
+        let mut prompt_cache = PromptCache::new(4, 3);
+        let prompt: Vec<u32> = (0..99).collect();
+        prompt_cache.remember(&prompt, &dense_cache(99));
+
+        let mut repeat = prompt;
+        repeat.truncate(96);
+        repeat.extend([900, 901, 902]);
+        assert_eq!(prompt_cache.covered_tokens(&repeat), 96);
+
+        let (resume_at, _) = prompt_cache
+            .resume(&repeat, || {
+                Err(EngineError::Generation("expected a hit".to_owned()))
+            })
+            .unwrap();
+        assert_eq!(resume_at, 96);
+    }
+
+    #[test]
+    fn prompt_cache_reuses_the_start_of_a_diverging_prompt() {
+        let mut prompt_cache = PromptCache::new(4, 3);
+        let stored: Vec<u32> = (0..131).collect();
+        prompt_cache.remember(&stored, &dense_cache(131));
+
+        let mut diverging: Vec<u32> = (0..100).collect();
+        diverging.extend(500..540);
+        assert_eq!(prompt_cache.covered_tokens(&diverging), 96);
+    }
+
+    #[test]
+    fn hybrid_snapshot_pauses_at_the_cache_key() {
+        let prompt_cache = PromptCache::new(4, 4);
+        let prompt: Vec<u32> = (0..50).collect();
+        let hybrid = AnyCache::Hybrid(Vec::new());
+
+        assert_eq!(
+            prompt_cache.snapshot_boundary(&prompt, 0, &hybrid),
+            Some(46)
+        );
+        assert_eq!(
+            prompt_cache.snapshot_boundary(&prompt, 10, &hybrid),
+            Some(36)
+        );
+        assert_eq!(prompt_cache.snapshot_boundary(&prompt, 46, &hybrid), None);
+        assert_eq!(
+            prompt_cache.snapshot_boundary(&prompt, 0, &dense_cache(0)),
+            None
+        );
+    }
+
+    #[test]
+    fn hybrid_snapshot_is_unneeded_without_a_generation_suffix() {
+        let prompt_cache = PromptCache::new(4, 0);
+        let prompt: Vec<u32> = (0..50).collect();
+        assert_eq!(
+            prompt_cache.snapshot_boundary(&prompt, 0, &AnyCache::Hybrid(Vec::new())),
+            None
+        );
+    }
+
+    #[test]
+    fn chunking_splits_only_prompts_past_the_threshold() {
+        let chunking = PrefillChunking {
+            threshold: 2048,
+            chunk_tokens: 1024,
+        };
+        assert_eq!(chunking.quantum(100), u32::MAX);
+        assert_eq!(chunking.quantum(2048), u32::MAX);
+        assert_eq!(chunking.quantum(2049), 1024);
     }
 }
