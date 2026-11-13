@@ -98,31 +98,37 @@ MLX checkpoints from Hugging Face IDs or local paths: Qwen 3.x (dense and MoE, i
 [server]
 host = "127.0.0.1"
 port = 8000
+api_key = "${HIGGS_API_KEY}"    # environment reference; a missing variable is a startup error
+request_timeout = "5m"          # durations and sizes are strings: "90s", "5m", "512MB", "4GB"
 
 [[models]]
 path = "mlx-community/Qwen3.6-35B-A3B-4bit"
 name = "qwen"
+aliases = ["default"]           # extra request names that resolve to this model
 
-[provider.anthropic]
+[providers.anthropic]
 url = "https://api.anthropic.com"
 format = "anthropic"
+api_key = "${ANTHROPIC_API_KEY}"
 
 [[routes]]
-pattern = "claude-.*"
+match = "claude-.*"
 provider = "anthropic"
 
-[default]
-provider = "higgs"
+[routing]
+default = "higgs"
 ```
 
 By default every local model loads at startup. To load on first use and free memory when idle, add to the config:
 
 ```toml
-[local]
-load = "on_demand"
-idle_ttl_seconds = 900      # unload after 15 idle minutes
+[memory]
 max_loaded_models = 2       # evict the least recently used beyond two
-memory_guard = "balanced"   # keep ~8% of unified memory for the system
+guard = "balanced"          # keep ~8% of unified memory for the system
+
+[defaults]                  # applies to every model; a [[models]] entry overrides it
+load = "on_demand"
+idle_ttl = "15m"            # unload after 15 idle minutes
 
 [[models]]
 path = "mlx-community/Qwen3.6-35B-A3B-4bit"
@@ -130,7 +136,7 @@ name = "qwen"
 pinned = true               # never evicted or expired
 ```
 
-Requests for `qwen` run locally; anything matching `claude-.*` is proxied to Anthropic with format translation; everything else falls through to the default. Routing precedence, the auto-router, KV cache and prefill options, profiles, and metrics settings are covered in [docs/configuration.md](docs/configuration.md).
+Requests for `qwen` run locally; anything matching `claude-.*` is proxied to Anthropic with format translation; everything else falls through to the default. Unknown keys are errors with a suggestion (`idel_ttl` -> `idle_ttl`), and `higgs config check` validates a file without loading models, `higgs config explain` shows where every resolved value comes from, and `higgs config migrate` rewrites a file written for an earlier version. Routing precedence, the auto-router, KV cache and prefill options, profiles, includes, and metrics settings are covered in [docs/configuration.md](docs/configuration.md).
 
 ## API and CLI Overview
 
@@ -158,7 +164,7 @@ Requests for `qwen` run locally; anything matching `claude-.*` is proxied to Ant
     grammar compiler rejects returns 400 with the reason.
   - `reasoning.max_tokens` sets the reasoning-token budget for a request;
     Anthropic `thinking.budget_tokens` does the same on `/v1/messages`.
-    Defaults come from `[[models]].thinking_budget`, then `[local].thinking_budget`,
+    Defaults come from `[[models]].thinking_budget`, then `[defaults].thinking_budget`,
     then 256. See [Thinking budget](docs/configuration.md#thinking-budget).
   - `tool_choice`: `"auto"` (default), `"none"` (tools are not shown to the
     model and tool calls are not parsed), `"required"`, and
@@ -230,6 +236,7 @@ traffic in metrics. The read-only ones never load a model.
 - `higgs ui`: open the desktop app if it is installed (macOS)
 - `higgs init`: create `~/.config/higgs/config.toml`
 - `higgs doctor`: validate config, model paths, and providers
+- `higgs config check|explain|migrate`: validate a config file, show where each resolved value comes from, rewrite a file written for an earlier version
 - `higgs shellenv`: print `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` after verifying the server is reachable
 - `higgs exec -- <cmd>`: run a tool with those variables set after the same reachability check
 
@@ -238,11 +245,11 @@ traffic in metrics. The read-only ones never load a model.
 
 - Release artifacts bundle `mlx.metallib`.
 - Source builds also require `mlx.metallib` next to the executable. Higgs now restores it automatically from Cargo build output when possible, then fails loudly if it still cannot be found.
-- `[local].raise_wired_limit` defaults to `false`. Enable it only when you explicitly want MLX to raise the process wired-memory limit.
-- With several large models, `load = "on_demand"` plus `max_loaded_models`, `memory_guard`, or `idle_ttl_seconds` keeps unified memory from filling up; unloading shuts the engine down and clears the MLX buffer cache.
-- `batch` is `true`, `false`, or `"auto"` (the default). `auto` uses the continuous-batching engine whenever the model supports it and nothing configured needs a simple-engine-only feature (TurboQuant KV, `kv_disk_dir`, vision, MTP speculative decode, `HIGGS_PROMPT_LOOKUP`); `higgs serve --batch` / `--no-batch` force it either way. See [docs/configuration.md](docs/configuration.md#engine-selection).
+- `[memory].raise_wired_limit` defaults to `false`. Enable it only when you explicitly want MLX to raise the process wired-memory limit.
+- With several large models, `load = "on_demand"` plus `max_loaded_models`, `guard`, or `idle_ttl` keeps unified memory from filling up; unloading shuts the engine down and clears the MLX buffer cache.
+- `batch` is `true`, `false`, or `"auto"` (the default). `auto` uses the continuous-batching engine whenever the model supports it and nothing configured needs a simple-engine-only feature (TurboQuant KV, `prefix_cache.disk_dir`, vision, MTP speculative decode, `experimental.prompt_lookup`); `higgs serve --batch` / `--no-batch` force it either way. See [docs/configuration.md](docs/configuration.md#engine-selection).
 - `batch = true` is only supported for transformer families with true batched decode support.
-- For batch models, `prefill_yield_tokens` can interleave long prompt prefills with decode; use `0` or omit it for the synchronous default.
+- For batch models, `prefill.yield_tokens` can interleave long prompt prefills with decode; use `0` or omit it for the synchronous default.
 
 
 ## Performance

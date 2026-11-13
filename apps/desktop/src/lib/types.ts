@@ -273,8 +273,13 @@ export interface ConfigFile {
   path: string;
   exists: boolean;
   raw: string;
+  /** The file in the current schema: migrated by the server when the file uses deprecated keys. */
   parsed: unknown;
   parse_error: string | null;
+  /** Deprecated keys the server rewrote to produce `parsed`, one note per key. */
+  deprecations: string[];
+  /** Why `higgs config migrate` could not read the file, when it could not. */
+  migration_error: string | null;
 }
 
 export interface DaemonStatus {

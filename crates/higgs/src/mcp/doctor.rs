@@ -44,7 +44,7 @@ pub fn mcp_findings(
     if config.max_result_bytes == 0 {
         findings.push(Finding::new(
             Level::Fail,
-            "mcp.max_result_bytes must be greater than zero".to_owned(),
+            "mcp.max_result_size must be greater than zero".to_owned(),
         ));
     }
     for (name, server) in &config.servers {
@@ -280,7 +280,7 @@ mod tests {
             (
                 "bad_timeout",
                 McpServerConfig {
-                    timeout_seconds: 0.0,
+                    timeout: std::time::Duration::ZERO,
                     ..stdio("x")
                 },
             ),
@@ -305,7 +305,7 @@ mod tests {
             "unknown transport 'pigeon'",
             "non-empty command",
             "invalid url",
-            "timeout_seconds",
+            "timeout",
             "UNSET_VARIABLE is not set",
         ] {
             assert!(
@@ -351,7 +351,7 @@ mod tests {
             web: WebConfig {
                 enabled: true,
                 search_provider: "searxng".to_owned(),
-                timeout_seconds: -3.0,
+                timeout: std::time::Duration::ZERO,
                 ..WebConfig::default()
             },
             ..HiggsConfig::default()

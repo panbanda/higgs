@@ -10,14 +10,14 @@ Servers live under `[mcp.servers.<name>]` in the config file:
 
 ```toml
 [mcp]
-max_result_bytes = 262144          # larger tool results are truncated (default 256 KiB)
+max_result_size = "256KB"          # larger tool results are truncated (default 256KB)
 
 [mcp.servers.filesystem]           # stdio: Higgs starts the process
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/Documents"]
 env = { API_TOKEN = "${API_TOKEN}" }
 cwd = "/Users/me"
-timeout_seconds = 30
+timeout = "30s"
 enabled = true
 
 [mcp.servers.remote]               # Streamable HTTP: Higgs connects to a URL
@@ -33,7 +33,7 @@ headers = { Authorization = "Bearer ${MCP_TOKEN}" }
 | `cwd` | stdio | Working directory of the child. |
 | `url` | http | Streamable HTTP endpoint (`http` or `https`). |
 | `headers` | http | Extra request headers. |
-| `timeout_seconds` | both | Bound on connecting, on listing tools, and on each tool call. Default 30. |
+| `timeout` | both | Bound on connecting, on listing tools, and on each tool call, as a duration string (`"30s"`). Default `"30s"`. |
 | `enabled` | both | `false` keeps the entry but never starts it. Default `true`. |
 
 Server names may contain letters, digits, `-` and `_`, but not `__` (the tool namespace separator), and `higgs` is reserved for built-in tools.
@@ -123,15 +123,15 @@ The list can be passed as `tools` of a chat request. Strict clients that reject 
 | 404 | Unknown tool |
 | 502 | The server failed or answered with a protocol error |
 | 503 | The server is `failed` or still `connecting` (the message carries its last error) |
-| 504 | The tool call exceeded `timeout_seconds` |
+| 504 | The tool call exceeded `timeout` |
 
 ## Security notes
 
 - Stdio servers run local commands taken from your own config. That is by design; treat the config file (and `--mcp-config` files) as code.
 - Request data never reaches a command line or the environment: tool names and arguments travel only as JSON-RPC parameters. The executable and arguments are fixed by the config and started without a shell.
 - Anyone who can call `/v1/mcp/execute` can run every enabled tool. Set `api_key` before binding to anything but loopback, and give MCP servers only the access they need (for example, point the filesystem server at one directory).
-- Results are capped at `max_result_bytes`; text is cut on a character boundary and `truncated` is set. Messages from a server are capped at 16 MiB.
-- `timeout_seconds` bounds every call. A timed-out call is cancelled with `notifications/cancelled`.
+- Results are capped at `max_result_size`; text is cut on a character boundary and `truncated` is set. Messages from a server are capped at 16 MiB.
+- `timeout` bounds every call. A timed-out call is cancelled with `notifications/cancelled`.
 - Credentials in `headers` and `env` come from `${VAR}`; they are not logged, and `higgs doctor` prints URLs without credentials or query strings.
 - HTTP servers are contacted at the configured URL only; redirects are not followed.
 
@@ -188,7 +188,7 @@ search_provider = "duckduckgo"           # or "searxng"
 searxng_url = "http://localhost:8888"    # required for searxng
 allow_private_addresses = false
 expose_as_tools = false
-timeout_seconds = 15
+timeout = "15s"
 ```
 
 | Field | Meaning |
@@ -198,7 +198,7 @@ timeout_seconds = 15
 | `searxng_url` | Base URL of a SearXNG instance with the `json` format enabled under `search.formats` in its `settings.yml`. |
 | `allow_private_addresses` | Let `/v1/web/fetch` reach loopback, private and link-local addresses. Default `false`. |
 | `expose_as_tools` | List `web_search` and `web_fetch` in `/v1/mcp/tools` under the built-in server `higgs` (as `higgs__web_search` and `higgs__web_fetch`) so the tool loop can use them. |
-| `timeout_seconds` | Bound on one search or one fetch, redirects included. |
+| `timeout` | Bound on one search or one fetch, redirects included, as a duration string. Default `"15s"`. |
 
 The search provider URL comes from your config and is trusted; only URLs in `/v1/web/fetch` requests are subject to the address checks. Higgs does not use Brave or other keyed providers.
 
@@ -237,7 +237,7 @@ returns `{"url": "<final url>", "title": "...", "text": "...", "truncated": fals
 
 ## `higgs doctor`
 
-`higgs doctor` validates every server without starting it: unknown transport, missing `command` or `url`, a malformed URL, `timeout_seconds <= 0`, unresolved `${VAR}` references (failures), and a `command` that is not on `PATH` or a `cwd` that is missing (warnings). Each valid server is reported with its transport. For `[web]` it fails on an unknown `search_provider`, a missing or invalid `searxng_url`, and an out-of-range timeout, and warns when `allow_private_addresses` is on, when `expose_as_tools` has no effect because web is disabled, or when `searxng_url` is set for another provider.
+`higgs doctor` validates every server without starting it: unknown transport, missing `command` or `url`, a malformed URL, `timeout` of zero, unresolved `${VAR}` references (failures), and a `command` that is not on `PATH` or a `cwd` that is missing (warnings). Each valid server is reported with its transport. For `[web]` it fails on an unknown `search_provider`, a missing or invalid `searxng_url`, and an out-of-range timeout, and warns when `allow_private_addresses` is on, when `expose_as_tools` has no effect because web is disabled, or when `searxng_url` is set for another provider.
 
 ## Verifying against a real server
 

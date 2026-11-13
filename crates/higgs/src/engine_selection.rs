@@ -9,9 +9,9 @@
 use std::fmt;
 use std::path::Path;
 
-use higgs_engine::{mlx_tuning::resolve_runtime_tuning, model_loader};
+use higgs_engine::{mlx_tuning::resolve_runtime_tuning_with, model_loader};
 
-use crate::config::{BatchMode, LocalConfig, ModelConfig};
+use crate::config::{BatchMode, ExperimentalConfig, ModelConfig};
 
 /// What the engine choice depends on, for one model under one configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,14 +21,14 @@ pub struct BatchFacts {
     pub architecture_batches: bool,
     /// `TurboQuant` KV compression is configured.
     pub turboquant_kv: bool,
-    /// A disk prefix store (`kv_disk_dir`) is configured.
+    /// A disk prefix store (`prefix_cache.disk_dir`) is configured.
     pub disk_prefix_store: bool,
     /// The architecture takes image inputs.
     pub vision: bool,
     /// The checkpoint carries an MTP head and the MLX profile enables
     /// speculative decode, so the simple engine would use it.
     pub mtp_speculative_decode: bool,
-    /// Experimental prompt-lookup decoding is switched on (`HIGGS_PROMPT_LOOKUP`).
+    /// Experimental prompt-lookup decoding is switched on (`experimental.prompt_lookup`).
     pub prompt_lookup: bool,
 }
 
@@ -36,21 +36,26 @@ impl BatchFacts {
     /// Facts for a model whose checkpoint is on disk at `resolved`.
     pub fn inspect(
         model: &ModelConfig,
-        local: &LocalConfig,
+        experimental: &ExperimentalConfig,
         resolved: &Path,
     ) -> Result<Self, String> {
         let inspected = model_loader::ModelConfig::from_dir(resolved)
             .map_err(|e| format!("failed to inspect {}: {e}", resolved.display()))?;
         let mtp_speculative_decode = inspected.capabilities.mtp
-            && resolve_runtime_tuning(resolved, model.requested_mlx_profile(local)).enable_mtp()
+            && resolve_runtime_tuning_with(
+                resolved,
+                model.profile,
+                &experimental.tuning_overrides(),
+            )
+            .enable_mtp()
             && model_loader::checkpoint_has_mtp_head(resolved);
         Ok(Self {
             architecture_batches: inspected.capabilities.batch_engine,
-            turboquant_kv: model.kv_cache_config().is_turboquant(),
-            disk_prefix_store: model.kv_disk_dir.is_some(),
+            turboquant_kv: model.kv_cache.is_turboquant(),
+            disk_prefix_store: model.prefix_cache.disk_dir.is_some(),
             vision: inspected.capabilities.vision,
             mtp_speculative_decode,
-            prompt_lookup: higgs_engine::simple::prompt_lookup_enabled(),
+            prompt_lookup: experimental.prompt_lookup,
         })
     }
 }
@@ -74,12 +79,12 @@ impl fmt::Display for SimpleReason {
             Self::Requested => "batch is turned off for this model",
             Self::UnsupportedArchitecture => "the architecture has no batched decode",
             Self::TurboQuantKv => "TurboQuant KV cache is configured (simple engine only)",
-            Self::DiskPrefixStore => "a disk prefix store (kv_disk_dir) is configured (simple engine only)",
+            Self::DiskPrefixStore => "a disk prefix store (prefix_cache.disk_dir) is configured (simple engine only)",
             Self::Vision => "the model takes image inputs (simple engine only)",
             Self::MtpSpeculativeDecode => {
                 "the checkpoint has an MTP head and speculative decode is enabled (simple engine only)"
             }
-            Self::PromptLookup => "prompt-lookup decoding is enabled via HIGGS_PROMPT_LOOKUP (simple engine only)",
+            Self::PromptLookup => "prompt-lookup decoding is enabled (experimental.prompt_lookup or HIGGS_PROMPT_LOOKUP; simple engine only)",
         })
     }
 }
@@ -132,13 +137,16 @@ pub const fn choose_engine(mode: BatchMode, facts: &BatchFacts) -> EngineChoice 
 
 /// The engine a model will get, or `None` when its checkpoint cannot be
 /// inspected yet (for example a Hugging Face model not downloaded).
-pub fn planned_engine(model: &ModelConfig, local: &LocalConfig) -> Option<EngineChoice> {
+pub fn planned_engine(
+    model: &ModelConfig,
+    experimental: &ExperimentalConfig,
+) -> Option<EngineChoice> {
     match model.batch {
         BatchMode::On => Some(EngineChoice::Batch),
         BatchMode::Off => Some(EngineChoice::Simple(SimpleReason::Requested)),
         BatchMode::Auto => {
             let resolved = crate::model_resolver::resolve(&model.path).ok()?;
-            let facts = BatchFacts::inspect(model, local, &resolved).ok()?;
+            let facts = BatchFacts::inspect(model, experimental, &resolved).ok()?;
             Some(choose_engine(BatchMode::Auto, &facts))
         }
     }
@@ -293,11 +301,11 @@ mod tests {
     fn inspect_reads_the_facts_from_the_checkpoint_and_config() {
         let checkpoint = write_checkpoint(LLAMA);
         let model = model_config(&format!(
-            "[[models]]\npath = \"{}\"\nkv_disk_dir = \"/tmp/higgs-test-kv\"\n",
+            "[[models]]\npath = \"{}\"\n[models.prefix_cache]\ndisk_dir = \"/tmp/higgs-test-kv\"\n",
             checkpoint.path().display()
         ));
         let facts =
-            BatchFacts::inspect(&model, &LocalConfig::default(), checkpoint.path()).unwrap();
+            BatchFacts::inspect(&model, &ExperimentalConfig::default(), checkpoint.path()).unwrap();
 
         assert!(facts.architecture_batches);
         assert!(facts.disk_prefix_store);
@@ -310,11 +318,11 @@ mod tests {
     fn inspect_sees_turboquant() {
         let checkpoint = write_checkpoint(LLAMA);
         let model = model_config(&format!(
-            "[[models]]\npath = \"{}\"\nkv_cache = \"turboquant\"\n",
+            "[[models]]\npath = \"{}\"\n[models.kv_cache]\nmode = \"turboquant\"\n",
             checkpoint.path().display()
         ));
         let facts =
-            BatchFacts::inspect(&model, &LocalConfig::default(), checkpoint.path()).unwrap();
+            BatchFacts::inspect(&model, &ExperimentalConfig::default(), checkpoint.path()).unwrap();
 
         assert!(facts.turboquant_kv);
         assert_eq!(
@@ -328,7 +336,7 @@ mod tests {
         let on = model_config("[[models]]\npath = \"org/missing\"\nbatch = true\n");
         let off = model_config("[[models]]\npath = \"org/missing\"\nbatch = false\n");
         let auto_mode = model_config("[[models]]\npath = \"org/never-downloaded\"\n");
-        let local = LocalConfig::default();
+        let local = ExperimentalConfig::default();
 
         assert_eq!(planned_engine(&on, &local), Some(EngineChoice::Batch));
         assert_eq!(

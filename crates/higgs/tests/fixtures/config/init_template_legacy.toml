@@ -1,0 +1,148 @@
+[server]
+# Bind to loopback by default. To expose on the network, set host = "0.0.0.0"
+# and set an api_key.
+host = "127.0.0.1"
+port = 8000
+# max_tokens = 32768
+# timeout = 300.0
+# api_key = "sk-..."
+# rate_limit = 0
+# CORS origin allow-list for browser clients. Unset = no CORS headers.
+# cors_origins = ["*"]
+
+# --- Local serving defaults ---
+# MLX profile applies to simple-engine local models. "auto" picks balanced for
+# small/medium models and throughput for large models.
+
+# thinking_budget caps reasoning tokens before </think> is forced (default 256,
+# minimum 1); a model's own thinking_budget and per-request
+# reasoning.max_tokens / thinking.budget_tokens take precedence.
+
+# [local]
+# mlx_profile = "auto"
+# thinking_budget = 256
+# Model lifecycle. By default every model loads at startup and stays loaded.
+# load = "on_demand"          # load a model on the first request that uses it
+# idle_ttl_seconds = 900      # unload a model after this long with no requests (0 = never)
+# max_loaded_models = 2       # keep at most N loaded; least recently used idle model is evicted
+# memory_guard = "balanced"   # off | safe (reserve 20%) | balanced (8%) | aggressive (2%) of RAM
+# memory_limit_gb = 48        # explicit ceiling on MLX active memory; wins over memory_guard
+
+# --- Local models ---
+# Each [[models]] entry loads an MLX model into GPU memory.
+# Use a HuggingFace model ID or a local path.
+
+# [[models]]
+# path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
+# name = "llama"
+# mlx_profile = "throughput"
+# load = "startup"           # per-model override of [local].load
+# idle_ttl_seconds = 600     # per-model override of [local].idle_ttl_seconds
+# pinned = true              # never evicted or unloaded on idle
+# batch = "auto"             # true | false | "auto" (default). auto serves the model with the
+#                            # continuous-batching engine unless it needs a simple-engine-only
+#                            # feature (TurboQuant, kv_disk_dir, vision, MTP speculative decode, HIGGS_PROMPT_LOOKUP)
+# kv_disk_dir = "/var/lib/higgs/prefix-kv" # optional durable prefix cache
+# kv_disk_space_mb = 4096                # LRU budget; minimum 64 MiB
+# prefill_yield_tokens = 512 # optional: interleave decode during long prefills
+# thinking_budget = 256 # optional: reasoning tokens before </think> is forced; overrides [local]
+# mla_latent_cache = true # DeepSeek-V2 only: compressed latent KV cache; cannot combine with kv_cache = "turboquant"
+
+# --- Remote providers ---
+# Forward requests to external APIs via proxy routes.
+
+# [provider.anthropic]
+# url = "https://api.anthropic.com"
+# format = "anthropic"
+
+# [provider.openai]
+# url = "https://api.openai.com"
+# format = "openai"
+
+# [provider.ollama]
+# url = "http://localhost:11434"
+# strip_auth = true
+# api_key = "ollama"
+# stub_count_tokens = true
+
+# --- Routes ---
+# Pattern routes match model names with regex. First match wins.
+
+# [[routes]]
+# pattern = "claude-.*"
+# provider = "anthropic"
+
+# [[routes]]
+# pattern = "gpt-.*"
+# provider = "openai"
+
+# --- Default route ---
+# When no pattern matches and the model isn't loaded locally.
+
+[default]
+provider = "higgs"
+
+# --- Auto router ---
+# Classify requests using a local model to pick the best route.
+
+# [auto_router]
+# enabled = true
+# model = "router"             # matches a [[models]] name
+# timeout_ms = 2000
+
+# --- Usage ---
+# eval "$(higgs shellenv)"  -- set env vars in current shell
+# higgs exec -- claude       -- exec a command with env vars set
+
+# --- Retention ---
+# How long to keep metrics in memory for the TUI dashboard.
+
+# [retention]
+# enabled = true
+# minutes = 60
+
+# --- Metrics logging ---
+# Append request metrics to a JSONL file for attach/TUI history.
+
+# [logging.metrics]
+# enabled = true
+# path = "~/.config/higgs/logs/metrics.jsonl"
+# max_size_mb = 50
+# max_files = 5
+
+# --- MCP servers ---
+# Model Context Protocol servers whose tools Higgs can run for you. They
+# connect in the background; see GET /v1/mcp/servers, GET /v1/mcp/tools and
+# POST /v1/mcp/execute, and docs/mcp.md. Tool names are namespaced
+# "<server>__<tool>". `${VAR}` in env and headers reads the Higgs process
+# environment; an unset variable is an error. A desktop-client JSON file
+# ({"mcpServers": ...}) can be loaded with `higgs serve --mcp-config <file>`.
+
+# [mcp]
+# max_result_bytes = 262144    # larger tool results are truncated
+
+# [mcp.servers.filesystem]
+# command = "npx"              # run directly, never through a shell
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/dir"]
+# env = { EXAMPLE_TOKEN = "${EXAMPLE_TOKEN}" }
+# cwd = "/path/to/workdir"
+# timeout_seconds = 30         # connect, list and each tool call
+# enabled = true
+
+# [mcp.servers.remote]
+# url = "https://mcp.example.com/mcp"    # Streamable HTTP
+# headers = { Authorization = "Bearer ${MCP_TOKEN}" }
+
+# --- Web search and fetch ---
+# POST /v1/web/search and POST /v1/web/fetch. Off by default: both answer 404
+# until enabled. Fetch refuses non-http(s) URLs and, by default, loopback,
+# private and link-local addresses (checked after DNS resolution and on every
+# redirect). See docs/mcp.md.
+
+# [web]
+# enabled = true
+# search_provider = "duckduckgo"       # keyless, or "searxng"
+# searxng_url = "http://localhost:8888" # required for searxng; JSON format must be enabled
+# allow_private_addresses = false      # true lets fetch reach loopback/private ranges
+# expose_as_tools = false              # offer web_search and web_fetch under the built-in "higgs" server
+# timeout_seconds = 15

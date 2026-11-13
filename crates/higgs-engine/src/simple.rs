@@ -63,12 +63,6 @@ fn experimental_paged_kv_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Whether the experimental prompt-lookup decoder is switched on with
-/// `HIGGS_PROMPT_LOOKUP`; only the simple engine implements it.
-pub fn prompt_lookup_enabled() -> bool {
-    parse_enabled_flag(std::env::var("HIGGS_PROMPT_LOOKUP").ok().as_deref()).unwrap_or(false)
-}
-
 fn unchecked_prompt_lookup_enabled() -> bool {
     parse_enabled_flag(
         std::env::var("HIGGS_PROMPT_LOOKUP_UNCHECKED")
@@ -76,14 +70,6 @@ fn unchecked_prompt_lookup_enabled() -> bool {
             .as_deref(),
     )
     .unwrap_or(false)
-}
-
-fn mtp_adaptive_draft_enabled() -> bool {
-    parse_enabled_flag(std::env::var("HIGGS_MTP_ADAPTIVE_DRAFT").ok().as_deref()).unwrap_or(false)
-}
-
-fn mtp_prompt_lookup_enabled() -> bool {
-    parse_enabled_flag(std::env::var("HIGGS_MTP_PROMPT_LOOKUP").ok().as_deref()).unwrap_or(false)
 }
 
 fn adaptive_draft_depth_for_cap(configured_max: usize) -> crate::mtp::AdaptiveDraftDepth {
@@ -1386,7 +1372,10 @@ impl SimpleEngineCore {
         // batched verifier logits. Explicitly opt-in while benchmark data is
         // collected because the normal path has a pipelined single-token loop.
         #[allow(clippy::float_cmp)]
-        if prompt_lookup_enabled() && constraint.is_none() && !logprobs && params.temperature == 0.0
+        if self.tuning.prompt_lookup()
+            && constraint.is_none()
+            && !logprobs
+            && params.temperature == 0.0
         {
             return self.prompt_lookup_generate(
                 &mut prepared.model,
@@ -1931,9 +1920,11 @@ impl SimpleEngineCore {
         let mut current_hidden = h;
         let mut confirmed_token_id: u32 = next_arr.item_cast();
         let mut mtp_stats = crate::mtp::MtpStats::default();
-        let mut adaptive_depth = mtp_adaptive_draft_enabled()
+        let mut adaptive_depth = self
+            .tuning
+            .mtp_adaptive_draft()
             .then(|| adaptive_draft_depth_for_cap(self.tuning.mtp_draft_n_max()));
-        let hybrid_prompt_lookup = mtp_prompt_lookup_enabled();
+        let hybrid_prompt_lookup = self.tuning.mtp_prompt_lookup();
         let hybrid_prompt_lookup_config = prompt_lookup_config();
         let t_start = std::time::Instant::now();
 
@@ -2176,9 +2167,11 @@ impl SimpleEngineCore {
         let mut current_hidden = h;
         let mut confirmed_token_id: u32 = next_arr.item_cast();
         let mut mtp_stats = crate::mtp::MtpStats::default();
-        let mut adaptive_depth = mtp_adaptive_draft_enabled()
+        let mut adaptive_depth = self
+            .tuning
+            .mtp_adaptive_draft()
             .then(|| adaptive_draft_depth_for_cap(self.tuning.mtp_draft_n_max()));
-        let hybrid_prompt_lookup = mtp_prompt_lookup_enabled();
+        let hybrid_prompt_lookup = self.tuning.mtp_prompt_lookup();
         let hybrid_prompt_lookup_config = prompt_lookup_config();
         let t_start = std::time::Instant::now();
         let think_close_token = if enable_thinking {

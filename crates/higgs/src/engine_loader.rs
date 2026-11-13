@@ -4,9 +4,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use higgs_engine::mlx_tuning::resolve_runtime_tuning;
+use higgs_engine::mlx_tuning::resolve_runtime_tuning_with;
 
-use crate::config::{self, BatchMode, HiggsConfig, LoadMode, LocalConfig, ModelConfig};
+use crate::config::{
+    self, BatchMode, ExperimentalConfig, HiggsConfig, LoadMode, MemoryConfig, ModelConfig,
+};
 use crate::engine_selection::{
     BatchFacts, EngineChoice, SimpleReason, choose_engine, planned_engine,
 };
@@ -17,7 +19,8 @@ use crate::state::Engine;
 /// Loads engines for the models named in the config.
 pub struct EngineLoader {
     models: HashMap<String, ModelConfig>,
-    local: LocalConfig,
+    memory: MemoryConfig,
+    experimental: ExperimentalConfig,
 }
 
 impl EngineLoader {
@@ -33,7 +36,7 @@ impl ModelLoader<Engine> for EngineLoader {
         let model = self.model(name)?;
         let resolved = model_resolver::resolve(&model.path)
             .map_err(|error| format!("cannot find '{}': {error}", model.path))?;
-        load_engine(model, &self.local, &resolved)
+        load_engine(model, &self.memory, &self.experimental, &resolved)
     }
 
     fn unload(&self, name: &str, model: Arc<Engine>) {
@@ -73,7 +76,8 @@ impl ModelLoader<Engine> for EngineLoader {
 /// Build one engine from a resolved model directory.
 pub fn load_engine(
     model: &ModelConfig,
-    local: &LocalConfig,
+    memory: &MemoryConfig,
+    experimental: &ExperimentalConfig,
     resolved: &Path,
 ) -> Result<Engine, String> {
     tracing::info!(model = %model.path, resolved = %resolved.display(), "Loading model");
@@ -86,7 +90,7 @@ pub fn load_engine(
         }
         BatchMode::Off => EngineChoice::Simple(SimpleReason::Requested),
         BatchMode::Auto => {
-            let facts = BatchFacts::inspect(model, local, resolved)?;
+            let facts = BatchFacts::inspect(model, experimental, resolved)?;
             let choice = choose_engine(BatchMode::Auto, &facts);
             match choice {
                 EngineChoice::Batch => {
@@ -99,25 +103,26 @@ pub fn load_engine(
             choice
         }
     };
-    let kv_cache_config = model.kv_cache_config();
-    let tuning = resolve_runtime_tuning(resolved, model.requested_mlx_profile(local));
+    let kv_cache_config = model.kv_cache;
+    let tuning =
+        resolve_runtime_tuning_with(resolved, model.profile, &experimental.tuning_overrides());
     let engine = match choice {
         EngineChoice::Batch => Engine::load_batch(
             resolved,
             kv_cache_config,
             &tuning,
-            local.raise_wired_limit,
+            memory.raise_wired_limit,
             model.prefill_yield_tokens,
-            model.effective_thinking_budget(local),
+            model.thinking_budget,
         ),
         EngineChoice::Simple(_) => Engine::load_simple(
             resolved,
             kv_cache_config,
             tuning,
-            local.raise_wired_limit,
-            model.kv_disk_dir.as_deref().map(Path::new),
-            model.kv_disk_space_mb.saturating_mul(1024 * 1024),
-            model.effective_thinking_budget(local),
+            memory.raise_wired_limit,
+            model.prefix_cache.disk_dir.as_deref().map(Path::new),
+            model.prefix_cache.disk_budget.bytes(),
+            model.thinking_budget,
         ),
     }
     .map_err(|error| error.to_string())?;
@@ -142,20 +147,16 @@ pub fn served_name(model: &ModelConfig) -> String {
 /// The auto-router classifier is consulted on every `model = "auto"` request, so it always
 /// loads at startup and is never evicted or expired.
 pub fn model_spec(config: &HiggsConfig, model: &ModelConfig, name: String) -> ModelSpec {
-    let is_classifier = config.auto_router.enabled && config.auto_router.model == name;
+    let is_classifier = config.routing.auto.enabled && config.routing.auto.model == name;
     ModelSpec {
-        engine_kind: planned_engine(model, &config.local).map_or("auto", EngineChoice::kind),
+        engine_kind: planned_engine(model, &config.experimental).map_or("auto", EngineChoice::kind),
         load: if is_classifier {
             LoadMode::Startup
         } else {
-            model.effective_load(&config.local)
+            model.load
         },
         pinned: model.pinned || is_classifier,
-        idle_ttl: if is_classifier {
-            None
-        } else {
-            model.effective_idle_ttl(&config.local)
-        },
+        idle_ttl: if is_classifier { None } else { model.idle_ttl },
         name,
     }
 }
@@ -183,14 +184,15 @@ pub fn build_pool(config: &HiggsConfig) -> Result<Arc<ModelPool<Engine>>, String
         specs.push(model_spec(config, model, name));
     }
     let limits = PoolLimits {
-        max_loaded_models: config.local.max_loaded_models,
+        max_loaded_models: config.memory.max_loaded_models,
         memory_ceiling_bytes: config
-            .local
-            .memory_ceiling_bytes(crate::routes::system::physical_memory_bytes()),
+            .memory
+            .ceiling_bytes(crate::routes::system::physical_memory_bytes()),
     };
     let loader = EngineLoader {
         models,
-        local: config.local.clone(),
+        memory: config.memory.clone(),
+        experimental: config.experimental.clone(),
     };
     Ok(ModelPool::new(specs, Arc::new(loader), limits))
 }
@@ -242,9 +244,9 @@ mod tests {
     fn spec_applies_local_defaults_and_model_overrides() {
         let config = config_from_toml(
             r#"
-            [local]
+            [defaults]
             load = "on_demand"
-            idle_ttl_seconds = 300
+            idle_ttl = "5m"
 
             [[models]]
             path = "a/default"
@@ -252,7 +254,7 @@ mod tests {
             [[models]]
             path = "b/override"
             load = "startup"
-            idle_ttl_seconds = 0
+            idle_ttl = "0"
             pinned = true
             batch = false
             "#,
@@ -277,9 +279,9 @@ mod tests {
     fn auto_router_classifier_always_loads_at_startup_and_is_never_evicted() {
         let config = config_from_toml(
             r#"
-            [local]
+            [defaults]
             load = "on_demand"
-            idle_ttl_seconds = 60
+            idle_ttl = "1m"
 
             [[models]]
             path = "org/router"
@@ -290,7 +292,7 @@ mod tests {
             path = "org/chat"
             name = "chat"
 
-            [auto_router]
+            [routing.auto]
             enabled = true
             model = "router"
             "#,
@@ -333,8 +335,9 @@ mod tests {
     fn pool_lists_every_model_unloaded_and_reports_the_limits() {
         let config = config_from_toml(
             r#"
-            [local]
+            [defaults]
             load = "on_demand"
+            [memory]
             max_loaded_models = 1
 
             [[models]]
@@ -390,7 +393,7 @@ mod tests {
 
     #[test]
     fn memory_guard_is_off_by_default_in_the_pool_limits() {
-        assert_eq!(LocalConfig::default().memory_guard, MemoryGuard::Off);
+        assert_eq!(MemoryConfig::default().guard, MemoryGuard::Off);
     }
 
     #[test]
@@ -407,7 +410,8 @@ mod tests {
                 .iter()
                 .map(|model| (served_name(model), model.clone()))
                 .collect(),
-            local: config.local.clone(),
+            memory: config.memory.clone(),
+            experimental: config.experimental.clone(),
         };
 
         assert_eq!(loader.estimate_bytes("sized"), Some(4096));
@@ -420,7 +424,8 @@ mod tests {
             config_from_toml("[[models]]\npath = \"/nonexistent/higgs/model\"\nname = \"gone\"\n");
         let loader = EngineLoader {
             models: [("gone".to_owned(), config.models.first().unwrap().clone())].into(),
-            local: config.local.clone(),
+            memory: config.memory.clone(),
+            experimental: config.experimental.clone(),
         };
 
         let error = loader.load("gone").err().unwrap();

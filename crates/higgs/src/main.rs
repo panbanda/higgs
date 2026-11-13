@@ -74,32 +74,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Doctor(ref args) => {
             init_tracing(cli.verbose);
-            let (config, config_path) = if let Some(ref path) = cli.config {
-                (
-                    config::load_config_file(path, Some(args))?,
-                    Some(path.clone()),
-                )
-            } else if cli.profile.is_some() {
-                let path = resolve_config_path(&cli)?;
-                let config = config::load_config_file(&path, Some(args))?;
-                (config, Some(path))
-            } else {
-                let default = config::default_config_path();
-                if default.exists() {
-                    let config = config::load_config_file(&default, Some(args))?;
-                    (config, Some(default))
-                } else if !args.models.is_empty() {
-                    (config::build_simple_config(args)?, None)
-                } else {
-                    return Err("no config to validate; use --config or 'higgs init'".into());
-                }
-            };
-            let result = higgs::doctor::run_doctor(&config, config_path.as_deref()).await;
-            if result.failures > 0 {
-                std::process::exit(1);
+            let exit_code =
+                higgs::doctor::run_doctor_command(resolve_doctor_source(&cli, args)?, args).await;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
             }
             Ok(())
         }
+    }
+}
+
+/// Where `doctor` and `config check` read the configuration from.
+fn resolve_doctor_source(
+    cli: &Cli,
+    args: &ServeArgs,
+) -> Result<higgs::doctor::ConfigSource, Box<dyn std::error::Error>> {
+    use higgs::doctor::ConfigSource;
+    if let Some(ref path) = cli.config {
+        return Ok(ConfigSource::File(path.clone()));
+    }
+    if cli.profile.is_some() {
+        return Ok(ConfigSource::File(resolve_config_path(cli)?));
+    }
+    let default = config::default_config_path();
+    if default.exists() {
+        Ok(ConfigSource::File(default))
+    } else if !args.models.is_empty() {
+        Ok(ConfigSource::Flags)
+    } else {
+        Err("no config to validate; use --config or 'higgs init'".into())
     }
 }
 
@@ -179,13 +182,14 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
     if let Some(name) = profile {
         let default_path = config::default_metrics_log_path_for_profile(name);
         let generic_default = MetricsLogConfig::default().path;
-        if higgs_config.logging.metrics.path == generic_default {
-            higgs_config.logging.metrics.path = default_path;
+        if higgs_config.observability.metrics_log.path == generic_default {
+            higgs_config.observability.metrics_log.path = default_path;
         }
     }
 
+    log_config_notices(&higgs_config);
     ensure_local_runtime_ready(&higgs_config)?;
-    if higgs_config.local.raise_wired_limit && higgs_config.models.len() > 1 {
+    if higgs_config.memory.raise_wired_limit && higgs_config.models.len() > 1 {
         tracing::warn!(
             model_count = higgs_config.models.len(),
             "MLX wired-limit escalation is enabled with multiple resident local models; unified-memory pressure may spike"
@@ -200,15 +204,14 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
     pool.spawn_idle_sweeper();
     let router = Router::new(&higgs_config, pool)?;
 
-    // Validate timeout
-    let timeout_secs = higgs_config.server.timeout;
-    if !timeout_secs.is_finite() || timeout_secs <= 0.0 {
-        return Err("timeout must be a positive, finite number".into());
-    }
-
-    let api_key = higgs_config.server.api_key.clone();
+    let timeout_secs = higgs_config.server.request_timeout.as_secs_f64();
+    let api_key = higgs_config
+        .server
+        .api_key
+        .as_ref()
+        .map(|key| key.expose().to_owned());
     let rate_limit = higgs_config.server.rate_limit;
-    let max_body_size = higgs_config.server.max_body_size;
+    let max_body_size = usize::try_from(higgs_config.server.max_body_size.bytes())?;
     let cors_origins = higgs_config.server.cors_origins.clone();
     let bind_addr = format!("{}:{}", higgs_config.server.host, higgs_config.server.port);
 
@@ -260,6 +263,28 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
 
     higgs::daemon::remove_pid_file(profile);
     Ok(())
+}
+
+/// Say once, at startup, which keys are deprecated and which environment variables are in effect.
+fn log_config_notices(config: &HiggsConfig) {
+    for deprecation in &config.notices.deprecations {
+        tracing::warn!("{deprecation}");
+    }
+    for entry in &config.notices.env_overrides {
+        if entry.applied {
+            tracing::info!(
+                variable = entry.variable,
+                key = entry.key,
+                "environment variable overrides the config key"
+            );
+        } else {
+            tracing::warn!(
+                variable = entry.variable,
+                key = entry.key,
+                "environment variable has a value that cannot be used and is ignored"
+            );
+        }
+    }
 }
 
 fn download_missing_startup_models(config: &HiggsConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -412,6 +437,15 @@ fn cmd_config(cli: &Cli, action: &ConfigAction) {
             {
                 println!("{}", config_path.display());
             }
+        }
+        ConfigAction::Migrate { write } => {
+            higgs::cli_config::config_migrate(&config_path, *write);
+        }
+        ConfigAction::Explain { target, flags } => {
+            higgs::cli_config::config_explain(&config_path, flags, target.as_deref());
+        }
+        ConfigAction::Check => {
+            higgs::cli_config::config_check(&config_path);
         }
     }
 }

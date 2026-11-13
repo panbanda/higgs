@@ -125,7 +125,7 @@ pub async fn completions(
                 proxy_body,
                 &headers,
                 strip_auth,
-                api_key.as_deref(),
+                api_key.as_ref().map(crate::config::Secret::expose),
             )
             .await;
             let metrics_model = model_rewrite.as_deref().unwrap_or(&req.model).to_owned();

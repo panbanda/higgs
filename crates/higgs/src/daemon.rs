@@ -130,7 +130,10 @@ pub fn cmd_stop(profile: Option<&str>, force: bool) -> i32 {
     0
 }
 
-#[allow(clippy::print_stderr, clippy::too_many_lines)]
+/// The commented config `higgs init` writes. `__METRICS_PATH__` is the profile-specific log path.
+const INIT_TEMPLATE: &str = include_str!("config/init_template.toml");
+
+#[allow(clippy::print_stderr)]
 pub fn cmd_init(profile: Option<&str>) {
     let dir = config::config_dir();
     let filename = profile.map_or_else(
@@ -154,157 +157,7 @@ pub fn cmd_init(profile: Option<&str>) {
         |name| format!("~/.config/higgs/logs/metrics.{name}.jsonl"),
     );
 
-    let default_config = format!(
-        r#"[server]
-# Bind to loopback by default. To expose on the network, set host = "0.0.0.0"
-# and set an api_key.
-host = "127.0.0.1"
-port = 8000
-# max_tokens = 32768
-# timeout = 300.0
-# api_key = "sk-..."
-# rate_limit = 0
-# CORS origin allow-list for browser clients. Unset = no CORS headers.
-# cors_origins = ["*"]
-
-# --- Local serving defaults ---
-# MLX profile applies to simple-engine local models. "auto" picks balanced for
-# small/medium models and throughput for large models.
-
-# thinking_budget caps reasoning tokens before </think> is forced (default 256,
-# minimum 1); a model's own thinking_budget and per-request
-# reasoning.max_tokens / thinking.budget_tokens take precedence.
-
-# [local]
-# mlx_profile = "auto"
-# thinking_budget = 256
-# Model lifecycle. By default every model loads at startup and stays loaded.
-# load = "on_demand"          # load a model on the first request that uses it
-# idle_ttl_seconds = 900      # unload a model after this long with no requests (0 = never)
-# max_loaded_models = 2       # keep at most N loaded; least recently used idle model is evicted
-# memory_guard = "balanced"   # off | safe (reserve 20%) | balanced (8%) | aggressive (2%) of RAM
-# memory_limit_gb = 48        # explicit ceiling on MLX active memory; wins over memory_guard
-
-# --- Local models ---
-# Each [[models]] entry loads an MLX model into GPU memory.
-# Use a HuggingFace model ID or a local path.
-
-# [[models]]
-# path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
-# name = "llama"
-# mlx_profile = "throughput"
-# load = "startup"           # per-model override of [local].load
-# idle_ttl_seconds = 600     # per-model override of [local].idle_ttl_seconds
-# pinned = true              # never evicted or unloaded on idle
-# batch = "auto"             # true | false | "auto" (default). auto serves the model with the
-#                            # continuous-batching engine unless it needs a simple-engine-only
-#                            # feature (TurboQuant, kv_disk_dir, vision, MTP speculative decode, HIGGS_PROMPT_LOOKUP)
-# kv_disk_dir = "/var/lib/higgs/prefix-kv" # optional durable prefix cache
-# kv_disk_space_mb = 4096                # LRU budget; minimum 64 MiB
-# prefill_yield_tokens = 512 # optional: interleave decode during long prefills
-# thinking_budget = 256 # optional: reasoning tokens before </think> is forced; overrides [local]
-# mla_latent_cache = true # DeepSeek-V2 only: compressed latent KV cache; cannot combine with kv_cache = "turboquant"
-
-# --- Remote providers ---
-# Forward requests to external APIs via proxy routes.
-
-# [provider.anthropic]
-# url = "https://api.anthropic.com"
-# format = "anthropic"
-
-# [provider.openai]
-# url = "https://api.openai.com"
-# format = "openai"
-
-# [provider.ollama]
-# url = "http://localhost:11434"
-# strip_auth = true
-# api_key = "ollama"
-# stub_count_tokens = true
-
-# --- Routes ---
-# Pattern routes match model names with regex. First match wins.
-
-# [[routes]]
-# pattern = "claude-.*"
-# provider = "anthropic"
-
-# [[routes]]
-# pattern = "gpt-.*"
-# provider = "openai"
-
-# --- Default route ---
-# When no pattern matches and the model isn't loaded locally.
-
-[default]
-provider = "higgs"
-
-# --- Auto router ---
-# Classify requests using a local model to pick the best route.
-
-# [auto_router]
-# enabled = true
-# model = "router"             # matches a [[models]] name
-# timeout_ms = 2000
-
-# --- Usage ---
-# eval "$(higgs shellenv)"  -- set env vars in current shell
-# higgs exec -- claude       -- exec a command with env vars set
-
-# --- Retention ---
-# How long to keep metrics in memory for the TUI dashboard.
-
-# [retention]
-# enabled = true
-# minutes = 60
-
-# --- Metrics logging ---
-# Append request metrics to a JSONL file for attach/TUI history.
-
-# [logging.metrics]
-# enabled = true
-# path = "{metrics_path_example}"
-# max_size_mb = 50
-# max_files = 5
-
-# --- MCP servers ---
-# Model Context Protocol servers whose tools Higgs can run for you. They
-# connect in the background; see GET /v1/mcp/servers, GET /v1/mcp/tools and
-# POST /v1/mcp/execute, and docs/mcp.md. Tool names are namespaced
-# "<server>__<tool>". `${{VAR}}` in env and headers reads the Higgs process
-# environment; an unset variable is an error. A desktop-client JSON file
-# ({{"mcpServers": ...}}) can be loaded with `higgs serve --mcp-config <file>`.
-
-# [mcp]
-# max_result_bytes = 262144    # larger tool results are truncated
-
-# [mcp.servers.filesystem]
-# command = "npx"              # run directly, never through a shell
-# args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/dir"]
-# env = {{ EXAMPLE_TOKEN = "${{EXAMPLE_TOKEN}}" }}
-# cwd = "/path/to/workdir"
-# timeout_seconds = 30         # connect, list and each tool call
-# enabled = true
-
-# [mcp.servers.remote]
-# url = "https://mcp.example.com/mcp"    # Streamable HTTP
-# headers = {{ Authorization = "Bearer ${{MCP_TOKEN}}" }}
-
-# --- Web search and fetch ---
-# POST /v1/web/search and POST /v1/web/fetch. Off by default: both answer 404
-# until enabled. Fetch refuses non-http(s) URLs and, by default, loopback,
-# private and link-local addresses (checked after DNS resolution and on every
-# redirect). See docs/mcp.md.
-
-# [web]
-# enabled = true
-# search_provider = "duckduckgo"       # keyless, or "searxng"
-# searxng_url = "http://localhost:8888" # required for searxng; JSON format must be enabled
-# allow_private_addresses = false      # true lets fetch reach loopback/private ranges
-# expose_as_tools = false              # offer web_search and web_fetch under the built-in "higgs" server
-# timeout_seconds = 15
-"#
-    );
+    let default_config = INIT_TEMPLATE.replace("__METRICS_PATH__", &metrics_path_example);
 
     if let Err(e) = config::write_private_file(&path, &default_config) {
         eprintln!("failed to write {}: {e}", path.display());
@@ -444,9 +297,10 @@ fn ensure_reachable(config: &HiggsConfig) -> Result<String, String> {
 }
 
 fn ensure_dashboard_ready(config: &HiggsConfig, profile: Option<&str>) -> Result<(), String> {
-    if !config.logging.metrics.enabled {
+    if !config.observability.metrics_log.enabled {
         return Err(
-            "cannot open dashboard: [logging.metrics] enabled = true required in config".to_owned(),
+            "cannot open dashboard: [observability.metrics_log] enabled = true required in config"
+                .to_owned(),
         );
     }
     let Some(pid) = read_pid(profile) else {
@@ -460,7 +314,7 @@ fn ensure_dashboard_ready(config: &HiggsConfig, profile: Option<&str>) -> Result
     }
     check_health(config)?;
 
-    let metrics_path = Path::new(&config.logging.metrics.path);
+    let metrics_path = Path::new(&config.observability.metrics_log.path);
     if !metrics_path.exists() {
         return Err(format!(
             "cannot open dashboard: metrics log not found at {}",
@@ -694,9 +548,9 @@ pub fn run_attached(config: &HiggsConfig, profile: Option<&str>) {
     let retention = retention_duration(config);
     let metrics = Arc::new(MetricsStore::new(retention));
 
-    attach::load_history(&config.logging.metrics, &metrics);
+    attach::load_history(&config.observability.metrics_log, &metrics);
 
-    let log_path_buf = PathBuf::from(&config.logging.metrics.path);
+    let log_path_buf = PathBuf::from(&config.observability.metrics_log.path);
     let stop = Arc::new(AtomicBool::new(false));
 
     let tail_store = Arc::clone(&metrics);
@@ -726,20 +580,19 @@ pub fn run_attached(config: &HiggsConfig, profile: Option<&str>) {
     stop.store(true, Ordering::Relaxed);
 }
 
-pub const fn retention_duration(config: &HiggsConfig) -> Duration {
-    if config.retention.enabled {
-        Duration::from_secs(config.retention.minutes.saturating_mul(60))
-    } else {
-        Duration::from_secs(DEFAULT_RETENTION_SECS)
-    }
+pub fn retention_duration(config: &HiggsConfig) -> Duration {
+    config
+        .observability
+        .retention
+        .unwrap_or(Duration::from_secs(DEFAULT_RETENTION_SECS))
 }
 
 pub fn create_metrics(config: &HiggsConfig) -> Arc<MetricsStore> {
     let retention = retention_duration(config);
-    Arc::new(if config.logging.metrics.enabled {
-        match MetricsLogger::new(&config.logging.metrics) {
+    Arc::new(if config.observability.metrics_log.enabled {
+        match MetricsLogger::new(&config.observability.metrics_log) {
             Ok(logger) => {
-                tracing::info!(path = %config.logging.metrics.path, "metrics logging enabled");
+                tracing::info!(path = %config.observability.metrics_log.path, "metrics logging enabled");
                 MetricsStore::with_logger(retention, logger)
             }
             Err(e) => {
@@ -915,24 +768,21 @@ mod tests {
     #[test]
     fn retention_duration_uses_configured_minutes() {
         let config = HiggsConfig {
-            retention: crate::config::RetentionConfig {
-                enabled: true,
-                minutes: 30,
+            observability: crate::config::ObservabilityConfig {
+                retention: Some(Duration::from_secs(30 * 60)),
+                ..Default::default()
             },
             ..HiggsConfig::default()
         };
-        assert_eq!(
-            retention_duration(&config),
-            Duration::from_secs(config.retention.minutes.saturating_mul(60))
-        );
+        assert_eq!(retention_duration(&config), Duration::from_secs(30 * 60));
     }
 
     #[test]
     fn retention_duration_one_year_when_disabled() {
         let config = HiggsConfig {
-            retention: crate::config::RetentionConfig {
-                enabled: false,
-                minutes: 30,
+            observability: crate::config::ObservabilityConfig {
+                retention: None,
+                ..Default::default()
             },
             ..HiggsConfig::default()
         };
@@ -945,11 +795,12 @@ mod tests {
     #[test]
     fn create_metrics_without_logger() {
         let config = HiggsConfig {
-            logging: crate::config::LoggingConfig {
-                metrics: crate::config::MetricsLogConfig {
+            observability: crate::config::ObservabilityConfig {
+                metrics_log: crate::config::MetricsLogConfig {
                     enabled: false,
                     ..Default::default()
                 },
+                ..Default::default()
             },
             ..HiggsConfig::default()
         };
@@ -988,44 +839,115 @@ mod tests {
             .join("\n")
     }
 
+    fn load_text_with(toml: &str, environment: &crate::config::Environment) -> HiggsConfig {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, toml).unwrap();
+        crate::config::load_config_file_in(&path, None, environment)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn load_text(toml: &str) -> HiggsConfig {
+        load_text_with(toml, &crate::config::Environment::default())
+    }
+
+    const A_MODEL: &str = "\n[[models]]\npath = \"org/model\"\n";
+
     #[test]
     fn cmd_init_template_mcp_examples_are_valid_when_uncommented() {
-        use figment::providers::Format;
-
         with_temp_config_dir(|dir| {
             std::fs::create_dir_all(dir).unwrap();
             cmd_init(None);
             let template = std::fs::read_to_string(dir.join("config.toml")).unwrap();
             assert!(template.contains("--mcp-config"));
             let section = uncommented_section(&template, "# [mcp]");
-            let config: crate::config::HiggsConfig = figment::Figment::new()
-                .merge(figment::providers::Toml::string(&section))
-                .extract()
-                .unwrap();
+            let config = load_text(&format!("{section}{A_MODEL}"));
             assert_eq!(config.mcp.servers.len(), 2);
             let lookup = |name: &str| {
                 (name == "EXAMPLE_TOKEN" || name == "MCP_TOKEN").then(|| "x".to_owned())
             };
             assert!(config.mcp.problems(&lookup).is_empty());
+            assert!(config.notices.deprecations.is_empty());
         });
     }
 
     #[test]
     fn cmd_init_template_web_examples_are_valid_when_uncommented() {
-        use figment::providers::Format;
-
         with_temp_config_dir(|dir| {
             std::fs::create_dir_all(dir).unwrap();
             cmd_init(None);
             let template = std::fs::read_to_string(dir.join("config.toml")).unwrap();
             let section = uncommented_section(&template, "# [web]");
-            let config: crate::config::HiggsConfig = figment::Figment::new()
-                .merge(figment::providers::Toml::string(&section))
-                .extract()
-                .unwrap();
+            let config = load_text(&format!("{section}{A_MODEL}"));
             assert!(config.web.enabled);
             assert!(config.web.problems().is_empty());
             assert_eq!(config.web.search_provider, "duckduckgo");
+        });
+    }
+
+    /// Every commented line of the template that is a table header or `key = value`, uncommented.
+    fn uncomment_everything(template: &str) -> String {
+        let config_line = regex::Regex::new(r"^# (\[\[?[A-Za-z_.*]+\]\]?|[a-z_]+ = .+)$").unwrap();
+        template
+            .lines()
+            .filter(|line| !line.starts_with("# include ="))
+            .map(|line| {
+                if config_line.is_match(line) {
+                    line.strip_prefix("# ").unwrap_or(line)
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn cmd_init_template_loads_without_warnings_when_every_example_is_uncommented() {
+        with_temp_config_dir(|dir| {
+            std::fs::create_dir_all(dir).unwrap();
+            cmd_init(None);
+            let template = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+            let everything = uncomment_everything(&template);
+            let environment = crate::config::Environment::from_pairs([
+                ("HIGGS_API_KEY", "sk-test"),
+                ("ANTHROPIC_API_KEY", "sk-ant-test"),
+            ]);
+            let config = load_text_with(&everything, &environment);
+            assert!(
+                config.notices.deprecations.is_empty(),
+                "{:?}",
+                config.notices.deprecations
+            );
+            let model = config.models.first().unwrap();
+            assert_eq!(model.path, "mlx-community/Llama-3.2-1B-Instruct-4bit");
+            assert_eq!(model.aliases, ["default"]);
+            assert_eq!(config.providers.len(), 3);
+            assert!(config.web.enabled);
+            assert_eq!(config.experimental.chunked_prefill_threshold, Some(4096));
+        });
+    }
+
+    #[test]
+    fn cmd_init_template_has_no_deprecated_keys_and_loads_as_written() {
+        with_temp_config_dir(|dir| {
+            std::fs::create_dir_all(dir).unwrap();
+            cmd_init(None);
+            let template = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+            let config = load_text(&format!("{template}{A_MODEL}"));
+            assert!(config.notices.deprecations.is_empty());
+            assert!(!template.contains("__METRICS_PATH__"));
+        });
+    }
+
+    #[test]
+    fn cmd_init_template_uses_the_profile_specific_metrics_path() {
+        with_temp_config_dir(|dir| {
+            std::fs::create_dir_all(dir).unwrap();
+            cmd_init(Some("dev"));
+            let template = std::fs::read_to_string(dir.join("config.dev.toml")).unwrap();
+            assert!(template.contains("metrics.dev.jsonl"));
+            assert!(!template.contains("__METRICS_PATH__"));
         });
     }
 

@@ -625,6 +625,7 @@ mod tests {
     /// `HIGGS_MODEL_PATH=<hybrid model dir> cargo test -p higgs-engine --release -- --ignored resume_from_checkpoint --nocapture --test-threads=1`
     #[test]
     #[ignore = "requires real model weights (set HIGGS_MODEL_PATH)"]
+    #[allow(clippy::too_many_lines)]
     fn resume_from_checkpoint_matches_cold_prefill() {
         use crate::paged_prefix_cache::PagedPrefixCache;
         let Ok(model_path) = std::env::var("HIGGS_MODEL_PATH") else {

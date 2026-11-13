@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use regex::Regex;
@@ -47,7 +47,7 @@ pub enum ResolvedRoute {
         provider_format: ApiFormat,
         model_rewrite: Option<String>,
         strip_auth: bool,
-        api_key: Option<String>,
+        api_key: Option<crate::config::Secret>,
         stub_count_tokens: bool,
         routing_method: RoutingMethod,
     },
@@ -73,7 +73,7 @@ enum RouteTarget {
         provider_format: ApiFormat,
         model_rewrite: Option<String>,
         strip_auth: bool,
-        api_key: Option<String>,
+        api_key: Option<crate::config::Secret>,
         stub_count_tokens: bool,
     },
 }
@@ -102,8 +102,10 @@ pub struct Router {
     auto_candidates: Vec<RouteCandidate>,
     auto_router_model: Option<String>,
     auto_router_force: bool,
-    auto_router_timeout_ms: u64,
+    auto_router_timeout: std::time::Duration,
     default_target: RouteTarget,
+    /// Extra request names (`aliases`) mapped to the served name of their model.
+    aliases: HashMap<String, String>,
 }
 
 impl Router {
@@ -155,17 +157,17 @@ impl Router {
             }
         }
 
-        let auto_router_model = if config.auto_router.enabled {
-            if config.auto_router.model.is_empty() {
-                return Err("auto_router.enabled is true but model is empty".to_owned());
+        let auto_router_model = if config.routing.auto.enabled {
+            if config.routing.auto.model.is_empty() {
+                return Err("routing.auto.enabled is true but model is empty".to_owned());
             }
             if auto_candidates.is_empty() {
-                warn!("auto_router is enabled but no routes have descriptions");
+                warn!("routing.auto is enabled but no routes have descriptions");
             }
-            let auto_model = &config.auto_router.model;
+            let auto_model = &config.routing.auto.model;
             if !pool.contains(auto_model) {
                 return Err(format!(
-                    "auto_router model '{auto_model}' not found among loaded models"
+                    "routing.auto.model '{auto_model}' not found among loaded models"
                 ));
             }
             Some(auto_model.clone())
@@ -173,7 +175,15 @@ impl Router {
             None
         };
 
-        let default_target = build_route_target(&config.default.provider, None, config)?;
+        let default_target = build_route_target(&config.routing.default_provider, None, config)?;
+
+        let mut aliases = HashMap::new();
+        for model in &config.models {
+            let served = crate::engine_loader::served_name(model);
+            for alias in &model.aliases {
+                aliases.insert(alias.clone(), served.clone());
+            }
+        }
 
         Ok(Self {
             pool,
@@ -181,9 +191,10 @@ impl Router {
             auto_routes,
             auto_candidates,
             auto_router_model,
-            auto_router_force: config.auto_router.force,
-            auto_router_timeout_ms: config.auto_router.timeout_ms,
+            auto_router_force: config.routing.auto.force,
+            auto_router_timeout: config.routing.auto.timeout,
             default_target,
+            aliases,
         })
     }
 
@@ -208,11 +219,12 @@ impl Router {
             // force mode: auto-routing returned nothing, fall through to normal resolution
         }
 
-        // Direct engine lookup
-        if self.pool.contains(model) {
+        // Direct engine lookup, under the model's name or one of its aliases
+        let canonical = self.canonical_name(model);
+        if self.pool.contains(canonical) {
             return Ok(ResolvedRoute::Higgs {
-                engine: self.pool.acquire(model).await?,
-                model_name: model.to_owned(),
+                engine: self.pool.acquire(canonical).await?,
+                model_name: canonical.to_owned(),
                 routing_method: RoutingMethod::Direct,
             });
         }
@@ -229,6 +241,11 @@ impl Router {
         // Default fallback
         self.resolve_target(&self.default_target, model, RoutingMethod::Default)
             .await
+    }
+
+    /// The served name a request name refers to: itself, or the model it is an alias of.
+    fn canonical_name<'a>(&'a self, name: &'a str) -> &'a str {
+        self.aliases.get(name).map_or(name, String::as_str)
     }
 
     /// Build a router over engines the caller already loaded.
@@ -282,7 +299,7 @@ impl Router {
         let candidates = self.auto_candidates.clone();
         let messages_owned = msg_slice.to_vec();
 
-        let timeout = std::time::Duration::from_millis(self.auto_router_timeout_ms);
+        let timeout = self.auto_router_timeout;
         let timeout_result = tokio::time::timeout(
             timeout,
             tokio::task::spawn_blocking(move || {
@@ -311,7 +328,7 @@ impl Router {
     ) -> Result<ResolvedRoute, RouteError> {
         match target {
             RouteTarget::Higgs { model_rewrite } => {
-                let lookup_name = model_rewrite.as_deref().unwrap_or(model);
+                let lookup_name = self.canonical_name(model_rewrite.as_deref().unwrap_or(model));
                 let resolved_name = if self.pool.contains(lookup_name) {
                     lookup_name
                 } else if model == "auto" {
@@ -485,7 +502,10 @@ mod tests {
                 assert_eq!(provider_url, "http://localhost:11434");
                 assert_eq!(model_rewrite.as_deref(), Some("qwen3-coder:30b"));
                 assert!(strip_auth);
-                assert_eq!(api_key.as_deref(), Some("ollama"));
+                assert_eq!(
+                    api_key.as_ref().map(crate::config::Secret::expose),
+                    Some("ollama")
+                );
                 assert!(stub_count_tokens);
             }
             ResolvedRoute::Higgs { .. } => panic!("expected Remote route"),
@@ -1068,6 +1088,69 @@ mod tests {
         assert_eq!(*loader.events.lock().unwrap(), ["load:lazy"]);
         drop(engine);
         assert_eq!(router.pool().status("lazy").unwrap().in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn an_alias_resolves_to_its_models_served_name() {
+        let (pool, loader) = stub_pool_with(vec![stub_spec("lazy")], PoolLimits::default());
+        let config = config_from_toml(
+            r#"
+            [[models]]
+            path = "some/model"
+            name = "lazy"
+            aliases = ["default", "chat"]
+            "#,
+        );
+        let router = Router::new(&config, pool).unwrap();
+
+        for requested in ["default", "chat", "lazy"] {
+            let route = router.resolve(requested, None).await.unwrap();
+            let ResolvedRoute::Higgs {
+                model_name,
+                routing_method,
+                ..
+            } = route
+            else {
+                panic!("expected a local route for {requested}");
+            };
+            assert_eq!(model_name, "lazy", "{requested}");
+            assert_eq!(routing_method, RoutingMethod::Direct);
+        }
+        assert_eq!(
+            loader.events.lock().unwrap().len(),
+            1,
+            "one load serves all names"
+        );
+        assert!(matches!(
+            router.resolve("unknown", None).await,
+            Err(RouteError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_route_can_rewrite_to_an_alias() {
+        let (pool, _loader) = stub_pool_with(vec![stub_spec("lazy")], PoolLimits::default());
+        let config = config_from_toml(
+            r#"
+            [[models]]
+            path = "some/model"
+            name = "lazy"
+            aliases = ["short"]
+
+            [[routes]]
+            match = "^gpt-"
+            provider = "higgs"
+            model = "short"
+            "#,
+        );
+        let router = Router::new(&config, pool).unwrap();
+
+        let route = router.resolve("gpt-4", None).await.unwrap();
+
+        let ResolvedRoute::Higgs { model_name, .. } = route else {
+            panic!("expected a local route");
+        };
+        assert_eq!(model_name, "lazy");
     }
 
     #[tokio::test]
