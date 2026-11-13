@@ -266,7 +266,7 @@ mod tests {
         let pinned = ModelSpec {
             pinned: true,
             idle_ttl: Some(std::time::Duration::from_secs(90)),
-            engine_kind: "batch",
+            decode: "batched",
             ..stub_spec("kept")
         };
         let fx = harness_with(
@@ -285,12 +285,12 @@ mod tests {
         assert_eq!(plain["pinned"], false);
         assert_eq!(plain["in_flight"], 0);
         assert_eq!(plain["last_used_at"], Value::Null);
-        assert_eq!(plain["engine"], "simple");
+        assert_eq!(plain["engine"], "sequential");
         assert_eq!(plain["load"], "on_demand");
         let kept = model(&body, "kept");
         assert_eq!(kept["pinned"], true);
         assert_eq!(kept["idle_ttl_seconds"], 90);
-        assert_eq!(kept["engine"], "batch");
+        assert_eq!(kept["engine"], "batched");
         for field in [
             "last_error",
             "load_duration_ms",
@@ -535,7 +535,7 @@ mod tests {
         let find = |name: &str| models.iter().find(|entry| entry["name"] == name).unwrap();
         assert_eq!(find("a")["state"], "loaded");
         assert_eq!(find("b")["state"], "unloaded");
-        assert_eq!(find("b")["engine"], "simple");
+        assert_eq!(find("b")["engine"], "sequential");
         assert_eq!(
             fx.events(),
             ["load:a"],

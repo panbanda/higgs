@@ -45,7 +45,7 @@ impl ModelConfig {
 }
 
 /// Whether loading `model_dir` would attach a multi-token-prediction head, which the
-/// simple engine uses for speculative decode.
+/// engine uses for speculative decode.
 ///
 /// Reads the config and weight index only; the model is not loaded.
 pub fn checkpoint_has_mtp_head<P: AsRef<Path>>(model_dir: P) -> bool {
@@ -65,6 +65,137 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError>
 /// Load a tokenizer from a model directory.
 pub fn load_tokenizer<P: AsRef<Path>>(model_dir: P) -> Result<tokenizers::Tokenizer, EngineError> {
     shared_load_tokenizer(model_dir).map_err(|e| EngineError::Tokenization(e.to_string()))
+}
+
+/// Derive a human-readable model name from a directory path.
+///
+/// Detects `HuggingFace` cache paths (`models--<org>--<name>/snapshots/<hash>`)
+/// and extracts `<org>/<name>` instead of using the hash as the name.
+/// Falls back to the directory's file name.
+pub fn derive_model_name(model_dir: &Path) -> String {
+    // HuggingFace cache: .../models--<org>--<name>/snapshots/<hash>
+    if let (Some(leaf), Some(parent)) = (model_dir.file_name(), model_dir.parent()) {
+        let leaf_str = leaf.to_string_lossy();
+        if let (Some(snapshots), Some(grandparent)) = (parent.file_name(), parent.parent()) {
+            if snapshots.to_string_lossy() == "snapshots" {
+                let gp_name = grandparent
+                    .file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default();
+                if let Some(rest) = gp_name.strip_prefix("models--") {
+                    // "org--model-name" -> "org/model-name"
+                    if let Some(sep) = rest.find("--") {
+                        let org = &rest[..sep];
+                        let model = &rest[sep + 2..];
+                        return format!("{org}/{model}");
+                    }
+                    return rest.to_owned();
+                }
+            }
+        }
+        // Not an HF cache path -- use the leaf directory name
+        if !leaf_str.is_empty() {
+            return leaf_str.to_string();
+        }
+    }
+    "unknown".to_owned()
+}
+
+/// Extract EOS token IDs from config.json.
+pub fn extract_eos_tokens(model_dir: &Path) -> Vec<u32> {
+    let config_path = model_dir.join("config.json");
+    let config_str = match std::fs::read_to_string(&config_path) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(path = %config_path.display(), error = %e, "Could not read config.json for EOS tokens");
+            return vec![];
+        }
+    };
+
+    let config: serde_json::Value = match serde_json::from_str(&config_str) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "Could not parse config.json for EOS tokens");
+            return vec![];
+        }
+    };
+
+    // Check top-level first, then text_config (VLM/Qwen3.5 nested config).
+    // Filter null so explicit `"eos_token_id": null` falls through to text_config.
+    let eos_value = config
+        .get("eos_token_id")
+        .filter(|v| !v.is_null())
+        .or_else(|| {
+            config
+                .get("text_config")
+                .and_then(|tc| tc.get("eos_token_id"))
+        });
+
+    let mut ids = eos_ids_from_value(eos_value);
+
+    // Union eos_token_id from generation_config.json — HF applies it at inference
+    // and it often lists turn-end tokens the base config.json omits.
+    if let Ok(gen_str) = std::fs::read_to_string(model_dir.join("generation_config.json"))
+        && let Ok(gen_cfg) = serde_json::from_str::<serde_json::Value>(&gen_str)
+    {
+        for id in eos_ids_from_value(gen_cfg.get("eos_token_id")) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+
+    // Gemma chat models end assistant turns with <end_of_turn>, which their
+    // config.json typically leaves out of eos_token_id. Without it generation runs
+    // past the answer into filler. Add it for the Gemma family.
+    let model_type = config
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            config
+                .get("text_config")
+                .and_then(|tc| tc.get("model_type"))
+                .and_then(|v| v.as_str())
+        });
+    if model_type.is_some_and(|t| t.starts_with("gemma"))
+        && let Some(id) = special_token_id(model_dir, "<end_of_turn>")
+        && !ids.contains(&id)
+    {
+        ids.push(id);
+    }
+
+    if ids.is_empty() {
+        tracing::warn!("No eos_token_id found in config.json, generation will rely on max_tokens");
+    }
+    ids
+}
+
+/// Parse an `eos_token_id` JSON value (a single number or an array of numbers).
+fn eos_ids_from_value(value: Option<&serde_json::Value>) -> Vec<u32> {
+    match value {
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .map_or_else(Vec::new, |id| vec![id]),
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_u64().and_then(|val| u32::try_from(val).ok()))
+            .collect(),
+        _ => vec![],
+    }
+}
+
+/// Resolve the id of an added special token by its `content` string, reading
+/// `tokenizer_config.json`'s `added_tokens_decoder` map.
+fn special_token_id(model_dir: &Path, content: &str) -> Option<u32> {
+    let text = std::fs::read_to_string(model_dir.join("tokenizer_config.json")).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let decoder = config.get("added_tokens_decoder")?.as_object()?;
+    decoder.iter().find_map(|(id, info)| {
+        (info.get("content").and_then(serde_json::Value::as_str) == Some(content))
+            .then(|| id.parse::<u32>().ok())
+            .flatten()
+    })
 }
 
 #[allow(
@@ -832,5 +963,197 @@ mod tests {
             Err(e) => assert!(e.to_string().contains("Tokenization error")),
             Ok(_) => panic!("Expected error for missing tokenizer.json"),
         }
+    }
+
+    /// Write a config.json file into the given directory with the provided JSON content.
+    fn write_config(dir: &std::path::Path, json: &str) {
+        std::fs::write(dir.join("config.json"), json).unwrap();
+    }
+
+    /// Gemma chat models stop on `<end_of_turn>`, which their `config.json` often
+    /// omits from `eos_token_id`. It must be resolved from the tokenizer and added.
+    #[test]
+    fn extract_eos_tokens_adds_gemma_end_of_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"{"model_type":"gemma3_text","eos_token_id":1}"#,
+        );
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder":{"106":{"content":"<end_of_turn>"}}}"#,
+        )
+        .unwrap();
+        let ids = extract_eos_tokens(dir.path());
+        assert!(ids.contains(&1), "base eos retained: {ids:?}");
+        assert!(ids.contains(&106), "gemma <end_of_turn> added: {ids:?}");
+    }
+
+    /// `generation_config.json`'s `eos_token_id` (used by HF at inference) is unioned in.
+    #[test]
+    fn extract_eos_tokens_unions_generation_config() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), r#"{"model_type":"llama","eos_token_id":2}"#);
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            r#"{"eos_token_id":[2,7]}"#,
+        )
+        .unwrap();
+        let ids = extract_eos_tokens(dir.path());
+        assert!(
+            ids.contains(&2) && ids.contains(&7),
+            "union with generation_config: {ids:?}"
+        );
+    }
+
+    /// Non-Gemma models must not pull in `<end_of_turn>`.
+    #[test]
+    fn extract_eos_tokens_non_gemma_ignores_end_of_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), r#"{"model_type":"llama","eos_token_id":2}"#);
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder":{"106":{"content":"<end_of_turn>"}}}"#,
+        )
+        .unwrap();
+        let ids = extract_eos_tokens(dir.path());
+        assert_eq!(ids, vec![2], "non-gemma must not add end_of_turn: {ids:?}");
+    }
+
+    // --- derive_model_name tests ---
+
+    #[test]
+    fn test_derive_model_name_plain_directory() {
+        let name = derive_model_name(Path::new("/home/user/models/Llama-3.2-1B"));
+        assert_eq!(name, "Llama-3.2-1B");
+    }
+
+    #[test]
+    fn test_derive_model_name_hf_cache_path() {
+        let path = "/Users/me/.cache/huggingface/hub/models--mlx-community--Qwen3-Coder-Next-4bit/snapshots/7b9321eabb85ce79625cac3f61ea691e4ea984b5";
+        let name = derive_model_name(Path::new(path));
+        assert_eq!(name, "mlx-community/Qwen3-Coder-Next-4bit");
+    }
+
+    #[test]
+    fn test_derive_model_name_hf_cache_no_org() {
+        let path = "/cache/models--MyModel/snapshots/abc123";
+        let name = derive_model_name(Path::new(path));
+        assert_eq!(name, "MyModel");
+    }
+
+    #[test]
+    fn test_derive_model_name_relative_path() {
+        let name = derive_model_name(Path::new("./my-model"));
+        assert_eq!(name, "my-model");
+    }
+
+    /// Create a temp dir, write config.json with the given content, and return
+    /// the result of `extract_eos_tokens`.
+    fn eos_from_config(json: &str) -> Vec<u32> {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), json);
+        extract_eos_tokens(dir.path())
+    }
+
+    #[test]
+    fn test_extract_eos_tokens_single_number() {
+        assert_eq!(
+            eos_from_config(r#"{"eos_token_id": 151643}"#),
+            vec![151_643]
+        );
+    }
+
+    #[test]
+    fn test_extract_eos_tokens_array() {
+        assert_eq!(
+            eos_from_config(r#"{"eos_token_id": [151643, 151645]}"#),
+            vec![151_643, 151_645]
+        );
+    }
+
+    #[test]
+    fn test_extract_eos_tokens_missing_field() {
+        assert_eq!(
+            eos_from_config(r#"{"model_type": "qwen2"}"#),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn test_extract_eos_tokens_unexpected_type() {
+        assert_eq!(
+            eos_from_config(r#"{"eos_token_id": "string"}"#),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn test_extract_eos_tokens_missing_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(extract_eos_tokens(dir.path()), Vec::<u32>::new());
+    }
+
+    // -- Additional extract_eos_tokens edge cases --
+
+    #[test]
+    fn test_extract_eos_tokens_float_value() {
+        // serde_json parses 151643.0 as a float, and as_u64() returns None for floats
+        assert_eq!(
+            eos_from_config(r#"{"eos_token_id": 151643.0}"#),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn test_extract_eos_tokens_string_value() {
+        assert_eq!(
+            eos_from_config(r#"{"eos_token_id": "not_a_number"}"#),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn test_extract_eos_tokens_nested_array() {
+        // Inner arrays are not numbers, so as_u64() returns None for them
+        assert_eq!(
+            eos_from_config(r#"{"eos_token_id": [[1, 2], [3, 4]]}"#),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn test_extract_eos_tokens_negative_number() {
+        // as_u64() returns None for negative numbers
+        assert_eq!(
+            eos_from_config(r#"{"eos_token_id": -1}"#),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn test_extract_eos_tokens_very_large_number() {
+        // u32::MAX is 4294967295; as_u64() succeeds but u32::try_from fails
+        assert_eq!(
+            eos_from_config(r#"{"eos_token_id": 4294967296}"#),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn test_extract_eos_tokens_empty_array() {
+        assert_eq!(
+            eos_from_config(r#"{"eos_token_id": []}"#),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn test_extract_eos_tokens_mixed_types_in_array() {
+        // Only numeric entries are extracted; "two" is skipped
+        assert_eq!(
+            eos_from_config(r#"{"eos_token_id": [1, "two", 3]}"#),
+            vec![1, 3]
+        );
     }
 }

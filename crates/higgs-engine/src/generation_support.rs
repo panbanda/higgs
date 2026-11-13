@@ -1,5 +1,5 @@
-//! Model setup and helpers shared by the simple and batch engines, so both
-//! resolve thinking, prefix-cache keys and embeddings identically.
+//! Model setup and helpers for the engine: thinking support, chat prompts,
+//! prefix-cache keys and embeddings.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -19,47 +19,6 @@ use crate::{
     paged_prefix_cache::PagedPrefixMatch,
     prefix_checkpoints::RecurrentCheckpoint,
 };
-
-/// Counts a request's reasoning tokens for a decode loop that samples one
-/// token ahead of the one it emits, and says when `</think>` must be the next
-/// token so a reasoning block never runs past its budget.
-#[derive(Debug, Clone, Copy)]
-pub struct ThinkingBudgetGate {
-    close_token: u32,
-    budget: u32,
-    reasoning_tokens: u32,
-    closed: bool,
-}
-
-impl ThinkingBudgetGate {
-    /// `first_token` is the token already emitted before the decode loop.
-    pub const fn new(close_token: u32, budget: u32, first_token: u32) -> Self {
-        Self {
-            close_token,
-            budget,
-            reasoning_tokens: 1,
-            closed: first_token == close_token,
-        }
-    }
-
-    /// Record the token about to be emitted. Returns `</think>` when that
-    /// must be the token emitted after it; at most once per request.
-    pub const fn observe(&mut self, token_id: u32) -> Option<u32> {
-        if self.closed {
-            return None;
-        }
-        if token_id == self.close_token {
-            self.closed = true;
-            return None;
-        }
-        self.reasoning_tokens += 1;
-        if self.reasoning_tokens + 1 >= self.budget {
-            self.closed = true;
-            return Some(self.close_token);
-        }
-        None
-    }
-}
 
 /// Whether the model can reason inside `<think>` tags, and the token that closes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +41,7 @@ impl ThinkingSupport {
             .map_or_else(
                 || detect_thinking_support(model_dir),
                 |value| {
-                    crate::simple::parse_enabled_flag(Some(value))
+                    crate::mlx_tuning::parse_enabled_flag(Some(value))
                         .unwrap_or_else(|| detect_thinking_support(model_dir))
                 },
             );
@@ -388,45 +347,50 @@ mod tests {
     }
 
     #[test]
-    fn thinking_gate_forces_close_as_the_budgeth_token_exactly_once() {
-        let mut gate = ThinkingBudgetGate::new(99, 5, 1);
-        assert_eq!(gate.observe(2), None);
-        assert_eq!(gate.observe(3), None);
-        assert_eq!(gate.observe(4), Some(99));
-        assert_eq!(gate.observe(5), None);
-        assert_eq!(gate.observe(99), None);
-    }
-
-    #[test]
-    fn thinking_gate_stays_quiet_after_a_natural_close() {
-        let mut gate = ThinkingBudgetGate::new(99, 3, 1);
-        assert_eq!(gate.observe(99), None);
-        assert_eq!(gate.observe(5), None);
-        assert_eq!(gate.observe(6), None);
-    }
-
-    #[test]
-    fn thinking_gate_stays_quiet_when_the_first_token_closed() {
-        let mut gate = ThinkingBudgetGate::new(99, 2, 99);
-        assert_eq!(gate.observe(5), None);
-    }
-
-    #[test]
-    fn forced_close_yields_one_close_in_the_visible_text() {
-        let mut gate = ThinkingBudgetGate::new(99, 4, 1);
-        let mut emitted = vec![1];
-        let mut forced = None;
-        for sampled in [2, 3, 4, 5, 6] {
-            let token = forced.take().unwrap_or(sampled);
-            emitted.push(token);
-            forced = gate.observe(token);
-        }
-        assert_eq!(emitted.iter().filter(|&&token| token == 99).count(), 1);
-        assert_eq!(emitted.iter().position(|&token| token == 99), Some(3));
-    }
-
-    #[test]
     fn l2_normalization_leaves_zero_vector_alone() {
         assert_eq!(l2_normalized(&[0.0, 0.0]), vec![0.0, 0.0]);
+    }
+
+    /// Write a config.json file into the given directory with the provided JSON content.
+    fn write_config(dir: &std::path::Path, json: &str) {
+        std::fs::write(dir.join("config.json"), json).unwrap();
+    }
+
+    // --- detect_thinking_support tests ---
+
+    /// MiniCPM5-style: a non-reasoning `model_type` (llama) but a chat template
+    /// that exposes the `enable_thinking` switch ⇒ thinking-capable.
+    #[test]
+    fn detect_thinking_from_template_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), r#"{"model_type": "llama"}"#);
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "{%- if enable_thinking %}<think>\n{%- endif %}",
+        )
+        .unwrap();
+        assert!(detect_thinking_support(dir.path()));
+    }
+
+    /// Qwen3.5 reasoning `model_type` is detected even without a template file.
+    #[test]
+    fn detect_thinking_from_model_type() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), r#"{"model_type": "qwen3_5_moe"}"#);
+        assert!(detect_thinking_support(dir.path()));
+    }
+
+    /// A plain Llama (no reasoning `model_type`, no `enable_thinking` in the
+    /// template) must NOT be treated as a thinking model.
+    #[test]
+    fn no_thinking_for_plain_llama() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), r#"{"model_type": "llama"}"#);
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "{%- for m in messages %}{{ m.content }}{%- endfor %}",
+        )
+        .unwrap();
+        assert!(!detect_thinking_support(dir.path()));
     }
 }

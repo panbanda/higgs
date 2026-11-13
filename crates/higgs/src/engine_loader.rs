@@ -4,14 +4,13 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use higgs_engine::inference::{DiskPrefixConfig, EngineOptions};
 use higgs_engine::mlx_tuning::resolve_runtime_tuning_with;
 
 use crate::config::{
-    self, BatchMode, ExperimentalConfig, HiggsConfig, LoadMode, MemoryConfig, ModelConfig,
+    BatchMode, ExperimentalConfig, HiggsConfig, LoadMode, MemoryConfig, ModelConfig,
 };
-use crate::engine_selection::{
-    BatchFacts, EngineChoice, SimpleReason, choose_engine, planned_engine,
-};
+use crate::decode_strategy::{DecodeFacts, DecodeStrategy, decode_strategy, planned_strategy};
 use crate::model_pool::{ModelLoader, ModelPool, ModelSpec, PoolLimits};
 use crate::model_resolver;
 use crate::state::Engine;
@@ -81,50 +80,37 @@ pub fn load_engine(
     resolved: &Path,
 ) -> Result<Engine, String> {
     tracing::info!(model = %model.path, resolved = %resolved.display(), "Loading model");
-    let choice = match model.batch {
-        BatchMode::On => {
-            if !config::resolved_model_supports_batch(resolved)? {
-                return Err(config::batch_unsupported_message(&model.path));
+    if let Ok(facts) = DecodeFacts::inspect(model, experimental, resolved) {
+        match decode_strategy(&facts) {
+            DecodeStrategy::Batched => {
+                tracing::info!(model = %model.path, "requests decode together in batched passes");
             }
-            EngineChoice::Batch
-        }
-        BatchMode::Off => EngineChoice::Simple(SimpleReason::Requested),
-        BatchMode::Auto => {
-            let facts = BatchFacts::inspect(model, experimental, resolved)?;
-            let choice = choose_engine(BatchMode::Auto, &facts);
-            match choice {
-                EngineChoice::Batch => {
-                    tracing::info!(model = %model.path, "batch = auto: using the batch engine");
-                }
-                EngineChoice::Simple(reason) => {
-                    tracing::info!(model = %model.path, %reason, "batch = auto: using the simple engine");
-                }
+            DecodeStrategy::Sequential(reason) => {
+                tracing::info!(model = %model.path, %reason, "requests decode one at a time");
             }
-            choice
         }
-    };
-    let kv_cache_config = model.kv_cache;
+    }
     let tuning =
         resolve_runtime_tuning_with(resolved, model.profile, &experimental.tuning_overrides());
-    let engine = match choice {
-        EngineChoice::Batch => Engine::load_batch(
-            resolved,
-            kv_cache_config,
-            &tuning,
-            memory.raise_wired_limit,
-            model.prefill_yield_tokens,
-            model.thinking_budget,
-        ),
-        EngineChoice::Simple(_) => Engine::load_simple(
-            resolved,
-            kv_cache_config,
+    let engine = Engine::load(
+        resolved,
+        EngineOptions {
+            kv_cache: model.kv_cache,
             tuning,
-            memory.raise_wired_limit,
-            model.prefix_cache.disk_dir.as_deref().map(Path::new),
-            model.prefix_cache.disk_budget.bytes(),
-            model.thinking_budget,
-        ),
-    }
+            raise_wired_limit: memory.raise_wired_limit,
+            prefill_yield_tokens: model.prefill_yield_tokens,
+            default_thinking_budget: model.thinking_budget,
+            disk_prefix: model
+                .prefix_cache
+                .disk_dir
+                .as_deref()
+                .map(|dir| DiskPrefixConfig {
+                    dir: Path::new(dir).to_path_buf(),
+                    budget: model.prefix_cache.disk_budget.bytes(),
+                }),
+            max_concurrent_requests: (model.batch == BatchMode::Off).then_some(1),
+        },
+    )
     .map_err(|error| error.to_string())?;
     tracing::info!(model_name = %engine.model_name(), "Model loaded");
     Ok(engine)
@@ -136,9 +122,9 @@ pub fn served_name(model: &ModelConfig) -> String {
         return name.clone();
     }
     match model_resolver::resolve(&model.path) {
-        Ok(directory) => higgs_engine::simple::derive_model_name(&directory),
+        Ok(directory) => higgs_engine::model_loader::derive_model_name(&directory),
         Err(_) if model_resolver::is_hf_model_id(&model.path) => model.path.clone(),
-        Err(_) => higgs_engine::simple::derive_model_name(Path::new(&model.path)),
+        Err(_) => higgs_engine::model_loader::derive_model_name(Path::new(&model.path)),
     }
 }
 
@@ -149,7 +135,8 @@ pub fn served_name(model: &ModelConfig) -> String {
 pub fn model_spec(config: &HiggsConfig, model: &ModelConfig, name: String) -> ModelSpec {
     let is_classifier = config.routing.auto.enabled && config.routing.auto.model == name;
     ModelSpec {
-        engine_kind: planned_engine(model, &config.experimental).map_or("auto", EngineChoice::kind),
+        decode: planned_strategy(model, &config.experimental)
+            .map_or("unknown", DecodeStrategy::kind),
         load: if is_classifier {
             LoadMode::Startup
         } else {
@@ -364,9 +351,9 @@ mod tests {
             status.state == crate::model_pool::ModelState::Unloaded
                 && status.load == LoadMode::OnDemand
         }));
-        assert_eq!(pool.status("one").unwrap().engine, "batch");
-        assert_eq!(pool.status("two").unwrap().engine, "simple");
-        assert_eq!(pool.status("three").unwrap().engine, "auto");
+        assert_eq!(pool.status("one").unwrap().engine, "unknown");
+        assert_eq!(pool.status("two").unwrap().engine, "sequential");
+        assert_eq!(pool.status("three").unwrap().engine, "unknown");
     }
 
     #[test]

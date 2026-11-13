@@ -1,43 +1,8 @@
 //! Checks on a resolved configuration that make it unusable, collected rather than stopping at
 //! the first. Range checks that only warn live in `higgs doctor`.
 
-use std::collections::HashSet;
-use std::path::Path;
-
-use higgs_engine::model_loader;
-
 use super::settings::{HiggsConfig, ModelConfig};
-use super::types::BatchMode;
-
-pub fn batch_unsupported_message(model_path: &str) -> String {
-    format!(
-        "batch=true is only supported for models with batched decode (llama, mistral, qwen2, qwen3, qwen3_moe, qwen3_5, qwen3_5_moe, phi3, starcoder2, gemma2, gemma3, gemma4); {model_path} is not supported"
-    )
-}
-
-pub fn resolved_model_supports_batch(model_dir: &Path) -> Result<bool, String> {
-    let inspected = model_loader::ModelConfig::from_dir(model_dir)
-        .map_err(|e| format!("failed to inspect {}: {e}", model_dir.display()))?;
-    Ok(inspected.capabilities.batch_engine)
-}
-
-fn batch_support_for_model_path(model_path: &str) -> Result<Option<bool>, String> {
-    match crate::model_resolver::resolve(model_path) {
-        Ok(resolved) => resolved_model_supports_batch(&resolved).map(Some),
-        Err(err) if batch_support_check_can_be_deferred(model_path, &err) => Ok(None),
-        Err(err) => Err(err),
-    }
-}
-
-fn batch_support_check_can_be_deferred(model_path: &str, err: &str) -> bool {
-    crate::model_resolver::is_hf_model_id(model_path)
-        && (err
-            == format!(
-                "model '{model_path}' is not an existing directory and was not found in the HuggingFace cache"
-            )
-            || (err.starts_with(&format!("could not read HF cache ref for '{model_path}':"))
-                && err.contains("No such file or directory")))
-}
+use std::collections::HashSet;
 
 fn model_problems(model: &ModelConfig, problems: &mut Vec<String>) {
     if model.path.trim().is_empty() {
@@ -61,19 +26,6 @@ fn model_problems(model: &ModelConfig, problems: &mut Vec<String>) {
     }
     if let Err(error) = model.kv_cache.validate() {
         problems.push(error.to_string());
-    }
-    if model.batch == BatchMode::On && model.kv_cache.is_turboquant() {
-        problems.push(format!(
-            "TurboQuant is not supported with batch=true for model {}",
-            model.path
-        ));
-    }
-    if model.batch == BatchMode::On {
-        match batch_support_for_model_path(&model.path) {
-            Ok(Some(false)) => problems.push(batch_unsupported_message(&model.path)),
-            Ok(Some(true) | None) => {}
-            Err(error) => problems.push(error),
-        }
     }
 }
 

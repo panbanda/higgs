@@ -373,8 +373,8 @@ mod tests {
         );
     }
 
-    /// A duplicated `</think>` (the simple engine once emitted the forced close
-    /// twice) must not reach the visible text of a non-streaming response.
+    /// A duplicated `</think>` (an engine once emitted the forced close twice)
+    /// must not reach the visible text of a non-streaming response.
     #[test]
     fn parse_reasoning_drops_a_duplicated_close() {
         let result = parse_reasoning("<think>budget spent</think></think>\nThe answer.");

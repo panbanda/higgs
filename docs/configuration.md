@@ -21,8 +21,8 @@ This document collects the full CLI, environment, and config-file reference for 
 | `--rate-limit` | `HIGGS_RATE_LIMIT` | `0` | Requests/min per client |
 | `--timeout` | `HIGGS_TIMEOUT` | `300` | Request timeout in seconds |
 | `--mlx-profile` | `HIGGS_MLX_PROFILE` | `auto` | MLX tuning profile: `auto`, `latency`, `balanced`, or `throughput` |
-| `--batch` | -- | *(auto)* | Force the continuous-batching engine for every model |
-| `--no-batch` | -- | *(auto)* | Force the simple (one request at a time) engine for every model |
+| `--batch` | -- | -- | Deprecated; has no effect |
+| `--no-batch` | -- | *(off)* | Limit every `--model` to one request at a time |
 | `--kv-cache` | -- | `off` | KV cache mode: `off` or `turboquant` |
 | `--kv-bits` | -- | `3` | Default TurboQuant KV bit width |
 | `--kv-key-bits` | -- | `kv-bits - 1` | Override TurboQuant key bit width |
@@ -191,8 +191,8 @@ Keys valid in both. A `[[models]]` entry additionally needs `path` and may set `
 | `load` | `"startup"`, `"on_demand"` | `"startup"` | When the model is loaded |
 | `idle_ttl` | duration | *(none)* | Unload after this long with no in-flight request. `"0"` or unset never unloads; a model-level `"0"` opts one model out of a `[defaults]` value |
 | `pinned` | bool | `false` | Never evicted or unloaded on idle. An explicit `/unload` still works |
-| `batch` | `true`, `false`, `"auto"` | `"auto"` | Engine selection, see [Engine selection](#engine-selection) |
-| `profile` | `"auto"`, `"latency"`, `"balanced"`, `"throughput"` | `"auto"` | MLX tuning preset for the simple engine |
+| `batch` | `true`, `false`, `"auto"` | `"auto"` | `false` limits the model to one request at a time; `true` and `"auto"` mean no limit. See [Concurrent requests](#concurrent-requests) |
+| `profile` | `"auto"`, `"latency"`, `"balanced"`, `"throughput"` | `"auto"` | MLX tuning preset |
 | `thinking_budget` | integer >= 1 | `256` | Reasoning tokens the model may spend before `</think>` is forced |
 
 `[models.kv_cache]` (and `[defaults.kv_cache]`):
@@ -274,14 +274,14 @@ Config equivalents of engine environment variables. The variable, when set, wins
 | `mtp_draft_tokens` | integer 1-8 | `2` for huge checkpoints, else `1` | `HIGGS_MTP_DRAFT_N_MAX` | Draft tokens per speculative cycle |
 | `chunked_prefill.threshold` | integer | from the profile | `HIGGS_CHUNKED_PREFILL_THRESHOLD` | Prompts longer than this prefill in chunks |
 | `chunked_prefill.chunk` | integer | from the profile | `HIGGS_CHUNKED_PREFILL_CHUNK_SIZE` | Tokens per prefill chunk |
-| `clear_cache_after_prefill` | bool | from the profile | `HIGGS_CLEAR_CACHE_AFTER_PREFILL` | Clear the MLX allocator cache after prefill (simple engine; the batch engine reads only the variable) |
-| `prompt_lookup` | bool | `false` | `HIGGS_PROMPT_LOOKUP` | Prompt-lookup decoding (simple engine only) |
+| `clear_cache_after_prefill` | bool | from the profile | `HIGGS_CLEAR_CACHE_AFTER_PREFILL` | Clear the MLX allocator cache after prefill |
+| `prompt_lookup` | bool | `false` | `HIGGS_PROMPT_LOOKUP` | Prompt-lookup decoding while a request runs alone (see [Speculative decode](#speculative-decode)) |
 | `mtp_adaptive_draft` | bool | `false` | `HIGGS_MTP_ADAPTIVE_DRAFT` | Grow or shrink the MTP draft window from recent acceptance |
 | `mtp_prompt_lookup` | bool | `false` | `HIGGS_MTP_PROMPT_LOOKUP` | Hybrid MTP loop that also tries verified prompt-lookup drafts |
 
 Other `HIGGS_*` variables that change behavior and have no config key: `HIGGS_ENABLE_THINKING`
 (`0|1` forces Qwen thinking off or on), `HIGGS_TURBOQUANT_MIN_TOKENS` (TurboQuant activation threshold, default
-`2048`), `HIGGS_EXPERIMENTAL_PAGED_KV` (`1` enables the experimental paged-KV path). The rest are debugging or
+`2048`). The rest are debugging or
 profiling switches for the model kernels.
 
 ### `[mcp]` and `[web]`
@@ -406,7 +406,7 @@ Unloading a model that is already unloaded succeeds. Unloading a model that is l
 | `load_duration_ms` | How long the current load took, while loaded |
 | `estimated_bytes` | Size predicted from weight files before loading |
 | `measured_bytes` | Growth in MLX active memory while loading, while loaded |
-| `engine` | `simple`, `batch`, or `auto` while a `batch = "auto"` model's checkpoint cannot be inspected yet (not downloaded) |
+| `engine` | `batched` when concurrent requests decode together, `sequential` when requests queue and decode one at a time, or `unknown` while the checkpoint cannot be inspected yet (not downloaded) |
 | `idle_ttl_seconds` | Effective idle timeout, or `null` |
 
 ## Routing Behavior
@@ -431,9 +431,7 @@ is never used for that name; `higgs doctor` warns about it.
 
 ## Local Model Notes
 
-- `batch` is `true`, `false`, or `"auto"` (the default); see [Engine selection](#engine-selection).
-- `batch = true` is only supported for transformer families with true batched decode support: `llama`, `mistral`, `qwen2`, `qwen3`, `qwen3_moe`, `qwen3_5`, `qwen3_5_moe`, `phi3`, `starcoder2`, `gemma2`, `gemma3`, and `gemma4`.
-- `higgs doctor` and server startup reject unsupported `batch = true` combinations instead of silently degrading.
+- `batch = false` limits a model to one request at a time; `true` and `"auto"` (the default) mean no limit. See [Concurrent requests](#concurrent-requests).
 - `[memory] raise_wired_limit` defaults to `false`. Turn it on only when you explicitly want MLX to raise the process wired-memory limit.
 - With several resident models, consider `max_loaded_models`, `guard`, or `load = "on_demand"`; see [Model lifecycle](#model-lifecycle).
 - For a local model, set `prefix_cache.disk_dir` to retain block-aligned prefix KV state across restarts.
@@ -514,7 +512,7 @@ the request; the server never fills in zeros as placeholders.
 | `generation_tokens_per_second` | `(completion_tokens - 1) / generation_duration`; the first token is produced by prefill and is not part of the decode rate. |
 
 For streaming requests the engine events are timestamped as the server receives them, so
-the figures include the channel hop between engine and HTTP handler. The batch engine
+the figures include the channel hop between engine and HTTP handler. The engine
 reports a prefix-cache hit only for requests prefilled individually; requests prefilled
 together in a group are reported with `cached_tokens: 0`.
 
@@ -569,44 +567,60 @@ order, first match wins:
 A budget must be at least 1, in config (`higgs doctor` fails on `0`) and in requests (`400`).
 To turn thinking off use reasoning effort `"none"`; a zero budget is not a way to do that.
 `higgs doctor` warns when a budget is not below `server.max_tokens`, since reasoning could
-then consume the whole response. Both engines enforce the budget. The simple engine forces
-`</think>` in place of the next token; the batch engine forces it when it samples that token, so
-its KV cache always matches the text the client receives. On `/v1/messages` only
+then consume the whole response. The engine forces `</think>` in place of the sampled token, so
+its KV cache always matches the text the client receives, including during speculative decode. On `/v1/messages` only
 `budget_tokens` is read from `thinking`; `type` is ignored.
 
-### Engine selection
+### Concurrent requests
 
-Each model is served by one of two engines. The simple engine runs one request at a time;
-the batch engine decodes every active request in one batched forward pass, so concurrent
-requests share the GPU instead of queueing (measured on an M4 Max: Phi-3 at 8 clients
-164 to 461 tok/s, a 27B Qwen3.5 model at 4 clients 27 to 69 tok/s).
+One engine serves every model. It runs on a worker thread that owns the model, admits requests
+as they arrive, prefills them (through the prefix cache, in chunks for long prompts) and then
+decodes every active request together. How a model decodes depends on the model, not on a
+setting:
 
-The per-model `batch` setting chooses between them:
-
-| `batch` | Engine |
+| Model | Decoding |
 |---|---|
-| `"auto"` (default) | Batch, unless one of the rules below applies, in which case simple |
-| `true` | Always batch. A model or configuration the batch engine cannot serve fails to load |
-| `false` | Always simple |
+| An architecture with batched decode (see [docs/models.md](models.md)) | All active requests share one batched forward pass per token, so concurrent requests share the GPU instead of queueing (measured on an M4 Max: Phi-3 at 8 clients 164 to 461 tok/s, a 27B Qwen3.5 model at 4 clients 27 to 69 tok/s) |
+| Any other architecture, a checkpoint with an MTP head, or `kv_cache.mode = "turboquant"` | Requests queue in arrival order and decode one at a time, the lone request running a token ahead of the one it reports |
 
-`higgs serve --batch` forces `true` and `--no-batch` forces `false` for every `--model`.
+A request that needs per-request handling does not slow the others' setup: a request with
+`logprobs` or a structured-output constraint makes the round step every active request on its own
+forward pass until it finishes, and a request with images prefills alone and never reads or
+writes the prefix cache.
 
-Under `"auto"`, a model falls back to the simple engine when any of these hold, checked in this
-order; the server logs one info line naming the rule, and `higgs doctor` reports the engine
-each model will get:
+The per-model `batch` setting is a concurrency cap:
 
-1. The architecture has no batched decode (see [docs/models.md](models.md)).
-2. `kv_cache.mode = "turboquant"` is configured.
-3. A disk prefix store (`prefix_cache.disk_dir`) is configured.
-4. The model takes image inputs (LLaVA).
-5. The checkpoint ships an MTP head and the MLX profile enables speculative decode
-   (`experimental.mtp` or `HIGGS_MTP`, and the profile, decide; `experimental.mtp = "off"` or `HIGGS_MTP=0` turns it off).
-6. `experimental.prompt_lookup` (or `HIGGS_PROMPT_LOOKUP`) is on.
+| `batch` | Effect |
+|---|---|
+| `"auto"` (default), `true` | No limit. `true` is the same as `"auto"`; `higgs doctor` warns that it has no effect |
+| `false` | One request at a time, whatever the model could batch (for example to bound KV memory) |
 
-Both engines share the prefix cache semantics (block-paged, keyed without the chat template's
-generation prompt, so repeated prompts and multi-turn conversations reuse everything but that
-suffix, and a prompt that diverges mid-way reuses the shared leading blocks), the thinking
-budget, logprobs, stop sequences, structured output, `return_progress`, and embeddings.
+`higgs serve --no-batch` sets `false` for every `--model`; `--batch` is accepted and ignored.
+`higgs doctor` and the server's load log report which of the two a model gets and why, and
+`/v1/models/status` shows it as `engine`.
+
+The prefix cache is block-paged and keyed without the chat template's generation prompt, so
+repeated prompts and multi-turn conversations reuse everything but that suffix, and a prompt that
+diverges mid-way reuses the shared leading blocks. The thinking budget, logprobs, stop sequences,
+structured output, `return_progress` and embeddings work the same for every model.
+
+### Speculative decode
+
+Speculative decode drafts several tokens, verifies them with the model in one pass, and keeps the
+accepted prefix. It advances one sequence at a time, so it only runs while a request is alone and
+only for greedy requests (`temperature = 0`, no penalties) without `logprobs` or a constraint:
+
+- Prompt-lookup decoding (`experimental.prompt_lookup`) copies drafts from text the request
+  already produced. It works on any architecture.
+- MTP decode uses the checkpoint's multi-token-prediction head (`experimental.mtp`, subject to
+  the MLX profile). A checkpoint with an MTP head decodes one request at a time, so its requests
+  queue and each runs speculatively.
+
+When a second request arrives while a prompt-lookup request is running, the first request is
+handed over to ordinary batched decode at the next token boundary: the token the model had already
+settled on is reported, the draft state is dropped, and the request continues in the batch. When it is
+alone again it returns to speculative decode. An MTP request never needs a handover because
+its model queues requests; if its reasoning budget forces `</think>` it finishes on ordinary decode.
 
 ### Tokenizer endpoints
 

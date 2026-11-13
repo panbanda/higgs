@@ -260,7 +260,7 @@ impl Router {
             .map(|(name, engine)| {
                 let spec = ModelSpec {
                     name,
-                    engine_kind: engine.kind(),
+                    decode: engine.decode_kind(),
                     load: LoadMode::Startup,
                     pinned: true,
                     idle_ttl: None,

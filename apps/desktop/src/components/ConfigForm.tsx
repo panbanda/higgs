@@ -141,7 +141,7 @@ function ModelSettingsEditor({ settings, onChange, inherit }: { settings: ModelS
           <Select value={settings.profile} options={MLX_PROFILES} onChange={(v) => onChange({ profile: v })} inherit={inherit} />
         </div>
         <div className="field">
-          <label>Batch engine</label>
+          <label>Concurrent requests</label>
           <select
             value={settings.batch === undefined ? "" : String(settings.batch)}
             onChange={(event) => {
@@ -150,9 +150,8 @@ function ModelSettingsEditor({ settings, onChange, inherit }: { settings: ModelS
             }}
           >
             <option value="">{inherit}</option>
-            <option value="auto">auto</option>
-            <option value="true">always</option>
-            <option value="false">never</option>
+            <option value="auto">unlimited</option>
+            <option value="false">one at a time</option>
           </select>
         </div>
         <div className="field">

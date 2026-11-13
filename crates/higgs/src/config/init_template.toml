@@ -43,8 +43,8 @@ port = 8000
 # [defaults]
 # load = "on_demand"        # startup (default) | on_demand: load on the first request
 # idle_ttl = "15m"          # unload after this long with no requests; "0" or unset = never
-# batch = "auto"            # auto | true | false; auto serves with the continuous-batching engine
-#                           # unless the model needs a simple-engine-only feature
+# batch = "auto"            # false limits the model to one request at a time; true and "auto" mean
+#                           # no limit (concurrent requests decode together whenever the model can)
 # profile = "auto"          # MLX tuning preset: auto | latency | balanced | throughput
 # thinking_budget = 256     # reasoning tokens before </think> is forced; minimum 1
 
@@ -62,8 +62,8 @@ port = 8000
 # idle_ttl = "10m"
 # thinking_budget = 256
 
-# KV cache compression (simple engine only). mla_latent is for DeepSeek-V2 and
-# cannot be combined with mode = "turboquant".
+# KV cache compression. A model with turboquant decodes one request at a time.
+# mla_latent is for DeepSeek-V2 and cannot be combined with mode = "turboquant".
 
 # [models.kv_cache]
 # mode = "turboquant"       # off | turboquant
@@ -160,7 +160,7 @@ default = "higgs"
 # mtp_draft_tokens = 2      # (HIGGS_MTP_DRAFT_N_MAX)
 # mtp_adaptive_draft = false # (HIGGS_MTP_ADAPTIVE_DRAFT)
 # mtp_prompt_lookup = false # (HIGGS_MTP_PROMPT_LOOKUP)
-# prompt_lookup = false     # prompt-lookup decoding, simple engine only (HIGGS_PROMPT_LOOKUP)
+# prompt_lookup = false     # prompt-lookup decoding while one request runs alone (HIGGS_PROMPT_LOOKUP)
 # clear_cache_after_prefill = false # (HIGGS_CLEAR_CACHE_AFTER_PREFILL)
 
 # [experimental.chunked_prefill]

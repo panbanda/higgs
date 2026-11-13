@@ -91,7 +91,8 @@ pub enum ModelError {
 #[derive(Debug, Clone)]
 pub struct ModelSpec {
     pub name: String,
-    pub engine_kind: &'static str,
+    /// `batched`, `sequential`, or `unknown` while the checkpoint cannot be inspected.
+    pub decode: &'static str,
     pub load: LoadMode,
     /// Never evicted or expired by idle time. An explicit unload still works.
     pub pinned: bool,
@@ -328,7 +329,7 @@ impl<M: Send + Sync + 'static> Slot<M> {
                 .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
             estimated_bytes: inner.estimated_bytes,
             measured_bytes,
-            engine: self.spec.engine_kind,
+            engine: self.spec.decode,
             idle_ttl_seconds: self.spec.idle_ttl.map(|ttl| ttl.as_secs()),
         }
     }

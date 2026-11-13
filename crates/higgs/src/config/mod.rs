@@ -39,7 +39,6 @@ pub use settings::{
     RoutingConfig, ServerConfig, ServerSection,
 };
 pub use types::{ApiFormat, BatchMode, LoadMode, MemoryGuard, MlxProfile, MtpMode, Secret};
-pub use validate::{batch_unsupported_message, resolved_model_supports_batch};
 
 /// Returns true if this is "simple mode" -- no config file, models come from CLI.
 pub const fn is_simple_mode(cli: &Cli, serve_args: &ServeArgs) -> bool {
