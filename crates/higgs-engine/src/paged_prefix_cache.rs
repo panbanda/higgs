@@ -1,13 +1,17 @@
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use std::sync::Arc;
 
 use higgs_models::cache::{KeyValueCache, SteppingKeyValueCache, slice_axis1, slice_axis2};
-use higgs_models::qwen3_next::ArraysCache;
 use higgs_models::turboquant::TurboQuantContext;
 use higgs_models::{AnyCache, LayerCache};
+
+use crate::prefix_checkpoints::{
+    CheckpointPolicy, DEFAULT_CHECKPOINT_BUDGET_BYTES, DEFAULT_CHECKPOINT_INTERVAL_TOKENS,
+    MAX_CHECKPOINTS_PER_ENTRY, RecurrentCheckpoint, supports_checkpoints, thin_positions,
+};
 use mlx_rs::Array;
 use mlx_rs::error::Exception;
 use mlx_rs::ops::concatenate;
@@ -27,15 +31,6 @@ pub const DEFAULT_BLOCK_SIZE: usize = 32;
 struct KvBlock {
     keys: Array,
     values: Array,
-}
-
-/// GDN state snapshot at a block boundary (Hybrid models only).
-#[derive(Debug, Clone)]
-struct GdnSnapshot {
-    conv_state: Option<Array>,
-    ssm_state: Option<Array>,
-    conv_pos: i32,
-    offset: i32,
 }
 
 /// Per-layer block for `TurboQuant` KV cache.
@@ -61,8 +56,6 @@ enum CachedLayerData {
     TurboQuantKv(Vec<TqBlock>),
     /// Attention layer: compressed MLA latent blocks `[1, 1, T, r + rope]`.
     MlaLatent(Vec<Array>, i32, i32),
-    /// GDN/SSM layer: state snapshot at block boundary.
-    Gdn(GdnSnapshot),
     /// Layer had no cache data.
     Empty,
 }
@@ -77,14 +70,18 @@ enum CachedData {
     Paged {
         layers: Vec<CachedLayerData>,
         total_tokens: usize,
-        is_hybrid: bool,
     },
     /// Block-paged `TurboQuant` cache with shared quantization context.
     TurboQuantPaged {
         layers: Vec<CachedLayerData>,
         context: Arc<TurboQuantContext>,
         total_tokens: usize,
-        is_hybrid: bool,
+    },
+    /// Hybrid (recurrent plus attention) cache holding exactly its key's
+    /// tokens, with recurrent checkpoints at earlier block-aligned positions.
+    Hybrid {
+        cache: AnyCache,
+        checkpoints: Vec<Arc<RecurrentCheckpoint>>,
     },
     /// Full clone fallback (cache too short for paging).
     Cloned(AnyCache),
@@ -111,6 +108,9 @@ pub struct PagedPrefixMatch {
     pub prefix_len: usize,
     /// Materialized cache state for the matched prefix.
     pub cache: AnyCache,
+    /// Recurrent checkpoints of the matched entry at or before `prefix_len`,
+    /// to carry into the entry that replaces it. Empty for dense caches.
+    pub checkpoints: Vec<Arc<RecurrentCheckpoint>>,
 }
 
 /// Paged prefix cache with block-level storage and LRU eviction.
@@ -125,6 +125,7 @@ pub struct PagedPrefixCache {
     num_cached: usize,
     max_cached: usize,
     block_size: usize,
+    checkpoint_policy: CheckpointPolicy,
 }
 
 // ---------------------------------------------------------------------------
@@ -158,7 +159,7 @@ impl RadixNode {
     /// Where the walk ends partway along an edge, or at a node whose prompt
     /// has run out, every entry below shares the leading `shared_len` tokens
     /// with `tokens`; a dense entry among them can serve a block-aligned part
-    /// of that shared run (see [`is_truncatable`]).
+    /// of that shared run (see [`CachedData::partial_len`]).
     fn find_best_match(
         &self,
         tokens: &[u32],
@@ -172,7 +173,7 @@ impl RadixNode {
             let usable = node.cached.as_ref().filter(|cs| match &cs.data {
                 // Cloned entries are valid at any depth > 0 (no block alignment needed).
                 // Paged entries require at least min_prefix tokens for block alignment.
-                CachedData::Cloned(_) => depth > 0,
+                CachedData::Cloned(_) | CachedData::Hybrid { .. } => depth > 0,
                 CachedData::Paged { .. } | CachedData::TurboQuantPaged { .. } => {
                     depth >= min_prefix
                 }
@@ -187,7 +188,7 @@ impl RadixNode {
             let Some(child) = next_child else {
                 // The prompt ended, or continues differently than every
                 // child: all entries below share the first `depth` tokens.
-                return better_truncated(best, node.children.values(), depth, block_size);
+                return better_partial(best, node.children.values(), depth, block_size);
             };
             let remaining = tokens.get(depth..).unwrap_or_default();
             let common = child
@@ -197,21 +198,30 @@ impl RadixNode {
                 .take_while(|(a, b)| a == b)
                 .count();
             if common < child.edge.len() {
-                return better_truncated(best, std::iter::once(child), depth + common, block_size);
+                return better_partial(best, std::iter::once(child), depth + common, block_size);
             }
             node = child;
             depth += common;
         }
     }
 
-    /// The most recently used entry in this subtree that [`is_truncatable`] allows
-    /// cutting down.
-    fn truncatable_entry(&self) -> Option<&CachedState> {
-        let own = self.cached.as_ref().filter(|cs| is_truncatable(&cs.data));
-        let below = self.children.values().filter_map(Self::truncatable_entry);
+    /// The entry in this subtree serving the most tokens of a prompt that
+    /// shares `shared_len` tokens with all of them (see
+    /// [`CachedData::partial_len`]), preferring the more recently used on a tie.
+    fn best_partial(&self, shared_len: usize, block_size: usize) -> Option<(usize, &CachedState)> {
+        let own = self.cached.as_ref().and_then(|state| {
+            state
+                .data
+                .partial_len(shared_len, block_size)
+                .map(|len| (len, state))
+        });
+        let below = self
+            .children
+            .values()
+            .filter_map(|child| child.best_partial(shared_len, block_size));
         own.into_iter()
             .chain(below)
-            .max_by_key(|cs| cs.last_accessed.get())
+            .max_by_key(|&(len, state)| (len, state.last_accessed.get()))
     }
 
     fn oldest_cached_time(&self) -> Option<Instant> {
@@ -245,6 +255,50 @@ impl RadixNode {
         false
     }
 
+    fn add_checkpoint_bytes(
+        &self,
+        seen: &mut HashSet<*const RecurrentCheckpoint>,
+        total: &mut usize,
+    ) {
+        if let Some(state) = &self.cached {
+            state.data.add_checkpoint_bytes(seen, total);
+        }
+        for child in self.children.values() {
+            child.add_checkpoint_bytes(seen, total);
+        }
+    }
+
+    fn oldest_checkpointed_time(&self) -> Option<Instant> {
+        self.cached
+            .iter()
+            .filter(|state| state.data.has_checkpoints())
+            .map(|state| state.last_accessed.get())
+            .chain(
+                self.children
+                    .values()
+                    .filter_map(Self::oldest_checkpointed_time),
+            )
+            .min()
+    }
+
+    /// Drop the checkpoints of the entry last used at `target`, keeping the
+    /// entry itself.
+    fn strip_checkpoints_with_time(&mut self, target: Instant) -> bool {
+        if let Some(state) = self
+            .cached
+            .as_mut()
+            .filter(|state| state.last_accessed.get() == target && state.data.has_checkpoints())
+        {
+            if let CachedData::Hybrid { checkpoints, .. } = &mut state.data {
+                checkpoints.clear();
+            }
+            return true;
+        }
+        self.children
+            .values_mut()
+            .any(|child| child.strip_checkpoints_with_time(target))
+    }
+
     fn prune(&mut self) {
         for child in self.children.values_mut() {
             child.prune();
@@ -266,47 +320,76 @@ impl RadixNode {
     }
 }
 
-/// Whether an entry's stored tokens can be cut to any block-aligned length.
-///
-/// True only for dense attention KV, where the keys and values of a token
-/// depend on earlier tokens alone, so the first `n` tokens of a longer entry
-/// are exactly the entry a shorter prompt would have produced. Recurrent
-/// (hybrid) snapshots are valid only at the position they were taken, and
-/// `TurboQuant`, MLA latent and cloned entries are left whole.
-fn is_truncatable(data: &CachedData) -> bool {
-    match data {
-        CachedData::Paged {
-            layers,
-            is_hybrid: false,
-            ..
-        } => layers
-            .iter()
-            .all(|layer| matches!(layer, CachedLayerData::Kv(_) | CachedLayerData::Empty)),
-        CachedData::Paged { .. } | CachedData::TurboQuantPaged { .. } | CachedData::Cloned(_) => {
-            false
+impl CachedData {
+    /// How many leading tokens of this entry can serve a prompt that shares
+    /// only the first `shared_len` tokens of its key, when that is fewer than
+    /// the entry holds. `None` when the entry cannot be cut back.
+    ///
+    /// Dense attention KV can be cut to any block-aligned length: the keys and
+    /// values of a token depend on earlier tokens alone, so the first `n`
+    /// tokens of a longer entry are exactly the entry a shorter prompt would
+    /// have produced. A hybrid entry can only resume where it holds a
+    /// recurrent checkpoint. `TurboQuant`, MLA latent and cloned entries are
+    /// left whole.
+    fn partial_len(&self, shared_len: usize, block_size: usize) -> Option<usize> {
+        match self {
+            Self::Paged { layers, .. }
+                if layers.iter().all(|layer| {
+                    matches!(layer, CachedLayerData::Kv(_) | CachedLayerData::Empty)
+                }) =>
+            {
+                let aligned = shared_len / block_size * block_size;
+                (aligned > 0).then_some(aligned)
+            }
+            Self::Hybrid { checkpoints, .. } => checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.position())
+                .filter(|&position| {
+                    position > 0 && position <= shared_len && position % block_size == 0
+                })
+                .max(),
+            Self::Paged { .. } | Self::TurboQuantPaged { .. } | Self::Cloned(_) => None,
         }
+    }
+
+    /// Checkpoint bytes this entry holds, counting each shared checkpoint once
+    /// in `seen`.
+    fn add_checkpoint_bytes(
+        &self,
+        seen: &mut HashSet<*const RecurrentCheckpoint>,
+        total: &mut usize,
+    ) {
+        if let Self::Hybrid { checkpoints, .. } = self {
+            for checkpoint in checkpoints {
+                if seen.insert(Arc::as_ptr(checkpoint)) {
+                    *total += checkpoint.bytes();
+                }
+            }
+        }
+    }
+
+    const fn has_checkpoints(&self) -> bool {
+        matches!(self, Self::Hybrid { checkpoints, .. } if !checkpoints.is_empty())
     }
 }
 
-/// Prefer a truncated descendant entry over `best` when it covers more tokens.
+/// Prefer the entry in `subtrees` that serves the most of a prompt sharing
+/// `shared_len` tokens with all of them, over `best`, when it covers more.
 ///
 /// `subtrees` are the nodes whose entries all share the first `shared_len`
 /// tokens with the prompt.
-fn better_truncated<'a>(
+fn better_partial<'a>(
     best: Option<(usize, &'a CachedState)>,
     subtrees: impl Iterator<Item = &'a RadixNode>,
     shared_len: usize,
     block_size: usize,
 ) -> Option<(usize, &'a CachedState)> {
-    let truncated_len = shared_len / block_size * block_size;
     let best_len = best.map_or(0, |(len, _)| len);
-    if truncated_len == 0 || truncated_len <= best_len {
-        return best;
-    }
     subtrees
-        .filter_map(RadixNode::truncatable_entry)
-        .max_by_key(|cs| cs.last_accessed.get())
-        .map_or(best, |cs| Some((truncated_len, cs)))
+        .filter_map(|subtree| subtree.best_partial(shared_len, block_size))
+        .filter(|&(len, _)| len > best_len)
+        .max_by_key(|&(len, state)| (len, state.last_accessed.get()))
+        .or(best)
 }
 
 // ---------------------------------------------------------------------------
@@ -321,7 +404,31 @@ impl PagedPrefixCache {
             num_cached: 0,
             max_cached: max_entries,
             block_size,
+            checkpoint_policy: CheckpointPolicy::new(
+                DEFAULT_CHECKPOINT_INTERVAL_TOKENS,
+                MAX_CHECKPOINTS_PER_ENTRY,
+                DEFAULT_CHECKPOINT_BUDGET_BYTES,
+            ),
         }
+    }
+
+    #[must_use]
+    pub const fn with_checkpoint_policy(mut self, policy: CheckpointPolicy) -> Self {
+        self.checkpoint_policy = policy;
+        self
+    }
+
+    pub const fn checkpoint_policy(&self) -> &CheckpointPolicy {
+        &self.checkpoint_policy
+    }
+
+    /// Bytes of recurrent checkpoint state held by all entries, counting a
+    /// checkpoint shared between entries once.
+    pub fn checkpoint_bytes(&self) -> usize {
+        let mut seen = HashSet::new();
+        let mut total = 0;
+        self.root.add_checkpoint_bytes(&mut seen, &mut total);
+        total
     }
 
     /// Find the longest cached prefix that matches the beginning of `tokens`.
@@ -329,9 +436,11 @@ impl PagedPrefixCache {
     /// Returns `None` if no prefix matches or if the match is shorter than one
     /// block. On hit, blocks are gathered into a contiguous `AnyCache`.
     ///
-    /// A dense entry that shares only the start of its key with `tokens` (the
-    /// same system prompt followed by a different question) serves the
-    /// block-aligned part of that shared run, so the first such request hits.
+    /// An entry that shares only the start of its key with `tokens` (the same
+    /// system prompt followed by a different question) serves the part of that
+    /// shared run it can be cut back to: any block-aligned length for dense
+    /// KV, the nearest recurrent checkpoint for a hybrid entry. So the first
+    /// such request hits.
     pub fn find_longest_prefix(&mut self, tokens: &[u32]) -> Option<PagedPrefixMatch> {
         let block_size = self.block_size;
         self.root
@@ -341,7 +450,11 @@ impl PagedPrefixCache {
                     Ok(cache) => {
                         tracing::debug!(prefix_len, "Prefix cache hit");
                         cs.last_accessed.set(Instant::now());
-                        Some(PagedPrefixMatch { prefix_len, cache })
+                        Some(PagedPrefixMatch {
+                            prefix_len,
+                            cache,
+                            checkpoints: checkpoints_up_to(&cs.data, prefix_len),
+                        })
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "Prefix cache materialize failed");
@@ -365,26 +478,47 @@ impl PagedPrefixCache {
     /// (lazy, nearly free). For `TurboQuant` caches, a full clone fallback is
     /// used. Only block-aligned tokens are stored in the trie.
     pub fn store(&mut self, prefix_tokens: &[u32], cache: &AnyCache) {
+        self.store_with_checkpoints(prefix_tokens, cache, Vec::new());
+    }
+
+    /// [`Self::store`] for a hybrid `cache`, with recurrent `checkpoints` taken
+    /// at earlier positions of `prefix_tokens`. Checkpoints that are not block
+    /// aligned or not before the end of the key are dropped, the rest thinned
+    /// to the policy's per-entry cap and then to its memory budget, keeping
+    /// the newest.
+    pub fn store_with_checkpoints(
+        &mut self,
+        prefix_tokens: &[u32],
+        cache: &AnyCache,
+        checkpoints: Vec<Arc<RecurrentCheckpoint>>,
+    ) {
         if self.max_cached == 0 {
             return;
         }
 
-        // TurboQuant caches with deferred quantization are stored as dense
-        // blocks until TQ activates. Full TQ block paging is implemented in the
-        // CachedData::TurboQuantPaged variant but requires the TQ arrays to be
-        // populated (post-activation). For now, use clone fallback when TQ config
-        // is set but arrays aren't yet quantized to avoid cache corruption.
-        let data = match slice_into_blocks(cache, self.block_size, prefix_tokens.len()) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to page cache, using clone fallback");
-                CachedData::Cloned(cache.clone())
+        let data = if matches!(cache, AnyCache::Hybrid(_)) {
+            CachedData::Hybrid {
+                cache: cache.clone(),
+                checkpoints: self.retained_checkpoints(cache, prefix_tokens.len(), checkpoints),
+            }
+        } else {
+            // TurboQuant caches with deferred quantization are stored as dense
+            // blocks until TQ activates. Full TQ block paging is implemented in the
+            // CachedData::TurboQuantPaged variant but requires the TQ arrays to be
+            // populated (post-activation). For now, use clone fallback when TQ config
+            // is set but arrays aren't yet quantized to avoid cache corruption.
+            match slice_into_blocks(cache, self.block_size, prefix_tokens.len()) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to page cache, using clone fallback");
+                    CachedData::Cloned(cache.clone())
+                }
             }
         };
         // A cloned entry is reused as-is, so it must hold exactly the tokens
         // its key names. A cache that also ran the chat template's generation
         // suffix would replay those tokens on the next hit.
-        if matches!(data, CachedData::Cloned(_)) {
+        if matches!(data, CachedData::Cloned(_) | CachedData::Hybrid { .. }) {
             if let Some(offset) = cache_offset(cache).and_then(|o| usize::try_from(o).ok()) {
                 if offset != prefix_tokens.len() {
                     tracing::debug!(
@@ -400,7 +534,7 @@ impl PagedPrefixCache {
         let stored_len = match &data {
             CachedData::Paged { total_tokens, .. }
             | CachedData::TurboQuantPaged { total_tokens, .. } => *total_tokens,
-            CachedData::Cloned(_) => prefix_tokens.len(),
+            CachedData::Cloned(_) | CachedData::Hybrid { .. } => prefix_tokens.len(),
         };
         let Some(tokens_to_store) = prefix_tokens.get(..stored_len) else {
             tracing::warn!(
@@ -417,6 +551,57 @@ impl PagedPrefixCache {
             self.num_cached += 1;
             while self.num_cached > self.max_cached {
                 self.evict_lru();
+            }
+        }
+        self.enforce_checkpoint_budget();
+    }
+
+    /// The `checkpoints` an entry of `key_len` tokens keeps.
+    fn retained_checkpoints(
+        &self,
+        cache: &AnyCache,
+        key_len: usize,
+        mut checkpoints: Vec<Arc<RecurrentCheckpoint>>,
+    ) -> Vec<Arc<RecurrentCheckpoint>> {
+        if !supports_checkpoints(cache) || !self.checkpoint_policy.is_enabled() {
+            return Vec::new();
+        }
+        checkpoints.retain(|checkpoint| {
+            checkpoint.position() < key_len && checkpoint.position() % self.block_size == 0
+        });
+        checkpoints.sort_by_key(|checkpoint| checkpoint.position());
+        checkpoints.dedup_by_key(|checkpoint| checkpoint.position());
+        let positions = thin_positions(
+            checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.position())
+                .collect(),
+            self.checkpoint_policy.max_per_entry(),
+        );
+        checkpoints.retain(|checkpoint| positions.contains(&checkpoint.position()));
+
+        let mut bytes = 0;
+        let mut within_budget = checkpoints
+            .into_iter()
+            .rev()
+            .take_while(|checkpoint| {
+                bytes += checkpoint.bytes();
+                bytes <= self.checkpoint_policy.budget_bytes()
+            })
+            .collect::<Vec<_>>();
+        within_budget.reverse();
+        within_budget
+    }
+
+    /// Strip checkpoints from the least recently used entries until the
+    /// total fits the policy's budget.
+    fn enforce_checkpoint_budget(&mut self) {
+        while self.checkpoint_bytes() > self.checkpoint_policy.budget_bytes() {
+            let Some(oldest) = self.root.oldest_checkpointed_time() else {
+                return;
+            };
+            if !self.root.strip_checkpoints_with_time(oldest) {
+                return;
             }
         }
     }
@@ -569,17 +754,14 @@ fn cache_offset(cache: &AnyCache) -> Option<i32> {
     })
 }
 
-/// Slice a cache into block-aligned paged data.
+/// Slice a dense cache into block-aligned paged data.
 fn slice_into_blocks(
     cache: &AnyCache,
     block_size: usize,
     max_tokens: usize,
 ) -> Result<CachedData, Exception> {
-    // Hybrid caches (GDN+KV) can't be block-paged because GDN sequential state
-    // doesn't align to block boundaries. The KV offset would mismatch the GDN
-    // offset after materialization, producing corrupt attention. Use clone instead.
     let AnyCache::KV(kv_layers) = cache else {
-        return Ok(CachedData::Cloned(cache.clone()));
+        return Err(Exception::custom("only dense caches are block-paged"));
     };
 
     let offset = kv_offset(cache).unwrap_or(0);
@@ -618,13 +800,11 @@ fn slice_into_blocks(
             layers,
             context,
             total_tokens,
-            is_hybrid: false,
         })
     } else {
         Ok(CachedData::Paged {
             layers,
             total_tokens,
-            is_hybrid: false,
         })
     }
 }
@@ -720,8 +900,9 @@ fn slice_kv_layer(
 
 /// Materialize the first `prefix_len` tokens of an entry.
 ///
-/// `prefix_len` is the entry's full length except for the truncated hits
-/// [`is_truncatable`] allows, which keep only the leading blocks.
+/// `prefix_len` is the entry's full length except for the partial hits
+/// [`CachedData::partial_len`] allows: dense entries keep only the leading
+/// blocks and hybrid entries restore the checkpoint taken at `prefix_len`.
 fn materialize_prefix(
     data: &CachedData,
     prefix_len: usize,
@@ -731,7 +912,6 @@ fn materialize_prefix(
         CachedData::Paged {
             layers,
             total_tokens,
-            is_hybrid: false,
         } if prefix_len < *total_tokens => {
             let kept_blocks = prefix_len / block_size;
             let kept: Vec<CachedLayerData> = layers
@@ -742,43 +922,87 @@ fn materialize_prefix(
                     }
                     other @ (CachedLayerData::TurboQuantKv(_)
                     | CachedLayerData::MlaLatent(..)
-                    | CachedLayerData::Gdn(_)
                     | CachedLayerData::Empty) => other.clone(),
                 })
                 .collect();
             materialize_kv(&kept)
         }
+        CachedData::Hybrid { cache, checkpoints } => checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.position() == prefix_len)
+            .map_or_else(
+                || Ok(cache.clone()),
+                |checkpoint| restore_checkpoint(cache, checkpoint),
+            ),
         CachedData::Paged { .. } | CachedData::TurboQuantPaged { .. } | CachedData::Cloned(_) => {
             materialize(data)
         }
     }
 }
 
+/// The checkpoints of a hybrid entry that a resume at `prefix_len` keeps valid.
+fn checkpoints_up_to(data: &CachedData, prefix_len: usize) -> Vec<Arc<RecurrentCheckpoint>> {
+    match data {
+        CachedData::Hybrid { checkpoints, .. } => checkpoints
+            .iter()
+            .filter(|checkpoint| checkpoint.position() <= prefix_len)
+            .cloned()
+            .collect(),
+        CachedData::Paged { .. } | CachedData::TurboQuantPaged { .. } | CachedData::Cloned(_) => {
+            Vec::new()
+        }
+    }
+}
+
+/// `entry` cut back to the position of `checkpoint`: attention layers keep
+/// their first tokens, recurrent layers take the checkpointed state.
+fn restore_checkpoint(
+    entry: &AnyCache,
+    checkpoint: &RecurrentCheckpoint,
+) -> Result<AnyCache, Exception> {
+    let AnyCache::Hybrid(layers) = entry else {
+        return Err(Exception::custom("checkpoint restored into a dense cache"));
+    };
+    let length = i32::try_from(checkpoint.position())
+        .map_err(|_| Exception::custom("checkpoint position overflow"))?;
+    layers
+        .iter()
+        .enumerate()
+        .map(|(index, layer)| match layer {
+            Some(LayerCache::KV(kv)) => {
+                truncate_dense_kv(kv, length).map(|truncated| Some(LayerCache::KV(truncated)))
+            }
+            Some(LayerCache::Arrays(_)) => checkpoint
+                .layer(index)
+                .map(|state| Some(LayerCache::Arrays(state)))
+                .ok_or_else(|| Exception::custom("checkpoint is missing a recurrent layer")),
+            None => Ok(None),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(AnyCache::Hybrid)
+}
+
+fn truncate_dense_kv(
+    kv: &SteppingKeyValueCache,
+    length: i32,
+) -> Result<SteppingKeyValueCache, Exception> {
+    match (kv.keys(), kv.values()) {
+        (Some(keys), Some(values)) => SteppingKeyValueCache::from_arrays(
+            slice_axis2(keys, 0, length)?,
+            slice_axis2(values, 0, length)?,
+        ),
+        _ => Ok(SteppingKeyValueCache::new()),
+    }
+}
+
 /// Materialize block references into a contiguous `AnyCache`.
 fn materialize(data: &CachedData) -> Result<AnyCache, Exception> {
     match data {
-        CachedData::Cloned(cache) => Ok(cache.clone()),
-        CachedData::Paged {
-            layers, is_hybrid, ..
-        } => {
-            if *is_hybrid {
-                materialize_hybrid(layers)
-            } else {
-                materialize_kv(layers)
-            }
-        }
+        CachedData::Cloned(cache) | CachedData::Hybrid { cache, .. } => Ok(cache.clone()),
+        CachedData::Paged { layers, .. } => materialize_kv(layers),
         CachedData::TurboQuantPaged {
-            layers,
-            context,
-            is_hybrid,
-            ..
-        } => {
-            if *is_hybrid {
-                materialize_tq_hybrid(layers, context)
-            } else {
-                materialize_tq_kv(layers, context)
-            }
-        }
+            layers, context, ..
+        } => materialize_tq_kv(layers, context),
     }
 }
 
@@ -794,7 +1018,6 @@ fn materialize_kv(layers: &[CachedLayerData]) -> Result<AnyCache, Exception> {
                 gather_mla_blocks(blocks, *r, *rope).map(Some)
             }
             CachedLayerData::Empty => Ok(Some(SteppingKeyValueCache::new())),
-            CachedLayerData::Gdn(_) => Err(Exception::custom("Unexpected GDN layer in KV cache")),
         })
         .collect();
     Ok(AnyCache::KV(kv_layers?))
@@ -813,61 +1036,9 @@ fn materialize_tq_kv(
                 gather_mla_blocks(blocks, *r, *rope).map(Some)
             }
             CachedLayerData::Empty => Ok(Some(SteppingKeyValueCache::new())),
-            CachedLayerData::Gdn(_) => {
-                Err(Exception::custom("Unexpected GDN layer in TQ KV cache"))
-            }
         })
         .collect();
     Ok(AnyCache::KV(kv_layers?))
-}
-
-fn materialize_hybrid(layers: &[CachedLayerData]) -> Result<AnyCache, Exception> {
-    let hybrid_layers: Result<Vec<_>, _> = layers
-        .iter()
-        .map(|layer| match layer {
-            CachedLayerData::Kv(blocks) => gather_blocks(blocks).map(|kv| Some(LayerCache::KV(kv))),
-            CachedLayerData::TurboQuantKv(_) => {
-                Err(Exception::custom("TQ layer in non-TQ hybrid materialize"))
-            }
-            CachedLayerData::MlaLatent(blocks, r, rope) => {
-                gather_mla_blocks(blocks, *r, *rope).map(|kv| Some(LayerCache::KV(kv)))
-            }
-            CachedLayerData::Gdn(snap) => Ok(Some(LayerCache::Arrays(ArraysCache {
-                conv_state: snap.conv_state.clone(),
-                ssm_state: snap.ssm_state.clone(),
-                conv_pos: snap.conv_pos,
-                offset: snap.offset,
-            }))),
-            CachedLayerData::Empty => Ok(None),
-        })
-        .collect();
-    Ok(AnyCache::Hybrid(hybrid_layers?))
-}
-
-fn materialize_tq_hybrid(
-    layers: &[CachedLayerData],
-    context: &Arc<TurboQuantContext>,
-) -> Result<AnyCache, Exception> {
-    let hybrid_layers: Result<Vec<_>, _> = layers
-        .iter()
-        .map(|layer| match layer {
-            CachedLayerData::TurboQuantKv(blocks) => {
-                gather_tq_blocks(blocks, context).map(|kv| Some(LayerCache::KV(kv)))
-            }
-            CachedLayerData::Kv(blocks) => gather_blocks(blocks).map(|kv| Some(LayerCache::KV(kv))),
-            CachedLayerData::MlaLatent(blocks, r, rope) => {
-                gather_mla_blocks(blocks, *r, *rope).map(|kv| Some(LayerCache::KV(kv)))
-            }
-            CachedLayerData::Gdn(snap) => Ok(Some(LayerCache::Arrays(ArraysCache {
-                conv_state: snap.conv_state.clone(),
-                ssm_state: snap.ssm_state.clone(),
-                conv_pos: snap.conv_pos,
-                offset: snap.offset,
-            }))),
-            CachedLayerData::Empty => Ok(None),
-        })
-        .collect();
-    Ok(AnyCache::Hybrid(hybrid_layers?))
 }
 
 /// Gather KV blocks into a single contiguous `SteppingKeyValueCache`.
@@ -961,6 +1132,8 @@ fn gather_tq_blocks(
 mod tests {
     use super::*;
     use higgs_models::cache::KeyValueCache;
+    use higgs_models::qwen3_next::ArraysCache;
+    use mlx_rs::ops::indexing::IndexOp;
 
     /// Create a KV cache with `num_layers` layers, each containing `seq_len`
     /// tokens of shape `[1, 2, seq_len, 8]`.
@@ -1436,6 +1609,357 @@ mod tests {
             cache.find_longest_prefix(&barely_past).unwrap().prefix_len,
             64
         );
+    }
+
+    /// A hybrid cache of `tokens` tokens: layers 0 and 4 are recurrent with
+    /// state filled with the token count, the others dense KV whose value at
+    /// each position is that position (plus the layer), so any prefix of a
+    /// longer cache equals the shorter cache.
+    fn make_positional_hybrid(tokens: i32) -> AnyCache {
+        let layers: Vec<Option<LayerCache>> = (0..6)
+            .map(|layer| {
+                if layer % 4 == 0 {
+                    let marker = Array::from_f32(f32::from(u16::try_from(tokens).unwrap()));
+                    Some(LayerCache::Arrays(ArraysCache {
+                        conv_state: Some(
+                            Array::zeros::<f32>(&[1, 3, 4])
+                                .unwrap()
+                                .add(&marker)
+                                .unwrap(),
+                        ),
+                        ssm_state: Some(
+                            Array::zeros::<f32>(&[1, 16]).unwrap().add(&marker).unwrap(),
+                        ),
+                        conv_pos: 2,
+                        offset: tokens,
+                    }))
+                } else {
+                    let positions = mlx_rs::ops::arange::<_, f32>(0, tokens, None)
+                        .unwrap()
+                        .reshape(&[1, 1, tokens, 1])
+                        .unwrap();
+                    let shift =
+                        Array::from_f32(f32::from(u16::try_from(layer).unwrap()) * 10_000.0);
+                    let keys = mlx_rs::ops::broadcast_to(
+                        positions.add(&shift).unwrap(),
+                        &[1, 2, tokens, 8],
+                    )
+                    .unwrap();
+                    let values = keys.negative().unwrap();
+                    Some(LayerCache::KV(
+                        SteppingKeyValueCache::from_arrays(keys, values).unwrap(),
+                    ))
+                }
+            })
+            .collect();
+        AnyCache::Hybrid(layers)
+    }
+
+    fn checkpoint_at(position: usize) -> Arc<RecurrentCheckpoint> {
+        let tokens = i32::try_from(position).unwrap();
+        RecurrentCheckpoint::capture(&make_positional_hybrid(tokens), position).unwrap()
+    }
+
+    fn store_hybrid(
+        cache: &mut PagedPrefixCache,
+        key: &[u32],
+        checkpoint_positions: &[usize],
+    ) -> Vec<Arc<RecurrentCheckpoint>> {
+        let checkpoints: Vec<_> = checkpoint_positions
+            .iter()
+            .map(|&p| checkpoint_at(p))
+            .collect();
+        let tokens = i32::try_from(key.len()).unwrap();
+        cache.store_with_checkpoints(key, &make_positional_hybrid(tokens), checkpoints.clone());
+        checkpoints
+    }
+
+    fn diverging_after(shared: usize, total: usize) -> Vec<u32> {
+        let mut query: Vec<u32> = (0..u32::try_from(shared).unwrap()).collect();
+        query.extend(10_000..10_000 + u32::try_from(total - shared).unwrap());
+        query
+    }
+
+    /// (recurrent state marker, recurrent offset, ring position, KV length,
+    /// last KV key) of a restored hybrid cache.
+    fn restored_summary(cache: &AnyCache) -> (f32, i32, i32, i32, f32) {
+        let AnyCache::Hybrid(layers) = cache else {
+            panic!("expected a hybrid cache")
+        };
+        let Some(LayerCache::Arrays(state)) = layers.first().unwrap() else {
+            panic!("layer 0 is recurrent")
+        };
+        let Some(LayerCache::KV(kv)) = layers.get(1).unwrap() else {
+            panic!("layer 1 is attention")
+        };
+        let keys = kv.keys().unwrap();
+        let last = keys.shape()[2] - 1;
+        let last_key = keys.index((0, 0, last, 0)).item_cast::<f32>();
+        (
+            state.ssm_state.as_ref().unwrap().as_slice::<f32>()[0],
+            state.offset,
+            state.conv_pos,
+            KeyValueCache::offset(kv),
+            last_key - 10_000.0,
+        )
+    }
+
+    #[test]
+    fn test_hybrid_resumes_from_the_checkpoint_before_the_divergence() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        let key: Vec<u32> = (0..200).collect();
+        store_hybrid(&mut cache, &key, &[64, 128]);
+
+        let matched = cache
+            .find_longest_prefix(&diverging_after(150, 190))
+            .unwrap();
+        assert_eq!(matched.prefix_len, 128);
+        assert_eq!(
+            restored_summary(&matched.cache),
+            (128.0, 128, 2, 128, 127.0)
+        );
+        let inherited: Vec<_> = matched.checkpoints.iter().map(|c| c.position()).collect();
+        assert_eq!(inherited, vec![64, 128]);
+    }
+
+    #[test]
+    fn test_hybrid_divergence_just_after_and_just_before_a_checkpoint() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        let key: Vec<u32> = (0..200).collect();
+        store_hybrid(&mut cache, &key, &[64, 128]);
+
+        let after = cache
+            .find_longest_prefix(&diverging_after(129, 190))
+            .unwrap();
+        assert_eq!(after.prefix_len, 128);
+        let at = cache
+            .find_longest_prefix(&diverging_after(128, 190))
+            .unwrap();
+        assert_eq!(at.prefix_len, 128);
+        let before = cache
+            .find_longest_prefix(&diverging_after(127, 190))
+            .unwrap();
+        assert_eq!(before.prefix_len, 64);
+        assert_eq!(restored_summary(&before.cache), (64.0, 64, 2, 64, 63.0));
+        assert_eq!(
+            before
+                .checkpoints
+                .iter()
+                .map(|c| c.position())
+                .collect::<Vec<_>>(),
+            vec![64]
+        );
+    }
+
+    #[test]
+    fn test_hybrid_divergence_before_the_first_checkpoint_misses() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        let key: Vec<u32> = (0..200).collect();
+        store_hybrid(&mut cache, &key, &[64, 128]);
+
+        assert!(
+            cache
+                .find_longest_prefix(&diverging_after(63, 190))
+                .is_none()
+        );
+        assert!(
+            cache
+                .find_longest_prefix(&diverging_after(10, 190))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_hybrid_whole_key_is_served_with_all_checkpoints() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        let key: Vec<u32> = (0..200).collect();
+        store_hybrid(&mut cache, &key, &[64, 128]);
+
+        let mut extended = key;
+        extended.extend(500..530);
+        let matched = cache.find_longest_prefix(&extended).unwrap();
+        assert_eq!(matched.prefix_len, 200);
+        assert_eq!(
+            restored_summary(&matched.cache),
+            (200.0, 200, 2, 200, 199.0)
+        );
+        assert_eq!(matched.checkpoints.len(), 2);
+    }
+
+    #[test]
+    fn test_hybrid_checkpoints_must_be_block_aligned_and_inside_the_key() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        let key: Vec<u32> = (0..200).collect();
+        store_hybrid(&mut cache, &key, &[40, 64, 200, 256]);
+
+        let matched = cache
+            .find_longest_prefix(&diverging_after(199, 230))
+            .unwrap();
+        assert_eq!(matched.prefix_len, 64);
+        assert_eq!(matched.checkpoints.len(), 1);
+    }
+
+    #[test]
+    fn test_hybrid_without_checkpoints_behaves_as_before() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        let key: Vec<u32> = (0..96).collect();
+        store_hybrid(&mut cache, &key, &[]);
+        assert!(
+            cache
+                .find_longest_prefix(&diverging_after(70, 120))
+                .is_none()
+        );
+
+        let mut extended = key;
+        extended.push(5000);
+        assert_eq!(cache.find_longest_prefix(&extended).unwrap().prefix_len, 96);
+    }
+
+    #[test]
+    fn test_disabled_policy_keeps_no_checkpoints() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE)
+            .with_checkpoint_policy(CheckpointPolicy::disabled());
+        let key: Vec<u32> = (0..200).collect();
+        store_hybrid(&mut cache, &key, &[64, 128]);
+        assert_eq!(cache.checkpoint_bytes(), 0);
+        assert!(
+            cache
+                .find_longest_prefix(&diverging_after(150, 190))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_hybrid_checkpoints_are_thinned_to_the_per_entry_cap() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE)
+            .with_checkpoint_policy(CheckpointPolicy::new(32, 3, usize::MAX));
+        let key: Vec<u32> = (0..400).collect();
+        store_hybrid(&mut cache, &key, &[64, 128, 192, 256, 320]);
+
+        let matched = cache
+            .find_longest_prefix(&diverging_after(399, 420))
+            .unwrap();
+        let kept: Vec<_> = matched.checkpoints.iter().map(|c| c.position()).collect();
+        assert_eq!(kept, vec![64, 192, 320]);
+    }
+
+    #[test]
+    fn test_entries_extending_each_other_share_checkpoints() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        let first: Vec<u32> = (0..200).collect();
+        store_hybrid(&mut cache, &first, &[64, 128]);
+        let one_checkpoint = cache.checkpoint_bytes() / 2;
+        assert!(one_checkpoint > 0);
+
+        let matched = cache
+            .find_longest_prefix(&diverging_after(150, 300))
+            .unwrap();
+        let mut inherited = matched.checkpoints;
+        inherited.push(checkpoint_at(192));
+        let second = diverging_after(150, 300);
+        cache.store_with_checkpoints(&second, &make_positional_hybrid(300), inherited);
+
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.checkpoint_bytes(), 3 * one_checkpoint);
+        let from_first = cache
+            .find_longest_prefix(&diverging_after(100, 240))
+            .unwrap();
+        let from_second = cache
+            .find_longest_prefix(
+                &second[..100]
+                    .iter()
+                    .copied()
+                    .chain(8000..8100)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        assert_eq!(from_first.prefix_len, 64);
+        assert_eq!(from_second.prefix_len, 64);
+        assert!(Arc::ptr_eq(
+            &from_first.checkpoints[0],
+            &from_second.checkpoints[0]
+        ));
+    }
+
+    #[test]
+    fn test_budget_strips_checkpoints_from_the_least_recently_used_entry_first() {
+        let one_checkpoint = checkpoint_at(64).bytes();
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE)
+            .with_checkpoint_policy(CheckpointPolicy::new(32, 8, 3 * one_checkpoint));
+        let old_key: Vec<u32> = (0..200).collect();
+        let new_key: Vec<u32> = (1000..1200).collect();
+        store_hybrid(&mut cache, &old_key, &[64, 128]);
+        assert_eq!(cache.checkpoint_bytes(), 2 * one_checkpoint);
+        store_hybrid(&mut cache, &new_key, &[64, 128]);
+
+        assert_eq!(cache.checkpoint_bytes(), 2 * one_checkpoint);
+        assert_eq!(cache.len(), 2);
+        assert!(
+            cache
+                .find_longest_prefix(&diverging_after(150, 190))
+                .is_none()
+        );
+        let mut extended = old_key;
+        extended.push(5000);
+        assert_eq!(
+            cache.find_longest_prefix(&extended).unwrap().prefix_len,
+            200
+        );
+        let recent = new_key[..150]
+            .iter()
+            .copied()
+            .chain(9000..9040)
+            .collect::<Vec<_>>();
+        assert_eq!(cache.find_longest_prefix(&recent).unwrap().prefix_len, 128);
+    }
+
+    #[test]
+    fn test_a_single_entry_over_budget_keeps_its_newest_checkpoints() {
+        let one_checkpoint = checkpoint_at(64).bytes();
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE)
+            .with_checkpoint_policy(CheckpointPolicy::new(32, 8, 2 * one_checkpoint));
+        let key: Vec<u32> = (0..300).collect();
+        store_hybrid(&mut cache, &key, &[64, 128, 192, 256]);
+        assert_eq!(cache.checkpoint_bytes(), 2 * one_checkpoint);
+        let matched = cache
+            .find_longest_prefix(&diverging_after(299, 320))
+            .unwrap();
+        assert_eq!(matched.prefix_len, 256);
+        assert_eq!(
+            matched
+                .checkpoints
+                .iter()
+                .map(|c| c.position())
+                .collect::<Vec<_>>(),
+            vec![192, 256]
+        );
+    }
+
+    #[test]
+    fn test_evicting_an_entry_releases_its_checkpoints() {
+        let mut cache = PagedPrefixCache::new(1, DEFAULT_BLOCK_SIZE);
+        store_hybrid(&mut cache, &(0..200).collect::<Vec<u32>>(), &[64, 128]);
+        assert!(cache.checkpoint_bytes() > 0);
+        cache.store(&(1000..1096).collect::<Vec<u32>>(), &make_kv_cache(2, 96));
+        assert_eq!(cache.checkpoint_bytes(), 0);
+    }
+
+    #[test]
+    fn test_the_longer_of_a_dense_and_a_hybrid_partial_hit_wins() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        let shared_head: Vec<u32> = (0..200).collect();
+        let mut hybrid_key = shared_head.clone();
+        hybrid_key.extend(300..340);
+        store_hybrid(&mut cache, &hybrid_key, &[64, 128]);
+        let mut dense_key = shared_head;
+        dense_key.extend(400..440);
+        cache.store(&dense_key, &make_kv_cache(2, 240));
+
+        let matched = cache
+            .find_longest_prefix(&diverging_after(199, 260))
+            .unwrap();
+        assert_eq!(matched.prefix_len, 192);
+        assert!(matches!(matched.cache, AnyCache::KV(_)));
     }
 
     #[test]

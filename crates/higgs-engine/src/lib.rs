@@ -13,6 +13,7 @@ pub mod mlx_tuning;
 pub mod model_loader;
 pub mod mtp;
 pub mod paged_prefix_cache;
+pub mod prefix_checkpoints;
 pub mod prompt_cache;
 pub mod reasoning_parser;
 pub mod scheduler;

@@ -2,6 +2,7 @@
 //! resolve thinking, prefix-cache keys and embeddings identically.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use higgs_models::{AnyCache, AnyModel, turboquant::KvCacheConfig};
 use mlx_rs::{
@@ -16,6 +17,7 @@ use crate::{
     chat_template::{ChatMessage, ChatTemplateRenderer},
     error::EngineError,
     paged_prefix_cache::PagedPrefixMatch,
+    prefix_checkpoints::RecurrentCheckpoint,
 };
 
 /// Counts a request's reasoning tokens for a decode loop that samples one
@@ -128,23 +130,6 @@ pub fn tokenize_chat_prompt(
     Ok(encoding.get_ids().to_vec())
 }
 
-/// Where a prefill that resumes at `resume_at` must pause to snapshot its
-/// cache for the prefix cache, as an index into the tokens it will run.
-///
-/// Dense KV caches are sliced to the key length when stored. A recurrent
-/// (hybrid) state cannot be cut back, so it is captured while the cache
-/// holds exactly the key's tokens, before the generation suffix runs.
-pub fn snapshot_boundary(
-    prompt: &[u32],
-    resume_at: usize,
-    generation_suffix_len: usize,
-    cache: &AnyCache,
-) -> Option<usize> {
-    let key_len = prefix_cache_key(prompt, generation_suffix_len).len();
-    (matches!(cache, AnyCache::Hybrid(_)) && key_len > resume_at && key_len < prompt.len())
-        .then(|| key_len - resume_at)
-}
-
 /// Number of trailing tokens `add_generation_prompt=true` appends to a chat
 /// prompt (for example `<|im_start|>assistant\n<think>\n`).
 ///
@@ -190,6 +175,14 @@ pub fn prefix_cache_key(prompt_tokens: &[u32], generation_suffix_len: usize) -> 
         .unwrap_or(prompt_tokens)
 }
 
+/// Where prefill resumes, the cache to resume from, and the recurrent
+/// checkpoints that remain valid for the longer entry this prefill will store.
+pub struct PrefixResume {
+    pub resume_at: usize,
+    pub cache: AnyCache,
+    pub checkpoints: Vec<Arc<RecurrentCheckpoint>>,
+}
+
 /// Where prefill resumes, and the cache to resume from, given the longest
 /// cached prefix of `prompt_tokens`.
 ///
@@ -200,7 +193,7 @@ pub fn resume_from_prefix<MakeCache: FnOnce() -> Result<AnyCache, EngineError>>(
     prefix_match: Option<PagedPrefixMatch>,
     prompt_tokens: &[u32],
     fresh_cache: MakeCache,
-) -> Result<(usize, AnyCache), EngineError> {
+) -> Result<PrefixResume, EngineError> {
     match prefix_match {
         Some(matched) if matched.prefix_len < prompt_tokens.len() => {
             tracing::debug!(
@@ -208,16 +201,28 @@ pub fn resume_from_prefix<MakeCache: FnOnce() -> Result<AnyCache, EngineError>>(
                 total_len = prompt_tokens.len(),
                 "Prefix cache hit — reusing cached prefix"
             );
-            Ok((matched.prefix_len, matched.cache))
+            Ok(PrefixResume {
+                resume_at: matched.prefix_len,
+                cache: matched.cache,
+                checkpoints: matched.checkpoints,
+            })
         }
         Some(_) => {
             tracing::debug!(
                 prompt_len = prompt_tokens.len(),
                 "Full prefix hit requires cached logits; falling back to fresh prefill"
             );
-            Ok((0, fresh_cache()?))
+            Ok(PrefixResume {
+                resume_at: 0,
+                cache: fresh_cache()?,
+                checkpoints: Vec::new(),
+            })
         }
-        None => Ok((0, fresh_cache()?)),
+        None => Ok(PrefixResume {
+            resume_at: 0,
+            cache: fresh_cache()?,
+            checkpoints: Vec::new(),
+        }),
     }
 }
 
@@ -345,34 +350,34 @@ mod tests {
         PagedPrefixMatch {
             prefix_len,
             cache: AnyCache::KV(Vec::new()),
+            checkpoints: Vec::new(),
         }
     }
 
     #[test]
     fn partial_prefix_hit_resumes_after_the_prefix() {
         let prompt = [1, 2, 3, 4, 5];
-        let (resume_at, _) = resume_from_prefix(Some(prefix_match(3)), &prompt, || {
+        let resumed = resume_from_prefix(Some(prefix_match(3)), &prompt, || {
             Err(EngineError::Generation("no fresh cache needed".to_owned()))
         })
         .unwrap();
-        assert_eq!(resume_at, 3);
+        assert_eq!(resumed.resume_at, 3);
     }
 
     #[test]
     fn full_prefix_hit_replays_the_prompt_from_scratch() {
         let prompt = [1, 2, 3];
-        let (resume_at, _) = resume_from_prefix(Some(prefix_match(3)), &prompt, || {
+        let resumed = resume_from_prefix(Some(prefix_match(3)), &prompt, || {
             Ok(AnyCache::KV(Vec::new()))
         })
         .unwrap();
-        assert_eq!(resume_at, 0);
+        assert_eq!(resumed.resume_at, 0);
     }
 
     #[test]
     fn miss_starts_from_a_fresh_cache() {
-        let (resume_at, _) =
-            resume_from_prefix(None, &[1, 2], || Ok(AnyCache::KV(Vec::new()))).unwrap();
-        assert_eq!(resume_at, 0);
+        let resumed = resume_from_prefix(None, &[1, 2], || Ok(AnyCache::KV(Vec::new()))).unwrap();
+        assert_eq!(resumed.resume_at, 0);
     }
 
     #[test]

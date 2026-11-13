@@ -29,12 +29,13 @@ use crate::{
     engine_thread::EngineThread,
     error::EngineError,
     generation_support::{
-        ThinkingBudgetGate, ThinkingSupport, embed_tokens, generation_prompt_suffix_len,
-        prefix_cache_key, resume_from_prefix, snapshot_boundary, tokenize_chat_prompt,
+        PrefixResume, ThinkingBudgetGate, ThinkingSupport, embed_tokens,
+        generation_prompt_suffix_len, prefix_cache_key, resume_from_prefix, tokenize_chat_prompt,
     },
     mlx_tuning::MlxRuntimeTuning,
     model_loader,
     paged_prefix_cache::{DEFAULT_BLOCK_SIZE, PagedPrefixCache},
+    prefix_checkpoints::{Arrival, CheckpointPolicy, PrefillCheckpoints},
     scheduler::RoundRobinScheduler,
 };
 
@@ -302,6 +303,7 @@ struct PreparedGeneration<'a> {
     prompt_len: u32,
     pixel_values: Option<Array>,
     disk_loaded: bool,
+    checkpoints: PrefillCheckpoints,
 }
 
 impl PreparedGeneration<'_> {
@@ -771,10 +773,12 @@ impl SimpleEngineCore {
             });
         Ok(Self {
             model: Mutex::new(model),
-            prefix_cache: Mutex::new(PagedPrefixCache::new(
-                DEFAULT_PREFIX_CACHE_SIZE,
-                DEFAULT_BLOCK_SIZE,
-            )),
+            prefix_cache: Mutex::new(
+                PagedPrefixCache::new(DEFAULT_PREFIX_CACHE_SIZE, DEFAULT_BLOCK_SIZE)
+                    .with_checkpoint_policy(CheckpointPolicy::resolve(
+                        usize::try_from(tuning.chunked_prefill_chunk_size()).unwrap_or(1),
+                    )),
+            ),
             disk_prefix_store,
             paged_cache: paged_cache.map(Mutex::new),
             scheduler: Mutex::new(RoundRobinScheduler::new()),
@@ -887,11 +891,28 @@ impl SimpleEngineCore {
             }
         }
 
-        let (resume_at, cache) = resume_from_prefix(prefix_match, prompt_tokens, || {
+        let PrefixResume {
+            resume_at,
+            cache,
+            checkpoints: inherited,
+        } = resume_from_prefix(prefix_match, prompt_tokens, || {
             model
                 .make_cache_with_config(self.kv_cache_config)
                 .map_err(EngineError::Mlx)
         })?;
+        let checkpoints = if has_images {
+            PrefillCheckpoints::carrying(Vec::new())
+        } else {
+            let policy = *lock_or_recover(&self.prefix_cache).checkpoint_policy();
+            PrefillCheckpoints::plan(
+                &policy,
+                &cache,
+                resume_at,
+                prefix_cache_key(prompt_tokens, self.gen_prompt_suffix_len).len(),
+                prompt_tokens.len(),
+                inherited,
+            )
+        };
         let actual_prompt_tokens = prompt_tokens.get(resume_at..).unwrap_or_default().to_vec();
 
         let prompt_array = Array::from(actual_prompt_tokens.as_slice()).index(NewAxis);
@@ -904,24 +925,13 @@ impl SimpleEngineCore {
             prompt_len,
             pixel_values,
             disk_loaded,
+            checkpoints,
         })
     }
 
-    /// Index into the prompt being prefilled at which the cache holds exactly
-    /// the prefix-cache key, for caches that can only be captured there.
-    fn snapshot_boundary(
-        &self,
-        prompt_tokens: &[u32],
-        prepared: &PreparedGeneration<'_>,
-    ) -> Option<i32> {
-        let resumed_at = prompt_tokens.len() - prepared.actual_prompt_tokens.len();
-        snapshot_boundary(
-            prompt_tokens,
-            resumed_at,
-            self.gen_prompt_suffix_len,
-            &prepared.cache,
-        )
-        .and_then(|boundary| i32::try_from(boundary).ok())
+    fn offset_in_prompt(position: usize, resume_at: usize) -> Result<i32, EngineError> {
+        i32::try_from(position - resume_at)
+            .map_err(|_| EngineError::Generation("Prompt too long".to_owned()))
     }
 
     /// Feed prompt tokens through the model, chunked when long to bound peak
@@ -976,26 +986,38 @@ impl SimpleEngineCore {
                 .forward_multimodal(&prepared.prompt_array, pixel_values, &mut prepared.cache)
                 .map_err(EngineError::Mlx)?
         } else {
-            let prompt_array = prepared.prompt_array.clone();
-            let snapshot_at = (!capture_hidden)
-                .then(|| self.snapshot_boundary(prompt_tokens, prepared))
-                .flatten();
-            if let Some(boundary) = snapshot_at {
-                // Recurrent state cannot be cut back to the key later, so
-                // capture it here, before the generation suffix runs.
-                let head = prompt_array.index((.., ..boundary));
-                self.forward_prompt(prepared, &head, false)?;
-                let key = prefix_cache_key(prompt_tokens, self.gen_prompt_suffix_len);
-                lock_or_recover(&self.prefix_cache).store(key, &prepared.cache);
-                let tail = prompt_array.index((.., boundary..));
-                let (logits, _) = self.forward_prompt(prepared, &tail, false)?;
-                logits
-            } else {
-                let (logits, hidden) =
-                    self.forward_prompt(prepared, &prompt_array, capture_hidden)?;
-                prefill_hidden = hidden;
-                logits
+            if capture_hidden {
+                prepared.checkpoints.cancel_stops();
             }
+            let prompt_array = prepared.prompt_array.clone();
+            let resume_at = prompt_tokens.len() - prepared.actual_prompt_tokens.len();
+            let mut position = resume_at;
+            while let Some(stop) = prepared.checkpoints.next_stop(position) {
+                let segment = prompt_array.index((
+                    ..,
+                    Self::offset_in_prompt(position, resume_at)?
+                        ..Self::offset_in_prompt(stop, resume_at)?,
+                ));
+                self.forward_prompt(prepared, &segment, false)?;
+                position = stop;
+                if prepared
+                    .checkpoints
+                    .arrive(stop, &prepared.cache)
+                    .map_err(EngineError::Mlx)?
+                    == Arrival::EntryEnd
+                {
+                    let key = prefix_cache_key(prompt_tokens, self.gen_prompt_suffix_len);
+                    lock_or_recover(&self.prefix_cache).store_with_checkpoints(
+                        key,
+                        &prepared.cache,
+                        prepared.checkpoints.collected(),
+                    );
+                }
+            }
+            let tail = prompt_array.index((.., Self::offset_in_prompt(position, resume_at)?..));
+            let (logits, hidden) = self.forward_prompt(prepared, &tail, capture_hidden)?;
+            prefill_hidden = hidden;
+            logits
         };
         let last_logits = logits.index((.., -1, ..));
 
@@ -1041,7 +1063,7 @@ impl SimpleEngineCore {
                 .lock()
                 .map_err(|e| EngineError::Generation(format!("Cache lock poisoned: {e}")))?;
             let cache_key = prefix_cache_key(prompt_tokens, self.gen_prompt_suffix_len);
-            pc.store(cache_key, &prepared.cache);
+            pc.store_with_checkpoints(cache_key, &prepared.cache, prepared.checkpoints.collected());
             // A hybrid cache that ran the generation suffix holds more tokens
             // than its key, and the disk format cannot cut recurrent state back.
             let cache_matches_key = !matches!(prepared.cache, AnyCache::Hybrid(_))
