@@ -149,7 +149,7 @@ pub async fn create_message(
                             proxy_body,
                             &headers,
                             strip_auth,
-                            api_key.as_deref(),
+                            api_key.as_ref().map(crate::config::Secret::expose),
                         )
                         .await
                     } else {
@@ -160,7 +160,7 @@ pub async fn create_message(
                             proxy_body,
                             &headers,
                             strip_auth,
-                            api_key.as_deref(),
+                            api_key.as_ref().map(crate::config::Secret::expose),
                         )
                         .await?;
                         usage = crate::proxy::extract_usage(&resp_bytes);
@@ -187,7 +187,7 @@ pub async fn create_message(
                         proxy_body,
                         &headers,
                         strip_auth,
-                        api_key.as_deref(),
+                        api_key.as_ref().map(crate::config::Secret::expose),
                     )
                     .await?;
                     let upstream_status = upstream.status().as_u16();
@@ -679,7 +679,7 @@ pub async fn count_tokens(
                 proxy_body,
                 &headers,
                 strip_auth,
-                api_key.as_deref(),
+                api_key.as_ref().map(crate::config::Secret::expose),
             )
             .await
         }

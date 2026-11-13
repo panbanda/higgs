@@ -55,8 +55,8 @@ impl WebService {
             return Ok(Self::disabled());
         }
         let timeout = config
-            .timeout()
-            .ok_or_else(|| "web.timeout_seconds is out of range".to_owned())?;
+            .valid_timeout()
+            .ok_or_else(|| "web.timeout is out of range".to_owned())?;
         let provider = if config.search_provider == PROVIDER_SEARXNG {
             SearchProvider::SearxNg {
                 base: config.searxng_base()?,

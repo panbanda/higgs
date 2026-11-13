@@ -169,6 +169,149 @@ fn config_set_dynamic_provider_key_round_trips() {
     );
 }
 
+const MIGRATABLE: &str = "[server]\nhost = \"127.0.0.1\"\nport = 8000\n\n# the upstream\n[provider.dummy]\nurl = \"http://127.0.0.1:1\"\n\n[default]\nprovider = \"dummy\"\n";
+
+#[test]
+fn config_check_passes_a_deprecated_file_with_warnings_and_fails_a_typo() {
+    let dir = tempfile::tempdir().unwrap();
+    write_config(dir.path(), MIGRATABLE);
+    let passing = Command::new(higgs_bin())
+        .args(["config", "check"])
+        .env("HIGGS_CONFIG_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(passing.status.success());
+    let warnings = String::from_utf8_lossy(&passing.stderr);
+    assert!(
+        warnings.contains("deprecated key `provider.dummy.url`; use `providers.dummy.url`"),
+        "{warnings}"
+    );
+    assert!(String::from_utf8_lossy(&passing.stdout).contains("ok (2 warning(s))"));
+
+    write_config(
+        dir.path(),
+        "[server]\nprot = 1\n[[models]]\npath = \"org/m\"\n",
+    );
+    let failing = Command::new(higgs_bin())
+        .args(["config", "check"])
+        .env("HIGGS_CONFIG_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(!failing.status.success());
+    let errors = String::from_utf8_lossy(&failing.stderr);
+    assert!(
+        errors.contains("config.toml:2: unknown key `prot` in [server]; did you mean `port`?"),
+        "{errors}"
+    );
+}
+
+#[test]
+fn config_migrate_prints_then_writes_with_a_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    write_config(dir.path(), MIGRATABLE);
+
+    let printed = Command::new(higgs_bin())
+        .args(["config", "migrate"])
+        .env("HIGGS_CONFIG_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(printed.status.success());
+    let migrated = String::from_utf8_lossy(&printed.stdout).into_owned();
+    assert!(
+        migrated.contains("[providers.dummy]") && migrated.contains("# the upstream"),
+        "{migrated}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("config.toml")).unwrap(),
+        MIGRATABLE
+    );
+
+    let written = Command::new(higgs_bin())
+        .args(["config", "migrate", "--write"])
+        .env("HIGGS_CONFIG_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        written.status.success(),
+        "{}",
+        String::from_utf8_lossy(&written.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("config.toml")).unwrap(),
+        migrated
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("config.toml.bak")).unwrap(),
+        MIGRATABLE
+    );
+
+    let again = Command::new(higgs_bin())
+        .args(["config", "migrate", "--write"])
+        .env("HIGGS_CONFIG_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(again.status.success());
+    assert!(String::from_utf8_lossy(&again.stderr).contains("already uses the current schema"));
+    assert!(!dir.path().join("config.toml.bak.1").exists());
+}
+
+#[test]
+fn config_migrate_refuses_a_file_with_an_unknown_key_and_leaves_it_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = "[server]\nprot = 8000\n[provider.dummy]\nurl = \"http://x\"\n";
+    write_config(dir.path(), original);
+    let output = Command::new(higgs_bin())
+        .args(["config", "migrate", "--write"])
+        .env("HIGGS_CONFIG_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("`prot`"));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("config.toml")).unwrap(),
+        original
+    );
+    assert!(!dir.path().join("config.toml.bak").exists());
+}
+
+#[test]
+fn config_explain_names_the_source_of_each_value() {
+    let dir = tempfile::tempdir().unwrap();
+    write_config(
+        dir.path(),
+        "[server]\nport = 9100\n[[models]]\npath = \"org/m\"\nname = \"m\"\n[models.kv_cache]\nbits = 4\n",
+    );
+    let output = Command::new(higgs_bin())
+        .args(["config", "explain", "m", "--port", "9200"])
+        .env("HIGGS_CONFIG_DIR", dir.path())
+        .env_remove("HIGGS_MLX_PROFILE")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let model_text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        model_text.contains("kv_cache.bits") && model_text.contains("(model entry)"),
+        "{model_text}"
+    );
+    assert!(model_text.contains("(built-in default)"), "{model_text}");
+
+    let server = Command::new(higgs_bin())
+        .args(["config", "explain", "--port", "9200"])
+        .env("HIGGS_CONFIG_DIR", dir.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&server.stdout);
+    assert!(stdout.contains("(CLI flag --port)"), "{stdout}");
+    assert!(
+        stdout.contains("server.port") && stdout.contains("9200"),
+        "{stdout}"
+    );
+}
+
 #[test]
 fn start_rejects_legacy_serve_flags() {
     let output = Command::new(higgs_bin())
@@ -199,7 +342,7 @@ fn shellenv_fails_on_invalid_config() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("config must define at least one [[models]] entry or [provider.*]"),
+        stderr.contains("config must define at least one [[models]] entry or [providers.*]"),
         "stderr was: {stderr}"
     );
 }
@@ -323,7 +466,7 @@ fn exec_fails_on_invalid_config_instead_of_falling_back() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("config must define at least one [[models]] entry or [provider.*]"),
+        stderr.contains("config must define at least one [[models]] entry or [providers.*]"),
         "stderr was: {stderr}"
     );
 }

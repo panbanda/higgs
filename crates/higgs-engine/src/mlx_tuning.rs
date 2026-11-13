@@ -213,12 +213,51 @@ pub struct MlxRuntimeTuning {
     /// checkpoints and 1 otherwise, clamped to 1..=8.
     mtp_draft_n_max: usize,
     paged_kv_target_bytes: usize,
+    /// Experimental decode toggles; off unless the config or a `HIGGS_*` variable turns them on.
+    decode_toggles: DecodeToggles,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DecodeToggles {
+    mtp_adaptive_draft: bool,
+    mtp_prompt_lookup: bool,
+    prompt_lookup: bool,
+}
+
+/// An on/off decode toggle: the environment variable wins, then the config value, then off.
+fn toggle(variable: &str, configured: Option<bool>) -> bool {
+    parse_enabled_flag(std::env::var(variable).ok().as_deref())
+        .or(configured)
+        .unwrap_or(false)
+}
+
+/// Tuning settings that came from the configuration file instead of the profile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TuningOverrides {
+    pub chunked_prefill_threshold: Option<i32>,
+    pub chunked_prefill_chunk_size: Option<i32>,
+    pub clear_cache_after_prefill: Option<bool>,
+    pub enable_mtp: Option<bool>,
+    pub mtp_draft_n_max: Option<usize>,
+    pub mtp_adaptive_draft: Option<bool>,
+    pub mtp_prompt_lookup: Option<bool>,
+    pub prompt_lookup: Option<bool>,
 }
 
 impl MlxRuntimeTuning {
     /// Resolve runtime tuning settings from model metadata.
     /// `requested_profile` drives both explicit profile selection and auto-resolution.
     pub fn from_model_dir(model_dir: &Path, requested_profile: RequestedMlxProfile) -> Self {
+        Self::from_model_dir_with(model_dir, requested_profile, &TuningOverrides::default())
+    }
+
+    /// [`Self::from_model_dir`] with settings from the configuration file; environment
+    /// variables still win over them.
+    pub fn from_model_dir_with(
+        model_dir: &Path,
+        requested_profile: RequestedMlxProfile,
+        overrides: &TuningOverrides,
+    ) -> Self {
         let metadata = ModelMetadata::from_model_dir(model_dir);
         let resolved_profile = resolve_profile_from_metadata(requested_profile, &metadata);
         let mut tuning = Self::from_profile(requested_profile, resolved_profile, &metadata);
@@ -227,26 +266,44 @@ impl MlxRuntimeTuning {
             std::env::var("HIGGS_CHUNKED_PREFILL_THRESHOLD")
                 .ok()
                 .as_deref(),
-            tuning.chunked_prefill_threshold,
+            overrides
+                .chunked_prefill_threshold
+                .filter(|value| *value > 0)
+                .unwrap_or(tuning.chunked_prefill_threshold),
         );
         tuning.chunked_prefill_chunk_size = parse_positive_chunked_prefill_value(
             std::env::var("HIGGS_CHUNKED_PREFILL_CHUNK_SIZE")
                 .ok()
                 .as_deref(),
-            tuning.chunked_prefill_chunk_size,
+            overrides
+                .chunked_prefill_chunk_size
+                .filter(|value| *value > 0)
+                .unwrap_or(tuning.chunked_prefill_chunk_size),
         );
         tuning.clear_cache_after_prefill = parse_enabled_flag(
             std::env::var("HIGGS_CLEAR_CACHE_AFTER_PREFILL")
                 .ok()
                 .as_deref(),
         )
+        .or(overrides.clear_cache_after_prefill)
         .unwrap_or(tuning.clear_cache_after_prefill);
         tuning.enable_mtp = parse_enabled_flag(std::env::var("HIGGS_MTP").ok().as_deref())
+            .or(overrides.enable_mtp)
             .unwrap_or(tuning.enable_mtp);
         tuning.mtp_draft_n_max = parse_mtp_draft_n_max(
             std::env::var("HIGGS_MTP_DRAFT_N_MAX").ok().as_deref(),
-            tuning.mtp_draft_n_max,
+            overrides
+                .mtp_draft_n_max
+                .filter(|value| *value > 0)
+                .map_or(tuning.mtp_draft_n_max, |value| {
+                    value.min(MAX_MTP_DRAFT_N_MAX)
+                }),
         );
+        tuning.decode_toggles = DecodeToggles {
+            mtp_adaptive_draft: toggle("HIGGS_MTP_ADAPTIVE_DRAFT", overrides.mtp_adaptive_draft),
+            mtp_prompt_lookup: toggle("HIGGS_MTP_PROMPT_LOOKUP", overrides.mtp_prompt_lookup),
+            prompt_lookup: toggle("HIGGS_PROMPT_LOOKUP", overrides.prompt_lookup),
+        };
 
         tuning
     }
@@ -274,6 +331,7 @@ impl MlxRuntimeTuning {
                 enable_mtp: false,
                 mtp_draft_n_max: 1,
                 paged_kv_target_bytes: DEFAULT_PAGED_KV_TARGET_BYTES,
+                decode_toggles: DecodeToggles::default(),
             },
             ResolvedMlxProfile::Latency => Self {
                 requested_profile,
@@ -286,6 +344,7 @@ impl MlxRuntimeTuning {
                 paged_kv_target_bytes: clamp_paged_kv_target_bytes(
                     balanced_paged_kv.saturating_mul(9) / 8,
                 ),
+                decode_toggles: DecodeToggles::default(),
             },
             ResolvedMlxProfile::Balanced => Self {
                 requested_profile,
@@ -296,6 +355,7 @@ impl MlxRuntimeTuning {
                 enable_mtp: true,
                 mtp_draft_n_max: default_mtp_draft_n_max,
                 paged_kv_target_bytes: balanced_paged_kv,
+                decode_toggles: DecodeToggles::default(),
             },
             ResolvedMlxProfile::Throughput => Self {
                 requested_profile,
@@ -308,6 +368,7 @@ impl MlxRuntimeTuning {
                 paged_kv_target_bytes: clamp_paged_kv_target_bytes(
                     balanced_paged_kv.saturating_mul(5) / 4,
                 ),
+                decode_toggles: DecodeToggles::default(),
             },
         }
     }
@@ -349,6 +410,21 @@ impl MlxRuntimeTuning {
     pub const fn paged_kv_target_bytes(&self) -> usize {
         self.paged_kv_target_bytes
     }
+
+    /// Whether the MTP loop grows and shrinks its draft window from recent acceptance.
+    pub const fn mtp_adaptive_draft(&self) -> bool {
+        self.decode_toggles.mtp_adaptive_draft
+    }
+
+    /// Whether the MTP loop also tries verified prompt-lookup drafts.
+    pub const fn mtp_prompt_lookup(&self) -> bool {
+        self.decode_toggles.mtp_prompt_lookup
+    }
+
+    /// Whether prompt-lookup decoding is on (simple engine only).
+    pub const fn prompt_lookup(&self) -> bool {
+        self.decode_toggles.prompt_lookup
+    }
 }
 
 /// Resolve the full `MlxRuntimeTuning` object for runtime use.
@@ -357,6 +433,16 @@ pub fn resolve_runtime_tuning(
     requested_profile: RequestedMlxProfile,
 ) -> MlxRuntimeTuning {
     MlxRuntimeTuning::from_model_dir(model_dir, requested_profile)
+}
+
+/// [`resolve_runtime_tuning`] with settings from the configuration file. For each setting the
+/// matching `HIGGS_*` environment variable wins over the override, which wins over the profile.
+pub fn resolve_runtime_tuning_with(
+    model_dir: &Path,
+    requested_profile: RequestedMlxProfile,
+    overrides: &TuningOverrides,
+) -> MlxRuntimeTuning {
+    MlxRuntimeTuning::from_model_dir_with(model_dir, requested_profile, overrides)
 }
 
 /// Resolve only the effective runtime profile (used for diagnostics and reporting).

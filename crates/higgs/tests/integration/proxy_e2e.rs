@@ -333,7 +333,7 @@ async fn metrics_record_success_and_all_http_failures_once() {
     let logger = MetricsLogger::new(&MetricsLogConfig {
         enabled: true,
         path: log_path.to_string_lossy().into_owned(),
-        max_size_mb: 1,
+        max_size: higgs::config::units::ByteSize::from_mebibytes(1),
         max_files: 1,
     })
     .unwrap();

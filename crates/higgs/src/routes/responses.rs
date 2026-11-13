@@ -141,7 +141,7 @@ pub async fn create_response(
                     proxy_body,
                     &headers,
                     strip_auth,
-                    api_key.as_deref(),
+                    api_key.as_ref().map(crate::config::Secret::expose),
                 )
                 .await;
                 if let Some(ref metrics) = state.metrics {

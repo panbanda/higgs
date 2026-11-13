@@ -1,0 +1,204 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8123,
+    "max_tokens": 16384,
+    "api_key": "sk-fixture-not-a-secret",
+    "rate_limit": 120,
+    "request_timeout_secs": 90.5,
+    "max_body_size": 20971520,
+    "cors_origins": [
+      "https://app.example.com",
+      "http://localhost:5173"
+    ]
+  },
+  "memory": {
+    "raise_wired_limit": true,
+    "max_loaded_models": 3,
+    "ceiling_bytes_at_128gib": 52076478464,
+    "default_profile": "Throughput"
+  },
+  "models": [
+    {
+      "path": "mlx-community/Qwen3-4B-4bit",
+      "name": "qwen",
+      "profile": "Latency",
+      "batch": "true",
+      "prefill_yield_tokens": 512,
+      "thinking_budget": 64,
+      "kv_mode": "Off",
+      "kv_bits": 3,
+      "kv_key_bits": null,
+      "kv_value_bits": null,
+      "kv_norm_correction": true,
+      "kv_adaptive_dense_layers": 0,
+      "kv_seed": 0,
+      "mla_latent": false,
+      "kv_disk_dir": "/var/lib/higgs/prefix-kv",
+      "kv_disk_bytes": 8589934592,
+      "load": "startup",
+      "idle_ttl_secs": null,
+      "pinned": true
+    },
+    {
+      "path": "mlx-community/Qwen3-8B-4bit",
+      "name": "turbo",
+      "profile": "Throughput",
+      "batch": "false",
+      "prefill_yield_tokens": null,
+      "thinking_budget": 128,
+      "kv_mode": "Turboquant",
+      "kv_bits": 4,
+      "kv_key_bits": 3,
+      "kv_value_bits": 4,
+      "kv_norm_correction": false,
+      "kv_adaptive_dense_layers": 2,
+      "kv_seed": 7,
+      "mla_latent": false,
+      "kv_disk_dir": null,
+      "kv_disk_bytes": 4294967296,
+      "load": "on_demand",
+      "idle_ttl_secs": 900.0,
+      "pinned": false
+    },
+    {
+      "path": "mlx-community/DeepSeek-V2-Lite-4bit",
+      "name": "deepseek",
+      "profile": "Throughput",
+      "batch": "auto",
+      "prefill_yield_tokens": null,
+      "thinking_budget": 128,
+      "kv_mode": "Off",
+      "kv_bits": 3,
+      "kv_key_bits": null,
+      "kv_value_bits": null,
+      "kv_norm_correction": true,
+      "kv_adaptive_dense_layers": 0,
+      "kv_seed": 0,
+      "mla_latent": true,
+      "kv_disk_dir": null,
+      "kv_disk_bytes": 4294967296,
+      "load": "on_demand",
+      "idle_ttl_secs": 900.0,
+      "pinned": false
+    },
+    {
+      "path": "mlx-community/Llama-3.2-1B-Instruct-4bit",
+      "name": "router",
+      "profile": "Throughput",
+      "batch": "auto",
+      "prefill_yield_tokens": null,
+      "thinking_budget": 128,
+      "kv_mode": "Off",
+      "kv_bits": 3,
+      "kv_key_bits": null,
+      "kv_value_bits": null,
+      "kv_norm_correction": true,
+      "kv_adaptive_dense_layers": 0,
+      "kv_seed": 0,
+      "mla_latent": false,
+      "kv_disk_dir": null,
+      "kv_disk_bytes": 4294967296,
+      "load": "on_demand",
+      "idle_ttl_secs": 900.0,
+      "pinned": false
+    }
+  ],
+  "providers": [
+    {
+      "name": "anthropic",
+      "url": "https://api.anthropic.com",
+      "format": "Anthropic",
+      "api_key": "sk-ant-fixture-not-a-secret",
+      "strip_auth": false,
+      "stub_count_tokens": true
+    },
+    {
+      "name": "ollama",
+      "url": "http://localhost:11434",
+      "format": "OpenAi",
+      "api_key": null,
+      "strip_auth": true,
+      "stub_count_tokens": false
+    }
+  ],
+  "routes": [
+    {
+      "name": "code",
+      "description": "Programming questions",
+      "pattern": "claude-.*",
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-5"
+    },
+    {
+      "name": null,
+      "description": null,
+      "pattern": "llama.*",
+      "provider": "ollama",
+      "model": null
+    }
+  ],
+  "routing": {
+    "default": "ollama",
+    "auto": {
+      "enabled": true,
+      "force": true,
+      "model": "router",
+      "timeout_ms": 1500
+    }
+  },
+  "observability": {
+    "retention_secs": 1800,
+    "metrics_log": {
+      "enabled": true,
+      "path": "/var/log/higgs/metrics.jsonl",
+      "max_size_bytes": 26214400,
+      "max_files": 3
+    }
+  },
+  "mcp": {
+    "max_result_bytes": 131072,
+    "servers": [
+      {
+        "name": "filesystem",
+        "enabled": true,
+        "transport": "stdio",
+        "command": "npx",
+        "args": [
+          "-y",
+          "@modelcontextprotocol/server-filesystem",
+          "/tmp"
+        ],
+        "env": {
+          "EXAMPLE_TOKEN": "literal-value"
+        },
+        "cwd": "/tmp",
+        "url": null,
+        "headers": {},
+        "timeout_secs": 45.0
+      },
+      {
+        "name": "remote",
+        "enabled": true,
+        "transport": null,
+        "command": null,
+        "args": [],
+        "env": {},
+        "cwd": null,
+        "url": "https://mcp.example.com/mcp",
+        "headers": {
+          "Authorization": "Bearer literal-token"
+        },
+        "timeout_secs": 12.5
+      }
+    ]
+  },
+  "web": {
+    "enabled": true,
+    "search_provider": "searxng",
+    "searxng_url": "http://localhost:8888",
+    "allow_private_addresses": true,
+    "expose_as_tools": true,
+    "timeout_secs": 20.0
+  }
+}

@@ -1,29 +1,33 @@
-//! `[mcp]` configuration: server definitions, the desktop-client JSON file
-//! format, `${VAR}` expansion and validation.
+//! Resolved `[mcp]` configuration: server definitions, the desktop-client JSON file
+//! format, `${VAR}` expansion and validation. The on-disk spelling lives in
+//! `crate::config::raw`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+
+use crate::config::env_ref;
+use crate::config::units::HumanDuration;
+
+pub use crate::config::env_ref::{EnvLookup, process_env};
 
 /// Namespace reserved for tools Higgs provides itself (see `[web]`).
 pub const BUILTIN_SERVER_NAME: &str = "higgs";
 /// Separator between server and tool name in namespaced tool names.
 pub const NAMESPACE_SEPARATOR: &str = "__";
 
-const DEFAULT_TIMEOUT_SECONDS: f64 = 30.0;
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_RESULT_BYTES: usize = 256 * 1024;
-const MAX_TIMEOUT_SECONDS: f64 = 3600.0;
+const MAX_TIMEOUT: Duration = Duration::from_secs(3600);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpConfig {
     /// `[mcp.servers.<name>]` tables.
-    #[serde(default)]
     pub servers: BTreeMap<String, McpServerConfig>,
     /// Upper bound on the size of one tool result; larger results are
     /// truncated and flagged.
-    #[serde(default = "default_max_result_bytes")]
     pub max_result_bytes: usize,
 }
 
@@ -31,51 +35,30 @@ impl Default for McpConfig {
     fn default() -> Self {
         Self {
             servers: BTreeMap::new(),
-            max_result_bytes: default_max_result_bytes(),
+            max_result_bytes: DEFAULT_MAX_RESULT_BYTES,
         }
     }
 }
 
-const fn default_max_result_bytes() -> usize {
-    DEFAULT_MAX_RESULT_BYTES
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpServerConfig {
-    #[serde(default = "default_enabled")]
     pub enabled: bool,
     /// `"stdio"` or `"http"` (Streamable HTTP). Inferred from `command` or
     /// `url` when omitted.
-    #[serde(default, alias = "type")]
     pub transport: Option<String>,
     /// Executable for stdio servers. Run directly, never through a shell.
-    #[serde(default)]
     pub command: Option<String>,
-    #[serde(default)]
     pub args: Vec<String>,
     /// Extra environment for the child process; values may reference the
     /// Higgs process environment as `${VAR}`.
-    #[serde(default)]
     pub env: BTreeMap<String, String>,
-    #[serde(default)]
     pub cwd: Option<String>,
     /// Endpoint for Streamable HTTP servers.
-    #[serde(default)]
     pub url: Option<String>,
     /// Extra request headers; values may reference `${VAR}`.
-    #[serde(default)]
     pub headers: BTreeMap<String, String>,
     /// Bound on connecting, listing and each tool call.
-    #[serde(default = "default_timeout_seconds")]
-    pub timeout_seconds: f64,
-}
-
-const fn default_enabled() -> bool {
-    true
-}
-
-const fn default_timeout_seconds() -> f64 {
-    DEFAULT_TIMEOUT_SECONDS
+    pub timeout: Duration,
 }
 
 impl Default for McpServerConfig {
@@ -89,7 +72,7 @@ impl Default for McpServerConfig {
             cwd: None,
             url: None,
             headers: BTreeMap::new(),
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            timeout: DEFAULT_TIMEOUT,
         }
     }
 }
@@ -134,11 +117,9 @@ impl McpServerConfig {
         }
     }
 
-    pub fn timeout(&self) -> Option<Duration> {
-        (self.timeout_seconds.is_finite()
-            && self.timeout_seconds > 0.0
-            && self.timeout_seconds <= MAX_TIMEOUT_SECONDS)
-            .then(|| Duration::from_secs_f64(self.timeout_seconds))
+    /// The timeout, if it is within the range the client can honor.
+    pub fn valid_timeout(&self) -> Option<Duration> {
+        (!self.timeout.is_zero() && self.timeout <= MAX_TIMEOUT).then_some(self.timeout)
     }
 }
 
@@ -181,51 +162,6 @@ pub struct HttpSpec {
     pub request_timeout: Duration,
 }
 
-/// Look up an environment variable; injectable so tests do not touch the
-/// process environment.
-pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
-
-pub fn process_env(name: &str) -> Option<String> {
-    std::env::var(name).ok()
-}
-
-/// Expand `${VAR}` references. A reference to an unset variable is an error
-/// rather than an empty string, so a typo cannot silently drop a credential.
-/// `$${` produces a literal `${`.
-pub fn expand_variables(value: &str, lookup: EnvLookup<'_>) -> Result<String, String> {
-    let mut output = String::with_capacity(value.len());
-    let mut rest = value;
-    while let Some(position) = rest.find('$') {
-        output.push_str(rest.get(..position).unwrap_or_default());
-        let after = rest.get(position + 1..).unwrap_or_default();
-        if let Some(escaped) = after.strip_prefix("${") {
-            output.push_str("${");
-            rest = escaped;
-        } else if let Some(reference) = after.strip_prefix('{') {
-            let end = reference
-                .find('}')
-                .ok_or_else(|| format!("unterminated variable reference in '{value}'"))?;
-            let name = reference.get(..end).unwrap_or_default();
-            if name.is_empty()
-                || !name
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
-            {
-                return Err(format!("invalid variable name '{name}' in '{value}'"));
-            }
-            let resolved =
-                lookup(name).ok_or_else(|| format!("environment variable {name} is not set"))?;
-            output.push_str(&resolved);
-            rest = reference.get(end + 1..).unwrap_or_default();
-        } else {
-            output.push('$');
-            rest = after;
-        }
-    }
-    output.push_str(rest);
-    Ok(output)
-}
-
 fn valid_server_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("server name must not be empty".to_owned());
@@ -258,7 +194,7 @@ impl McpConfig {
     pub fn problems(&self, lookup: EnvLookup<'_>) -> Vec<String> {
         let mut problems = Vec::new();
         if self.max_result_bytes == 0 {
-            problems.push("mcp.max_result_bytes must be greater than zero".to_owned());
+            problems.push("mcp.max_result_size must be greater than zero".to_owned());
         }
         for (name, server) in &self.servers {
             if let Err(message) = Self::resolve_server(name, server, lookup) {
@@ -288,17 +224,18 @@ impl McpConfig {
     ) -> Result<ResolvedServer, String> {
         valid_server_name(name)?;
         let kind = server.transport_kind()?;
-        let timeout = server.timeout().ok_or_else(|| {
+        let timeout = server.valid_timeout().ok_or_else(|| {
             format!(
-                "timeout_seconds must be a finite number in (0, {MAX_TIMEOUT_SECONDS}], got {}",
-                server.timeout_seconds
+                "timeout must be longer than zero and at most {}, got {}",
+                HumanDuration::new(MAX_TIMEOUT),
+                HumanDuration::new(server.timeout)
             )
         })?;
         // A disabled server is never started, so its environment is not
         // required to resolve.
         let expand = |value: &str| -> Result<String, String> {
             if server.enabled {
-                expand_variables(value, lookup)
+                env_ref::expand(value, lookup).map_err(|error| error.to_string())
             } else {
                 Ok(value.to_owned())
             }
@@ -420,8 +357,7 @@ struct ServersFile {
 
 pub fn parse_servers_file(contents: &str) -> Result<BTreeMap<String, McpServerConfig>, String> {
     let file: ServersFile = serde_json::from_str(contents).map_err(|error| error.to_string())?;
-    Ok(file
-        .servers
+    file.servers
         .into_iter()
         .map(|(name, entry)| {
             let enabled = entry
@@ -436,18 +372,21 @@ pub fn parse_servers_file(contents: &str) -> Result<BTreeMap<String, McpServerCo
                 cwd: entry.cwd,
                 url: entry.url,
                 headers: entry.headers,
-                timeout_seconds: entry.timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECONDS),
+                timeout: match entry.timeout_seconds {
+                    None => DEFAULT_TIMEOUT,
+                    Some(seconds) => Duration::try_from_secs_f64(seconds).map_err(|_| {
+                        format!("server '{name}': timeout must be a non-negative number of seconds")
+                    })?,
+                },
             };
-            (name, server)
+            Ok((name, server))
         })
-        .collect())
+        .collect()
 }
 
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
-    use figment::providers::Format;
-
     use super::*;
 
     fn no_env(_: &str) -> Option<String> {
@@ -474,32 +413,15 @@ mod tests {
     }
 
     #[test]
-    fn toml_tables_parse_with_defaults() {
-        let config: McpConfig = figment::Figment::new()
-            .merge(figment::providers::Toml::string(
-                r#"
-            max_result_bytes = 1000
-            [servers.files]
-            command = "npx"
-            args = ["-y", "server"]
-            env = { TOKEN = "${TOKEN}" }
-            cwd = "/tmp"
-            timeout_seconds = 5
-            [servers.remote]
-            url = "https://example.com/mcp"
-            headers = { Authorization = "Bearer ${TOKEN}" }
-            "#,
-            ))
-            .extract()
-            .unwrap();
-        assert_eq!(config.max_result_bytes, 1000);
-        let files = &config.servers["files"];
-        assert!(files.enabled);
-        assert_eq!(files.transport_kind().unwrap(), TransportKind::Stdio);
-        assert!((files.timeout_seconds - 5.0).abs() < f64::EPSILON);
-        let remote = &config.servers["remote"];
-        assert_eq!(remote.transport_kind().unwrap(), TransportKind::Http);
-        assert!((remote.timeout_seconds - 30.0).abs() < f64::EPSILON);
+    fn server_defaults_are_a_thirty_second_timeout_and_enabled() {
+        let server = McpServerConfig::default();
+        assert!(server.enabled);
+        assert_eq!(server.timeout, Duration::from_secs(30));
+        assert_eq!(
+            server.transport_kind().unwrap_err(),
+            "needs either command (stdio) or url (http)"
+        );
+        assert_eq!(McpConfig::default().max_result_bytes, 256 * 1024);
     }
 
     #[test]
@@ -572,24 +494,24 @@ mod tests {
             ),
             (
                 McpServerConfig {
-                    timeout_seconds: 0.0,
+                    timeout: Duration::ZERO,
                     ..stdio_server("x")
                 },
-                "timeout_seconds",
+                "timeout must be longer than zero",
             ),
             (
                 McpServerConfig {
-                    timeout_seconds: -1.0,
+                    timeout: Duration::from_secs(4000),
                     ..stdio_server("x")
                 },
-                "timeout_seconds",
+                "timeout must be longer than zero",
             ),
             (
                 McpServerConfig {
-                    timeout_seconds: f64::NAN,
+                    timeout: Duration::from_secs(3601),
                     ..stdio_server("x")
                 },
-                "timeout_seconds",
+                "timeout must be longer than zero",
             ),
             (
                 McpServerConfig {
@@ -675,7 +597,7 @@ mod tests {
                     "Authorization".to_owned(),
                     "Bearer ${TOKEN}".to_owned(),
                 )]),
-                timeout_seconds: 2.5,
+                timeout: Duration::from_millis(2500),
                 ..McpServerConfig::default()
             },
         );
@@ -699,30 +621,43 @@ mod tests {
     #[test]
     fn variable_expansion_rules() {
         let lookup = env_with("A", "1");
-        assert_eq!(expand_variables("x${A}y${A}", &lookup).unwrap(), "x1y1");
-        assert_eq!(expand_variables("$A $ 5$", &lookup).unwrap(), "$A $ 5$");
-        assert_eq!(expand_variables("$${A}", &lookup).unwrap(), "${A}");
+        assert_eq!(
+            crate::config::env_ref::expand("x${A}y${A}", &lookup).unwrap(),
+            "x1y1"
+        );
+        assert_eq!(
+            crate::config::env_ref::expand("$A $ 5$", &lookup).unwrap(),
+            "$A $ 5$"
+        );
+        assert_eq!(
+            crate::config::env_ref::expand("$${A}", &lookup).unwrap(),
+            "${A}"
+        );
         assert!(
-            expand_variables("${B}", &lookup)
+            crate::config::env_ref::expand("${B}", &lookup)
                 .unwrap_err()
+                .to_string()
                 .contains("B is not set")
         );
         assert!(
-            expand_variables("${A", &lookup)
+            crate::config::env_ref::expand("${A", &lookup)
                 .unwrap_err()
+                .to_string()
                 .contains("unterminated")
         );
         assert!(
-            expand_variables("${}", &lookup)
+            crate::config::env_ref::expand("${}", &lookup)
                 .unwrap_err()
+                .to_string()
                 .contains("invalid variable")
         );
         assert!(
-            expand_variables("${a-b}", &lookup)
+            crate::config::env_ref::expand("${a-b}", &lookup)
                 .unwrap_err()
+                .to_string()
                 .contains("invalid variable")
         );
-        assert_eq!(expand_variables("", &lookup).unwrap(), "");
+        assert_eq!(crate::config::env_ref::expand("", &lookup).unwrap(), "");
     }
 
     #[test]
@@ -754,7 +689,7 @@ mod tests {
         );
         assert!(!servers["off"].enabled);
         assert!(!servers["also_off"].enabled);
-        assert!((servers["slow"].timeout_seconds - 90.0).abs() < f64::EPSILON);
+        assert_eq!(servers["slow"].timeout, Duration::from_secs(90));
         assert!(servers["filesystem"].enabled);
     }
 

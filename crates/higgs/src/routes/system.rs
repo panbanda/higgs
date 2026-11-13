@@ -63,8 +63,8 @@ pub async fn system(State(state): State<SharedState>) -> Json<SystemResponse> {
             });
             LoadedModel {
                 path: configured.map(|m| m.path.clone()),
-                mlx_profile: configured.and_then(|m| serialized_name(&m.mlx_profile)),
-                kv_cache: configured.and_then(|m| serialized_name(&m.kv_cache)),
+                mlx_profile: configured.map(|m| m.profile.as_str().to_owned()),
+                kv_cache: configured.and_then(|m| serialized_name(&m.kv_cache.mode)),
                 status,
             }
         })
