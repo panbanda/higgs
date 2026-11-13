@@ -47,6 +47,8 @@ A conversation with roughly 3,000 tokens of context; turn 2 repeats the history 
 
 Higgs keeps prefix KV state in memory in 32-token blocks and reuses everything up to the last full block; oMLX reconstructs from its SSD block cache (256-token blocks, RAM tier off by default).
 
+Prompts that share a prefix and then diverge (the same system prompt and tools with a different user message, or an edited earlier turn) also reuse the shared part. Dense models truncate the cached KV blocks to the shared length. The Qwen3.5/3.6 hybrid models cannot do that directly, because their recurrent layers' state is only valid at the position where it was captured, so Higgs checkpoints that state during prefill (every 512 to 1,024 tokens, at most 8 per entry, 2 GiB total by default; one checkpoint is 147 MiB on the 27B model) and resumes from the nearest one. On Thinklite-27B with a 3,850-token shared context, a new question went from 20.1 s to first token (cold) to 3.7 s (3,072 tokens reused), and an exact repeat to 0.1 s. Resuming from a checkpoint is bit-identical to a cold prefill on real weights.
+
 ### Concurrent throughput
 
 Aggregate tokens per second across N simultaneous streaming requests of 256 tokens each (distinct prompts), with mean time to first token in parentheses. Higgs is run with `batch = true`.
