@@ -432,6 +432,72 @@ fn margin(token: &TokenLogprob) -> Option<f64> {
     }
 }
 
+const THINK_DELIMITERS: [&str; 2] = ["<think>", "</think>"];
+
+/// The pieces of `raw` that survive reasoning parsing, as `(start in raw, length)`: the text
+/// between `<think>` and `</think>` delimiters with surrounding whitespace removed.
+fn surviving_pieces(raw: &str) -> Vec<(usize, usize)> {
+    let mut pieces = Vec::new();
+    let mut segment_start = 0;
+    let mut push_segment = |start: usize, end: usize| {
+        let segment = raw.get(start..end).unwrap_or_default();
+        let trimmed = segment.trim();
+        if !trimmed.is_empty() {
+            pieces.push((
+                start + segment.len() - segment.trim_start().len(),
+                trimmed.len(),
+            ));
+        }
+    };
+    let mut cursor = 0;
+    while let Some((position, delimiter)) = THINK_DELIMITERS
+        .iter()
+        .filter_map(|delimiter| {
+            raw.get(cursor..)
+                .and_then(|rest| rest.find(delimiter))
+                .map(|found| (cursor + found, *delimiter))
+        })
+        .min_by_key(|(position, _)| *position)
+    {
+        push_segment(segment_start, position);
+        cursor = position + delimiter.len();
+        segment_start = cursor;
+    }
+    push_segment(segment_start, raw.len());
+    pieces
+}
+
+/// Where byte `offset` of the reference's parsed text (reasoning then content) sits in the raw
+/// token text the logprobs describe, which still holds the `<think>` delimiters and the
+/// whitespace the parse removed. `None` when the parsed text is not what the raw text parses to.
+fn raw_offset(reference: &Completion, offset: usize) -> Option<usize> {
+    let raw: String = reference
+        .token_logprobs
+        .iter()
+        .map(|token| token.token.as_str())
+        .collect();
+    let parsed = reference.full_text();
+    if raw == parsed {
+        return Some(offset);
+    }
+    let pieces = surviving_pieces(&raw);
+    let rebuilt: String = pieces
+        .iter()
+        .filter_map(|&(start, length)| raw.get(start..start + length))
+        .collect();
+    if rebuilt != parsed {
+        return None;
+    }
+    let mut parsed_start = 0;
+    for (start, length) in pieces {
+        if offset < parsed_start + length {
+            return Some(start + offset - parsed_start);
+        }
+        parsed_start += length;
+    }
+    None
+}
+
 /// Compares the batched text with the solo text. A difference is accepted only where the
 /// `reference` run (the same request with logprobs) shows a margin under `NEAR_TIE_NATS` for the
 /// token at the first differing position.
@@ -454,10 +520,16 @@ fn compare_texts(reference: &Completion, solo: &str, batched: &str) -> Compariso
             describe()
         ));
     }
+    let Some(raw_position) = raw_offset(reference, offset) else {
+        return Comparison::Different(format!(
+            "texts differ at byte {offset}, past the reference tokens: {}",
+            describe()
+        ));
+    };
     let mut start = 0;
     for (index, token) in reference.token_logprobs.iter().enumerate() {
         let end = start + token.token.len();
-        if offset < end {
+        if raw_position < end {
             return match margin(token) {
                 Some(gap) if gap < NEAR_TIE_NATS => Comparison::NearTie { index, gap },
                 Some(gap) => Comparison::Different(format!(
@@ -702,6 +774,33 @@ mod tests {
         assert!(matches!(
             compare_texts(&reference, "abc", "zbc"),
             Comparison::Different(detail) if detail.contains("token 0")
+        ));
+    }
+
+    #[test]
+    fn offsets_map_through_think_delimiters_and_trimmed_whitespace() {
+        let mut reference = run(&[
+            ("Let", &[-0.1, -5.0]),
+            (" me think", &[-0.1, -5.0]),
+            ("\n", &[-0.1, -5.0]),
+            ("</think>", &[-0.1, -5.0]),
+            ("\n\n", &[-0.1, -5.0]),
+            ("The", &[-0.5, -0.6]),
+            (" answer", &[-0.1, -5.0]),
+        ]);
+        reference.reasoning = "Let me think".to_owned();
+        reference.content = "The answer".to_owned();
+        assert!(matches!(
+            compare_texts(&reference, "Let me thinkThe answer", "Let me thinkA answer"),
+            Comparison::NearTie { index: 5, .. }
+        ));
+        assert!(matches!(
+            compare_texts(
+                &reference,
+                "Let me thinkThe answer",
+                "Let me thinkThe answer."
+            ),
+            Comparison::Different(_)
         ));
     }
 
