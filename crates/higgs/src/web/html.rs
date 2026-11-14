@@ -371,6 +371,10 @@ pub fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Longest entity name that is decoded, in bytes, without the `&` and the `;`. The search for
+/// the `;` stops there, so a page of bare `&` costs linear time.
+const MAX_ENTITY_NAME_BYTES: usize = 10;
+
 pub fn decode_entities(text: &str) -> String {
     if !text.contains('&') {
         return text.to_owned();
@@ -381,8 +385,10 @@ pub fn decode_entities(text: &str) -> String {
         output.push_str(rest.get(..index).unwrap_or_default());
         let candidate = rest.get(index + 1..).unwrap_or_default();
         let decoded = candidate
-            .find(';')
-            .filter(|end| *end <= 10)
+            .as_bytes()
+            .iter()
+            .take(MAX_ENTITY_NAME_BYTES + 1)
+            .position(|byte| *byte == b';')
             .and_then(|end| decode_entity(candidate.get(..end)?).map(|value| (value, end)));
         if let Some((value, end)) = decoded {
             output.push(value);
@@ -503,6 +509,22 @@ mod tests {
     fn quoted_attribute_values_may_contain_angle_brackets() {
         let page = extract(r#"<img alt="a > b" src="x"><p title="x>y">kept</p>"#);
         assert_eq!(page.text, "kept");
+    }
+
+    #[test]
+    fn a_page_of_ampersands_decodes_in_linear_time() {
+        let limit = std::time::Duration::from_secs(10);
+        for unit in ["&", "&amp", "&#x4", "&a;&b"] {
+            let page = unit.repeat(2 * 1024 * 1024 / unit.len());
+            let started = std::time::Instant::now();
+            let decoded = decode_entities(&page);
+            assert!(
+                started.elapsed() < limit,
+                "{unit:?} took {:?}",
+                started.elapsed()
+            );
+            assert_eq!(decoded, page);
+        }
     }
 
     #[test]
