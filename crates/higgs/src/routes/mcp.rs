@@ -478,7 +478,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_endpoints_do_not_count_as_traffic_in_metrics() {
-        let metrics = Arc::new(crate::metrics::MetricsStore::new(Duration::from_secs(60)));
+        let metrics = Arc::new(crate::metrics::MetricsStore::new(Duration::from_mins(1)));
         let fake = FakeMcp::new(&["echo"]);
         let hub = hub_with(vec![("files", fake, Duration::from_secs(1))], 1).await;
         let app = app_with_tools(hub, None, Some(Arc::clone(&metrics)));

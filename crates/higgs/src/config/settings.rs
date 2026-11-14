@@ -21,15 +21,15 @@ use crate::web::config::WebConfig;
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 8000;
 pub const DEFAULT_MAX_TOKENS: u32 = 32768;
-pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 pub const DEFAULT_MAX_BODY_SIZE: ByteSize = ByteSize::from_bytes(10 * 1024 * 1024);
 pub const DEFAULT_KV_BITS: u8 = 3;
 pub const CHECKPOINT_BUDGET_VARIABLE: &str = "HIGGS_PREFIX_CHECKPOINT_BUDGET_MB";
 pub const DEFAULT_PREFIX_DISK_BUDGET: ByteSize = ByteSize::from_bytes(4 * 1024 * 1024 * 1024);
 pub const DEFAULT_ROUTING_PROVIDER: &str = "higgs";
 pub const DEFAULT_AUTO_ROUTER_MODEL: &str = "katanemo/Arch-Router-1.5B";
-pub const DEFAULT_AUTO_ROUTER_TIMEOUT: Duration = Duration::from_millis(2000);
-pub const DEFAULT_RETENTION: Duration = Duration::from_secs(60 * 60);
+pub const DEFAULT_AUTO_ROUTER_TIMEOUT: Duration = Duration::from_secs(2);
+pub const DEFAULT_RETENTION: Duration = Duration::from_hours(1);
 pub const DEFAULT_METRICS_LOG_MAX_SIZE: ByteSize = ByteSize::from_bytes(50 * 1024 * 1024);
 pub const DEFAULT_METRICS_LOG_MAX_FILES: u32 = 5;
 

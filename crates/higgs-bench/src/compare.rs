@@ -546,7 +546,7 @@ mod tests {
         let plain =
             parse_sse_line(&line(r#"{"choices":[{"delta":{"content":"a"}}]}"#)).context("chunk")?;
         assert!(plain.finish_reason.is_none());
-        assert!(plain.reasoning.is_empty());
+        assert_eq!(plain.reasoning, "");
         Ok(())
     }
 

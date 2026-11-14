@@ -539,7 +539,7 @@ mod tests {
         let server = FakeMcp::new(&["echo"]);
         *server.has_tools_capability.lock().unwrap() = false;
         let client = connected(&server).await;
-        assert!(client.list_tools(TIMEOUT).await.unwrap().is_empty());
+        assert_eq!(client.list_tools(TIMEOUT).await.unwrap(), []);
         assert!(!server.received_methods().contains(&"tools/list".to_owned()));
     }
 

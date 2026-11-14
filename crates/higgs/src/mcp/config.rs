@@ -20,7 +20,7 @@ pub const NAMESPACE_SEPARATOR: &str = "__";
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_RESULT_BYTES: usize = 256 * 1024;
-const MAX_TIMEOUT: Duration = Duration::from_secs(3600);
+const MAX_TIMEOUT: Duration = Duration::from_hours(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpConfig {
@@ -428,7 +428,8 @@ mod tests {
     fn default_config_is_empty() {
         let config = McpConfig::default();
         assert!(config.servers.is_empty());
-        assert!(config.problems(&no_env).is_empty());
+        let found = &config.problems(&no_env);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
@@ -552,7 +553,8 @@ mod tests {
             env: BTreeMap::from([("A".to_owned(), "${NOPE}".to_owned())]),
             ..stdio_server("x")
         };
-        assert!(config_with("s", server).problems(&no_env).is_empty());
+        let found = &config_with("s", server).problems(&no_env);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
@@ -561,11 +563,8 @@ mod tests {
             let problems = config_with(bad, stdio_server("x")).problems(&no_env);
             assert_eq!(problems.len(), 1, "{bad}");
         }
-        assert!(
-            config_with("files-2_x", stdio_server("x"))
-                .problems(&no_env)
-                .is_empty()
-        );
+        let found = &config_with("files-2_x", stdio_server("x")).problems(&no_env);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

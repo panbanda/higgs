@@ -7,7 +7,7 @@ use crate::config::units::HumanDuration;
 pub const PROVIDER_SEARXNG: &str = "searxng";
 pub const PROVIDER_DUCKDUCKGO: &str = "duckduckgo";
 
-const MAX_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_TIMEOUT: Duration = Duration::from_mins(5);
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,8 +127,10 @@ mod tests {
         assert!(!config.allow_private_addresses);
         assert!(!config.expose_as_tools);
         assert_eq!(config.search_provider, "duckduckgo");
-        assert!(config.problems().is_empty());
-        assert!(config.warnings().is_empty());
+        let found = &config.problems();
+        assert!(found.is_empty(), "{found:?}");
+        let warnings = config.warnings();
+        assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(config.valid_timeout(), Some(Duration::from_secs(15)));
     }
 
@@ -147,7 +149,8 @@ mod tests {
             "http://localhost:8888/"
         );
         assert_eq!(config.valid_timeout(), Some(Duration::from_millis(5500)));
-        assert!(config.problems().is_empty());
+        let found = &config.problems();
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

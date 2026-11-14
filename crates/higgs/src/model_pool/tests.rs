@@ -564,7 +564,8 @@ async fn idle_model_expires_after_its_ttl() {
     touch(&fx.pool, "a").await;
 
     fx.clock.advance(Duration::from_secs(9));
-    assert!(fx.pool.sweep_idle().await.is_empty());
+    let found = &fx.pool.sweep_idle().await;
+    assert!(found.is_empty(), "{found:?}");
     assert_eq!(state_of(&fx, "a"), ModelState::Loaded);
 
     fx.clock.advance(Duration::from_secs(2));
@@ -583,7 +584,8 @@ async fn model_with_requests_in_flight_never_expires() {
     let lease = fx.pool.acquire("a").await.unwrap();
 
     fx.clock.advance(Duration::from_secs(1000));
-    assert!(fx.pool.sweep_idle().await.is_empty());
+    let found = &fx.pool.sweep_idle().await;
+    assert!(found.is_empty(), "{found:?}");
     assert_eq!(state_of(&fx, "a"), ModelState::Loaded);
 
     drop(lease);
@@ -607,7 +609,8 @@ async fn using_a_model_postpones_its_expiry() {
     touch(&fx.pool, "a").await;
     fx.clock.advance(Duration::from_secs(8));
 
-    assert!(fx.pool.sweep_idle().await.is_empty());
+    let found = &fx.pool.sweep_idle().await;
+    assert!(found.is_empty(), "{found:?}");
 }
 
 #[tokio::test]
@@ -625,7 +628,8 @@ async fn pinned_models_do_not_expire() {
 
     fx.clock.advance(Duration::from_secs(1000));
 
-    assert!(fx.pool.sweep_idle().await.is_empty());
+    let found = &fx.pool.sweep_idle().await;
+    assert!(found.is_empty(), "{found:?}");
     assert_eq!(state_of(&fx, "a"), ModelState::Loaded);
 }
 
@@ -640,7 +644,8 @@ async fn models_without_a_ttl_do_not_expire() {
 
     fx.clock.advance(Duration::from_secs(100_000));
 
-    assert!(fx.pool.sweep_idle().await.is_empty());
+    let found = &fx.pool.sweep_idle().await;
+    assert!(found.is_empty(), "{found:?}");
 }
 
 #[tokio::test]
@@ -718,7 +723,8 @@ async fn unload_of_an_unloaded_model_is_a_no_op() {
     let status = fx.pool.unload("a", false).await.unwrap();
 
     assert_eq!(status.state, ModelState::Unloaded);
-    assert!(fx.loader.events().is_empty());
+    let found = &fx.loader.events();
+    assert!(found.is_empty(), "{found:?}");
 }
 
 #[tokio::test]

@@ -1125,7 +1125,8 @@ mod tests {
             100,
         )
         .unwrap();
-        assert!(generation.chat().unwrap().tools.is_empty());
+        let found = &generation.chat().unwrap().tools;
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

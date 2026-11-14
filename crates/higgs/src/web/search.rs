@@ -359,7 +359,7 @@ mod tests {
             TIMEOUT,
         )
         .unwrap();
-        assert!(searcher.search("x", None).await.unwrap().is_empty());
+        assert_eq!(searcher.search("x", None).await.unwrap(), []);
     }
 
     #[tokio::test]

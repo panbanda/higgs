@@ -301,8 +301,10 @@ mod tests {
     #[test]
     fn cache_key_never_underflows() {
         let prompt = [1, 2, 3];
-        assert!(prefix_cache_key(&prompt, 3).is_empty());
-        assert!(prefix_cache_key(&prompt, 10).is_empty());
+        let short = prefix_cache_key(&prompt, 3);
+        assert!(short.is_empty(), "{short:?}");
+        let long = prefix_cache_key(&prompt, 10);
+        assert!(long.is_empty(), "{long:?}");
     }
 
     fn prefix_match(prefix_len: usize) -> PagedPrefixMatch {

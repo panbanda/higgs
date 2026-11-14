@@ -362,9 +362,9 @@ mod tests {
     fn durations_parse_every_unit() {
         assert_eq!(duration("250ms").unwrap(), Duration::from_millis(250));
         assert_eq!(duration("90s").unwrap(), Duration::from_secs(90));
-        assert_eq!(duration("5m").unwrap(), Duration::from_secs(300));
-        assert_eq!(duration("2h").unwrap(), Duration::from_secs(7200));
-        assert_eq!(duration("1d").unwrap(), Duration::from_secs(86_400));
+        assert_eq!(duration("5m").unwrap(), Duration::from_mins(5));
+        assert_eq!(duration("2h").unwrap(), Duration::from_hours(2));
+        assert_eq!(duration("1d").unwrap(), Duration::from_hours(24));
         assert_eq!(duration("15us").unwrap(), Duration::from_micros(15));
         assert_eq!(duration("7ns").unwrap(), Duration::from_nanos(7));
     }
@@ -372,9 +372,9 @@ mod tests {
     #[test]
     fn durations_accept_long_spellings_decimals_and_compounds() {
         assert_eq!(duration("30 seconds").unwrap(), Duration::from_secs(30));
-        assert_eq!(duration("10min").unwrap(), Duration::from_secs(600));
-        assert_eq!(duration("1.5h").unwrap(), Duration::from_secs(5400));
-        assert_eq!(duration("1h30m").unwrap(), Duration::from_secs(5400));
+        assert_eq!(duration("10min").unwrap(), Duration::from_mins(10));
+        assert_eq!(duration("1.5h").unwrap(), Duration::from_mins(90));
+        assert_eq!(duration("1h30m").unwrap(), Duration::from_mins(90));
         assert_eq!(duration(" 2s ").unwrap(), Duration::from_secs(2));
     }
 
@@ -480,7 +480,7 @@ mod tests {
             limit: ByteSize,
         }
         let holder: Holder = toml_edit_free_parse(r#"{"wait": "2m", "limit": 1048576}"#);
-        assert_eq!(holder.wait.get(), Duration::from_secs(120));
+        assert_eq!(holder.wait.get(), Duration::from_mins(2));
         assert_eq!(holder.limit.bytes(), 1_048_576);
 
         let zero: Holder = toml_edit_free_parse(r#"{"wait": 0, "limit": "1MB"}"#);
@@ -499,7 +499,7 @@ mod tests {
     #[test]
     fn serde_serializes_as_strings() {
         assert_eq!(
-            serde_json::to_string(&HumanDuration::new(Duration::from_secs(300))).unwrap(),
+            serde_json::to_string(&HumanDuration::new(Duration::from_mins(5))).unwrap(),
             "\"5m\""
         );
         assert_eq!(

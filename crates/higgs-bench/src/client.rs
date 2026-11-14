@@ -335,7 +335,7 @@ mod tests {
         assert_eq!(completion.finish_reason.as_deref(), Some("stop"));
         assert_eq!(completion.usage.cached_tokens, Some(32));
         assert_eq!(completion.usage.prompt_tokens, Some(50));
-        assert!(completion.tool_calls.is_empty());
+        assert_eq!(completion.tool_calls, []);
         Ok(())
     }
 
@@ -354,7 +354,7 @@ mod tests {
                 "finish_reason": "tool_calls"
             }]
         }))?;
-        assert!(completion.content.is_empty());
+        assert_eq!(completion.content, "");
         assert_eq!(
             completion.tool_calls,
             [ToolCall {

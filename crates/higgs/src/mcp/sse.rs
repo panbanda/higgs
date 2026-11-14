@@ -120,7 +120,7 @@ mod tests {
     #[test]
     fn parses_events_split_across_chunks() {
         let mut parser = SseParser::default();
-        assert!(parser.feed("event: message\nda").is_empty());
+        assert_eq!(parser.feed("event: message\nda"), []);
         let events = parser.feed("ta: {\"a\":1}\n\ndata: second\n\n");
         assert_eq!(
             events,
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn handles_crlf_even_when_split() {
         let mut parser = SseParser::default();
-        assert!(parser.feed("data: x\r").is_empty());
+        assert_eq!(parser.feed("data: x\r"), []);
         let events = parser.feed("\n\r\n");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "x");
@@ -176,13 +176,13 @@ mod tests {
     #[test]
     fn blank_lines_without_data_emit_nothing() {
         let mut parser = SseParser::default();
-        assert!(parser.feed("\n\nevent: ping\n\n").is_empty());
+        assert_eq!(parser.feed("\n\nevent: ping\n\n"), []);
     }
 
     #[test]
     fn finish_flushes_unterminated_event() {
         let mut parser = SseParser::default();
-        assert!(parser.feed("data: tail").is_empty());
+        assert_eq!(parser.feed("data: tail"), []);
         assert_eq!(parser.finish().unwrap().data, "tail");
         assert!(parser.finish().is_none());
     }

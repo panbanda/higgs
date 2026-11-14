@@ -840,7 +840,7 @@ mod tests {
             .await;
             assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
             assert!(body.contains("Invalid regex constraint"), "{body}");
-            assert!(recorded_calls(&engine).is_empty());
+            assert_eq!(recorded_calls(&engine), []);
         }
 
         #[tokio::test]
@@ -859,7 +859,7 @@ mod tests {
             let (status, body, engine) = post_chat(generating_stub(), &extra).await;
             assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
             assert!(body.contains("Only one output constraint"), "{body}");
-            assert!(recorded_calls(&engine).is_empty());
+            assert_eq!(recorded_calls(&engine), []);
         }
 
         #[tokio::test]
@@ -917,7 +917,7 @@ mod tests {
                 body.contains("reasoning.max_tokens must be at least 1"),
                 "{body}"
             );
-            assert!(recorded_calls(&engine).is_empty());
+            assert_eq!(recorded_calls(&engine), []);
         }
 
         #[tokio::test]

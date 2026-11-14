@@ -192,7 +192,8 @@ mod logprob_bytes_tests {
             .flat_map(|entry| entry.bytes.iter().copied())
             .collect();
         assert_eq!(String::from_utf8(joined).unwrap(), "Hello \u{1F600}");
-        assert!(logprobs.content[1].bytes.is_empty());
+        let found = &logprobs.content[1].bytes;
+        assert!(found.is_empty(), "{found:?}");
         assert!(
             logprobs
                 .content

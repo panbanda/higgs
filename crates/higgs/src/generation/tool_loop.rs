@@ -760,7 +760,8 @@ mod tests {
         assert!(body.get("mcp").is_none());
         assert_eq!(engine.recorded_prompt_tools(), vec![None]);
         assert_eq!(engine.recorded_calls().len(), 1);
-        assert!(fake.received_calls().is_empty());
+        let found = &fake.received_calls();
+        assert!(found.is_empty(), "{found:?}");
 
         let disabled = files_hub(&fake, Duration::from_secs(2)).await;
         let (_, off_body, off_engine) = chat(
@@ -785,7 +786,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(engine.recorded_prompt_tools(), vec![None]);
-        assert!(fake.received_calls().is_empty());
+        let found = &fake.received_calls();
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[tokio::test]
@@ -840,7 +842,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(engine.recorded_prompt_tools(), vec![Some(3)]);
         assert_eq!(engine.recorded_calls().len(), 1);
-        assert!(fake.received_calls().is_empty());
+        let found = &fake.received_calls();
+        assert!(found.is_empty(), "{found:?}");
         let choice = &body["choices"][0];
         assert_eq!(choice["finish_reason"], "tool_calls");
         assert_eq!(
@@ -867,7 +870,8 @@ mod tests {
             .unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["function"]["name"], "get_weather");
-        assert!(fake.received_calls().is_empty());
+        let found = &fake.received_calls();
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[tokio::test]
@@ -882,7 +886,8 @@ mod tests {
         )
         .await;
         assert_eq!(engine.recorded_prompt_tools(), vec![Some(2)]);
-        assert!(fake.received_calls().is_empty());
+        let found = &fake.received_calls();
+        assert!(found.is_empty(), "{found:?}");
         assert_eq!(
             body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
             "files__echo"
@@ -938,7 +943,7 @@ mod tests {
             )
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{value}: {body}");
-            assert!(engine.recorded_calls().is_empty());
+            assert_eq!(engine.recorded_calls(), []);
         }
     }
 
@@ -1172,7 +1177,8 @@ mod tests {
             })
             .collect();
         assert_eq!(finishes, vec!["tool_calls"]);
-        assert!(fake.received_calls().is_empty());
+        let found = &fake.received_calls();
+        assert!(found.is_empty(), "{found:?}");
         assert!(events.iter().all(|e| e.get("higgs_mcp").is_none()));
     }
 

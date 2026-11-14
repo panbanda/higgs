@@ -106,7 +106,9 @@ fn configured_metrics_logs(dir: &Path) -> Vec<PathBuf> {
         .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
         .filter_map(|raw| toml::from_str::<toml::Value>(&raw).ok())
         .filter_map(|value| {
-            let current = value.get("observability").and_then(|o| o.get("metrics_log"));
+            let current = value
+                .get("observability")
+                .and_then(|o| o.get("metrics_log"));
             let deprecated = value.get("logging").and_then(|l| l.get("metrics"));
             current
                 .and_then(|table| table.get("path"))

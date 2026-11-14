@@ -730,15 +730,13 @@ mod tests {
     fn events_without_output_are_ignored() {
         let mut builder = ResponseStreamBuilder::new(context());
         builder.start();
-        assert!(
-            builder
-                .ingest(GenerationEvent::Started { prompt_tokens: 3 })
-                .is_empty()
+        assert_eq!(
+            builder.ingest(GenerationEvent::Started { prompt_tokens: 3 }),
+            []
         );
-        assert!(
-            builder
-                .ingest(GenerationEvent::Error("tool loop failed".to_owned()))
-                .is_empty()
+        assert_eq!(
+            builder.ingest(GenerationEvent::Error("tool loop failed".to_owned())),
+            []
         );
     }
 
@@ -750,7 +748,7 @@ mod tests {
                 StreamEventBody::Created { response }
                 | StreamEventBody::InProgress { response } => {
                     assert_eq!(response.status, ResponseStatus::InProgress);
-                    assert!(response.output.is_empty());
+                    assert_eq!(response.output, []);
                     assert!(response.usage.is_none());
                 }
                 other => panic!("unexpected {other:?}"),

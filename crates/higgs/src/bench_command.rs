@@ -32,7 +32,7 @@ use crate::engine_loader::served_name;
 /// The environment variable that gives the private server the key its client will send.
 pub const PRIVATE_API_KEY_VARIABLE: &str = "HIGGS_PRIVATE_SERVER_KEY";
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(900);
+const REQUEST_TIMEOUT: Duration = Duration::from_mins(15);
 
 type CommandResult<T> = Result<T, Box<dyn Error>>;
 
@@ -447,7 +447,7 @@ mod tests {
         first.name = Some("first".to_owned());
         first.aliases = vec!["default".to_owned()];
         first.load = LoadMode::OnDemand;
-        first.idle_ttl = Some(Duration::from_secs(60));
+        first.idle_ttl = Some(Duration::from_mins(1));
         let mut second = ModelConfig::with_path("/models/second");
         second.name = Some("second".to_owned());
         let mut config = HiggsConfig {
@@ -475,7 +475,7 @@ mod tests {
         let model = &config.models[0];
         assert_eq!(model.load, LoadMode::Startup);
         assert_eq!(model.idle_ttl, None);
-        assert!(config.routes.is_empty());
+        assert_eq!(config.routes, []);
         assert!(config.providers.is_empty());
     }
 

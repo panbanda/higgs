@@ -15,7 +15,7 @@ pub const MAX_STORED_RESPONSES: usize = 256;
 
 /// Entries expire this long after being stored. Long enough for an agent to
 /// pause between turns, short enough that abandoned sessions free their memory.
-pub const STORED_RESPONSE_TTL: Duration = Duration::from_secs(60 * 60);
+pub const STORED_RESPONSE_TTL: Duration = Duration::from_hours(1);
 
 /// A response together with the full conversation that produced it.
 #[derive(Debug, Clone)]
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn evicts_least_recently_used_beyond_capacity() {
-        let store = ResponseStore::with_limits(2, Duration::from_secs(3600));
+        let store = ResponseStore::with_limits(2, Duration::from_hours(1));
         store.insert(stored("resp_a"));
         store.insert(stored("resp_b"));
         assert!(store.get("resp_a").is_some());
@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn entries_expire_after_the_ttl() {
-        let store = ResponseStore::with_limits(8, Duration::from_secs(60));
+        let store = ResponseStore::with_limits(8, Duration::from_mins(1));
         let start = Instant::now();
         store.insert_at(stored("resp_a"), start);
 
@@ -204,7 +204,7 @@ mod tests {
         );
         assert!(
             store
-                .get_at("resp_a", start + Duration::from_secs(60))
+                .get_at("resp_a", start + Duration::from_mins(1))
                 .is_none()
         );
         assert_eq!(store.len(), 0, "expired entry is dropped on access");
@@ -212,10 +212,10 @@ mod tests {
 
     #[test]
     fn insert_purges_expired_entries() {
-        let store = ResponseStore::with_limits(8, Duration::from_secs(60));
+        let store = ResponseStore::with_limits(8, Duration::from_mins(1));
         let start = Instant::now();
         store.insert_at(stored("resp_old"), start);
-        store.insert_at(stored("resp_new"), start + Duration::from_secs(120));
+        store.insert_at(stored("resp_new"), start + Duration::from_mins(2));
 
         assert_eq!(store.len(), 1);
         assert!(
@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn reinserting_an_id_replaces_it_without_growing() {
-        let store = ResponseStore::with_limits(2, Duration::from_secs(3600));
+        let store = ResponseStore::with_limits(2, Duration::from_hours(1));
         store.insert(stored("resp_a"));
         store.insert(stored("resp_a"));
         assert_eq!(store.len(), 1);

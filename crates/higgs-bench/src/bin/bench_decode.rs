@@ -185,7 +185,7 @@ async fn run(args: Args) -> Result<()> {
         .clone()
         .unwrap_or_else(|| DEFAULT_PROMPT.to_owned());
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(600))
+        .timeout(Duration::from_mins(10))
         .build()?;
 
     for i in 0..args.warmup {

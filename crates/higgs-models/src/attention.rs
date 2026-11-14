@@ -501,7 +501,7 @@ mod tests {
 
     #[test]
     fn split_heads_normalizes_queries_and_keys_over_head_dimension() {
-        let mut norm = nn::RmsNormBuilder::new(8).eps(1e-6).build().unwrap();
+        let mut norm = nn::RmsNormBuilder::new(8).eps(1e-6_f32).build().unwrap();
         let projections = || Projections {
             queries: random_array(&[1, 2, 2 * 8])
                 .multiply(array!(5.0_f32))
