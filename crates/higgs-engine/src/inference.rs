@@ -901,7 +901,7 @@ impl PromptCache {
     }
 
     /// The pauses a prefill of `prompt` resumed at `resume_at` makes to keep
-    /// state for the cache.
+    /// state for the cache. A cache with room for no entry needs none.
     fn plan_checkpoints(
         &self,
         prompt: &[u32],
@@ -909,6 +909,9 @@ impl PromptCache {
         cache: &AnyCache,
         inherited: Vec<Arc<RecurrentCheckpoint>>,
     ) -> PrefillCheckpoints {
+        if !self.entries.retains_entries() {
+            return PrefillCheckpoints::default();
+        }
         PrefillCheckpoints::plan(
             self.entries.checkpoint_policy(),
             cache,
@@ -3056,6 +3059,19 @@ mod tests {
                 .next_stop(0),
             None
         );
+    }
+
+    #[test]
+    fn a_cache_with_no_entries_plans_no_pauses_or_checkpoints() {
+        let prompt: Vec<u32> = (0..4096).collect();
+        let hybrid = AnyCache::Hybrid(Vec::new());
+        let plan = |max_entries| {
+            PromptCache::new(max_entries, 4)
+                .with_checkpoint_policy(CheckpointPolicy::new(512, 8, usize::MAX))
+                .plan_checkpoints(&prompt, 0, &hybrid, Vec::new())
+        };
+        assert!(plan(4).next_stop(0).is_some());
+        assert_eq!(plan(0).next_stop(0), None);
     }
 
     #[test]
