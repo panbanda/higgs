@@ -61,7 +61,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Shellenv(ref client) => {
             let target = resolve_client_target(&cli, client)?;
-            higgs::daemon::cmd_shellenv(&target)?;
+            if let Err(message) = higgs::daemon::cmd_shellenv(&target) {
+                eprintln!("{message}");
+                std::process::exit(1);
+            }
             Ok(())
         }
         Commands::Exec {
