@@ -485,7 +485,7 @@ impl InferenceEngine {
             clear_cache_after_prefill: tuning.clear_cache_after_prefill(),
             speculation: SpeculationSettings::from_tuning(&tuning),
             max_concurrent_requests,
-            disk_prefix,
+            disk_prefix: disk_prefix_in_use(disk_prefix, &prefix_cache),
             prefix_cache,
             model_dir: model_dir.to_path_buf(),
         };
@@ -827,8 +827,7 @@ impl PromptCache {
 
     #[must_use]
     fn with_disk_store(mut self, store: Option<DiskPrefixStore>) -> Self {
-        // Entries read from disk would be dropped and written ones never reused.
-        self.disk = store.filter(|_| self.entries.retains_entries());
+        self.disk = store;
         self
     }
 
@@ -968,6 +967,15 @@ impl PromptCache {
             }
         }
     }
+}
+
+/// The disk tier only holds entries the in-memory cache would keep, so with room for none it is
+/// never opened: no directories are made and no leftover files are cleaned.
+fn disk_prefix_in_use(
+    disk_prefix: Option<DiskPrefixConfig>,
+    prefix_cache: &PrefixCacheOptions,
+) -> Option<DiskPrefixConfig> {
+    disk_prefix.filter(|_| prefix_cache.max_entries > 0)
 }
 
 fn open_disk_store(settings: &WorkerSettings) -> Option<DiskPrefixStore> {
@@ -3063,28 +3071,20 @@ mod tests {
     }
 
     #[test]
-    fn a_cache_with_no_entries_builds_no_disk_tier() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = || {
-            DiskPrefixStore::new(
-                directory.path(),
-                1024 * 1024,
-                StoreIdentity::from_model_dir(directory.path(), String::new()),
-            )
-            .ok()
+    fn a_cache_with_no_entries_opens_no_disk_tier() {
+        let config = || {
+            Some(DiskPrefixConfig {
+                dir: PathBuf::from("/nonexistent/prefix-store"),
+                budget: 1024,
+            })
         };
-        assert!(
-            PromptCache::new(0, 4)
-                .with_disk_store(store())
-                .disk
-                .is_none()
-        );
-        assert!(
-            PromptCache::new(2, 4)
-                .with_disk_store(store())
-                .disk
-                .is_some()
-        );
+        let options = |max_entries| PrefixCacheOptions {
+            max_entries,
+            ..PrefixCacheOptions::default()
+        };
+        assert!(disk_prefix_in_use(config(), &options(0)).is_none());
+        assert!(disk_prefix_in_use(config(), &options(2)).is_some());
+        assert!(disk_prefix_in_use(None, &options(2)).is_none());
     }
 
     #[test]
