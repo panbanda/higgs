@@ -617,7 +617,9 @@ fn compare_texts(reference: &Completion, solo: &str, batched: &str) -> Compariso
         let end = start + token.bytes.len();
         if raw_position < end {
             // On a token boundary the other run may have taken a longer token at the previous
-            // position, or a different one at this position; either is a decision to check.
+            // position, or a different one at this position, so either neighbour being a near
+            // tie passes. This is intended: the batched run has no logprobs, so the token it
+            // chose is unknown. The cost is that a real fault right after a near tie can pass.
             let candidates = if raw_position == start && index > 0 {
                 vec![index - 1, index]
             } else {
