@@ -671,6 +671,50 @@ pub fn output_to_input_items(output: &[OutputItem]) -> Vec<InputItem> {
         .collect()
 }
 
+/// The conversation items for messages a server-side tool loop appended:
+/// assistant turns (text, then each tool call) and tool results.
+pub fn chat_messages_to_input_items(messages: &[ChatCompletionMessage]) -> Vec<InputItem> {
+    let mut items = Vec::new();
+    for message in messages {
+        match message.role.as_str() {
+            "assistant" => {
+                let text = message
+                    .content
+                    .as_ref()
+                    .map(MessageContent::text)
+                    .unwrap_or_default();
+                if !text.is_empty() {
+                    items.push(InputItem::Message {
+                        role: "assistant".to_owned(),
+                        content: vec![InputContent::Text(text)],
+                    });
+                }
+                for call in message.tool_calls.iter().flatten() {
+                    items.push(InputItem::FunctionCall {
+                        call_id: call.id.clone(),
+                        name: call.function.name.clone(),
+                        arguments: call.function.arguments.clone(),
+                    });
+                }
+            }
+            "tool" => {
+                if let Some(call_id) = &message.tool_call_id {
+                    items.push(InputItem::FunctionCallOutput {
+                        call_id: call_id.clone(),
+                        output: message
+                            .content
+                            .as_ref()
+                            .map(MessageContent::text)
+                            .unwrap_or_default(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    items
+}
+
 /// Best-effort `role`/`content` view of the input for model auto-routing,
 /// which runs before strict validation (a remote provider may understand
 /// items that local translation rejects).
