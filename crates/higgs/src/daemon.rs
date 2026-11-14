@@ -358,7 +358,13 @@ pub fn resolve_client_target(
             origin: TargetOrigin::Config,
         });
     }
-    let (host, serve_port) = config::simple_mode_address(environment)?;
+    // `--port` replaces `HIGGS_PORT`, so a bad value there must not fail the command.
+    let address_environment = if port_flag.is_some() {
+        environment.without("HIGGS_PORT")
+    } else {
+        environment.clone()
+    };
+    let (host, serve_port) = config::simple_mode_address(&address_environment)?;
     Ok(ClientTarget {
         addr: format!(
             "{}:{}",
@@ -826,6 +832,11 @@ mod tests {
                 .base_url(),
             "http://127.0.0.1:9001"
         );
+
+        let bad_port = config::Environment::from_pairs([("HIGGS_PORT", "abc")]);
+        assert!(resolve_client_target(None, &bad_port, None, None).is_err());
+        let flag_over_bad_port = resolve_client_target(None, &bad_port, None, Some(9100)).unwrap();
+        assert_eq!(flag_over_bad_port.base_url(), "http://127.0.0.1:9100");
 
         let flag_wins = resolve_client_target(None, &environment, None, Some(9100)).unwrap();
         assert_eq!(flag_wins.base_url(), "http://127.0.0.1:9100");

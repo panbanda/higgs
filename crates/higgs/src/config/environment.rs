@@ -24,6 +24,14 @@ impl Environment {
         }
     }
 
+    /// This environment without the variable `name`.
+    #[must_use]
+    pub fn without(&self, name: &str) -> Self {
+        let mut variables = self.variables.clone();
+        variables.remove(name);
+        Self { variables }
+    }
+
     pub fn get(&self, name: &str) -> Option<&str> {
         self.variables.get(name).map(String::as_str)
     }
