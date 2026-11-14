@@ -1,10 +1,9 @@
 use std::time::Instant;
 
-use higgs_engine::engine::GenerationOutput;
+use higgs_engine::engine::{GenerationOutput, LoggedToken};
 use higgs_engine::reasoning_parser::parse_reasoning;
 use higgs_engine::tokenizers::Tokenizer;
 use higgs_engine::tool_format::ToolCallParser;
-use higgs_models::TokenLogprobInfo;
 
 use super::event::{Completed, GeneratedToolCall};
 use super::prepare::{Prepared, ReasoningHandling, prepare};
@@ -51,7 +50,7 @@ fn assemble(
     let logprobs = output
         .token_logprobs
         .as_deref()
-        .map(|infos| decode_logprobs(infos, tokenizer));
+        .map(|tokens| decode_logprobs(tokens, tokenizer));
     let (visible, reasoning_text) = split_reasoning(output.text, reasoning);
 
     let with_calls = tool_parser
@@ -129,105 +128,79 @@ fn split_reasoning(text: String, handling: ReasoningHandling) -> (String, Option
     }
 }
 
-/// The text each token adds to the output, decoded in context. Decoding a token alone drops the
-/// leading space a `SentencePiece` tokenizer marks and turns half of a multi-byte character into
-/// U+FFFD; decoding a window ending at the token and subtracting the window before it (as the
-/// streaming detokenizer does) gives the text the client actually receives. A token whose text
-/// is incomplete adds nothing; the token that completes it adds the whole character.
-fn token_deltas(token_ids: &[u32], tokenizer: &Tokenizer) -> Vec<String> {
-    let decode = |ids: &[u32]| tokenizer.decode(ids, false).unwrap_or_default();
-    let mut deltas = vec![String::new(); token_ids.len()];
-    let (mut prefix_offset, mut read_offset) = (0, 0);
-    for (index, delta) in deltas.iter_mut().enumerate() {
-        let before = decode(
-            token_ids
-                .get(prefix_offset..read_offset)
-                .unwrap_or_default(),
-        );
-        let window = decode(token_ids.get(prefix_offset..=index).unwrap_or_default());
-        if window.len() > before.len() && !window.ends_with('\u{FFFD}') {
-            if let Some(added) = window.get(before.len()..) {
-                added.clone_into(delta);
-            }
-            prefix_offset = read_offset;
-            read_offset = index + 1;
-        }
-    }
-    deltas
-}
-
-pub(super) fn decode_logprobs(infos: &[TokenLogprobInfo], tokenizer: &Tokenizer) -> ChoiceLogprobs {
+pub(super) fn decode_logprobs(tokens: &[LoggedToken], tokenizer: &Tokenizer) -> ChoiceLogprobs {
     let decode = |token_id: u32| tokenizer.decode(&[token_id], false).unwrap_or_default();
-    let token_ids: Vec<u32> = infos.iter().map(|info| info.token_id).collect();
-    let deltas = token_deltas(&token_ids, tokenizer);
-    let content = infos
+    let content = tokens
         .iter()
-        .zip(deltas)
-        .map(|(info, delta)| {
-            let token = decode(info.token_id);
-            TokenLogprob {
-                bytes: delta.into_bytes(),
-                token,
-                logprob: info.logprob,
-                top_logprobs: info
-                    .top_logprobs
-                    .iter()
-                    .map(|entry| {
-                        let alternative = decode(entry.token_id);
-                        TopLogprob {
-                            bytes: alternative.clone().into_bytes(),
-                            token: alternative,
-                            logprob: entry.logprob,
-                        }
-                    })
-                    .collect(),
-            }
+        .map(|logged| TokenLogprob {
+            token: decode(logged.info.token_id),
+            logprob: logged.info.logprob,
+            bytes: logged.text.clone().into_bytes(),
+            top_logprobs: logged
+                .info
+                .top_logprobs
+                .iter()
+                .map(|entry| TopLogprob {
+                    token: decode(entry.token_id),
+                    logprob: entry.logprob,
+                    bytes: None,
+                })
+                .collect(),
         })
         .collect();
     ChoiceLogprobs { content }
 }
 
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 #[cfg(test)]
 mod logprob_bytes_tests {
+    use higgs_models::{TokenLogprobInfo, TopLogprobEntry};
+
     use super::*;
 
-    fn word_tokenizer(decoder: &str, vocab: &str) -> Tokenizer {
-        let json = format!(
-            r#"{{
-                "version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
-                "normalizer": null, "pre_tokenizer": null, "post_processor": null,
-                "decoder": {decoder},
-                "model": {{ "type": "WordLevel", "vocab": {vocab}, "unk_token": "a" }}
-            }}"#
-        );
+    fn tokenizer() -> Tokenizer {
+        let json = r#"{
+            "version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+            "normalizer": null, "pre_tokenizer": null, "post_processor": null,
+            "decoder": null,
+            "model": { "type": "WordLevel", "vocab": {"a": 0, "b": 1}, "unk_token": "a" }
+        }"#;
         Tokenizer::from_bytes(json.as_bytes()).unwrap()
     }
 
-    fn joined(deltas: &[String]) -> String {
-        deltas.concat()
+    fn logged(token_id: u32, text: &str) -> LoggedToken {
+        LoggedToken {
+            info: TokenLogprobInfo {
+                token_id,
+                logprob: -0.1,
+                top_logprobs: vec![TopLogprobEntry {
+                    token_id,
+                    logprob: -0.1,
+                }],
+            },
+            text: text.to_owned(),
+        }
     }
 
     #[test]
-    fn a_character_split_across_tokens_is_credited_to_the_token_that_completes_it() {
-        let tokenizer = word_tokenizer(
-            r#"{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true}"#,
-            r#"{"Hello": 0, "Ġworld": 1, "ðŁĺ": 3, "Ģ": 4}"#,
+    fn bytes_are_the_text_each_token_added_and_alternatives_have_none() {
+        let tokens = [logged(0, "Hello"), logged(1, ""), logged(0, " \u{1F600}")];
+        let logprobs = decode_logprobs(&tokens, &tokenizer());
+        let joined: Vec<u8> = logprobs
+            .content
+            .iter()
+            .flat_map(|entry| entry.bytes.iter().copied())
+            .collect();
+        assert_eq!(String::from_utf8(joined).unwrap(), "Hello \u{1F600}");
+        assert!(logprobs.content[1].bytes.is_empty());
+        assert!(
+            logprobs
+                .content
+                .iter()
+                .flat_map(|entry| &entry.top_logprobs)
+                .all(|alternative| alternative.bytes.is_none())
         );
-        let deltas = token_deltas(&[0, 1, 3, 4], &tokenizer);
-        assert_eq!(deltas, ["Hello", " world", "", "\u{1F600}"]);
-    }
-
-    #[test]
-    fn a_sentencepiece_space_survives_in_context() {
-        let tokenizer = word_tokenizer(
-            r#"{"type":"Metaspace","replacement":"\u2581","prepend_scheme":"always","split":true}"#,
-            r#"{"\u2581Hello": 0, "\u2581world": 1}"#,
-        );
-        let alone = tokenizer.decode(&[1], false).unwrap();
-        assert_eq!(alone, "world", "a lone token loses its space");
-        let deltas = token_deltas(&[0, 1], &tokenizer);
-        assert_eq!(deltas, ["Hello", " world"]);
-        assert_eq!(joined(&deltas), tokenizer.decode(&[0, 1], false).unwrap());
+        let json = serde_json::to_value(&logprobs).unwrap();
+        assert!(json["content"][0]["top_logprobs"][0]["bytes"].is_null());
     }
 }

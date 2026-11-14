@@ -52,6 +52,13 @@ The endpoints Higgs serves, with the request fields and response details that ar
     `tool_choice` `any`/`tool`/`none` and `disable_parallel_tool_use`, on
     `/v1/messages`. See [Tool calling](tool-calling.md) for the format
     each model family uses and which ones support forcing.
+  - With `"logprobs": true`, each entry in `choices[].logprobs.content` has `token`,
+    `logprob`, `top_logprobs` and `bytes`. In Higgs, `bytes` is the UTF-8 text that the token
+    added to the output. The `bytes` of all tokens, joined in order, give the generated text
+    before reasoning and tool-call parsing. A streamed response and a non-streamed response give
+    the same `bytes`. This differs from OpenAI, where `bytes` holds the raw bytes of the token.
+    A token that holds half of a character has empty `bytes`. The token that completes the
+    character holds the whole character. Each `top_logprobs` entry has `bytes` set to `null`.
   - `seed` is accepted for client compatibility but does not make sampling
     reproducible yet.
   - Unrecognized request fields are ignored.

@@ -32,7 +32,10 @@ use crate::{
     },
     detokenizer::{IncrementalDetok, find_stop_in_tail},
     disk_prefix_store::{DiskPrefixStore, StoreIdentity},
-    engine::{GenerationOutput, GenerationStats, PrefillProgress, StreamingOutput, ThinkingMode},
+    engine::{
+        GenerationOutput, GenerationStats, LoggedToken, PrefillProgress, StreamingOutput,
+        ThinkingMode,
+    },
     error::EngineError,
     generation_support::{
         PrefixResume, ThinkingSupport, embed_tokens, generation_prompt_suffix_len,
@@ -1535,7 +1538,9 @@ fn collect_output(
     let mut full_text = String::new();
     let mut finish_reason = "length".to_owned();
     let mut completion_tokens: u32 = 0;
-    let mut all_logprobs: Option<Vec<higgs_models::TokenLogprobInfo>> = logprobs.then(Vec::new);
+    let mut all_logprobs: Option<Vec<LoggedToken>> = logprobs.then(Vec::new);
+    // Text that arrived before the first logprob entry; it joins that entry.
+    let mut unattached = String::new();
     let mut stats = GenerationStats::default();
     let mut finished = false;
 
@@ -1549,8 +1554,20 @@ fn collect_output(
         if let Some(ref reason) = output.finish_reason {
             finish_reason.clone_from(reason);
         }
-        if let (Some(all_lp), Some(lp)) = (&mut all_logprobs, output.token_logprob) {
-            all_lp.push(lp);
+        if let Some(all_lp) = &mut all_logprobs {
+            // Every piece of text lands on a token, so the pieces join to the whole output:
+            // text that comes without logprobs (a flush at the end) joins the last token.
+            match output.token_logprob {
+                Some(info) => {
+                    let mut text = std::mem::take(&mut unattached);
+                    text.push_str(&output.new_text);
+                    all_lp.push(LoggedToken { info, text });
+                }
+                None => match all_lp.last_mut() {
+                    Some(last) => last.text.push_str(&output.new_text),
+                    None => unattached.push_str(&output.new_text),
+                },
+            }
         }
         if output.finished {
             finished = true;
@@ -3113,6 +3130,42 @@ mod tests {
                 .next_stop(0),
             None
         );
+    }
+
+    fn step(text: &str, token: Option<u32>, finished: bool) -> StreamingOutput {
+        StreamingOutput {
+            new_text: text.to_owned(),
+            finished,
+            finish_reason: finished.then(|| "stop".to_owned()),
+            prompt_tokens: 3,
+            completion_tokens: 1,
+            token_logprob: token.map(|token_id| higgs_models::TokenLogprobInfo {
+                token_id,
+                logprob: -0.1,
+                top_logprobs: Vec::new(),
+            }),
+            prefill_progress: None,
+        }
+    }
+
+    #[test]
+    fn collected_token_texts_join_to_the_whole_output() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        // A leading text without logprobs, a token that adds nothing, and a final flush.
+        for output in [
+            step("<", None, false),
+            step("a", Some(1), false),
+            step("", Some(2), false),
+            step("b\u{1F600}", Some(3), false),
+            step("\u{FFFD}", None, true),
+        ] {
+            sender.try_send(output).unwrap();
+        }
+        let collected = collect_output(&mut receiver, 3, true).unwrap();
+        let tokens = collected.token_logprobs.unwrap();
+        let texts: Vec<&str> = tokens.iter().map(|token| token.text.as_str()).collect();
+        assert_eq!(texts, ["<a", "", "b\u{1F600}\u{FFFD}"]);
+        assert_eq!(texts.concat(), collected.text);
     }
 
     #[test]
