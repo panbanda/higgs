@@ -96,18 +96,6 @@ impl ToolChoice {
             ))),
         }
     }
-
-    /// The Chat Completions spelling of this choice.
-    pub fn to_chat_value(&self) -> Value {
-        match self {
-            Self::Auto => Value::String("auto".to_owned()),
-            Self::Disabled => Value::String("none".to_owned()),
-            Self::Required => Value::String("required".to_owned()),
-            Self::Function(name) => {
-                serde_json::json!({"type": "function", "function": {"name": name}})
-            }
-        }
-    }
 }
 
 #[allow(clippy::unwrap_used, clippy::panic)]
@@ -189,20 +177,5 @@ mod tests {
         assert!(message(parse(r#"{"type":"tool"}"#)).contains("function name"));
         assert!(message(parse(r#"{"type":"mystery"}"#)).contains("mystery"));
         assert!(message(parse(r#""any""#)).contains("Invalid tool_choice"));
-    }
-
-    #[test]
-    fn chat_value_round_trips() {
-        for choice in [
-            ToolChoice::Auto,
-            ToolChoice::Disabled,
-            ToolChoice::Required,
-            ToolChoice::Function("f".to_owned()),
-        ] {
-            assert_eq!(
-                ToolChoice::from_request(Some(&choice.to_chat_value())).unwrap(),
-                choice
-            );
-        }
     }
 }

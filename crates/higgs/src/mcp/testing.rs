@@ -1,7 +1,7 @@
 //! In-memory MCP server and transport factory for tests.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use futures::future::BoxFuture;
@@ -34,6 +34,8 @@ pub struct FakeMcp {
     pub connections: AtomicUsize,
     pub connect_failures: AtomicUsize,
     pub closes: AtomicUsize,
+    /// Makes every `send` block forever, like a server that stopped reading.
+    pub stall_sends: AtomicBool,
     live: Mutex<Vec<mpsc::Sender<Incoming>>>,
 }
 
@@ -63,6 +65,7 @@ impl FakeMcp {
             connections: AtomicUsize::new(0),
             connect_failures: AtomicUsize::new(0),
             closes: AtomicUsize::new(0),
+            stall_sends: AtomicBool::new(false),
             live: Mutex::new(Vec::new()),
         })
     }
@@ -219,6 +222,9 @@ impl Transport for FakeTransport {
         Box::pin(async move {
             if self.closed.load(Ordering::SeqCst) {
                 return Err(TransportError::Send("closed".to_owned()));
+            }
+            if self.server.stall_sends.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
             }
             lock(&self.server.received).push(message.clone());
             match self.server.reply_to(&message) {

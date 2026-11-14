@@ -4,9 +4,12 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use higgs_engine::inference::{DiskPrefixConfig, EngineOptions, PrefixCacheOptions};
+use higgs_engine::inference::{
+    DiskPrefixConfig, EngineOptions, InferenceEngine, PrefixCacheOptions,
+};
 use higgs_engine::mlx_tuning::resolve_runtime_tuning_with;
 
+use crate::backend::LoadedEngine;
 use crate::config::{
     BatchMode, ExperimentalConfig, HiggsConfig, LoadMode, MemoryConfig, ModelConfig,
     PrefixCacheConfig,
@@ -14,7 +17,6 @@ use crate::config::{
 use crate::decode_strategy::{DecodeFacts, DecodeStrategy, decode_strategy, planned_strategy};
 use crate::model_pool::{ModelLoader, ModelPool, ModelSpec, PoolLimits};
 use crate::model_resolver;
-use crate::state::Engine;
 
 /// Loads engines for the models named in the config.
 pub struct EngineLoader {
@@ -31,15 +33,15 @@ impl EngineLoader {
     }
 }
 
-impl ModelLoader<Engine> for EngineLoader {
-    fn load(&self, name: &str) -> Result<Engine, String> {
+impl ModelLoader<LoadedEngine> for EngineLoader {
+    fn load(&self, name: &str) -> Result<LoadedEngine, String> {
         let model = self.model(name)?;
         let resolved = model_resolver::resolve(&model.path)
             .map_err(|error| format!("cannot find '{}': {error}", model.path))?;
         load_engine(model, &self.memory, &self.experimental, &resolved)
     }
 
-    fn unload(&self, name: &str, model: Arc<Engine>) {
+    fn unload(&self, name: &str, model: Arc<LoadedEngine>) {
         // MLX arrays are bound to the thread that built them, so an engine frees its model on
         // its own worker thread, and merely dropping the handle returns before that happens.
         // Shutting down joins the worker, so the memory is back before the pool clears the MLX
@@ -79,7 +81,7 @@ pub fn load_engine(
     memory: &MemoryConfig,
     experimental: &ExperimentalConfig,
     resolved: &Path,
-) -> Result<Engine, String> {
+) -> Result<LoadedEngine, String> {
     tracing::info!(model = %model.path, resolved = %resolved.display(), "Loading model");
     if let Ok(facts) = DecodeFacts::inspect(model, experimental, resolved) {
         match decode_strategy(&facts) {
@@ -93,7 +95,7 @@ pub fn load_engine(
     }
     let tuning =
         resolve_runtime_tuning_with(resolved, model.profile, &experimental.tuning_overrides());
-    let engine = Engine::load(
+    let engine = InferenceEngine::load(
         resolved,
         EngineOptions {
             kv_cache: model.kv_cache,
@@ -115,7 +117,7 @@ pub fn load_engine(
     )
     .map_err(|error| error.to_string())?;
     tracing::info!(model_name = %engine.model_name(), "Model loaded");
-    Ok(engine)
+    Ok(Box::new(engine))
 }
 
 fn prefix_cache_options(config: &PrefixCacheConfig) -> PrefixCacheOptions {
@@ -171,7 +173,7 @@ pub fn startup_models(config: &HiggsConfig) -> Vec<&ModelConfig> {
 }
 
 /// Build the pool for every `[[models]]` entry. Nothing is loaded yet.
-pub fn build_pool(config: &HiggsConfig) -> Result<Arc<ModelPool<Engine>>, String> {
+pub fn build_pool(config: &HiggsConfig) -> Result<Arc<ModelPool<LoadedEngine>>, String> {
     let mut specs = Vec::new();
     let mut models = HashMap::new();
     for model in &config.models {

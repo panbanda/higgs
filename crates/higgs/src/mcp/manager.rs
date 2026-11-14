@@ -274,8 +274,11 @@ impl McpManager {
                 .await
             {
                 Ok(result) => return Ok(build_output(result, self.max_result_bytes)),
-                // The server died between the state check and the call; the
-                // supervisor has not reconnected yet, so give it one chance.
+                // The connection was already gone before the request was
+                // written, so nothing reached the server; the supervisor has
+                // not reconnected yet, so give it one chance. A connection
+                // lost after the write is `Interrupted` and never replayed:
+                // a mutating tool may already have run.
                 Err(ClientError::Closed(_)) if !retried => retried = true,
                 Err(error) => return Err(map_error(error)),
             }
@@ -318,6 +321,7 @@ fn map_error(error: ClientError) -> ToolCallError {
         ClientError::Rpc(_)
         | ClientError::Transport(_)
         | ClientError::Closed(_)
+        | ClientError::Interrupted(_)
         | ClientError::Protocol(_) => ToolCallError::Upstream(error.to_string()),
     }
 }
@@ -747,6 +751,9 @@ mod tests {
         assert_eq!(server.connection_count(), 1);
 
         server.crash().await;
+        // A call written before the client notices the crash would be lost
+        // with an unknown outcome and is deliberately not replayed.
+        tokio::time::sleep(Duration::from_millis(100)).await;
         let output = manager.call("fake__echo", json!({})).await.unwrap();
         assert_eq!(output.text, "called echo");
         assert_eq!(server.connection_count(), 2);
@@ -754,20 +761,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_crash_during_a_call_is_retried_once_on_a_fresh_connection() {
+    async fn a_crash_after_the_request_was_sent_is_not_replayed() {
         let server = FakeMcp::new(&["flaky"]);
         server.on_call("flaky", CallBehavior::Crash);
         let manager = manager_for(&server, Duration::from_secs(2));
         wait_until(&manager, "fake", "ready").await;
-        // The first attempt crashes the connection; the retry crashes again,
-        // so the caller sees an upstream error rather than looping forever.
         let error = manager.call("fake__flaky", json!({})).await.unwrap_err();
-        assert!(matches!(error, ToolCallError::Upstream(_)), "{error:?}");
-        assert_eq!(server.connection_count(), 2);
+        let ToolCallError::Upstream(message) = error else {
+            panic!("expected Upstream")
+        };
+        assert!(message.contains("outcome unknown"), "{message}");
+        assert_eq!(server.received_calls().len(), 1);
 
         server.on_call("flaky", CallBehavior::Reply(text_result("recovered")));
         let output = manager.call("fake__flaky", json!({})).await.unwrap();
         assert_eq!(output.text, "recovered");
+        assert_eq!(server.received_calls().len(), 2);
     }
 
     #[tokio::test]

@@ -1157,6 +1157,61 @@ fn includes_merge_relative_to_the_including_file() {
 }
 
 #[test]
+fn a_provider_may_take_its_url_from_an_include_and_its_key_from_the_includer() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "providers.toml",
+        "[providers.test]\nurl = \"http://upstream\"\n",
+    );
+    let main = write(
+        dir.path(),
+        "config.toml",
+        "include = [\"providers.toml\"]\n[providers.test]\napi_key = \"secret\"\n",
+    );
+    let config = load_config_file_in(&main, None, &Environment::default()).unwrap();
+    let provider = &config.providers["test"];
+    assert_eq!(provider.url, "http://upstream");
+    assert_eq!(provider.api_key.as_ref().unwrap().expose(), "secret");
+}
+
+#[test]
+fn a_provider_still_missing_its_url_after_merging_is_reported_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "providers.toml",
+        "[providers.test]\nformat = \"openai\"\n",
+    );
+    let main = write(
+        dir.path(),
+        "config.toml",
+        "include = [\"providers.toml\"]\n[providers.test]\napi_key = \"secret\"\n",
+    );
+    let error = load_config_file_in(&main, None, &Environment::default()).unwrap_err();
+    assert!(error.contains("providers.test"), "{error}");
+    assert!(error.contains("missing field `url`"), "{error}");
+}
+
+#[test]
+fn unknown_provider_keys_are_still_rejected_with_a_suggestion_when_layered() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "providers.toml",
+        "[providers.test]\nurl = \"http://upstream\"\n",
+    );
+    let main = write(
+        dir.path(),
+        "config.toml",
+        "include = [\"providers.toml\"]\n[providers.test]\napi_kye = \"secret\"\n",
+    );
+    let error = load_config_file_in(&main, None, &Environment::default()).unwrap_err();
+    assert!(error.contains("unknown key `api_kye`"), "{error}");
+    assert!(error.contains("did you mean `api_key`"), "{error}");
+}
+
+#[test]
 fn includes_may_nest_and_later_files_override_earlier_ones() {
     let dir = tempfile::tempdir().unwrap();
     write(

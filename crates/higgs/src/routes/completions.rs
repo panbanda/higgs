@@ -12,21 +12,22 @@ use axum::{
     },
 };
 use bytes::Bytes;
-use tokio_stream::Stream;
+use tokio_stream::{Stream, StreamExt};
 
 use crate::{
     config::ApiFormat,
     error::ServerError,
-    metrics::{MetricsStore, RequestMetricsContext, RequestRecord, RequestTiming},
-    router::ResolvedRoute,
-    state::{EngineLease, SharedState},
-    types::openai::{
-        ChoiceLogprobs, CompletionChoice, CompletionChunkChoice, CompletionRequest,
-        CompletionResponse, StopSequence, TokenLogprob, TopLogprob,
+    generation::{
+        Completed, EventStream, GenerationEvent, GenerationRequest, Prompt, StreamMetrics,
     },
-    usage::{TokenCounts, build_usage},
+    metrics::{RequestMetricsContext, RequestRecord},
+    router::ResolvedRoute,
+    state::SharedState,
+    types::openai::{
+        CompletionChoice, CompletionChunkChoice, CompletionRequest, CompletionResponse,
+        StopSequence,
+    },
 };
-use higgs_engine::engine::{GenerationStats, ThinkingMode};
 use higgs_models::SamplingParams;
 
 #[allow(clippy::too_many_lines)]
@@ -57,43 +58,45 @@ pub async fn completions(
             model_name,
             routing_method,
         } => {
+            let request =
+                generation_request(&req, model_name.clone(), state.config.server.max_tokens);
             if req.stream == Some(true) {
-                let metrics = state.metrics.clone();
-                let stream = completions_stream(
+                let events = crate::generation::stream(
                     Arc::clone(&state),
-                    req,
+                    request,
                     engine,
-                    model_name,
-                    metrics,
-                    routing_method,
+                    state.metrics.clone().map(|store| StreamMetrics {
+                        store,
+                        routing_method,
+                    }),
                     received_at,
                 )?;
-                let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+                let include_usage = req
+                    .stream_options
+                    .as_ref()
+                    .is_some_and(|opts| opts.include_usage.unwrap_or(false));
+                let sse = Sse::new(completion_chunk_stream(events, req.model, include_usage))
+                    .keep_alive(KeepAlive::default());
                 if state.metrics.is_some() {
                     request_metrics.mark_recorded();
                 }
                 Ok(sse.into_response())
             } else {
                 let start = Instant::now();
-                let response =
-                    completions_non_streaming(Arc::clone(&state), req, engine, received_at).await?;
+                let completed =
+                    crate::generation::complete(Arc::clone(&state), request, engine, received_at)
+                        .await?;
                 if let Some(ref metrics) = state.metrics {
-                    metrics.record(RequestRecord {
-                        id: 0,
-                        timestamp: Instant::now(),
-                        wallclock: chrono::Utc::now(),
-                        model: Some(model_name),
-                        provider: Some("higgs".to_owned()),
-                        routing_method: routing_method.into(),
-                        status: 200,
-                        duration: start.elapsed(),
-                        input_tokens: u64::from(response.usage.prompt_tokens),
-                        output_tokens: u64::from(response.usage.completion_tokens),
-                        error_body: None,
-                        timing: crate::metrics::RequestTiming::default(),
-                    });
+                    crate::generation::record_completion(
+                        metrics,
+                        &model_name,
+                        routing_method,
+                        start,
+                        &completed.usage,
+                    );
                     request_metrics.mark_recorded();
                 }
+                let response = completion_response(completed, req.model);
                 Ok(Json(response).into_response())
             }
         }
@@ -152,196 +155,101 @@ pub async fn completions(
     }
 }
 
-async fn completions_non_streaming(
-    state: SharedState,
-    req: CompletionRequest,
-    engine: EngineLease,
-    received_at: Instant,
-) -> Result<CompletionResponse, ServerError> {
-    let max_tokens = req.max_tokens.unwrap_or(state.config.server.max_tokens);
-    let sampling = build_sampling_params(&req);
-    let stop_sequences = StopSequence::extract(req.stop);
-    let want_logprobs = req.logprobs.unwrap_or(false);
-    let top_logprobs = req.top_logprobs;
-
-    let encoding = engine
-        .tokenizer()
-        .encode(req.prompt.as_str(), false)
-        .map_err(|e| ServerError::BadRequest(format!("Tokenization error: {e}")))?;
-    let prompt_tokens = encoding.get_ids().to_vec();
-
-    let tokenizer = engine.tokenizer().clone();
-    let output = tokio::task::spawn_blocking(move || {
-        engine.generate(
-            &prompt_tokens,
-            max_tokens,
-            &sampling,
-            &stop_sequences,
-            want_logprobs,
-            top_logprobs,
-            None,
-            None,
-        )
-    })
-    .await
-    .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
-    .map_err(ServerError::Engine)?;
-
-    let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
-
-    let logprobs_response = output
-        .token_logprobs
-        .as_ref()
-        .map(|lps| logprobs_to_response(lps, &tokenizer));
-
-    Ok(CompletionResponse {
-        id: request_id,
-        object: "text_completion",
-        created: chrono::Utc::now().timestamp(),
-        model: req.model,
-        choices: vec![CompletionChoice {
-            index: 0,
-            text: output.text,
-            finish_reason: output.finish_reason,
-            logprobs: logprobs_response,
-        }],
-        usage: build_usage(
-            TokenCounts {
-                prompt: output.prompt_tokens,
-                completion: output.completion_tokens,
-                reasoning: None,
-            },
-            &output.stats,
-            received_at,
-        ),
-    })
+fn generation_request(
+    req: &CompletionRequest,
+    model_name: String,
+    default_max_tokens: u32,
+) -> GenerationRequest {
+    GenerationRequest {
+        model: model_name,
+        prompt: Prompt::Text(req.prompt.clone()),
+        max_tokens: req.max_tokens.unwrap_or(default_max_tokens),
+        sampling: build_sampling_params(req),
+        stop_sequences: StopSequence::extract(req.stop.clone()),
+        logprobs: req.logprobs.unwrap_or(false),
+        top_logprobs: req.top_logprobs,
+        constraint: None,
+        mcp: None,
+    }
 }
 
-#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
-fn completions_stream(
-    state: SharedState,
-    req: CompletionRequest,
-    engine: EngineLease,
-    model_name: String,
-    metrics: Option<Arc<MetricsStore>>,
-    routing_method: crate::router::RoutingMethod,
-    received_at: Instant,
-) -> Result<impl Stream<Item = Result<Event, Infallible>>, ServerError> {
-    let max_tokens = req.max_tokens.unwrap_or(state.config.server.max_tokens);
-    let sampling = build_sampling_params(&req);
-    let stop_sequences = StopSequence::extract(req.stop);
-    let want_logprobs = req.logprobs.unwrap_or(false);
-    let top_logprobs = req.top_logprobs;
+fn completion_response(completed: Completed, model: String) -> CompletionResponse {
+    CompletionResponse {
+        id: format!("cmpl-{}", uuid::Uuid::new_v4()),
+        object: "text_completion",
+        created: chrono::Utc::now().timestamp(),
+        model,
+        choices: vec![CompletionChoice {
+            index: 0,
+            text: completed.text,
+            finish_reason: completed.finish_reason,
+            logprobs: completed.logprobs,
+        }],
+        usage: completed.usage,
+    }
+}
 
-    let encoding = engine
-        .tokenizer()
-        .encode(req.prompt.as_str(), false)
-        .map_err(|e| ServerError::BadRequest(format!("Tokenization error: {e}")))?;
-    let prompt_tokens = encoding.get_ids().to_vec();
-    let input_token_count = u64::try_from(prompt_tokens.len()).unwrap_or(u64::MAX);
-
+/// Render generation events as completion chunks. Each piece of text is
+/// forwarded as it arrives; the finish reason follows in a final chunk with
+/// empty text, as in `OpenAI`'s own completions stream.
+fn completion_chunk_stream(
+    mut events: EventStream,
+    model: String,
+    include_usage: bool,
+) -> impl Stream<Item = Result<Event, Infallible>> {
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
     let created = chrono::Utc::now().timestamp();
-    let model = req.model;
-    let include_usage = req
-        .stream_options
-        .as_ref()
-        .is_some_and(|opts| opts.include_usage.unwrap_or(false));
-    let prompt_token_count = u32::try_from(prompt_tokens.len()).unwrap_or(u32::MAX);
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-
-    tokio::task::spawn_blocking(move || {
-        let result = engine.generate_streaming_with_thinking(
-            &prompt_tokens,
-            max_tokens,
-            &sampling,
-            &stop_sequences,
-            want_logprobs,
-            top_logprobs,
-            &tx,
-            ThinkingMode::new(engine.enable_thinking(), None),
-            // Progress events feed the usage block and metrics; they are
-            // never written to the client as completion chunks.
-            true,
-            None,
-            None,
-        );
-        if let Err(e) = result {
-            tracing::error!(error = %e, "Generation error during streaming");
-        }
-    });
-
-    let start = received_at;
-    let pending_id = metrics.as_ref().map(|m| {
-        m.record_pending(RequestRecord {
-            id: 0,
-            timestamp: Instant::now(),
-            wallclock: chrono::Utc::now(),
-            model: Some(model_name),
-            provider: Some("higgs".to_owned()),
-            routing_method: routing_method.into(),
-            status: 200,
-            duration: std::time::Duration::ZERO,
-            input_tokens: input_token_count,
-            output_tokens: 0,
-            error_body: None,
-            timing: crate::metrics::RequestTiming::default(),
-        })
-    });
-
-    let stream = async_stream::stream! {
+    async_stream::stream! {
         let mut writer = crate::sse::CompletionChunkWriter::new(&request_id, created, &model);
-        let mut output_tokens: u64 = 0;
-        let mut timing = RequestTiming::default();
-        let mut stats = GenerationStats::default();
-        while let Some(output) = rx.recv().await {
-            stats.observe(&output, Instant::now());
-            if let Some(progress) = output.prefill_progress {
-                timing.cached_tokens = Some(u64::from(progress.cached));
-                continue;
-            }
-            if timing.ttft_ms.is_none() {
-                timing.ttft_ms = Some(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
-            }
-            output_tokens = u64::from(output.completion_tokens);
-            let choice = CompletionChunkChoice {
-                index: 0,
-                text: output.new_text,
-                finish_reason: output.finish_reason,
+
+        macro_rules! emit_chunk {
+            ($text:expr, $finish_reason:expr) => {
+                let choice = CompletionChunkChoice {
+                    index: 0,
+                    text: $text,
+                    finish_reason: $finish_reason,
+                };
+                match writer.write(&choice) {
+                    Ok(json) => yield Ok(Event::default().data(json)),
+                    Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
+                }
             };
-            match writer.write(&choice) {
-                Ok(json) => yield Ok(Event::default().data(json)),
-                Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
-            }
         }
 
-        if include_usage {
-            let usage = build_usage(
-                TokenCounts {
-                    prompt: prompt_token_count,
-                    completion: u32::try_from(output_tokens).unwrap_or(u32::MAX),
-                    reasoning: None,
-                },
-                &stats,
-                start,
-            );
-            match writer.write_usage(&usage) {
-                Ok(json) => yield Ok(Event::default().data(json)),
-                Err(e) => tracing::error!(error = %e, "Failed to serialize usage chunk"),
-            }
-        }
-
-        if let Some(ref m) = metrics {
-            if let Some(id) = pending_id {
-                m.finalize_stream(id, output_tokens, start.elapsed(), timing);
+        while let Some(event) = events.next().await {
+            match event {
+                GenerationEvent::TextDelta { text, .. } => {
+                    emit_chunk!(text, None);
+                }
+                GenerationEvent::Finish { reason, .. } => {
+                    emit_chunk!(String::new(), Some(reason));
+                }
+                GenerationEvent::Usage(usage) => {
+                    if include_usage {
+                        match writer.write_usage(&usage) {
+                            Ok(json) => yield Ok(Event::default().data(json)),
+                            Err(e) => tracing::error!(error = %e, "Failed to serialize usage chunk"),
+                        }
+                    }
+                }
+                GenerationEvent::Error(message) => {
+                    yield Ok(Event::default().data(
+                        serde_json::json!({
+                            "error": {"message": message, "type": "server_error"}
+                        })
+                        .to_string(),
+                    ));
+                }
+                GenerationEvent::Started { .. }
+                | GenerationEvent::PrefillProgress(_)
+                | GenerationEvent::ReasoningDelta(_)
+                | GenerationEvent::ToolCall(_)
+                | GenerationEvent::ToolLoop(_) => {}
             }
         }
 
         yield Ok(Event::default().data("[DONE]"));
-    };
-
-    Ok(stream)
+    }
 }
 
 fn build_sampling_params(req: &CompletionRequest) -> SamplingParams {
@@ -356,49 +264,17 @@ fn build_sampling_params(req: &CompletionRequest) -> SamplingParams {
     }
 }
 
-fn logprobs_to_response(
-    infos: &[higgs_models::TokenLogprobInfo],
-    tokenizer: &higgs_engine::tokenizers::Tokenizer,
-) -> ChoiceLogprobs {
-    let content = infos
-        .iter()
-        .map(|info| {
-            let token_str = tokenizer
-                .decode(&[info.token_id], false)
-                .unwrap_or_default();
-            let top = info
-                .top_logprobs
-                .iter()
-                .map(|e| {
-                    let t = tokenizer.decode(&[e.token_id], false).unwrap_or_default();
-                    TopLogprob {
-                        token: t,
-                        logprob: e.logprob,
-                    }
-                })
-                .collect();
-            TokenLogprob {
-                token: token_str,
-                logprob: info.logprob,
-                top_logprobs: top,
-            }
-        })
-        .collect();
-    ChoiceLogprobs { content }
-}
-
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use crate::test_support::{
         StubEngine, app_with_stub, generation_output, post_json, progress_event, sse_json_events,
-        token_event, word_tokenizer,
+        token_event,
     };
     use higgs_engine::engine::GenerationStats;
 
     fn stub() -> StubEngine {
         let mut stub = StubEngine::named("stub");
-        stub.tokenizer = Some(word_tokenizer());
         stub.script.stamp_times = true;
         stub
     }
@@ -453,7 +329,11 @@ mod tests {
 
         assert_eq!(status, http::StatusCode::OK, "{text}");
         let events = sse_json_events(&text);
-        assert_eq!(events.len(), 3, "two token chunks plus usage: {text}");
+        assert_eq!(
+            events.len(),
+            4,
+            "two token chunks, the finish chunk and usage: {text}"
+        );
         let usage_chunk = events.last().unwrap();
         assert_eq!(usage_chunk["choices"], serde_json::json!([]));
         assert_eq!(usage_chunk["usage"]["prompt_tokens"], 3);
@@ -463,7 +343,7 @@ mod tests {
             1
         );
         assert!(usage_chunk["usage"]["time_to_first_token"].is_f64());
-        for chunk in &events[..2] {
+        for chunk in &events[..3] {
             assert!(chunk.get("usage").is_none());
             assert_eq!(chunk["choices"].as_array().unwrap().len(), 1);
         }
@@ -484,7 +364,15 @@ mod tests {
 
         assert_eq!(status, http::StatusCode::OK, "{text}");
         let events = sse_json_events(&text);
-        assert_eq!(events.len(), 1, "{text}");
+        assert_eq!(
+            events.len(),
+            2,
+            "one text chunk and the finish chunk: {text}"
+        );
+        assert_eq!(events[0]["choices"][0]["text"], "hello");
+        assert!(events[0]["choices"][0]["finish_reason"].is_null());
+        assert_eq!(events[1]["choices"][0]["text"], "");
+        assert_eq!(events[1]["choices"][0]["finish_reason"], "stop");
         assert!(!text.contains("\"usage\""));
     }
 
@@ -501,5 +389,54 @@ mod tests {
         let (_status, text) = post_json(&app, "/v1/completions", &request).await;
 
         assert!(!text.contains("\"usage\""), "{text}");
+    }
+
+    #[tokio::test]
+    async fn first_text_delta_is_forwarded_without_waiting_for_the_next_event() {
+        use super::{EventStream, GenerationEvent, completion_chunk_stream};
+        use tokio_stream::StreamExt;
+
+        let events: EventStream = Box::pin(
+            tokio_stream::iter([GenerationEvent::TextDelta {
+                text: "hello".to_owned(),
+                logprobs: None,
+            }])
+            .chain(tokio_stream::pending()),
+        );
+        let stream = completion_chunk_stream(events, "stub".to_owned(), false);
+        tokio::pin!(stream);
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await;
+
+        assert!(
+            matches!(first, Ok(Some(_))),
+            "the first chunk must not wait for a second event"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_stream_ends_with_an_error_frame_then_done() {
+        let mut stub = stub();
+        stub.script.stream = vec![
+            token_event("par", 1, None),
+            crate::test_support::failure_event(),
+        ];
+        let (app, _engine) = app_with_stub(stub);
+
+        let (status, text) = post_json(
+            &app,
+            "/v1/completions",
+            &body(&serde_json::json!({"stream": true})),
+        )
+        .await;
+
+        assert_eq!(status, http::StatusCode::OK, "{text}");
+        let frames: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .collect();
+        assert_eq!(frames.last(), Some(&"[DONE]"), "{text}");
+        let error: serde_json::Value = serde_json::from_str(frames[frames.len() - 2]).unwrap();
+        assert_eq!(error["error"]["type"], "server_error", "{text}");
     }
 }

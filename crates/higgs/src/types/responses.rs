@@ -48,7 +48,7 @@ pub struct CreateResponseRequest {
     pub conversation: Option<serde_json::Value>,
     /// Higgs extension: server-side MCP tool loop, as on chat completions.
     #[serde(default)]
-    pub mcp: Option<crate::tool_loop::McpOptions>,
+    pub mcp: Option<crate::generation::tool_loop::McpOptions>,
 }
 
 /// The `input` field: a bare prompt string or a list of input items.

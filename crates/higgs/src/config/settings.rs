@@ -773,18 +773,22 @@ pub fn resolve(raw: &RawConfig, context: &ResolveContext) -> Result<HiggsConfig,
         .providers
         .iter()
         .map(|(name, provider)| {
-            (
+            let url = provider
+                .url
+                .clone()
+                .ok_or_else(|| format!("`providers.{name}`: missing field `url`"))?;
+            Ok((
                 name.clone(),
                 ProviderConfig {
-                    url: provider.url.clone(),
+                    url,
                     format: provider.format.unwrap_or(ApiFormat::OpenAi),
                     api_key: provider.api_key.clone().map(Secret::new),
                     strip_auth: provider.strip_auth.unwrap_or(false),
                     stub_count_tokens: provider.stub_count_tokens.unwrap_or(false),
                 },
-            )
+            ))
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
     let routes = raw
         .routes
         .iter()

@@ -8,42 +8,38 @@
 //! `max_iterations` times. Calls to tools the client supplied end the loop
 //! and are handed back unchanged, so a client keeps control of its own tools.
 //!
-//! Generation itself is the existing chat path: this module only calls
-//! [`chat_completions_non_streaming`] and [`chat_completions_chunk_stream`]
-//! once per round and reads their output.
+//! Generation itself is [`complete_once`] and [`stream_once`]: this module
+//! only runs them once per round and reads their output.
 
 use std::collections::HashSet;
-use std::pin::Pin;
-use std::sync::Arc;
 use std::time::Instant;
 
+use higgs_engine::chat_template::ChatMessage;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio_stream::{Stream, StreamExt};
+use tokio_stream::StreamExt;
 
+use super::GenerationRequest;
+use super::complete::complete_once;
+use super::event::{
+    Completed, EventStream, GeneratedToolCall, GenerationEvent, LoopMessage, ToolLoopEvent,
+};
+use super::messages::{template_tool_call, wire_tool_call};
+use super::stream::{StreamMetrics, stream_once};
 use crate::{
-    constraint::ConstraintSpec,
+    backend::EngineLease,
     error::ServerError,
     mcp::manager::ToolOutput,
-    metrics::MetricsStore,
-    router::{ResolvedRoute, RoutingMethod},
-    routes::chat::{chat_completions_chunk_stream, chat_completions_non_streaming},
-    state::{AppState, EngineLease, SharedState},
-    tool_policy::ToolPolicy,
+    router::ResolvedRoute,
+    state::{AppState, SharedState},
     tools::openai_tool,
-    types::openai::{
-        ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse, MessageContent,
-        ToolCall, ToolCallFunction,
-    },
+    types::openai::CompletionUsage,
 };
 
 pub const DEFAULT_MAX_ITERATIONS: u32 = 5;
 pub const MAX_ITERATIONS_LIMIT: u32 = 25;
 /// How much of a tool result the streaming events echo to the client.
 const RESULT_PREVIEW_CHARS: usize = 1000;
-/// Key under which tool-loop information is reported in responses and
-/// stream events.
-const VENDOR_KEY: &str = "higgs_mcp";
 
 /// The `mcp` request field.
 #[derive(Debug, Clone, Deserialize)]
@@ -65,7 +61,7 @@ const fn default_enabled() -> bool {
     true
 }
 
-struct LoopPlan {
+pub(super) struct LoopPlan {
     /// Tools to add to the request, in `OpenAI` form.
     injected_tools: Vec<Value>,
     /// Names the server executes itself.
@@ -77,9 +73,8 @@ const fn bad_request(message: String) -> ServerError {
     ServerError::BadRequest(message)
 }
 
-fn client_tool_names(tools: Option<&[Value]>) -> HashSet<String> {
+fn client_tool_names(tools: &[Value]) -> HashSet<String> {
     tools
-        .unwrap_or_default()
         .iter()
         .filter_map(|tool| {
             tool.get("function")
@@ -93,11 +88,17 @@ fn client_tool_names(tools: Option<&[Value]>) -> HashSet<String> {
 
 /// Decide whether this request runs the loop and with which tools. `None`
 /// means the request is handled exactly as if `mcp` were absent.
-fn plan(state: &AppState, req: &ChatCompletionRequest) -> Result<Option<LoopPlan>, ServerError> {
-    let Some(options) = req.mcp.as_ref().filter(|options| options.enabled) else {
+pub(super) fn plan(
+    state: &AppState,
+    request: &GenerationRequest,
+) -> Result<Option<LoopPlan>, ServerError> {
+    let Some(options) = request.mcp.as_ref().filter(|options| options.enabled) else {
         return Ok(None);
     };
-    if !ToolPolicy::from_chat(req.tool_choice.as_ref(), req.parallel_tool_calls)?.exposes_tools() {
+    let Some(chat) = request.chat() else {
+        return Ok(None);
+    };
+    if !chat.tool_policy.exposes_tools() {
         return Ok(None);
     }
     let max_iterations = options.max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS);
@@ -125,7 +126,7 @@ fn plan(state: &AppState, req: &ChatCompletionRequest) -> Result<Option<LoopPlan
     }
 
     // A client tool with the same name as a server tool stays the client's.
-    let taken = client_tool_names(req.tools.as_deref());
+    let taken = client_tool_names(&chat.tools);
     let selected: Vec<_> = available
         .iter()
         .filter(|tool| {
@@ -137,13 +138,56 @@ fn plan(state: &AppState, req: &ChatCompletionRequest) -> Result<Option<LoopPlan
         .filter(|tool| !taken.contains(&tool.name))
         .collect();
 
-    let mut injected_tools = req.tools.clone().unwrap_or_default();
+    let mut injected_tools = chat.tools.clone();
     injected_tools.extend(selected.iter().map(|tool| openai_tool(tool)));
     Ok(Some(LoopPlan {
         injected_tools,
         names: selected.iter().map(|tool| tool.name.clone()).collect(),
         max_iterations,
     }))
+}
+
+/// The request as the loop's rounds send it: the loop's tools added and no
+/// nested loop.
+fn loop_conversation(mut request: GenerationRequest, plan: &LoopPlan) -> GenerationRequest {
+    request.mcp = None;
+    if let Some(chat) = request.chat_mut() {
+        chat.tools.clone_from(&plan.injected_tools);
+    }
+    request
+}
+
+/// Prepare the conversation for the round after one that ran tools: a forced
+/// `tool_choice` applied to the first generation only, so later rounds are
+/// free to answer.
+fn extend_conversation(
+    conversation: &mut GenerationRequest,
+    text: String,
+    calls: &[GeneratedToolCall],
+) {
+    if let Some(chat) = conversation.chat_mut() {
+        chat.tool_policy = chat.tool_policy.without_forced_choice();
+        chat.messages.push(ChatMessage {
+            role: "assistant".to_owned(),
+            content: text,
+            tool_calls: Some(
+                calls
+                    .iter()
+                    .filter_map(|call| template_tool_call(&wire_tool_call(call)))
+                    .collect(),
+            ),
+        });
+    }
+}
+
+fn push_tool_result(conversation: &mut GenerationRequest, call: &ExecutedCall) {
+    if let Some(chat) = conversation.chat_mut() {
+        chat.messages.push(ChatMessage {
+            role: "tool".to_owned(),
+            content: call.content.clone(),
+            tool_calls: None,
+        });
+    }
 }
 
 async fn reacquire(state: &AppState, model: &str) -> Result<EngineLease, ServerError> {
@@ -164,36 +208,19 @@ struct ExecutedCall {
     is_error: bool,
 }
 
-async fn execute_call(state: &AppState, call: &ToolCall) -> ExecutedCall {
-    let raw = call.function.arguments.trim();
-    let parsed: Result<Value, String> = if raw.is_empty() {
-        Ok(json!({}))
-    } else {
-        serde_json::from_str(raw).map_err(|error| format!("arguments are not valid JSON: {error}"))
-    };
-    let (arguments, outcome) = match parsed {
-        Ok(arguments) => {
-            let result = state
-                .tools
-                .call(&call.function.name, arguments.clone())
-                .await;
-            (
-                arguments,
-                result
-                    .map(|output| render_output(&output))
-                    .map_err(|error| error.to_string()),
-            )
-        }
-        Err(message) => (Value::String(raw.to_owned()), Err(message)),
-    };
-    let (content, is_error) = match outcome {
+async fn execute_call(state: &AppState, call: &GeneratedToolCall) -> ExecutedCall {
+    let result = state.tools.call(&call.name, call.arguments.clone()).await;
+    let (content, is_error) = match result
+        .map(|output| render_output(&output))
+        .map_err(|error| error.to_string())
+    {
         Ok((text, is_error)) => (text, is_error),
         Err(message) => (format!("Error: {message}"), true),
     };
     ExecutedCall {
         id: call.id.clone(),
-        name: call.function.name.clone(),
-        arguments,
+        name: call.name.clone(),
+        arguments: call.arguments.clone(),
         content,
         is_error,
     }
@@ -239,34 +266,12 @@ fn render_output(output: &ToolOutput) -> (String, bool) {
     (lines.join("\n"), output.is_error)
 }
 
-fn assistant_message(
-    content: Option<MessageContent>,
-    calls: Vec<ToolCall>,
-) -> ChatCompletionMessage {
-    ChatCompletionMessage {
-        role: "assistant".to_owned(),
-        content,
-        reasoning_content: None,
-        tool_calls: Some(calls),
-        tool_call_id: None,
-    }
-}
-
-fn tool_message(call: &ExecutedCall) -> ChatCompletionMessage {
-    ChatCompletionMessage {
-        role: "tool".to_owned(),
-        content: Some(MessageContent::Text(call.content.clone())),
-        reasoning_content: None,
-        tool_calls: None,
-        tool_call_id: Some(call.id.clone()),
-    }
-}
-
 #[derive(Default)]
 struct Trace {
     calls: Vec<Value>,
     rounds: u32,
     truncated: bool,
+    messages: Vec<LoopMessage>,
 }
 
 impl Trace {
@@ -287,31 +292,44 @@ impl Trace {
             "tool_calls": self.calls,
         })
     }
+
+    fn record_assistant(&mut self, text: String, calls: &[GeneratedToolCall]) {
+        self.messages.push(LoopMessage::AssistantCalls {
+            text,
+            calls: calls.to_vec(),
+        });
+    }
+
+    fn record_result(&mut self, call: &ExecutedCall) {
+        self.messages.push(LoopMessage::ToolResult {
+            call_id: call.id.clone(),
+            content: call.content.clone(),
+        });
+    }
+
+    const fn ran_tools(&self) -> bool {
+        self.rounds > 0 || self.truncated
+    }
 }
 
-fn split_calls(calls: Vec<ToolCall>, names: &HashSet<String>) -> (Vec<ToolCall>, Vec<ToolCall>) {
+fn split_calls(
+    calls: Vec<GeneratedToolCall>,
+    names: &HashSet<String>,
+) -> (Vec<GeneratedToolCall>, Vec<GeneratedToolCall>) {
     calls
         .into_iter()
-        .partition(|call| names.contains(&call.function.name))
+        .partition(|call| names.contains(&call.name))
 }
 
-/// Non-streaming generation with the tool loop. Requests without `mcp` take
-/// the plain path untouched.
-pub(crate) async fn complete(
+/// Non-streaming generation with the tool loop.
+pub(super) async fn complete(
     state: SharedState,
-    req: ChatCompletionRequest,
+    request: GenerationRequest,
     engine: EngineLease,
-    constraint_spec: Option<ConstraintSpec>,
+    plan: LoopPlan,
     received_at: Instant,
-) -> Result<ChatCompletionResponse, ServerError> {
-    let Some(plan) = plan(&state, &req)? else {
-        return chat_completions_non_streaming(state, req, engine, constraint_spec, received_at)
-            .await;
-    };
-
-    let mut conversation = req;
-    conversation.mcp = None;
-    conversation.tools = Some(plan.injected_tools.clone());
+) -> Result<Completed, ServerError> {
+    let mut conversation = loop_conversation(request, &plan);
     let mut first_lease = Some(engine);
     let mut trace = Trace::default();
     let mut totals: (u32, u32) = (0, 0);
@@ -321,60 +339,39 @@ pub(crate) async fn complete(
             Some(lease) => lease,
             None => reacquire(&state, &conversation.model).await?,
         };
-        let mut response = chat_completions_non_streaming(
-            Arc::clone(&state),
-            conversation.clone(),
-            lease,
-            constraint_spec.clone(),
-            received_at,
-        )
-        .await?;
+        let mut completed = complete_once(lease, &conversation, received_at).await?;
 
         let (previous_prompt, previous_completion) = totals;
         totals = (
-            previous_prompt.saturating_add(response.usage.prompt_tokens),
-            previous_completion.saturating_add(response.usage.completion_tokens),
+            previous_prompt.saturating_add(completed.usage.prompt_tokens),
+            previous_completion.saturating_add(completed.usage.completion_tokens),
         );
-        response.usage.prompt_tokens = totals.0;
-        response.usage.completion_tokens = totals.1;
-        response.usage.total_tokens = totals.0.saturating_add(totals.1);
+        completed.usage.prompt_tokens = totals.0;
+        completed.usage.completion_tokens = totals.1;
+        completed.usage.total_tokens = totals.0.saturating_add(totals.1);
 
-        let assistant = response
-            .choices
-            .first()
-            .map(|choice| choice.message.clone());
-        let calls = assistant
-            .as_ref()
-            .and_then(|reply| reply.tool_calls.clone())
-            .unwrap_or_default();
-        let (server_calls, client_calls) = split_calls(calls, &plan.names);
+        let (server_calls, client_calls) = split_calls(completed.tool_calls.clone(), &plan.names);
         if server_calls.is_empty() {
-            return Ok(finish(response, &trace));
+            return Ok(finish(completed, trace));
         }
         let exhausted = round == plan.max_iterations;
         if !client_calls.is_empty() {
-            if let Some(choice) = response.choices.first_mut() {
-                choice.message.tool_calls = Some(client_calls);
-            }
-            return Ok(finish(response, &trace));
+            completed.tool_calls = client_calls;
+            return Ok(finish(completed, trace));
         }
         if exhausted {
             trace.truncated = true;
-            return Ok(finish(response, &trace));
+            return Ok(finish(completed, trace));
         }
 
         trace.rounds += 1;
-        // A forced tool_choice applies to the first generation only; later
-        // rounds must be free to answer.
-        conversation.tool_choice = None;
-        conversation.messages.push(assistant_message(
-            assistant.and_then(|reply| reply.content),
-            server_calls.clone(),
-        ));
+        trace.record_assistant(completed.text.clone(), &server_calls);
+        extend_conversation(&mut conversation, completed.text, &server_calls);
         for call in &server_calls {
             let executed = execute_call(&state, call).await;
             trace.record(trace.rounds, &executed);
-            conversation.messages.push(tool_message(&executed));
+            trace.record_result(&executed);
+            push_tool_result(&mut conversation, &executed);
         }
     }
     Err(ServerError::InternalError(
@@ -382,193 +379,116 @@ pub(crate) async fn complete(
     ))
 }
 
-fn finish(mut response: ChatCompletionResponse, trace: &Trace) -> ChatCompletionResponse {
-    if trace.rounds > 0 || trace.truncated {
-        response.mcp = Some(trace.to_value());
+fn finish(mut completed: Completed, trace: Trace) -> Completed {
+    if trace.ran_tools() {
+        completed.tool_loop = Some(trace.to_value());
     }
-    response
-}
-
-type ChunkStream = Pin<Box<dyn Stream<Item = String> + Send>>;
-
-/// Id, creation time and model of the first chunk, reused on every chunk so
-/// the stream looks like one response across rounds.
-#[derive(Clone)]
-struct Identity {
-    id: Value,
-    created: Value,
-    model: Value,
+    completed.loop_messages = trace.messages;
+    completed
 }
 
 /// What a stream round has seen so far.
 #[derive(Default)]
 struct RoundState {
-    server_calls: Vec<ToolCall>,
+    /// Only the first round announces the start of the response.
+    later_round: bool,
+    server_calls: Vec<GeneratedToolCall>,
     text: String,
     client_call_forwarded: bool,
-    next_call_index: u64,
-    held_finish: Option<Value>,
-    held_usage: Option<Value>,
+    next_call_index: u32,
+    held_finish: Option<GenerationEvent>,
+    held_usage: Option<CompletionUsage>,
+    /// The round ended with an error, which also ends the loop.
+    failed: bool,
 }
 
 impl RoundState {
-    /// Route one chunk of the round's stream: `Some` is forwarded to the
-    /// client, `None` is suppressed (or held for the end of the round).
+    /// Route one event of the round: `Some` is forwarded to the client,
+    /// `None` is suppressed (or held for the end of the round).
     fn ingest(
         &mut self,
-        mut chunk: Value,
+        event: GenerationEvent,
         names: &HashSet<String>,
         final_round: bool,
-        role_sent: &mut bool,
-    ) -> Option<Value> {
-        let has_choice = chunk
-            .get("choices")
-            .and_then(Value::as_array)
-            .is_some_and(|choices| !choices.is_empty());
-        if !has_choice {
-            if chunk.get("usage").is_some_and(|usage| !usage.is_null()) {
-                self.held_usage = Some(chunk);
-                return None;
+    ) -> Option<GenerationEvent> {
+        match event {
+            GenerationEvent::Usage(usage) => {
+                self.held_usage = Some(usage);
+                None
             }
-            return Some(chunk);
-        }
-
-        let finished = chunk
-            .pointer("/choices/0/finish_reason")
-            .is_some_and(|reason| !reason.is_null());
-        if finished {
-            self.held_finish = Some(chunk);
-            return None;
-        }
-
-        let delta = chunk.pointer_mut("/choices/0/delta")?;
-        if delta.get("role").is_some() {
-            if *role_sent {
-                return None;
+            GenerationEvent::Finish { .. } => {
+                self.held_finish = Some(event);
+                None
             }
-            *role_sent = true;
-        }
-        if let Some(text) = delta.get("content").and_then(Value::as_str) {
-            self.text.push_str(text);
-        }
-        let Some(calls) = delta.get("tool_calls").and_then(Value::as_array).cloned() else {
-            return Some(chunk);
-        };
-
-        let mut forwarded = Vec::new();
-        for mut call in calls {
-            let name = call
-                .pointer("/function/name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            if !final_round && names.contains(&name) {
-                self.server_calls.push(ToolCall {
-                    id: call
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    r#type: "function".to_owned(),
-                    function: ToolCallFunction {
-                        name,
-                        arguments: call
-                            .pointer("/function/arguments")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                    },
-                });
-                continue;
+            GenerationEvent::TextDelta { ref text, .. } => {
+                self.text.push_str(text);
+                Some(event)
             }
-            if !names.contains(&name) {
-                self.client_call_forwarded = true;
+            GenerationEvent::ToolCall(call) => {
+                if !final_round && names.contains(&call.name) {
+                    self.server_calls.push(call);
+                    return None;
+                }
+                if !names.contains(&call.name) {
+                    self.client_call_forwarded = true;
+                }
+                let renumbered = GeneratedToolCall {
+                    index: self.next_call_index,
+                    ..call
+                };
+                self.next_call_index += 1;
+                Some(GenerationEvent::ToolCall(renumbered))
             }
-            if let Some(object) = call.as_object_mut() {
-                object.insert("index".to_owned(), json!(self.next_call_index));
+            GenerationEvent::Error(_) => {
+                self.failed = true;
+                Some(event)
             }
-            self.next_call_index += 1;
-            forwarded.push(call);
+            GenerationEvent::Started { .. } if self.later_round => None,
+            GenerationEvent::Started { .. }
+            | GenerationEvent::PrefillProgress(_)
+            | GenerationEvent::ReasoningDelta(_)
+            | GenerationEvent::ToolLoop(_) => Some(event),
         }
-        let delta_object = delta.as_object_mut()?;
-        if forwarded.is_empty() {
-            delta_object.remove("tool_calls");
-            let carries_anything = delta_object
-                .iter()
-                .any(|(key, value)| key != "role" && !value.is_null());
-            return carries_anything.then_some(chunk);
-        }
-        delta_object.insert("tool_calls".to_owned(), Value::Array(forwarded));
-        Some(chunk)
     }
 }
 
 /// Add the token counts of `next` into `total`; other usage fields (timings,
 /// details) come from the latest round.
-fn merge_usage(total: &mut Option<Value>, next: Value) {
+const fn merge_usage(total: &mut Option<CompletionUsage>, next: CompletionUsage) {
     let Some(previous) = total.take() else {
         *total = Some(next);
         return;
     };
     let mut merged = next;
-    for key in ["prompt_tokens", "completion_tokens", "total_tokens"] {
-        let sum = previous
-            .pointer(&format!("/usage/{key}"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-            .saturating_add(
-                merged
-                    .pointer(&format!("/usage/{key}"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-            );
-        if let Some(slot) = merged.pointer_mut(&format!("/usage/{key}")) {
-            *slot = json!(sum);
-        }
-    }
+    merged.prompt_tokens = merged.prompt_tokens.saturating_add(previous.prompt_tokens);
+    merged.completion_tokens = merged
+        .completion_tokens
+        .saturating_add(previous.completion_tokens);
+    merged.total_tokens = merged.total_tokens.saturating_add(previous.total_tokens);
     *total = Some(merged);
 }
 
-/// Streaming generation with the tool loop, as raw SSE `data` payloads
-/// ending in `[DONE]`.
+/// Streaming generation with the tool loop.
 ///
 /// Assistant text and reasoning stream as they are produced in every round.
-/// Executed tool calls never appear as `tool_calls` deltas; instead
-/// chunks with an empty `choices` array and a `higgs_mcp` field announce
-/// each call (`tool_call`), its outcome (`tool_result`) and the loop's end
-/// (`summary`). Standard clients ignore them, as they do usage chunks.
-#[allow(clippy::too_many_lines)]
-pub(crate) fn chunk_stream(
+/// Executed tool calls never appear as `ToolCall` events; instead
+/// [`ToolLoopEvent`]s announce each call, its outcome and the loop's end.
+/// Preparation errors of any round, including the first, end the stream with
+/// an `Error` event.
+pub(super) fn stream(
     state: SharedState,
-    req: ChatCompletionRequest,
+    request: GenerationRequest,
     engine: EngineLease,
-    constraint_spec: Option<ConstraintSpec>,
-    metrics: Option<Arc<MetricsStore>>,
-    routing_method: RoutingMethod,
+    plan: LoopPlan,
+    metrics: Option<StreamMetrics>,
     received_at: Instant,
-) -> Result<ChunkStream, ServerError> {
-    let Some(plan) = plan(&state, &req)? else {
-        return Ok(Box::pin(chat_completions_chunk_stream(
-            state,
-            req,
-            engine,
-            constraint_spec,
-            metrics,
-            routing_method,
-            received_at,
-        )?));
-    };
+) -> EventStream {
+    let mut conversation = loop_conversation(request, &plan);
 
-    let mut conversation = req;
-    conversation.mcp = None;
-    conversation.tools = Some(plan.injected_tools.clone());
-
-    Ok(Box::pin(async_stream::stream! {
+    Box::pin(async_stream::stream! {
         let mut first_lease = Some(engine);
         let mut trace = Trace::default();
-        let mut role_sent = false;
-        let mut identity: Option<Identity> = None;
-        let mut usage_total: Option<Value> = None;
+        let mut usage_total: Option<CompletionUsage> = None;
         let mut round: u32 = 0;
 
         'rounds: loop {
@@ -578,153 +498,99 @@ pub(crate) fn chunk_stream(
                 None => match reacquire(&state, &conversation.model).await {
                     Ok(lease) => lease,
                     Err(error) => {
-                        yield error_chunk(&error);
+                        yield loop_failure(&error);
                         break 'rounds;
                     }
                 },
             };
             let round_metrics = if round == 0 { metrics.clone() } else { None };
-            let source = chat_completions_chunk_stream(
-                Arc::clone(&state),
-                conversation.clone(),
-                lease,
-                constraint_spec.clone(),
-                round_metrics,
-                routing_method,
-                received_at,
-            );
-            let mut chunks = match source {
-                Ok(stream) => Box::pin(stream),
+            let mut events = match stream_once(lease, &conversation, received_at, round_metrics) {
+                Ok(events) => events,
                 Err(error) => {
-                    yield error_chunk(&error);
+                    yield loop_failure(&error);
                     break 'rounds;
                 }
             };
 
-            let mut state_of_round = RoundState::default();
-            while let Some(data) = chunks.next().await {
-                if data == "[DONE]" {
-                    break;
-                }
-                let Ok(mut chunk) = serde_json::from_str::<Value>(&data) else {
-                    yield data;
-                    continue;
-                };
-                match &identity {
-                    None => {
-                        identity = Some(Identity {
-                            id: chunk.get("id").cloned().unwrap_or(Value::Null),
-                            created: chunk.get("created").cloned().unwrap_or(Value::Null),
-                            model: chunk.get("model").cloned().unwrap_or(Value::Null),
-                        });
-                    }
-                    Some(first) => {
-                        if let Some(object) = chunk.as_object_mut() {
-                            object.insert("id".to_owned(), first.id.clone());
-                            object.insert("created".to_owned(), first.created.clone());
-                            object.insert("model".to_owned(), first.model.clone());
-                        }
-                    }
-                }
-                if let Some(forward) =
-                    state_of_round.ingest(chunk, &plan.names, final_round, &mut role_sent)
-                {
-                    yield forward.to_string();
+            let mut state_of_round = RoundState {
+                later_round: round > 0,
+                ..RoundState::default()
+            };
+            while let Some(event) = events.next().await {
+                if let Some(forward) = state_of_round.ingest(event, &plan.names, final_round) {
+                    yield forward;
                 }
             }
-            drop(chunks);
+            drop(events);
 
             if let Some(usage) = state_of_round.held_usage.take() {
                 merge_usage(&mut usage_total, usage);
+            }
+            if state_of_round.failed {
+                break 'rounds;
             }
             let run_tools = !state_of_round.server_calls.is_empty()
                 && !state_of_round.client_call_forwarded
                 && !final_round;
             if !run_tools {
-                trace.truncated =
-                    final_round && state_of_round.held_finish.as_ref().is_some_and(|chunk| {
-                        chunk.pointer("/choices/0/finish_reason").and_then(Value::as_str)
-                            == Some("tool_calls")
-                    }) && !state_of_round.client_call_forwarded;
+                trace.truncated = final_round
+                    && !state_of_round.client_call_forwarded
+                    && matches!(
+                        &state_of_round.held_finish,
+                        Some(GenerationEvent::Finish { reason, .. }) if reason == "tool_calls"
+                    );
                 if let Some(finish) = state_of_round.held_finish.take() {
-                    yield finish.to_string();
+                    yield finish;
                 }
                 break 'rounds;
             }
 
             round += 1;
-            conversation.tool_choice = None;
             trace.rounds = round;
             let calls = std::mem::take(&mut state_of_round.server_calls);
             let text = std::mem::take(&mut state_of_round.text);
-            conversation.messages.push(assistant_message(
-                (!text.is_empty()).then_some(MessageContent::Text(text)),
-                calls.clone(),
-            ));
+            trace.record_assistant(text.clone(), &calls);
+            extend_conversation(&mut conversation, text, &calls);
             for call in &calls {
-                let arguments = serde_json::from_str::<Value>(&call.function.arguments)
-                    .unwrap_or_else(|_| Value::String(call.function.arguments.clone()));
-                yield vendor_chunk(identity.as_ref(), &json!({
-                    "event": "tool_call",
-                    "round": round,
-                    "id": call.id,
-                    "name": call.function.name,
-                    "arguments": arguments,
-                }));
+                yield GenerationEvent::ToolLoop(ToolLoopEvent::Call {
+                    round,
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                });
                 let executed = execute_call(&state, call).await;
                 trace.record(round, &executed);
-                yield vendor_chunk(identity.as_ref(), &json!({
-                    "event": "tool_result",
-                    "round": round,
-                    "id": executed.id,
-                    "name": executed.name,
-                    "is_error": executed.is_error,
-                    "content": executed.content.chars().take(RESULT_PREVIEW_CHARS).collect::<String>(),
-                }));
-                conversation.messages.push(tool_message(&executed));
+                trace.record_result(&executed);
+                yield GenerationEvent::ToolLoop(ToolLoopEvent::Result {
+                    round,
+                    id: executed.id.clone(),
+                    name: executed.name.clone(),
+                    is_error: executed.is_error,
+                    content: executed.content.chars().take(RESULT_PREVIEW_CHARS).collect(),
+                });
+                push_tool_result(&mut conversation, &executed);
             }
         }
 
         if let Some(usage) = usage_total {
-            yield usage.to_string();
+            yield GenerationEvent::Usage(usage);
         }
-        if trace.rounds > 0 || trace.truncated {
-            let mut summary = trace.to_value();
-            if let Some(object) = summary.as_object_mut() {
-                object.insert("event".to_owned(), json!("summary"));
-            }
-            yield vendor_chunk(identity.as_ref(), &summary);
+        if trace.ran_tools() {
+            yield GenerationEvent::ToolLoop(ToolLoopEvent::Messages(trace.messages.clone()));
+            yield GenerationEvent::ToolLoop(ToolLoopEvent::Summary(trace.to_value()));
         }
-        yield "[DONE]".to_owned();
-    }))
-}
-
-fn vendor_chunk(identity: Option<&Identity>, payload: &Value) -> String {
-    let fallback = Identity {
-        id: Value::Null,
-        created: Value::Null,
-        model: Value::Null,
-    };
-    let source = identity.unwrap_or(&fallback);
-    json!({
-        "id": source.id,
-        "object": "chat.completion.chunk",
-        "created": source.created,
-        "model": source.model,
-        "choices": [],
-        VENDOR_KEY: payload,
     })
-    .to_string()
 }
 
-fn error_chunk(error: &ServerError) -> String {
+fn loop_failure(error: &ServerError) -> GenerationEvent {
     tracing::error!(%error, "tool loop failed mid-stream");
-    json!({"error": {"message": "tool loop failed", "type": "server_error"}}).to_string()
+    GenerationEvent::Error("tool loop failed".to_owned())
 }
 
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use http::StatusCode;
@@ -735,10 +601,9 @@ mod tests {
     use super::*;
     use crate::mcp::manager::McpManager;
     use crate::mcp::testing::{CallBehavior, FakeMcp, ready_manager, text_result};
-    use crate::state::Engine;
     use crate::test_support::{
         StubEngine, app_with_stub_config_and_tools, generation_output, post_json, sse_json_events,
-        token_event, word_tokenizer,
+        token_event,
     };
     use crate::tools::ToolHub;
     use crate::web::WebService;
@@ -753,7 +618,6 @@ mod tests {
 
     fn stub(generations: Vec<(&str, u32, u32)>) -> StubEngine {
         let mut stub = StubEngine::named("stub");
-        stub.tokenizer = Some(word_tokenizer());
         stub.script.prompt_tokens = vec![1, 2, 3];
         stub.script.generations = generations
             .into_iter()
@@ -773,7 +637,7 @@ mod tests {
         stub: StubEngine,
         hub: ToolHub,
         body: &serde_json::Value,
-    ) -> (StatusCode, serde_json::Value, Arc<Engine>) {
+    ) -> (StatusCode, serde_json::Value, StubEngine) {
         let (app, engine) = app_with_stub_config_and_tools(stub, "", hub);
         let (status, text) = post_json(&app, "/v1/chat/completions", body).await;
         let parsed = serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text));
@@ -830,9 +694,9 @@ mod tests {
             fake.received_calls(),
             vec![json!({"name": "echo", "arguments": {"text": "hi"}})]
         );
-        assert_eq!(engine.stub_calls().len(), 2);
-        assert_eq!(engine.stub_prompt_tools(), vec![Some(2), Some(2)]);
-        let prompts = engine.stub_prompt_messages();
+        assert_eq!(engine.recorded_calls().len(), 2);
+        assert_eq!(engine.recorded_prompt_tools(), vec![Some(2), Some(2)]);
+        let prompts = engine.recorded_prompt_messages();
         assert_eq!(prompts[0].len(), 1);
         let roles: Vec<_> = prompts[1].iter().map(|(role, _)| role.as_str()).collect();
         assert_eq!(roles, vec!["user", "assistant", "tool"]);
@@ -863,7 +727,7 @@ mod tests {
         let fake = echo_fake();
         let hub = files_hub(&fake, Duration::from_secs(2)).await;
         let mut forced = stub(vec![(CALL_ECHO, 5, 10), ("done", 1, 1)]);
-        forced.tokenizer = Some(crate::test_support::char_tokenizer());
+        forced.tokenizer = crate::test_support::char_tokenizer();
         let (status, body, engine) = chat(
             forced,
             hub,
@@ -876,7 +740,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["choices"][0]["message"]["content"], "done");
         let constrained: Vec<_> = engine
-            .stub_calls()
+            .recorded_calls()
             .iter()
             .map(|c| c.has_constraint)
             .collect();
@@ -891,8 +755,8 @@ mod tests {
             chat(stub(vec![(CALL_ECHO, 5, 10)]), hub, &request(json!({}))).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.get("mcp").is_none());
-        assert_eq!(engine.stub_prompt_tools(), vec![None]);
-        assert_eq!(engine.stub_calls().len(), 1);
+        assert_eq!(engine.recorded_prompt_tools(), vec![None]);
+        assert_eq!(engine.recorded_calls().len(), 1);
         assert!(fake.received_calls().is_empty());
 
         let disabled = files_hub(&fake, Duration::from_secs(2)).await;
@@ -903,7 +767,7 @@ mod tests {
         )
         .await;
         assert!(off_body.get("mcp").is_none());
-        assert_eq!(off_engine.stub_prompt_tools(), vec![None]);
+        assert_eq!(off_engine.recorded_prompt_tools(), vec![None]);
     }
 
     #[tokio::test]
@@ -917,7 +781,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(engine.stub_prompt_tools(), vec![None]);
+        assert_eq!(engine.recorded_prompt_tools(), vec![None]);
         assert!(fake.received_calls().is_empty());
     }
 
@@ -934,7 +798,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(engine.stub_calls().len(), 3);
+        assert_eq!(engine.recorded_calls().len(), 3);
         assert_eq!(fake.received_calls().len(), 2);
         let choice = &body["choices"][0];
         assert_eq!(choice["finish_reason"], "tool_calls");
@@ -954,7 +818,7 @@ mod tests {
         let mut always_calls = stub(vec![]);
         always_calls.script.generation = Some(generation_output(CALL_ECHO, 1, 1));
         let (_, body, engine) = chat(always_calls, hub, &request(json!({"mcp": {}}))).await;
-        assert_eq!(engine.stub_calls().len(), 6);
+        assert_eq!(engine.recorded_calls().len(), 6);
         assert_eq!(fake.received_calls().len(), 5);
         assert_eq!(body["mcp"]["truncated"], true);
     }
@@ -971,8 +835,8 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(engine.stub_prompt_tools(), vec![Some(3)]);
-        assert_eq!(engine.stub_calls().len(), 1);
+        assert_eq!(engine.recorded_prompt_tools(), vec![Some(3)]);
+        assert_eq!(engine.recorded_calls().len(), 1);
         assert!(fake.received_calls().is_empty());
         let choice = &body["choices"][0];
         assert_eq!(choice["finish_reason"], "tool_calls");
@@ -1014,7 +878,7 @@ mod tests {
             &request(json!({"mcp": {"enabled": true}, "tools": shadow})),
         )
         .await;
-        assert_eq!(engine.stub_prompt_tools(), vec![Some(2)]);
+        assert_eq!(engine.recorded_prompt_tools(), vec![Some(2)]);
         assert!(fake.received_calls().is_empty());
         assert_eq!(
             body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
@@ -1044,7 +908,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{text}");
-        assert_eq!(engine.stub_prompt_tools(), vec![Some(1)]);
+        assert_eq!(engine.recorded_prompt_tools(), vec![Some(1)]);
 
         let (unknown_status, unknown_text) = post_json(
             &app,
@@ -1071,7 +935,7 @@ mod tests {
             )
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{value}: {body}");
-            assert!(engine.stub_calls().is_empty());
+            assert!(engine.recorded_calls().is_empty());
         }
     }
 
@@ -1097,7 +961,7 @@ mod tests {
         assert_eq!(body["choices"][0]["message"]["content"], "recovered");
         assert_eq!(body["mcp"]["tool_calls"][0]["is_error"], true);
         assert_eq!(body["mcp"]["tool_calls"][1]["is_error"], true);
-        let tool_messages: Vec<_> = engine.stub_prompt_messages()[1]
+        let tool_messages: Vec<_> = engine.recorded_prompt_messages()[1]
             .iter()
             .filter(|(role, _)| role == "tool")
             .map(|(_, content)| content.clone())
@@ -1129,7 +993,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            engine.stub_prompt_messages()[1][2].1,
+            engine.recorded_prompt_messages()[1][2].1,
             "caption\n[image content omitted: image/png]"
         );
     }
@@ -1164,9 +1028,9 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(engine.stub_prompt_tools(), vec![Some(2), Some(2)]);
+        assert_eq!(engine.recorded_prompt_tools(), vec![Some(2), Some(2)]);
         assert!(
-            engine.stub_prompt_messages()[1][2]
+            engine.recorded_prompt_messages()[1][2]
                 .1
                 .contains("https://example.com/higgs")
         );
@@ -1189,7 +1053,7 @@ mod tests {
         stub: StubEngine,
         hub: ToolHub,
         extra: serde_json::Value,
-    ) -> (StatusCode, String, Arc<Engine>) {
+    ) -> (StatusCode, String, StubEngine) {
         let (app, engine) = app_with_stub_config_and_tools(stub, "", hub);
         let mut body = request(extra);
         body["stream"] = json!(true);
@@ -1275,7 +1139,7 @@ mod tests {
         assert_eq!(text.matches("[DONE]").count(), 1);
 
         assert_eq!(fake.received_calls().len(), 1);
-        let prompts = engine.stub_prompt_messages();
+        let prompts = engine.recorded_prompt_messages();
         assert_eq!(prompts[1][1].0, "assistant");
         assert!(prompts[1][1].1.contains("Let me check."));
         assert_eq!(prompts[1][2], ("tool".to_owned(), "pong".to_owned()));
@@ -1319,7 +1183,7 @@ mod tests {
             stream_chat(stub, hub, json!({"mcp": {"max_iterations": 1}})).await;
         assert_eq!(status, StatusCode::OK, "{text}");
         let events = sse_json_events(&text);
-        assert_eq!(engine.stub_calls().len(), 2);
+        assert_eq!(engine.recorded_calls().len(), 2);
         assert_eq!(fake.received_calls().len(), 1);
         let pending = events
             .iter()
@@ -1351,7 +1215,7 @@ mod tests {
         let (_, text, engine) = stream_chat(stub, hub, json!({})).await;
         let events = sse_json_events(&text);
         assert_eq!(content_of(&events), "hello");
-        assert_eq!(engine.stub_prompt_tools(), vec![None]);
+        assert_eq!(engine.recorded_prompt_tools(), vec![None]);
         assert!(events.iter().all(|e| e.get("higgs_mcp").is_none()));
     }
 
@@ -1375,7 +1239,7 @@ mod tests {
         assert_eq!(body["output_text"], "The answer is pong");
         assert_eq!(body["usage"]["input_tokens"], 12);
         assert_eq!(fake.received_calls().len(), 1);
-        assert_eq!(engine.stub_calls().len(), 2);
+        assert_eq!(engine.recorded_calls().len(), 2);
     }
 
     #[tokio::test]
@@ -1411,21 +1275,17 @@ mod tests {
     }
 
     #[test]
-    fn usage_chunks_are_merged_by_summing_token_counts() {
+    fn usage_is_merged_by_summing_token_counts() {
         let mut total = None;
-        merge_usage(
-            &mut total,
-            json!({"usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7, "time": 1}}),
-        );
-        merge_usage(
-            &mut total,
-            json!({"usage": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11, "time": 2}}),
-        );
+        merge_usage(&mut total, CompletionUsage::new(3, 4));
+        let mut latest = CompletionUsage::new(5, 6);
+        latest.timings.total_time = Some(2.0);
+        merge_usage(&mut total, latest);
         let merged = total.unwrap();
-        assert_eq!(merged["usage"]["prompt_tokens"], 8);
-        assert_eq!(merged["usage"]["completion_tokens"], 10);
-        assert_eq!(merged["usage"]["total_tokens"], 18);
-        assert_eq!(merged["usage"]["time"], 2);
+        assert_eq!(merged.prompt_tokens, 8);
+        assert_eq!(merged.completion_tokens, 10);
+        assert_eq!(merged.total_tokens, 18);
+        assert_eq!(merged.timings.total_time, Some(2.0));
     }
 
     #[test]

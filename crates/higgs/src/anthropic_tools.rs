@@ -1,12 +1,10 @@
 //! Tool use for the Anthropic Messages route: tool conversion, `tool_choice`
 //! handling and `tool_use` content blocks.
 
-use higgs_engine::tool_format::{ToolCallFormat, ToolCallParser};
-use higgs_engine::tool_parser::ParsedToolCall;
 use serde_json::{Value, json};
 
-use crate::constraint::ConstraintSpec;
 use crate::error::ServerError;
+use crate::generation::GeneratedToolCall;
 use crate::tool_policy::ToolPolicy;
 use crate::types::anthropic::{
     AnthropicContent, AnthropicMessage, ContentBlock, SystemPrompt, ToolUseBlock,
@@ -130,37 +128,19 @@ pub fn openai_tools(tools: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// Everything a Messages request's tool settings decide before generation.
-pub struct ToolPlan {
-    /// The tools to render into the prompt; `None` when there are none or
-    /// `tool_choice` is `none`.
-    pub tools: Option<Vec<Value>>,
-    pub policy: ToolPolicy,
-    /// The constraint that forces a call, when `tool_choice` demands one.
-    pub constraint: Option<ConstraintSpec>,
-    pub parser: ToolCallParser,
-}
-
-impl ToolPlan {
-    pub fn for_request(
-        tools: Option<&[Value]>,
-        tool_choice: Option<&Value>,
-        format: ToolCallFormat,
-    ) -> Result<Self, ServerError> {
-        let policy = ToolPolicy::from_anthropic(tool_choice)?;
-        let converted = tools
-            .filter(|declared| !declared.is_empty() && policy.exposes_tools())
-            .map(openai_tools);
-        let constraint =
-            policy.forced_constraint(converted.as_deref().unwrap_or_default(), format)?;
-        let parser = policy.parser(format, converted.as_deref());
-        Ok(Self {
-            tools: converted,
-            policy,
-            constraint,
-            parser,
-        })
-    }
+/// The tools to offer and the policy for using them, from a Messages
+/// request's `tools` and `tool_choice`. No tools are offered when there are
+/// none or `tool_choice` is `none`.
+pub fn tool_settings(
+    tools: Option<&[Value]>,
+    tool_choice: Option<&Value>,
+) -> Result<(Vec<Value>, ToolPolicy), ServerError> {
+    let policy = ToolPolicy::from_anthropic(tool_choice)?;
+    let offered = tools
+        .filter(|declared| !declared.is_empty() && policy.exposes_tools())
+        .map(openai_tools)
+        .unwrap_or_default();
+    Ok((offered, policy))
 }
 
 /// A fresh `tool_use` block id.
@@ -169,7 +149,7 @@ pub fn new_tool_use_id() -> String {
 }
 
 /// The non-streaming content block for a parsed call.
-pub fn tool_use_block(call: &ParsedToolCall) -> ToolUseBlock {
+pub fn tool_use_block(call: &GeneratedToolCall) -> ToolUseBlock {
     ToolUseBlock {
         block_type: "tool_use",
         id: new_tool_use_id(),
@@ -180,7 +160,7 @@ pub fn tool_use_block(call: &ParsedToolCall) -> ToolUseBlock {
 
 /// The three server-sent events (`(event name, data)`) that stream one
 /// complete call as content block `index`.
-pub fn tool_use_stream_events(index: u32, call: &ParsedToolCall) -> [(&'static str, String); 3] {
+pub fn tool_use_stream_events(index: u32, call: &GeneratedToolCall) -> [(&'static str, String); 3] {
     let start = json!({
         "type": "content_block_start",
         "index": index,
@@ -285,10 +265,7 @@ mod tests {
 
     #[test]
     fn streamed_call_is_three_events_with_the_arguments_as_one_json_delta() {
-        let call = ParsedToolCall {
-            name: "f".to_owned(),
-            arguments: json!({"a": 1}),
-        };
+        let call = GeneratedToolCall::new(0, "f".to_owned(), json!({"a": 1}));
         let events = tool_use_stream_events(2, &call);
         assert_eq!(events[0].0, "content_block_start");
         let start: Value = serde_json::from_str(&events[0].1).unwrap();

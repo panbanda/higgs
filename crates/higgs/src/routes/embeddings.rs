@@ -20,7 +20,7 @@ use crate::{
 };
 
 fn embed_inputs(
-    engine: &crate::state::Engine,
+    engine: &dyn crate::backend::Engine,
     inputs: &[String],
 ) -> Result<(Vec<EmbeddingObject>, u32), ServerError> {
     let mut data = Vec::with_capacity(inputs.len());
@@ -88,7 +88,7 @@ pub async fn embeddings(
             let start = Instant::now();
             // Embedding waits on the engine, so it runs off the async workers.
             let (data, total_tokens) =
-                tokio::task::spawn_blocking(move || embed_inputs(&engine, &inputs))
+                tokio::task::spawn_blocking(move || embed_inputs(&**engine, &inputs))
                     .await
                     .map_err(|e| {
                         ServerError::InternalError(format!("Embedding task failed: {e}"))

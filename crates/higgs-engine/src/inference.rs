@@ -65,6 +65,9 @@ const PREFILL_GROUP_TOKEN_BUDGET: usize = 4096;
 /// Token id used for left padding. Padding is masked out of attention, so any
 /// valid id works.
 const PREFILL_PAD_TOKEN: u32 = 0;
+/// `finish_reason` of the terminal event for a request the worker could not
+/// complete.
+pub(crate) const FAILURE_FINISH_REASON: &str = "error";
 static NEXT_PREFILL_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -711,38 +714,7 @@ impl InferenceEngine {
             })))
             .map_err(|_| EngineError::Generation("Engine shut down".to_owned()))?;
 
-        let mut full_text = String::new();
-        let mut finish_reason = "length".to_owned();
-        let mut completion_tokens: u32 = 0;
-        let mut all_logprobs: Option<Vec<higgs_models::TokenLogprobInfo>> = logprobs.then(Vec::new);
-        let mut stats = GenerationStats::default();
-
-        while let Some(output) = internal_rx.blocking_recv() {
-            stats.observe(&output, std::time::Instant::now());
-            if output.prefill_progress.is_some() {
-                continue;
-            }
-            full_text.push_str(&output.new_text);
-            completion_tokens = output.completion_tokens;
-            if let Some(ref reason) = output.finish_reason {
-                finish_reason.clone_from(reason);
-            }
-            if let (Some(all_lp), Some(lp)) = (&mut all_logprobs, output.token_logprob) {
-                all_lp.push(lp);
-            }
-            if output.finished {
-                break;
-            }
-        }
-
-        Ok(GenerationOutput {
-            text: full_text,
-            finish_reason,
-            prompt_tokens: prompt_len,
-            completion_tokens,
-            token_logprobs: all_logprobs,
-            stats,
-        })
+        collect_output(&mut internal_rx, prompt_len, logprobs)
     }
 
     /// Generate tokens one at a time via the provided channel.
@@ -802,20 +774,7 @@ impl InferenceEngine {
             })))
             .map_err(|_| EngineError::Generation("Engine shut down".to_owned()))?;
 
-        while let Some(output) = internal_rx.blocking_recv() {
-            if output.prefill_progress.is_some() && !return_progress {
-                continue;
-            }
-            let finished = output.finished;
-            if sender.blocking_send(output).is_err() {
-                break; // Client disconnected
-            }
-            if finished {
-                break;
-            }
-        }
-
-        Ok(())
+        forward_output(&mut internal_rx, sender, prompt_len, return_progress)
     }
 
     /// Compute an embedding on the worker thread, which owns the model.
@@ -1131,13 +1090,17 @@ fn worker_loop(
         } else {
             if pending_prefill.is_none() && slots > 0 {
                 if let Some(req) = waiting.pop_front() {
+                    let response_tx = req.response_tx.clone();
+                    let prompt_len = prompt_length(&req);
                     match start_prefill(&worker.model, &mut worker.prompt_cache, settings, req) {
                         Ok(prefill) => pending_prefill = Some(prefill),
-                        Err(e) => tracing::error!(error = %e, "Prefill failed"),
+                        Err(e) => report_prefill_failure(&response_tx, prompt_len, &e),
                     }
                 }
             }
             if let Some(prefill) = pending_prefill.take() {
+                let response_tx = prefill.req.response_tx.clone();
+                let prompt_len = prefill.prompt_len;
                 match advance_prefill(
                     &mut worker.model,
                     &mut worker.prompt_cache,
@@ -1152,7 +1115,7 @@ fn worker_loop(
                     }
                     Ok(PrefillAdvance::Complete(Some(ar))) => worker.active.push(ar),
                     Ok(PrefillAdvance::Complete(None)) => {}
-                    Err(e) => tracing::error!(error = %e, "Prefill failed"),
+                    Err(e) => report_prefill_failure(&response_tx, prompt_len, &e),
                 }
             }
         }
@@ -1197,6 +1160,8 @@ impl Worker {
         if group.len() > 1 {
             prefill_group(self, tokenizer, eos_token_ids, settings, group);
         } else if let Some(req) = group.into_iter().next().or_else(|| waiting.pop_front()) {
+            let response_tx = req.response_tx.clone();
+            let prompt_len = prompt_length(&req);
             match prefill_request(
                 &mut self.model,
                 &mut self.prompt_cache,
@@ -1207,7 +1172,7 @@ impl Worker {
             ) {
                 Ok(Some(ar)) => self.active.push(ar),
                 Ok(None) => {}
-                Err(e) => tracing::error!(error = %e, "Prefill failed"),
+                Err(e) => report_prefill_failure(&response_tx, prompt_len, &e),
             }
         }
     }
@@ -1537,18 +1502,128 @@ fn settle_in_flight(ar: &mut ActiveRequest, tokenizer: &Tokenizer, eos_token_ids
     deliver_token(ar, token_id, None, tokenizer, eos_token_ids)
 }
 
+/// Gather a whole generation from the worker. A worker failure, or the
+/// channel closing before the terminal event, is an error and never a
+/// truncated success.
+fn collect_output(
+    internal_rx: &mut tokio::sync::mpsc::Receiver<StreamingOutput>,
+    prompt_len: u32,
+    logprobs: bool,
+) -> Result<GenerationOutput, EngineError> {
+    let mut full_text = String::new();
+    let mut finish_reason = "length".to_owned();
+    let mut completion_tokens: u32 = 0;
+    let mut all_logprobs: Option<Vec<higgs_models::TokenLogprobInfo>> = logprobs.then(Vec::new);
+    let mut stats = GenerationStats::default();
+    let mut finished = false;
+
+    while let Some(output) = internal_rx.blocking_recv() {
+        stats.observe(&output, std::time::Instant::now());
+        if output.prefill_progress.is_some() {
+            continue;
+        }
+        full_text.push_str(&output.new_text);
+        completion_tokens = output.completion_tokens;
+        if let Some(ref reason) = output.finish_reason {
+            finish_reason.clone_from(reason);
+        }
+        if let (Some(all_lp), Some(lp)) = (&mut all_logprobs, output.token_logprob) {
+            all_lp.push(lp);
+        }
+        if output.finished {
+            finished = true;
+            break;
+        }
+    }
+
+    if finish_reason == FAILURE_FINISH_REASON {
+        return Err(EngineError::Generation(
+            "generation failed on the engine worker".to_owned(),
+        ));
+    }
+    if !finished {
+        return Err(EngineError::Generation(
+            "engine stopped before the request finished".to_owned(),
+        ));
+    }
+
+    Ok(GenerationOutput {
+        text: full_text,
+        finish_reason,
+        prompt_tokens: prompt_len,
+        completion_tokens,
+        token_logprobs: all_logprobs,
+        stats,
+    })
+}
+
+/// Pass the worker's events to the caller's channel. A failed request still
+/// reaches the caller as a terminal event with [`FAILURE_FINISH_REASON`], and
+/// is also returned as an error.
+fn forward_output(
+    internal_rx: &mut tokio::sync::mpsc::Receiver<StreamingOutput>,
+    sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+    prompt_len: u32,
+    return_progress: bool,
+) -> Result<(), EngineError> {
+    while let Some(output) = internal_rx.blocking_recv() {
+        if output.prefill_progress.is_some() && !return_progress {
+            continue;
+        }
+        let finished = output.finished;
+        let failed = output.finish_reason.as_deref() == Some(FAILURE_FINISH_REASON);
+        if sender.blocking_send(output).is_err() {
+            return Ok(()); // Client disconnected
+        }
+        if finished {
+            return if failed {
+                Err(EngineError::Generation(
+                    "generation failed on the engine worker".to_owned(),
+                ))
+            } else {
+                Ok(())
+            };
+        }
+    }
+
+    let _ = sender.blocking_send(failure_output(prompt_len));
+    Err(EngineError::Generation(
+        "engine stopped before the request finished".to_owned(),
+    ))
+}
+
+/// The terminal event that tells a caller its request failed. Callers must
+/// not mistake the channel closing for a normal end of generation.
+fn failure_output(prompt_len: u32) -> StreamingOutput {
+    StreamingOutput {
+        new_text: String::new(),
+        finished: true,
+        finish_reason: Some(FAILURE_FINISH_REASON.to_owned()),
+        prompt_tokens: prompt_len,
+        completion_tokens: 0,
+        token_logprob: None,
+        prefill_progress: None,
+    }
+}
+
+/// Log a prefill failure and tell the request's caller.
+fn report_prefill_failure(
+    response_tx: &tokio::sync::mpsc::Sender<StreamingOutput>,
+    prompt_len: u32,
+    error: &EngineError,
+) {
+    tracing::error!(error = %error, "Prefill failed");
+    let _ = response_tx.blocking_send(failure_output(prompt_len));
+}
+
+fn prompt_length(req: &GenerationRequest) -> u32 {
+    u32::try_from(req.prompt_tokens.len()).unwrap_or(u32::MAX)
+}
+
 /// Report a decode failure to every active request and mark them finished.
 fn fail_requests(active: &[ActiveRequest], finished_indices: &mut Vec<usize>) {
     for (i, ar) in active.iter().enumerate() {
-        let _ = ar.response_tx.blocking_send(StreamingOutput {
-            new_text: String::new(),
-            finished: true,
-            finish_reason: Some("error".to_owned()),
-            prompt_tokens: ar.prompt_len,
-            completion_tokens: 0,
-            token_logprob: None,
-            prefill_progress: None,
-        });
+        let _ = ar.response_tx.blocking_send(failure_output(ar.prompt_len));
         finished_indices.push(i);
     }
 }
@@ -1576,15 +1651,7 @@ fn run_pipelined_decode_round(
                     Ok(()) => graphs.push(Some(result)),
                     Err(e) => {
                         tracing::error!(error = %e, "async_eval failed");
-                        let _ = ar.response_tx.blocking_send(StreamingOutput {
-                            new_text: String::new(),
-                            finished: true,
-                            finish_reason: Some("error".to_owned()),
-                            prompt_tokens: ar.prompt_len,
-                            completion_tokens: 0,
-                            token_logprob: None,
-                            prefill_progress: None,
-                        });
+                        let _ = ar.response_tx.blocking_send(failure_output(ar.prompt_len));
                         finished_indices.push(i);
                         graphs.push(None);
                     }
@@ -1592,15 +1659,7 @@ fn run_pipelined_decode_round(
             }
             Err(e) => {
                 tracing::error!(error = %e, "Decode graph build failed");
-                let _ = ar.response_tx.blocking_send(StreamingOutput {
-                    new_text: String::new(),
-                    finished: true,
-                    finish_reason: Some("error".to_owned()),
-                    prompt_tokens: ar.prompt_len,
-                    completion_tokens: 0,
-                    token_logprob: None,
-                    prefill_progress: None,
-                });
+                let _ = ar.response_tx.blocking_send(failure_output(ar.prompt_len));
                 finished_indices.push(i);
                 graphs.push(None);
             }
@@ -1868,6 +1927,8 @@ fn prefill_group(
         Err(e) => {
             tracing::warn!(error = %e, "Grouped prefill failed; prefilling requests one at a time");
             for req in group {
+                let response_tx = req.response_tx.clone();
+                let prompt_len = prompt_length(&req);
                 match prefill_request(
                     &mut worker.model,
                     &mut worker.prompt_cache,
@@ -1879,7 +1940,7 @@ fn prefill_group(
                     Ok(Some(ar)) => worker.active.push(ar),
                     Ok(None) => {}
                     Err(prefill_error) => {
-                        tracing::error!(error = %prefill_error, "Prefill failed");
+                        report_prefill_failure(&response_tx, prompt_len, &prefill_error);
                     }
                 }
             }
@@ -1896,6 +1957,7 @@ fn prefill_group(
         let prompt_len = u32::try_from(req.prompt_tokens.len()).unwrap_or(u32::MAX);
         let row_logits = last_logits.index((row_index..row_index + 1, ..));
         let prefilled = req.prompt_tokens.clone();
+        let response_tx = req.response_tx.clone();
         let completed = with_stream(&Stream::new(), || {
             complete_prefill(
                 &mut worker.model,
@@ -1918,7 +1980,7 @@ fn prefill_group(
         match completed {
             Ok(Some(ar)) => worker.active.push(ar),
             Ok(None) => {}
-            Err(e) => tracing::error!(error = %e, "Prefill failed"),
+            Err(e) => report_prefill_failure(&response_tx, prompt_len, &e),
         }
     }
     tracing::debug!(
@@ -2526,6 +2588,77 @@ fn deliver_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Worker failures reach the caller
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_prefill_failure_is_reported_to_the_requester() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        report_prefill_failure(&tx, 7, &EngineError::Generation("boom".to_owned()));
+        let event = rx.try_recv().unwrap();
+        assert!(event.finished);
+        assert_eq!(event.finish_reason.as_deref(), Some(FAILURE_FINISH_REASON));
+        assert_eq!(event.prompt_tokens, 7);
+    }
+
+    #[test]
+    fn collecting_a_failed_generation_is_an_error_not_an_empty_success() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        tx.try_send(failure_output(3)).unwrap();
+        let error = collect_output(&mut rx, 3, false).unwrap_err();
+        assert!(error.to_string().contains("failed"), "{error}");
+    }
+
+    #[test]
+    fn collecting_a_generation_whose_channel_closed_early_is_an_error() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        drop(tx);
+        let error = collect_output(&mut rx, 3, false).unwrap_err();
+        assert!(error.to_string().contains("stopped"), "{error}");
+    }
+
+    #[test]
+    fn collecting_a_finished_generation_succeeds() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        tx.try_send(StreamingOutput {
+            new_text: "hi".to_owned(),
+            finished: true,
+            finish_reason: Some("stop".to_owned()),
+            prompt_tokens: 3,
+            completion_tokens: 1,
+            token_logprob: None,
+            prefill_progress: None,
+        })
+        .unwrap();
+        let output = collect_output(&mut rx, 3, false).unwrap();
+        assert_eq!(output.text, "hi");
+        assert_eq!(output.finish_reason, "stop");
+    }
+
+    #[test]
+    fn streaming_a_failed_generation_forwards_the_failure_and_errors() {
+        let (internal_tx, mut internal_rx) = tokio::sync::mpsc::channel(4);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        internal_tx.try_send(failure_output(3)).unwrap();
+        let result = forward_output(&mut internal_rx, &sender, 3, false);
+        assert!(result.is_err());
+        let event = receiver.try_recv().unwrap();
+        assert_eq!(event.finish_reason.as_deref(), Some(FAILURE_FINISH_REASON));
+    }
+
+    #[test]
+    fn streaming_with_a_channel_that_closes_early_sends_a_failure_event() {
+        let (internal_tx, mut internal_rx) = tokio::sync::mpsc::channel(4);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        drop(internal_tx);
+        let result = forward_output(&mut internal_rx, &sender, 3, false);
+        assert!(result.is_err());
+        let event = receiver.try_recv().unwrap();
+        assert!(event.finished);
+        assert_eq!(event.finish_reason.as_deref(), Some(FAILURE_FINISH_REASON));
+    }
 
     // -----------------------------------------------------------------------
     // materialize_decode_step
