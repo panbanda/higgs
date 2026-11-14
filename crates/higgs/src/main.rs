@@ -448,21 +448,36 @@ fn derive_profile_dir(exe: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Build output directories of mlx-sys under `<profile>/build`. Older Cargo names them
+/// `mlx-sys-<hash>`; the newer layout uses `mlx-sys/<hash>`.
+#[cfg(target_os = "macos")]
+fn mlx_sys_output_dirs(build_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(build_dir) else {
+        return Vec::new();
+    };
+    let mut directories = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name == "mlx-sys" {
+            if let Ok(hashed) = fs::read_dir(entry.path()) {
+                directories.extend(hashed.flatten().map(|hash| hash.path()));
+            }
+        } else if name.starts_with("mlx-sys-") {
+            directories.push(entry.path());
+        }
+    }
+    directories
+}
+
 #[cfg(target_os = "macos")]
 fn newest_metallib_candidate(profile_dir: &Path) -> Option<PathBuf> {
-    let build_dir = profile_dir.join("build");
-    let entries = fs::read_dir(build_dir).ok()?;
-    let candidates = entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let is_mlx_sys = name
-                .to_str()
-                .is_some_and(|value| value.starts_with("mlx-sys-"));
-            if !is_mlx_sys {
-                return None;
-            }
-            let candidate = entry.path().join("out/build/lib/mlx.metallib");
+    let candidates = mlx_sys_output_dirs(&profile_dir.join("build"))
+        .into_iter()
+        .filter_map(|directory| {
+            let candidate = directory.join("out/build/lib/mlx.metallib");
             candidate.exists().then(|| {
                 (
                     fs::metadata(&candidate)
@@ -540,6 +555,20 @@ fn init_tracing(verbose: bool) {
 #[allow(clippy::panic, clippy::unwrap_used, clippy::tests_outside_test_module)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_metallib_is_found_under_both_cargo_build_layouts() {
+        let root = tempfile::tempdir().unwrap();
+        for layout in ["build/mlx-sys-abc123", "build/mlx-sys/abc123"] {
+            let profile = root.path().join(layout.replace('/', "_"));
+            let library = profile.join(layout).join("out/build/lib");
+            fs::create_dir_all(&library).unwrap();
+            fs::write(library.join("mlx.metallib"), b"x").unwrap();
+            let found = newest_metallib_candidate(&profile).unwrap();
+            assert_eq!(found, library.join("mlx.metallib"), "{layout}");
+        }
+    }
 
     #[test]
     fn select_latest_metallib_candidate_prefers_newest_timestamp() {

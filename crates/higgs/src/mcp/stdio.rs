@@ -1,6 +1,7 @@
 //! Stdio transport: a child process speaking newline-delimited JSON-RPC.
 
 use std::collections::VecDeque;
+use std::ffi::{OsStr, OsString};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -31,10 +32,45 @@ pub struct StdioTransport {
     supervisor: Mutex<Option<JoinHandle<()>>>,
 }
 
-pub fn spawn(name: &str, spec: &StdioSpec) -> Result<Connection, TransportError> {
+/// Variables a command-line program usually needs. A server gets these and nothing else of the
+/// Higgs environment, so the API keys of Higgs and of its providers stay out of third-party
+/// packages. Anything else must be set under `env` in the server configuration.
+const INHERITED_VARIABLES: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "TERM",
+    "LANG",
+    "TZ",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+];
+
+fn is_inherited(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| INHERITED_VARIABLES.contains(&name) || name.starts_with("LC_"))
+}
+
+fn build_command(
+    spec: &StdioSpec,
+    parent_environment: impl IntoIterator<Item = (OsString, OsString)>,
+) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(&spec.command);
     command
         .args(&spec.args)
+        .env_clear()
+        .envs(
+            parent_environment
+                .into_iter()
+                .filter(|(name, _)| is_inherited(name)),
+        )
         .envs(spec.env.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -46,6 +82,11 @@ pub fn spawn(name: &str, spec: &StdioSpec) -> Result<Connection, TransportError>
     if let Some(directory) = &spec.cwd {
         command.current_dir(directory);
     }
+    command
+}
+
+pub fn spawn(name: &str, spec: &StdioSpec) -> Result<Connection, TransportError> {
+    let mut command = build_command(spec, std::env::vars_os());
     let mut child = command.spawn().map_err(|error| {
         TransportError::Start(format!("cannot run '{}': {error}", spec.command))
     })?;
@@ -243,6 +284,31 @@ mod tests {
     use crate::mcp::config::{ResolvedServer, ServerSpec};
     use crate::mcp::manager::{BackoffPolicy, McpManager};
     use crate::mcp::transport::{DefaultTransportFactory, TransportFactory};
+
+    #[tokio::test]
+    async fn a_server_does_not_see_the_environment_of_higgs() {
+        let spec = StdioSpec {
+            command: "/usr/bin/env".to_owned(),
+            args: Vec::new(),
+            env: vec![("CONFIGURED".to_owned(), "yes".to_owned())],
+            cwd: None,
+        };
+        let parent = ["HIGGS_API_KEY", "OPENAI_API_KEY", "PATH", "LC_ALL", "HOME"].map(|name| {
+            (
+                OsString::from(name),
+                OsString::from(format!("{name}-value")),
+            )
+        });
+        let output = build_command(&spec, parent).output().await.unwrap();
+        let seen = String::from_utf8(output.stdout).unwrap();
+        let mut names: Vec<&str> = seen
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(name, _)| name))
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["CONFIGURED", "HOME", "LC_ALL", "PATH"]);
+        assert!(seen.contains("CONFIGURED=yes"));
+    }
 
     const INITIALIZE_REPLY: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"sh-server","version":"0.1"}}}"#;
     const LIST_REPLY: &str = r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"greet","description":"say hi","inputSchema":{"type":"object"}}]}}"#;

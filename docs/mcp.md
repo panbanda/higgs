@@ -29,7 +29,7 @@ headers = { Authorization = "Bearer ${MCP_TOKEN}" }
 |---|---|---|
 | `transport` | both | `"stdio"` or `"http"` (Streamable HTTP). Inferred from `command` or `url` when omitted. `"sse"` (the legacy HTTP+SSE transport) is rejected. |
 | `command`, `args` | stdio | Executable and arguments. Run directly, never through a shell. |
-| `env` | stdio | Extra environment for the child, on top of the Higgs environment. |
+| `env` | stdio | Environment variables for the child, added to the short list of inherited variables (see [Environment variables](#environment-variables)). |
 | `cwd` | stdio | Working directory of the child. |
 | `url` | http | Streamable HTTP endpoint (`http` or `https`). |
 | `headers` | http | Extra request headers. |
@@ -41,6 +41,8 @@ Server names may contain letters, digits, `-` and `_`, but not `__` (the tool na
 ### Environment variables
 
 `${VAR}` in an `env` or `headers` value is replaced with the Higgs process environment. A reference to an unset variable is an error at startup (and a failure in `higgs doctor`), never an empty string, so a typo cannot silently drop a credential. Write `$${` for a literal `${`. Disabled servers are not checked.
+
+A stdio server does not get the Higgs environment. It gets only these variables, when Higgs has them: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `TERM`, `LANG`, `TZ`, all `LC_*` variables, `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `SSL_CERT_FILE` and `SSL_CERT_DIR`. Then it gets the `env` entries of its configuration, which replace an inherited variable of the same name. The API key of Higgs and the keys of providers do not reach the server. To give a secret to a server on purpose, name it in `env`: `env = { GITHUB_TOKEN = "${GITHUB_TOKEN}" }`. A proxy setting such as `HTTPS_PROXY` is not inherited, because it can hold a password. Pass it in the same way.
 
 ### Reusing a desktop-client config
 
@@ -132,6 +134,7 @@ The list can be passed as `tools` of a chat request. Strict clients that reject 
 - Anyone who can call `/v1/mcp/execute` can run every enabled tool. Set `api_key` before binding to anything but loopback, and give MCP servers only the access they need (for example, point the filesystem server at one directory).
 - Results are capped at `max_result_size`; text is cut on a character boundary and `truncated` is set. Messages from a server are capped at 16 MiB.
 - `timeout` bounds every call. A timed-out call is cancelled with `notifications/cancelled`.
+- A stdio server starts with a cleared environment and gets only the variables in [Environment variables](#environment-variables). Third-party server packages cannot read the Higgs API key or the provider keys.
 - Credentials in `headers` and `env` come from `${VAR}`; they are not logged, and `higgs doctor` prints URLs without credentials or query strings.
 - HTTP servers are contacted at the configured URL only; redirects are not followed.
 

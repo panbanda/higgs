@@ -49,7 +49,8 @@ pub struct McpServerConfig {
     /// Executable for stdio servers. Run directly, never through a shell.
     pub command: Option<String>,
     pub args: Vec<String>,
-    /// Extra environment for the child process; values may reference the
+    /// Environment of the child process, added to a short list of basic variables (`PATH`,
+    /// `HOME`, ...). The rest of the Higgs environment is not passed. Values may reference the
     /// Higgs process environment as `${VAR}`.
     pub env: BTreeMap<String, String>,
     pub cwd: Option<String>,
