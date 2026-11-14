@@ -47,7 +47,7 @@ curl http://localhost:8000/v1/chat/completions \
 ANTHROPIC_AUTH_TOKEN=higgs higgs exec -- claude
 ```
 
-`higgs exec` finds the server on `127.0.0.1:8000`, unless a config file sets another address. If the server uses another port, add `--port <port>`. The server answers every model name with its one model. This works only while the server has one local model and no routes or providers. For more than one model, use a config file with routes. See the [Claude Code recipe](#use-it-from-claude-code).
+`higgs exec` finds the server on `127.0.0.1:8000`, unless a config file sets another address or `HIGGS_HOST` and `HIGGS_PORT` are set. If the server uses another port, add `--port <port>`. The server answers every model name with its one model. This works only while the server has one local model and no routes or providers. For more than one model, use a config file with routes. See the [Claude Code recipe](#use-it-from-claude-code).
 
 This 1B model is small, so the first run is fast. It is too small for good agent work. Choose a larger model for daily use. See [which model to start with](#which-model-should-i-start-with).
 
