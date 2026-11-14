@@ -79,6 +79,10 @@ port = 8000
 # [models.prefix_cache]
 # disk_dir = "~/.cache/higgs/kv"
 # disk_budget = "4GB"       # LRU budget; minimum 64MB
+# max_entries = 8                       # prompts kept in memory; 0 turns the cache off
+# checkpoint_interval_tokens = 512      # hybrid models: tokens between recurrent-state checkpoints (rounded up to the prefill chunk)
+# max_checkpoints_per_entry = 8         # hybrid models: checkpoints one prompt keeps; 0 turns checkpoints off
+# checkpoint_budget = "2GB"             # hybrid models: checkpoint state kept in total; 0 turns checkpoints off
 
 # [models.prefill]
 # yield_tokens = 512        # interleave decode during long prefills; 0 or unset = synchronous

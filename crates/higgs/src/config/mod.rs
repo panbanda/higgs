@@ -30,7 +30,10 @@ mod load_tests;
 
 use std::path::{Path, PathBuf};
 
-pub use cli::{Cli, ClientArgs, Commands, ConfigAction, ServeArgs, StartArgs, StopArgs};
+pub use cli::{
+    BenchArgs, Cli, ClientArgs, Commands, ConfigAction, ModelTargetArgs, SelftestArgs, ServeArgs,
+    StartArgs, StopArgs,
+};
 pub use document::{ConfigError, Diagnostic};
 pub use environment::Environment;
 pub use settings::{

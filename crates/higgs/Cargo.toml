@@ -11,6 +11,7 @@ homepage.workspace = true
 workspace = true
 
 [dependencies]
+higgs-bench.workspace = true
 higgs-engine.workspace = true
 higgs-models.workspace = true
 mlx-rs.workspace = true

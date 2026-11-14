@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use higgs_engine::inference::PrefixCacheOptions;
 use higgs_engine::mlx_tuning::{RequestedMlxProfile, TuningOverrides};
 use higgs_models::turboquant::{KvCacheConfig, KvCacheMode};
 
@@ -23,6 +24,7 @@ pub const DEFAULT_MAX_TOKENS: u32 = 32768;
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 pub const DEFAULT_MAX_BODY_SIZE: ByteSize = ByteSize::from_bytes(10 * 1024 * 1024);
 pub const DEFAULT_KV_BITS: u8 = 3;
+pub const CHECKPOINT_BUDGET_VARIABLE: &str = "HIGGS_PREFIX_CHECKPOINT_BUDGET_MB";
 pub const DEFAULT_PREFIX_DISK_BUDGET: ByteSize = ByteSize::from_bytes(4 * 1024 * 1024 * 1024);
 pub const DEFAULT_ROUTING_PROVIDER: &str = "higgs";
 pub const DEFAULT_AUTO_ROUTER_MODEL: &str = "katanemo/Arch-Router-1.5B";
@@ -129,15 +131,66 @@ pub struct PrefixCacheConfig {
     /// Directory for durable, disk-backed prefix KV entries.
     pub disk_dir: Option<String>,
     pub disk_budget: ByteSize,
+    /// Prompts the in-memory prefix cache keeps; `0` turns the cache off.
+    pub max_entries: u32,
+    /// Tokens between recurrent-state checkpoints of a hybrid model. The engine rounds it up to a
+    /// multiple of the prefill chunk and the cache block, so the effective spacing can be larger.
+    pub checkpoint_interval_tokens: u32,
+    /// Checkpoints one hybrid-model entry keeps; `0` turns checkpointing off.
+    pub max_checkpoints_per_entry: u32,
+    /// Checkpoint state kept across all entries of a hybrid model; `0` turns checkpointing off.
+    pub checkpoint_budget: ByteSize,
 }
 
 impl Default for PrefixCacheConfig {
     fn default() -> Self {
+        let engine = PrefixCacheOptions::default();
         Self {
             disk_dir: None,
             disk_budget: DEFAULT_PREFIX_DISK_BUDGET,
+            max_entries: saturating_u32(engine.max_entries),
+            checkpoint_interval_tokens: saturating_u32(engine.checkpoint_interval_tokens),
+            max_checkpoints_per_entry: saturating_u32(engine.max_checkpoints_per_entry),
+            checkpoint_budget: ByteSize::from_bytes(
+                u64::try_from(engine.checkpoint_budget_bytes).unwrap_or(u64::MAX),
+            ),
         }
     }
+}
+
+/// Largest `prefix_cache.max_entries`: each entry holds a prompt's whole KV state.
+pub const MAX_PREFIX_CACHE_ENTRIES: u32 = 1024;
+/// Largest `prefix_cache.max_checkpoints_per_entry`: a checkpoint of a large hybrid model is
+/// tens to hundreds of megabytes.
+pub const MAX_CHECKPOINTS_PER_ENTRY_LIMIT: u32 = 64;
+/// Largest `prefix_cache.checkpoint_interval_tokens`, far beyond any context window.
+pub const MAX_CHECKPOINT_INTERVAL_TOKENS: u32 = 1 << 20;
+
+impl PrefixCacheConfig {
+    /// Every setting that is out of range.
+    pub fn range_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        if self.max_entries > MAX_PREFIX_CACHE_ENTRIES {
+            problems.push(format!(
+                "prefix_cache.max_entries must be at most {MAX_PREFIX_CACHE_ENTRIES} (0 turns the cache off)"
+            ));
+        }
+        if !(1..=MAX_CHECKPOINT_INTERVAL_TOKENS).contains(&self.checkpoint_interval_tokens) {
+            problems.push(format!(
+                "prefix_cache.checkpoint_interval_tokens must be between 1 and {MAX_CHECKPOINT_INTERVAL_TOKENS}; set max_checkpoints_per_entry to 0 to turn checkpoints off"
+            ));
+        }
+        if self.max_checkpoints_per_entry > MAX_CHECKPOINTS_PER_ENTRY_LIMIT {
+            problems.push(format!(
+                "prefix_cache.max_checkpoints_per_entry must be at most {MAX_CHECKPOINTS_PER_ENTRY_LIMIT} (0 turns checkpoints off)"
+            ));
+        }
+        problems
+    }
+}
+
+fn saturating_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 /// One local model with every setting resolved from the entry, `[defaults]` and built-in values.
@@ -459,6 +512,26 @@ pub fn resolve_model(
                 .disk_budget
                 .or(defaults.prefix_cache.disk_budget)
                 .unwrap_or(fallback.prefix_cache.disk_budget),
+            max_entries: own
+                .prefix_cache
+                .max_entries
+                .or(defaults.prefix_cache.max_entries)
+                .unwrap_or(fallback.prefix_cache.max_entries),
+            checkpoint_interval_tokens: own
+                .prefix_cache
+                .checkpoint_interval_tokens
+                .or(defaults.prefix_cache.checkpoint_interval_tokens)
+                .unwrap_or(fallback.prefix_cache.checkpoint_interval_tokens),
+            max_checkpoints_per_entry: own
+                .prefix_cache
+                .max_checkpoints_per_entry
+                .or(defaults.prefix_cache.max_checkpoints_per_entry)
+                .unwrap_or(fallback.prefix_cache.max_checkpoints_per_entry),
+            checkpoint_budget: own
+                .prefix_cache
+                .checkpoint_budget
+                .or(defaults.prefix_cache.checkpoint_budget)
+                .unwrap_or(fallback.prefix_cache.checkpoint_budget),
         },
         prefill_yield_tokens: own.prefill.yield_tokens.or(defaults.prefill.yield_tokens),
     }
@@ -615,6 +688,22 @@ fn resolve_experimental(
     config
 }
 
+/// `HIGGS_PREFIX_CHECKPOINT_BUDGET_MB`: whole mebibytes of checkpoint state, `0` meaning none. It
+/// replaces `prefix_cache.checkpoint_budget` for every model, as it did before the key existed.
+fn checkpoint_budget_override(
+    environment: &Environment,
+    overrides: &mut Vec<EnvOverride>,
+) -> Option<ByteSize> {
+    let raw = environment.get(CHECKPOINT_BUDGET_VARIABLE)?;
+    let parsed = raw.trim().parse::<u64>().ok().map(ByteSize::from_mebibytes);
+    overrides.push(EnvOverride {
+        variable: CHECKPOINT_BUDGET_VARIABLE,
+        key: "models[].prefix_cache.checkpoint_budget",
+        applied: parsed.is_some(),
+    });
+    parsed
+}
+
 /// Turn a merged, typed file into the resolved configuration.
 #[allow(clippy::too_many_lines)]
 ///
@@ -670,11 +759,16 @@ pub fn resolve(raw: &RawConfig, context: &ResolveContext) -> Result<HiggsConfig,
         max_loaded_models: raw.memory.max_loaded_models,
         raise_wired_limit: raw.memory.raise_wired_limit.unwrap_or(false),
     };
-    let models = raw
+    let mut models: Vec<ModelConfig> = raw
         .models
         .iter()
         .map(|entry| resolve_model(entry, &raw.defaults, profile_override))
         .collect();
+    if let Some(budget) = checkpoint_budget_override(&context.environment, &mut overrides) {
+        for model in &mut models {
+            model.prefix_cache.checkpoint_budget = budget;
+        }
+    }
     let providers = raw
         .providers
         .iter()

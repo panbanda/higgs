@@ -79,7 +79,14 @@ const KV_CACHE: &[Field] = &[
     leaf("mla_latent"),
 ];
 
-const PREFIX_CACHE: &[Field] = &[leaf("disk_dir"), leaf("disk_budget")];
+const PREFIX_CACHE: &[Field] = &[
+    leaf("disk_dir"),
+    leaf("disk_budget"),
+    leaf("max_entries"),
+    leaf("checkpoint_interval_tokens"),
+    leaf("max_checkpoints_per_entry"),
+    leaf("checkpoint_budget"),
+];
 
 const PREFILL: &[Field] = &[leaf("yield_tokens")];
 

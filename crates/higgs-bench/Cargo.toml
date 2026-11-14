@@ -32,6 +32,7 @@ toml = "1.0"
 built = { version = "0.8", features = ["git2"] }
 
 [dev-dependencies]
+axum.workspace = true
 tempfile = "3"
 
 [[bin]]

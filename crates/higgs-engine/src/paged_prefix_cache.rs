@@ -412,6 +412,11 @@ impl PagedPrefixCache {
         }
     }
 
+    /// Whether the cache can keep any entry; `false` when it was built with room for none.
+    pub const fn retains_entries(&self) -> bool {
+        self.max_cached > 0
+    }
+
     #[must_use]
     pub const fn with_checkpoint_policy(mut self, policy: CheckpointPolicy) -> Self {
         self.checkpoint_policy = policy;

@@ -241,6 +241,8 @@ traffic in metrics. The read-only ones never load a model.
 - `higgs init`: create `~/.config/higgs/config.toml`
 - `higgs doctor`: validate config, model paths, and providers
 - `higgs config check|explain|migrate`: validate a config file, show where each resolved value comes from, rewrite a file written for an earlier version
+- `higgs bench <model>`: measure decode, prefill, prefix-cache follow-up and concurrent throughput of one model in about a minute, optionally as JSON (`--json`)
+- `higgs selftest <model>`: check one model for correct output (chat, streaming, prefix cache, JSON schema, tool calls, concurrency); exits non-zero on a failure
 - `higgs shellenv [--url URL | --port PORT]`: print `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` after verifying the server is reachable
 - `higgs exec [--url URL | --port PORT] -- <cmd>`: run a tool with those variables set after the same reachability check, and print the server it found on stderr
 
