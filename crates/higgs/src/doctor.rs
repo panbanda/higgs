@@ -387,6 +387,14 @@ fn check_prefix_cache(
             ),
             result,
         );
+        if prefix_cache.disk_dir.is_some() {
+            warn(
+                &format!(
+                    "model {label} sets prefix_cache.disk_dir, which is not used while prefix_cache.max_entries=0"
+                ),
+                result,
+            );
+        }
     }
     if let Some(physical) = crate::routes::system::physical_memory_bytes() {
         if prefix_cache.checkpoint_budget.bytes() > physical / 2 {
@@ -2562,6 +2570,21 @@ mod tests {
         assert_eq!((auto.warnings, auto.failures), (0, 0));
         let forced = check_one_model(turboquant(BatchMode::On));
         assert_eq!((forced.warnings, forced.failures), (1, 0));
+    }
+
+    #[test]
+    fn a_disk_prefix_store_without_memory_entries_is_warned_about() {
+        let dir = llama_checkpoint();
+        let store = tempfile::tempdir().unwrap();
+        let result = check_one_model(ModelConfig {
+            prefix_cache: crate::config::PrefixCacheConfig {
+                max_entries: 0,
+                disk_dir: Some(store.path().display().to_string()),
+                ..crate::config::PrefixCacheConfig::default()
+            },
+            ..model_with_path(dir.path().display().to_string())
+        });
+        assert_eq!((result.warnings, result.failures), (2, 0));
     }
 
     #[test]

@@ -827,7 +827,8 @@ impl PromptCache {
 
     #[must_use]
     fn with_disk_store(mut self, store: Option<DiskPrefixStore>) -> Self {
-        self.disk = store;
+        // Entries read from disk would be dropped and written ones never reused.
+        self.disk = store.filter(|_| self.entries.retains_entries());
         self
     }
 
@@ -3058,6 +3059,31 @@ mod tests {
                 .plan_checkpoints(&prompt, 0, &dense_cache(0), Vec::new())
                 .next_stop(0),
             None
+        );
+    }
+
+    #[test]
+    fn a_cache_with_no_entries_builds_no_disk_tier() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = || {
+            DiskPrefixStore::new(
+                directory.path(),
+                1024 * 1024,
+                StoreIdentity::from_model_dir(directory.path(), String::new()),
+            )
+            .ok()
+        };
+        assert!(
+            PromptCache::new(0, 4)
+                .with_disk_store(store())
+                .disk
+                .is_none()
+        );
+        assert!(
+            PromptCache::new(2, 4)
+                .with_disk_store(store())
+                .disk
+                .is_some()
         );
     }
 
