@@ -11,7 +11,13 @@
 //! and git state, a `params` block describing the bench inputs, and a
 //! `results` block with the measurements. See `docs/benchmarking.md`.
 
+pub mod client;
+pub mod compare;
+pub mod local_server;
 pub mod models;
+pub mod rss;
+pub mod runner;
+pub mod selftest;
 pub mod server;
 pub mod speculative;
 pub mod stats;

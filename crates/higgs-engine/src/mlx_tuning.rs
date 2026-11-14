@@ -6,9 +6,6 @@ const DEFAULT_CHUNKED_PREFILL_THRESHOLD: i32 = 512;
 /// Conservative default chunk size for long-prefill chunking.
 const DEFAULT_CHUNKED_PREFILL_CHUNK_SIZE: i32 = 512;
 
-const DEFAULT_PAGED_KV_TARGET_BYTES: usize = 512 * 1024 * 1024;
-const MIN_PAGED_KV_TARGET_BYTES: usize = 256 * 1024 * 1024;
-const MAX_PAGED_KV_TARGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const MAX_MTP_DRAFT_N_MAX: usize = 8;
 
 fn parse_positive_chunked_prefill_value(raw: Option<&str>, default: i32) -> i32 {
@@ -23,7 +20,7 @@ fn parse_mtp_draft_n_max(raw: Option<&str>, default: usize) -> usize {
         .map_or(default, |v| v.min(MAX_MTP_DRAFT_N_MAX))
 }
 
-fn parse_enabled_flag(raw: Option<&str>) -> Option<bool> {
+pub(crate) fn parse_enabled_flag(raw: Option<&str>) -> Option<bool> {
     match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("1" | "true" | "on" | "yes") => Some(true),
         Some("0" | "false" | "off" | "no") => Some(false),
@@ -197,8 +194,7 @@ impl ModelMetadata {
 #[derive(Debug, Clone)]
 /// Tunable MLX runtime settings derived from a requested profile and model metadata.
 ///
-/// These settings are consumed only by the local simple-engine path and are resolved
-/// before model load. Advanced `HIGGS_*` env overrides may further mutate these
+/// These settings are consumed by the engine and are resolved before model load. Advanced `HIGGS_*` env overrides may further mutate these
 /// settings in `from_model_dir`.
 pub struct MlxRuntimeTuning {
     requested_profile: RequestedMlxProfile,
@@ -212,13 +208,51 @@ pub struct MlxRuntimeTuning {
     /// Controlled by `HIGGS_MTP_DRAFT_N_MAX`; defaults to 2 for huge
     /// checkpoints and 1 otherwise, clamped to 1..=8.
     mtp_draft_n_max: usize,
-    paged_kv_target_bytes: usize,
+    /// Experimental decode toggles; off unless the config or a `HIGGS_*` variable turns them on.
+    decode_toggles: DecodeToggles,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DecodeToggles {
+    mtp_adaptive_draft: bool,
+    mtp_prompt_lookup: bool,
+    prompt_lookup: bool,
+}
+
+/// An on/off decode toggle: the environment variable wins, then the config value, then off.
+fn toggle(variable: &str, configured: Option<bool>) -> bool {
+    parse_enabled_flag(std::env::var(variable).ok().as_deref())
+        .or(configured)
+        .unwrap_or(false)
+}
+
+/// Tuning settings that came from the configuration file instead of the profile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TuningOverrides {
+    pub chunked_prefill_threshold: Option<i32>,
+    pub chunked_prefill_chunk_size: Option<i32>,
+    pub clear_cache_after_prefill: Option<bool>,
+    pub enable_mtp: Option<bool>,
+    pub mtp_draft_n_max: Option<usize>,
+    pub mtp_adaptive_draft: Option<bool>,
+    pub mtp_prompt_lookup: Option<bool>,
+    pub prompt_lookup: Option<bool>,
 }
 
 impl MlxRuntimeTuning {
     /// Resolve runtime tuning settings from model metadata.
     /// `requested_profile` drives both explicit profile selection and auto-resolution.
     pub fn from_model_dir(model_dir: &Path, requested_profile: RequestedMlxProfile) -> Self {
+        Self::from_model_dir_with(model_dir, requested_profile, &TuningOverrides::default())
+    }
+
+    /// [`Self::from_model_dir`] with settings from the configuration file; environment
+    /// variables still win over them.
+    pub fn from_model_dir_with(
+        model_dir: &Path,
+        requested_profile: RequestedMlxProfile,
+        overrides: &TuningOverrides,
+    ) -> Self {
         let metadata = ModelMetadata::from_model_dir(model_dir);
         let resolved_profile = resolve_profile_from_metadata(requested_profile, &metadata);
         let mut tuning = Self::from_profile(requested_profile, resolved_profile, &metadata);
@@ -227,26 +261,44 @@ impl MlxRuntimeTuning {
             std::env::var("HIGGS_CHUNKED_PREFILL_THRESHOLD")
                 .ok()
                 .as_deref(),
-            tuning.chunked_prefill_threshold,
+            overrides
+                .chunked_prefill_threshold
+                .filter(|value| *value > 0)
+                .unwrap_or(tuning.chunked_prefill_threshold),
         );
         tuning.chunked_prefill_chunk_size = parse_positive_chunked_prefill_value(
             std::env::var("HIGGS_CHUNKED_PREFILL_CHUNK_SIZE")
                 .ok()
                 .as_deref(),
-            tuning.chunked_prefill_chunk_size,
+            overrides
+                .chunked_prefill_chunk_size
+                .filter(|value| *value > 0)
+                .unwrap_or(tuning.chunked_prefill_chunk_size),
         );
         tuning.clear_cache_after_prefill = parse_enabled_flag(
             std::env::var("HIGGS_CLEAR_CACHE_AFTER_PREFILL")
                 .ok()
                 .as_deref(),
         )
+        .or(overrides.clear_cache_after_prefill)
         .unwrap_or(tuning.clear_cache_after_prefill);
         tuning.enable_mtp = parse_enabled_flag(std::env::var("HIGGS_MTP").ok().as_deref())
+            .or(overrides.enable_mtp)
             .unwrap_or(tuning.enable_mtp);
         tuning.mtp_draft_n_max = parse_mtp_draft_n_max(
             std::env::var("HIGGS_MTP_DRAFT_N_MAX").ok().as_deref(),
-            tuning.mtp_draft_n_max,
+            overrides
+                .mtp_draft_n_max
+                .filter(|value| *value > 0)
+                .map_or(tuning.mtp_draft_n_max, |value| {
+                    value.min(MAX_MTP_DRAFT_N_MAX)
+                }),
         );
+        tuning.decode_toggles = DecodeToggles {
+            mtp_adaptive_draft: toggle("HIGGS_MTP_ADAPTIVE_DRAFT", overrides.mtp_adaptive_draft),
+            mtp_prompt_lookup: toggle("HIGGS_MTP_PROMPT_LOOKUP", overrides.mtp_prompt_lookup),
+            prompt_lookup: toggle("HIGGS_PROMPT_LOOKUP", overrides.prompt_lookup),
+        };
 
         tuning
     }
@@ -261,7 +313,6 @@ impl MlxRuntimeTuning {
         let is_moe = metadata.is_moe();
         let (balanced_threshold, balanced_chunk) =
             balanced_chunked_prefill(size_class, is_long_context, is_moe);
-        let balanced_paged_kv = heuristic_paged_kv_target_bytes(metadata, size_class, is_moe);
         let default_mtp_draft_n_max = default_mtp_draft_n_max(size_class);
 
         match resolved_profile {
@@ -273,7 +324,7 @@ impl MlxRuntimeTuning {
                 clear_cache_after_prefill: false,
                 enable_mtp: false,
                 mtp_draft_n_max: 1,
-                paged_kv_target_bytes: DEFAULT_PAGED_KV_TARGET_BYTES,
+                decode_toggles: DecodeToggles::default(),
             },
             ResolvedMlxProfile::Latency => Self {
                 requested_profile,
@@ -283,9 +334,7 @@ impl MlxRuntimeTuning {
                 clear_cache_after_prefill: false,
                 enable_mtp: true,
                 mtp_draft_n_max: default_mtp_draft_n_max,
-                paged_kv_target_bytes: clamp_paged_kv_target_bytes(
-                    balanced_paged_kv.saturating_mul(9) / 8,
-                ),
+                decode_toggles: DecodeToggles::default(),
             },
             ResolvedMlxProfile::Balanced => Self {
                 requested_profile,
@@ -295,7 +344,7 @@ impl MlxRuntimeTuning {
                 clear_cache_after_prefill: false,
                 enable_mtp: true,
                 mtp_draft_n_max: default_mtp_draft_n_max,
-                paged_kv_target_bytes: balanced_paged_kv,
+                decode_toggles: DecodeToggles::default(),
             },
             ResolvedMlxProfile::Throughput => Self {
                 requested_profile,
@@ -305,9 +354,7 @@ impl MlxRuntimeTuning {
                 clear_cache_after_prefill: false,
                 enable_mtp: true,
                 mtp_draft_n_max: default_mtp_draft_n_max,
-                paged_kv_target_bytes: clamp_paged_kv_target_bytes(
-                    balanced_paged_kv.saturating_mul(5) / 4,
-                ),
+                decode_toggles: DecodeToggles::default(),
             },
         }
     }
@@ -322,7 +369,7 @@ impl MlxRuntimeTuning {
         self.resolved_profile
     }
 
-    /// Chunked prefill threshold used by `simple` generation.
+    /// Prompts longer than this many tokens prefill in chunks.
     pub const fn chunked_prefill_threshold(&self) -> i32 {
         self.chunked_prefill_threshold
     }
@@ -346,8 +393,19 @@ impl MlxRuntimeTuning {
         self.mtp_draft_n_max
     }
 
-    pub const fn paged_kv_target_bytes(&self) -> usize {
-        self.paged_kv_target_bytes
+    /// Whether the MTP loop grows and shrinks its draft window from recent acceptance.
+    pub const fn mtp_adaptive_draft(&self) -> bool {
+        self.decode_toggles.mtp_adaptive_draft
+    }
+
+    /// Whether the MTP loop also tries verified prompt-lookup drafts.
+    pub const fn mtp_prompt_lookup(&self) -> bool {
+        self.decode_toggles.mtp_prompt_lookup
+    }
+
+    /// Whether prompt-lookup decoding is on.
+    pub const fn prompt_lookup(&self) -> bool {
+        self.decode_toggles.prompt_lookup
     }
 }
 
@@ -357,6 +415,16 @@ pub fn resolve_runtime_tuning(
     requested_profile: RequestedMlxProfile,
 ) -> MlxRuntimeTuning {
     MlxRuntimeTuning::from_model_dir(model_dir, requested_profile)
+}
+
+/// [`resolve_runtime_tuning`] with settings from the configuration file. For each setting the
+/// matching `HIGGS_*` environment variable wins over the override, which wins over the profile.
+pub fn resolve_runtime_tuning_with(
+    model_dir: &Path,
+    requested_profile: RequestedMlxProfile,
+    overrides: &TuningOverrides,
+) -> MlxRuntimeTuning {
+    MlxRuntimeTuning::from_model_dir_with(model_dir, requested_profile, overrides)
 }
 
 /// Resolve only the effective runtime profile (used for diagnostics and reporting).
@@ -407,65 +475,6 @@ fn balanced_chunked_prefill(
         base_chunk
     };
     (tuned_threshold, tuned_chunk)
-}
-
-fn heuristic_paged_kv_target_bytes(
-    metadata: &ModelMetadata,
-    size_class: ModelSizeClass,
-    is_moe: bool,
-) -> usize {
-    heuristic_paged_kv_target_bytes_with_max(
-        metadata,
-        size_class,
-        is_moe,
-        configured_max_working_set_bytes(),
-    )
-}
-
-fn heuristic_paged_kv_target_bytes_with_max(
-    metadata: &ModelMetadata,
-    size_class: ModelSizeClass,
-    is_moe: bool,
-    max_working_set_bytes: Option<usize>,
-) -> usize {
-    let Some(max_recommended) = max_working_set_bytes else {
-        return DEFAULT_PAGED_KV_TARGET_BYTES;
-    };
-
-    let available = metadata
-        .weight_bytes
-        .and_then(|bytes| usize::try_from(bytes).ok())
-        .map_or(max_recommended, |weight_bytes| {
-            max_recommended.saturating_sub(weight_bytes)
-        });
-
-    if available == 0 {
-        return DEFAULT_PAGED_KV_TARGET_BYTES.min(max_recommended);
-    }
-
-    let divisor = if is_moe {
-        8
-    } else {
-        match size_class {
-            ModelSizeClass::Small => 4,
-            ModelSizeClass::Medium => 5,
-            ModelSizeClass::Large => 6,
-            ModelSizeClass::Huge => 8,
-        }
-    };
-
-    clamp_paged_kv_target_bytes(available / divisor).min(max_recommended)
-}
-
-fn configured_max_working_set_bytes() -> Option<usize> {
-    std::env::var("HIGGS_MLX_MAX_WORKING_SET_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-}
-
-fn clamp_paged_kv_target_bytes(bytes: usize) -> usize {
-    bytes.clamp(MIN_PAGED_KV_TARGET_BYTES, MAX_PAGED_KV_TARGET_BYTES)
 }
 
 fn config_lookup<'a>(config: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
@@ -557,9 +566,9 @@ fn model_weight_bytes(model_dir: &Path) -> Option<u64> {
 mod tests {
     use super::{
         MlxRuntimeTuning, ModelMetadata, ModelSizeClass, RequestedMlxProfile, ResolvedMlxProfile,
-        default_mtp_draft_n_max, heuristic_paged_kv_target_bytes_with_max, model_weight_bytes,
-        parse_enabled_flag, parse_mtp_draft_n_max, parse_positive_chunked_prefill_value,
-        resolve_effective_mlx_profile, resolve_profile_from_metadata, resolve_runtime_tuning,
+        default_mtp_draft_n_max, model_weight_bytes, parse_enabled_flag, parse_mtp_draft_n_max,
+        parse_positive_chunked_prefill_value, resolve_effective_mlx_profile,
+        resolve_profile_from_metadata, resolve_runtime_tuning,
     };
     use std::fs;
     use tempfile::TempDir;
@@ -739,23 +748,6 @@ mod tests {
         assert_eq!(parse_enabled_flag(Some("maybe")), None);
         assert_eq!(parse_enabled_flag(Some("3")), None);
         assert_eq!(parse_enabled_flag(None), None);
-    }
-
-    #[test]
-    fn test_paged_kv_target_respects_configured_working_set_cap() {
-        let metadata = ModelMetadata {
-            weight_bytes: Some(134_217_728),
-            ..ModelMetadata::default()
-        };
-
-        let target = heuristic_paged_kv_target_bytes_with_max(
-            &metadata,
-            ModelSizeClass::Small,
-            false,
-            Some(134_217_728),
-        );
-
-        assert_eq!(target, 134_217_728);
     }
 
     #[test]

@@ -12,23 +12,40 @@ use axum::{
     },
 };
 use bytes::Bytes;
-use tokio_stream::Stream;
+use tokio_stream::{Stream, StreamExt};
 
 use crate::{
-    anthropic_adapter::{anthropic_messages_to_engine, openai_finish_to_anthropic_stop},
+    anthropic_adapter::openai_finish_to_anthropic_stop,
+    anthropic_tools::{
+        messages_with_tool_history, openai_tools, tool_settings, tool_use_block,
+        tool_use_stream_events,
+    },
     config::ApiFormat,
     error::ServerError,
-    metrics::{MetricsStore, RequestMetricsContext, RequestTiming},
+    generation::{
+        ChatPrompt, Completed, EventStream, GenerationEvent, GenerationRequest, Prompt,
+        StreamMetrics,
+    },
+    metrics::RequestMetricsContext,
     router::ResolvedRoute,
-    state::{Engine, SharedState},
+    state::SharedState,
     types::anthropic::{
         AnthropicUsage, ContentBlockResponse, ContentBlockStartEvent, ContentBlockStartPayload,
         ContentBlockStopEvent, CountTokensRequest, CountTokensResponse, CreateMessageRequest,
         CreateMessageResponse, MessageDelta, MessageDeltaEvent, MessageStartEvent,
-        MessageStartPayload, MessageStopEvent, TextDelta,
+        MessageStartPayload, MessageStopEvent, ResponseContentBlock, TextDelta,
     },
 };
 use higgs_models::SamplingParams;
+
+fn requested_thinking_budget(
+    thinking: Option<&crate::types::anthropic::ThinkingConfig>,
+) -> Result<Option<u32>, ServerError> {
+    crate::reasoning::validate_thinking_budget(
+        thinking.and_then(|config| config.budget_tokens),
+        "thinking.budget_tokens",
+    )
+}
 
 #[allow(clippy::too_many_lines)]
 pub async fn create_message(
@@ -60,8 +77,7 @@ pub async fn create_message(
     let resolved = state
         .router
         .resolve(&req.model, messages_json.as_deref())
-        .await
-        .map_err(ServerError::ModelNotFound)?;
+        .await?;
 
     match resolved {
         ResolvedRoute::Higgs {
@@ -71,38 +87,39 @@ pub async fn create_message(
         } => {
             req.model = model_name;
             let start = Instant::now();
+            let request = generation_request(&req)?;
             if req.stream == Some(true) {
-                let stream = create_message_stream(
-                    req,
+                let events = crate::generation::stream(
+                    Arc::clone(&state),
+                    request,
                     engine,
-                    state.metrics.clone(),
-                    routing_method,
+                    state.metrics.clone().map(|store| StreamMetrics {
+                        store,
+                        routing_method,
+                    }),
                     received_at,
                 )?;
-                let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+                let sse = Sse::new(message_event_stream(events, req.model))
+                    .keep_alive(KeepAlive::default());
                 if state.metrics.is_some() {
                     request_metrics.mark_recorded();
                 }
                 Ok(sse.into_response())
             } else {
-                let response = create_message_non_streaming(req, engine).await?;
+                let completed =
+                    crate::generation::complete(Arc::clone(&state), request, engine, received_at)
+                        .await?;
                 if let Some(ref metrics) = state.metrics {
-                    metrics.record(crate::metrics::RequestRecord {
-                        id: 0,
-                        timestamp: Instant::now(),
-                        wallclock: chrono::Utc::now(),
-                        model: Some(response.model.clone()),
-                        provider: Some("higgs".to_owned()),
-                        routing_method: routing_method.into(),
-                        status: 200,
-                        duration: start.elapsed(),
-                        input_tokens: u64::from(response.usage.input_tokens),
-                        output_tokens: u64::from(response.usage.output_tokens),
-                        error_body: None,
-                        timing: crate::metrics::RequestTiming::default(),
-                    });
+                    crate::generation::record_completion(
+                        metrics,
+                        &req.model,
+                        routing_method,
+                        start,
+                        &completed.usage,
+                    );
                     request_metrics.mark_recorded();
                 }
+                let response = message_response(completed, req.model);
                 Ok(Json(response).into_response())
             }
         }
@@ -136,7 +153,7 @@ pub async fn create_message(
                             proxy_body,
                             &headers,
                             strip_auth,
-                            api_key.as_deref(),
+                            api_key.as_ref().map(crate::config::Secret::expose),
                         )
                         .await
                     } else {
@@ -147,7 +164,7 @@ pub async fn create_message(
                             proxy_body,
                             &headers,
                             strip_auth,
-                            api_key.as_deref(),
+                            api_key.as_ref().map(crate::config::Secret::expose),
                         )
                         .await?;
                         usage = crate::proxy::extract_usage(&resp_bytes);
@@ -174,7 +191,7 @@ pub async fn create_message(
                         proxy_body,
                         &headers,
                         strip_auth,
-                        api_key.as_deref(),
+                        api_key.as_ref().map(crate::config::Secret::expose),
                     )
                     .await?;
                     let upstream_status = upstream.status().as_u16();
@@ -239,258 +256,170 @@ pub async fn create_message(
     }
 }
 
-async fn create_message_non_streaming(
-    req: CreateMessageRequest,
-    engine: Arc<Engine>,
-) -> Result<CreateMessageResponse, ServerError> {
-    let max_tokens = req.max_tokens;
-    let sampling = SamplingParams {
-        temperature: req.temperature.unwrap_or(1.0),
-        top_p: req.top_p.unwrap_or(1.0),
-        top_k: req.top_k,
-        ..SamplingParams::default()
-    };
-    let stop_sequences = req.stop_sequences.unwrap_or_default();
-
-    let engine_messages = anthropic_messages_to_engine(&req.messages, req.system.as_ref());
-    let tools = req.tools.as_deref();
-    let thinking_enabled = crate::reasoning::effective_thinking_enabled(
-        engine.enable_thinking(),
-        &[engine.model_name(), req.model.as_str()],
-        None,
-    );
-
-    let prompt_tokens = engine
-        .prepare_chat_prompt_with_thinking(&engine_messages, tools, thinking_enabled)
-        .map_err(ServerError::Engine)?;
-
-    let output = tokio::task::spawn_blocking(move || {
-        engine.generate_with_thinking(
-            &prompt_tokens,
-            max_tokens,
-            &sampling,
-            &stop_sequences,
-            false,
-            None,
-            thinking_enabled,
-            None,
-            None,
-        )
-    })
-    .await
-    .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
-    .map_err(ServerError::Engine)?;
-
-    let stop_reason = openai_finish_to_anthropic_stop(&output.finish_reason);
-    let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-
-    let output_text = output.text;
-    // When thinking is enabled, the template already opened `<think>` so
-    // the model output starts inside the thinking block. We wrap it in a
-    // properly closed `<think>...</think>` before parsing so the parser
-    // always sees balanced tags, even if the model was length-stopped.
-    let parse_input = if thinking_enabled {
-        if output_text.contains("</think>") {
-            format!("<think>{output_text}")
-        } else {
-            format!("<think>{output_text}</think>")
-        }
-    } else {
-        output_text.clone()
-    };
-    let reasoning_result = higgs_engine::reasoning_parser::parse_reasoning(&parse_input);
-    let visible_text = if reasoning_result.reasoning.is_some() {
-        reasoning_result.text
-    } else {
-        output_text
-    };
-
-    Ok(CreateMessageResponse {
-        id: msg_id,
-        message_type: "message",
-        role: "assistant",
-        content: vec![ContentBlockResponse {
-            block_type: "text",
-            text: visible_text,
-        }],
-        model: req.model,
-        stop_reason: Some(stop_reason),
-        usage: AnthropicUsage {
-            input_tokens: output.prompt_tokens,
-            output_tokens: output.completion_tokens,
+/// Translate a Messages request into the shared request.
+fn generation_request(req: &CreateMessageRequest) -> Result<GenerationRequest, ServerError> {
+    let messages = messages_with_tool_history(&req.messages, req.system.as_ref());
+    let (tools, tool_policy) = tool_settings(req.tools.as_deref(), req.tool_choice.as_ref())?;
+    let thinking_budget = requested_thinking_budget(req.thinking.as_ref())?;
+    Ok(GenerationRequest {
+        model: req.model.clone(),
+        prompt: Prompt::Chat(ChatPrompt {
+            messages,
+            images: Vec::new(),
+            tools,
+            tool_policy,
+            reasoning: None,
+            thinking_budget,
+            parse_reasoning_without_thinking: true,
+        }),
+        max_tokens: req.max_tokens,
+        sampling: SamplingParams {
+            temperature: req.temperature.unwrap_or(1.0),
+            top_p: req.top_p.unwrap_or(1.0),
+            top_k: req.top_k,
+            ..SamplingParams::default()
         },
+        stop_sequences: req.stop_sequences.clone().unwrap_or_default(),
+        logprobs: false,
+        top_logprobs: None,
+        constraint: None,
+        mcp: None,
     })
 }
 
-#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
-fn create_message_stream(
-    req: CreateMessageRequest,
-    engine: Arc<Engine>,
-    metrics: Option<Arc<MetricsStore>>,
-    routing_method: crate::router::RoutingMethod,
-    received_at: Instant,
-) -> Result<impl Stream<Item = Result<Event, Infallible>>, ServerError> {
-    let max_tokens = req.max_tokens;
-    let sampling = SamplingParams {
-        temperature: req.temperature.unwrap_or(1.0),
-        top_p: req.top_p.unwrap_or(1.0),
-        top_k: req.top_k,
-        ..SamplingParams::default()
+fn message_response(completed: Completed, model: String) -> CreateMessageResponse {
+    let usage = &completed.usage;
+    let anthropic_usage = AnthropicUsage {
+        input_tokens: usage.prompt_tokens,
+        output_tokens: usage.completion_tokens,
+        cache_read_input_tokens: usage
+            .prompt_tokens_details
+            .as_ref()
+            .map(|details| details.cached_tokens),
     };
-    let stop_sequences = req.stop_sequences.unwrap_or_default();
-
-    let engine_messages = anthropic_messages_to_engine(&req.messages, req.system.as_ref());
-    let tools = req.tools.as_deref();
-    let thinking_enabled = crate::reasoning::effective_thinking_enabled(
-        engine.enable_thinking(),
-        &[engine.model_name(), req.model.as_str()],
-        None,
-    );
-
-    let prompt_tokens = engine
-        .prepare_chat_prompt_with_thinking(&engine_messages, tools, thinking_enabled)
-        .map_err(ServerError::Engine)?;
-
-    let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-    let model = req.model;
-    let prompt_token_count = u32::try_from(prompt_tokens.len())
-        .map_err(|_| ServerError::BadRequest("Token count overflow".to_owned()))?;
-
-    // Spawn generation before creating the stream so prefill starts immediately
-    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-
-    tokio::task::spawn_blocking(move || {
-        let result = engine.generate_streaming_with_thinking(
-            &prompt_tokens,
-            max_tokens,
-            &sampling,
-            &stop_sequences,
-            false,
-            None,
-            &tx,
-            thinking_enabled,
-            // Progress events are consumed for metrics only; the Anthropic
-            // stream never surfaces them.
-            true,
-            None,
-            None,
-        );
-        if let Err(e) = result {
-            tracing::error!(error = %e, "Generation error during Anthropic streaming");
-        }
-    });
-
-    let start = received_at;
-    let metrics_id = metrics.as_ref().map(|m| {
-        m.record_pending(crate::metrics::RequestRecord {
-            id: 0,
-            timestamp: Instant::now(),
-            wallclock: chrono::Utc::now(),
-            model: Some(model.clone()),
-            provider: Some("higgs".to_owned()),
-            routing_method: routing_method.into(),
-            status: 200,
-            duration: std::time::Duration::ZERO,
-            input_tokens: u64::from(prompt_token_count),
-            output_tokens: 0,
-            error_body: None,
-            timing: crate::metrics::RequestTiming::default(),
-        })
-    });
-
-    let stream = async_stream::stream! {
-        // 1. message_start
-        let start_event = MessageStartEvent {
-            event_type: "message_start",
-            message: MessageStartPayload {
-                id: msg_id.clone(),
-                message_type: "message",
-                role: "assistant",
-                content: vec![],
-                model: model.clone(),
-                stop_reason: None,
-                usage: AnthropicUsage {
-                    input_tokens: prompt_token_count,
-                    output_tokens: 0,
-                },
-            },
-        };
-        match serde_json::to_string(&start_event) {
-            Ok(json) => yield Ok(Event::default().event("message_start").data(json)),
-            Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
-        }
-
-        // 2. content_block_start
-        let block_start = ContentBlockStartEvent {
-            event_type: "content_block_start",
-            index: 0,
-            content_block: ContentBlockStartPayload {
+    let stop_reason = openai_finish_to_anthropic_stop(&completed.finish_reason);
+    let content = if completed.tool_calls.is_empty() {
+        vec![ResponseContentBlock::Text(ContentBlockResponse {
+            block_type: "text",
+            text: completed.text,
+        })]
+    } else {
+        let text_block = (!completed.text.is_empty()).then(|| {
+            ResponseContentBlock::Text(ContentBlockResponse {
                 block_type: "text",
-                text: String::new(),
-            },
-        };
-        match serde_json::to_string(&block_start) {
-            Ok(json) => yield Ok(Event::default().event("content_block_start").data(json)),
-            Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
-        }
+                text: completed.text.clone(),
+            })
+        });
+        text_block
+            .into_iter()
+            .chain(
+                completed
+                    .tool_calls
+                    .iter()
+                    .map(|call| ResponseContentBlock::ToolUse(tool_use_block(call))),
+            )
+            .collect()
+    };
+    CreateMessageResponse {
+        id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
+        message_type: "message",
+        role: "assistant",
+        content,
+        model,
+        stop_reason: Some(stop_reason),
+        usage: anthropic_usage,
+    }
+}
 
-        // 3. content_block_delta events (one per token)
-        let mut final_stop_reason = None;
-        let mut total_output_tokens: u32 = 0;
-        let mut reasoning_tracker = if thinking_enabled {
-            higgs_engine::reasoning_parser::StreamingReasoningTracker::new_inside_think()
-        } else {
-            higgs_engine::reasoning_parser::StreamingReasoningTracker::new()
-        };
-
+/// Render generation events as Messages server-sent events. Reasoning is not
+/// part of the stream; tool calls follow the text as `tool_use` blocks.
+#[allow(clippy::too_many_lines)]
+fn message_event_stream(
+    mut events: EventStream,
+    model: String,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+    async_stream::stream! {
+        let mut prompt_tokens: u32 = 0;
+        let mut output_tokens: u32 = 0;
+        let mut cache_read_input_tokens: Option<u32> = None;
+        let mut stop_reason: Option<String> = None;
         let mut delta_writer = crate::sse::AnthropicDeltaWriter::new();
-        let mut timing = RequestTiming::default();
-        while let Some(output) = rx.recv().await {
-            if let Some(p) = output.prefill_progress {
-                timing.cached_tokens = Some(u64::from(p.cached));
-                continue;
-            }
-            if timing.ttft_ms.is_none() {
-                timing.ttft_ms = Some(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
-            }
-            let (visible, _reasoning) = reasoning_tracker.process(&output.new_text);
+        let mut tool_calls = Vec::new();
 
-            if !visible.is_empty() {
-                let td = TextDelta {
-                    delta_type: "text_delta",
-                    text: visible,
-                };
-                match delta_writer.write(&td) {
-                    Ok(json) => yield Ok(Event::default().event("content_block_delta").data(json)),
-                    Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
+        while let Some(event) = events.next().await {
+            match event {
+                GenerationEvent::Started { prompt_tokens: count } => {
+                    prompt_tokens = count;
+                    let start_event = MessageStartEvent {
+                        event_type: "message_start",
+                        message: MessageStartPayload {
+                            id: message_id.clone(),
+                            message_type: "message",
+                            role: "assistant",
+                            content: vec![],
+                            model: model.clone(),
+                            stop_reason: None,
+                            usage: AnthropicUsage {
+                                input_tokens: prompt_tokens,
+                                output_tokens: 0,
+                                cache_read_input_tokens: None,
+                            },
+                        },
+                    };
+                    match serde_json::to_string(&start_event) {
+                        Ok(json) => yield Ok(Event::default().event("message_start").data(json)),
+                        Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
+                    }
+                    let block_start = ContentBlockStartEvent {
+                        event_type: "content_block_start",
+                        index: 0,
+                        content_block: ContentBlockStartPayload {
+                            block_type: "text",
+                            text: String::new(),
+                        },
+                    };
+                    match serde_json::to_string(&block_start) {
+                        Ok(json) => yield Ok(Event::default().event("content_block_start").data(json)),
+                        Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
+                    }
                 }
-            }
-            total_output_tokens = output.completion_tokens;
-            if let Some(reason) = output.finish_reason {
-                final_stop_reason = Some(openai_finish_to_anthropic_stop(&reason));
+                GenerationEvent::TextDelta { text, .. } => {
+                    let delta = TextDelta {
+                        delta_type: "text_delta",
+                        text,
+                    };
+                    match delta_writer.write(&delta) {
+                        Ok(json) => yield Ok(Event::default().event("content_block_delta").data(json)),
+                        Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
+                    }
+                }
+                GenerationEvent::ToolCall { call, .. } => tool_calls.push(call),
+                GenerationEvent::Finish { reason, .. } => {
+                    stop_reason = Some(openai_finish_to_anthropic_stop(&reason));
+                }
+                GenerationEvent::Usage(usage) => {
+                    output_tokens = usage.completion_tokens;
+                    cache_read_input_tokens = usage
+                        .prompt_tokens_details
+                        .map(|details| details.cached_tokens);
+                }
+                GenerationEvent::Error(message) => {
+                    yield Ok(Event::default().event("error").data(
+                        serde_json::json!({
+                            "type": "error",
+                            "error": {"type": "api_error", "message": message},
+                        })
+                        .to_string(),
+                    ));
+                    return;
+                }
+                GenerationEvent::PrefillProgress(_)
+                | GenerationEvent::ReasoningDelta { .. }
+                | GenerationEvent::ToolLoop(_) => {}
             }
         }
 
-        // Flush any remaining visible text buffered by the reasoning tracker
-        let (flush_visible, _flush_reasoning) = reasoning_tracker.flush();
-        if !flush_visible.is_empty() {
-            let td = TextDelta {
-                delta_type: "text_delta",
-                text: flush_visible,
-            };
-            match delta_writer.write(&td) {
-                Ok(json) => yield Ok(Event::default().event("content_block_delta").data(json)),
-                Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
-            }
-        }
-
-        if let Some(ref m) = metrics {
-            if let Some(id) = metrics_id {
-                m.finalize_stream(id, u64::from(total_output_tokens), start.elapsed(), timing);
-            }
-        }
-
-        // 4. content_block_stop
         let block_stop = ContentBlockStopEvent {
             event_type: "content_block_stop",
             index: 0,
@@ -500,33 +429,39 @@ fn create_message_stream(
             Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
         }
 
-        // 5. message_delta
-        let msg_delta = MessageDeltaEvent {
+        // Tool calls follow the text block.
+        for (offset, call) in tool_calls.iter().enumerate() {
+            let index = u32::try_from(offset + 1).unwrap_or(u32::MAX);
+            for (event_name, data) in tool_use_stream_events(index, call) {
+                yield Ok(Event::default().event(event_name).data(data));
+            }
+        }
+        if !tool_calls.is_empty() {
+            stop_reason = Some("tool_use".to_owned());
+        }
+
+        let message_delta = MessageDeltaEvent {
             event_type: "message_delta",
-            delta: MessageDelta {
-                stop_reason: final_stop_reason,
-            },
+            delta: MessageDelta { stop_reason },
             usage: AnthropicUsage {
-                input_tokens: prompt_token_count,
-                output_tokens: total_output_tokens,
+                input_tokens: prompt_tokens,
+                output_tokens,
+                cache_read_input_tokens,
             },
         };
-        match serde_json::to_string(&msg_delta) {
+        match serde_json::to_string(&message_delta) {
             Ok(json) => yield Ok(Event::default().event("message_delta").data(json)),
             Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
         }
 
-        // 6. message_stop
-        let msg_stop = MessageStopEvent {
+        let message_stop = MessageStopEvent {
             event_type: "message_stop",
         };
-        match serde_json::to_string(&msg_stop) {
+        match serde_json::to_string(&message_stop) {
             Ok(json) => yield Ok(Event::default().event("message_stop").data(json)),
             Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
         }
-    };
-
-    Ok(stream)
+    }
 }
 
 pub async fn count_tokens(
@@ -549,15 +484,15 @@ pub async fn count_tokens(
     let resolved = state
         .router
         .resolve(&req.model, messages_json.as_deref())
-        .await
-        .map_err(ServerError::ModelNotFound)?;
+        .await?;
 
     match resolved {
         ResolvedRoute::Higgs {
             engine, model_name, ..
         } => {
-            let engine_messages = anthropic_messages_to_engine(&req.messages, req.system.as_ref());
-            let tools = req.tools.as_deref();
+            let engine_messages = messages_with_tool_history(&req.messages, req.system.as_ref());
+            let converted_tools = req.tools.as_deref().map(openai_tools);
+            let tools = converted_tools.as_deref();
             let thinking_enabled = crate::reasoning::effective_thinking_enabled(
                 engine.enable_thinking(),
                 &[engine.model_name(), model_name.as_str()],
@@ -565,7 +500,7 @@ pub async fn count_tokens(
             );
 
             let tokens = engine
-                .prepare_chat_prompt_with_thinking(&engine_messages, tools, thinking_enabled)
+                .prepare_chat_prompt(&engine_messages, tools, thinking_enabled)
                 .map_err(ServerError::Engine)?;
 
             let count = u32::try_from(tokens.len())
@@ -601,9 +536,150 @@ pub async fn count_tokens(
                 proxy_body,
                 &headers,
                 strip_auth,
-                api_key.as_deref(),
+                api_key.as_ref().map(crate::config::Secret::expose),
             )
             .await
         }
+    }
+}
+
+#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+#[cfg(test)]
+mod tests {
+    use crate::test_support::{
+        StubEngine, app_with_stub, generation_output, post_json, progress_event, token_event,
+    };
+    use higgs_engine::engine::GenerationStats;
+
+    fn body(stream: bool) -> serde_json::Value {
+        serde_json::json!({
+            "model": "stub",
+            "max_tokens": 16,
+            "stream": stream,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+    }
+
+    #[tokio::test]
+    async fn non_streaming_reports_cache_read_input_tokens() {
+        let mut stub = StubEngine::named("stub");
+        let mut output = generation_output("hello", 9, 2);
+        output.stats = GenerationStats {
+            cached_tokens: Some(6),
+            ..GenerationStats::default()
+        };
+        stub.script.generation = Some(output);
+        let (app, _engine) = app_with_stub(stub);
+
+        let (status, text) = post_json(&app, "/v1/messages", &body(false)).await;
+
+        assert_eq!(status, http::StatusCode::OK, "{text}");
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["usage"]["input_tokens"], 9);
+        assert_eq!(json["usage"]["cache_read_input_tokens"], 6);
+    }
+
+    #[tokio::test]
+    async fn non_streaming_omits_cache_read_when_unknown() {
+        let mut stub = StubEngine::named("stub");
+        stub.script.generation = Some(generation_output("hello", 9, 2));
+        let (app, _engine) = app_with_stub(stub);
+
+        let (_status, text) = post_json(&app, "/v1/messages", &body(false)).await;
+
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            json["usage"].get("cache_read_input_tokens").is_none(),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_message_delta_reports_cache_read_input_tokens() {
+        let mut stub = StubEngine::named("stub");
+        stub.script.prompt_tokens = vec![1, 2, 3, 4];
+        stub.script.stream = vec![
+            progress_event(3, 4),
+            token_event("hi", 1, None),
+            token_event("!", 2, Some("stop")),
+        ];
+        let (app, _engine) = app_with_stub(stub);
+
+        let (status, text) = post_json(&app, "/v1/messages", &body(true)).await;
+
+        assert_eq!(status, http::StatusCode::OK, "{text}");
+        let delta_line = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .find(|data| data.contains("\"message_delta\""))
+            .unwrap();
+        let delta: serde_json::Value = serde_json::from_str(delta_line.trim()).unwrap();
+        assert_eq!(delta["usage"]["cache_read_input_tokens"], 3);
+        assert_eq!(delta["usage"]["input_tokens"], 4);
+        assert_eq!(delta["usage"]["output_tokens"], 2);
+    }
+
+    fn thinking_stub() -> StubEngine {
+        let mut stub = StubEngine::named("stub");
+        stub.script.enable_thinking = true;
+        stub.script.generation = Some(generation_output("hello", 9, 2));
+        stub
+    }
+
+    #[tokio::test]
+    async fn thinking_budget_tokens_sets_the_budget() {
+        let (app, engine) = app_with_stub(thinking_stub());
+        let mut request = body(false);
+        request["thinking"] = serde_json::json!({"type": "enabled", "budget_tokens": 2048});
+
+        let (status, text) = post_json(&app, "/v1/messages", &request).await;
+
+        assert_eq!(status, http::StatusCode::OK, "{text}");
+        let calls = engine.recorded_calls();
+        assert_eq!(calls[0].thinking_budget, Some(2048));
+        assert!(calls[0].thinking_enabled);
+    }
+
+    #[tokio::test]
+    async fn absent_thinking_leaves_the_budget_to_configuration() {
+        let (app, engine) = app_with_stub(thinking_stub());
+
+        let (status, _text) = post_json(&app, "/v1/messages", &body(false)).await;
+
+        assert_eq!(status, http::StatusCode::OK);
+        assert_eq!(engine.recorded_calls()[0].thinking_budget, None);
+    }
+
+    #[tokio::test]
+    async fn zero_budget_tokens_is_rejected() {
+        let (app, engine) = app_with_stub(thinking_stub());
+        let mut request = body(false);
+        request["thinking"] = serde_json::json!({"type": "enabled", "budget_tokens": 0});
+
+        let (status, text) = post_json(&app, "/v1/messages", &request).await;
+
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{text}");
+        assert!(
+            text.contains("thinking.budget_tokens must be at least 1"),
+            "{text}"
+        );
+        assert!(engine.recorded_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_stream_ends_with_an_error_event_and_no_message_stop() {
+        let mut stub = StubEngine::named("stub");
+        stub.script.stream = vec![
+            token_event("par", 1, None),
+            crate::test_support::failure_event(),
+        ];
+        let (app, _engine) = app_with_stub(stub);
+
+        let (status, text) = post_json(&app, "/v1/messages", &body(true)).await;
+
+        assert_eq!(status, http::StatusCode::OK, "{text}");
+        assert!(text.contains("event: error"), "{text}");
+        assert!(text.contains("\"type\":\"api_error\""), "{text}");
+        assert!(!text.contains("message_stop"), "{text}");
     }
 }

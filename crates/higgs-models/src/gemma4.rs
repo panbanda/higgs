@@ -28,9 +28,13 @@ use mlx_rs::{
 use serde::Deserialize;
 
 use crate::{
+    attention::{
+        HeadCounts, HeadNorms, Projections, ScaleFreeRmsNorm, merge_heads, rotate, split_heads,
+        split_queries,
+    },
     cache::KeyValueCache,
     error::ModelError,
-    utils::{apply_rope, create_causal_mask, create_windowed_causal_mask},
+    utils::{apply_rope_at, create_causal_mask, create_windowed_causal_mask},
 };
 
 // ---------------------------------------------------------------------------
@@ -285,30 +289,6 @@ impl Gemma4ModelArgs {
         }
 
         table
-    }
-}
-
-// ---------------------------------------------------------------------------
-// No-scale RMSNorm (v_norm)
-// ---------------------------------------------------------------------------
-
-/// Normalizes with `RMSNorm` but applies no learnable scale weight.
-///
-/// Matches mlx-lm's `RMSNormNoScale` used for `v_norm` in Gemma 4.
-struct RmsNormNoScale {
-    eps: f32,
-}
-
-impl RmsNormNoScale {
-    const fn new(eps: f32) -> Self {
-        Self { eps }
-    }
-
-    fn forward(&self, x: &Array) -> Result<Array, Exception> {
-        let x_sq = x.square()?;
-        let mean_sq = x_sq.mean_axes(&[-1], true)?;
-        let rms = mean_sq.add(array!(self.eps))?.rsqrt()?;
-        x.multiply(rms)
     }
 }
 
@@ -707,26 +687,15 @@ impl Gemma4Attention {
         })
     }
 
-    /// Forward for owner layers.
-    ///
-    /// Returns `(output, (keys, values), offset_after_update)`.
-    #[allow(non_snake_case)]
+    /// Forward for owner layers: attends over the cache and returns what
+    /// shared layers later in the stack reuse.
     fn forward_owner<C: KeyValueCache>(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
         kv_cache: Option<&mut C>,
-    ) -> Result<(Array, (Array, Array), i32), Exception> {
-        let shape = x.shape();
-        let B = *shape
-            .first()
-            .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
-        let L = *shape
-            .get(1)
-            .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
-
-        let v_norm = RmsNormNoScale::new(self.v_norm_eps);
-
+    ) -> Result<(Array, SharedKeyValues), Exception> {
+        let value_norm = ScaleFreeRmsNorm::new(self.v_norm_eps);
         let k_proj = self
             .k_proj
             .as_mut()
@@ -736,102 +705,99 @@ impl Gemma4Attention {
             .as_mut()
             .ok_or_else(|| Exception::custom("forward_owner called on shared-only attention"))?;
 
-        let q_reshaped = self
-            .q_proj
-            .forward(x)?
-            .reshape(&[B, L, self.n_heads, self.head_dim])?;
-        let q_normed = self
-            .q_norm
-            .forward(&q_reshaped)?
-            .transpose_axes(&[0, 2, 1, 3])?;
-
-        let k_raw = k_proj
-            .forward(x)?
-            .reshape(&[B, L, self.n_kv_heads, self.head_dim])?;
-        let k_normed = k_norm.forward(&k_raw)?.transpose_axes(&[0, 2, 1, 3])?;
-
-        let v_unnormed = match &mut self.v_proj {
-            Some(vp) => vp
-                .forward(x)?
-                .reshape(&[B, L, self.n_kv_heads, self.head_dim])?,
-            None => k_raw.clone(), // k_eq_v: values = (pre-norm) keys
+        let raw_keys = k_proj.forward(x)?;
+        // k_eq_v: values are the keys before their norm and rotation.
+        let raw_values = match &mut self.v_proj {
+            Some(v_proj) => v_proj.forward(x)?,
+            None => raw_keys.clone(),
         };
-        let values_new = v_norm.forward(&v_unnormed)?.transpose_axes(&[0, 2, 1, 3])?;
+        let heads = split_heads(
+            &Projections {
+                queries: self.q_proj.forward(x)?,
+                keys: raw_keys,
+                values: raw_values,
+            },
+            HeadCounts {
+                query: self.n_heads,
+                key_value: self.n_kv_heads,
+            },
+            HeadNorms {
+                query: Some(&mut self.q_norm),
+                key: Some(k_norm),
+                value: Some(&value_norm),
+            },
+        )?;
 
-        // The PRE-update offset is the absolute position of this layer's queries.
-        // It is threaded to shared layers so they rope their queries at the same
-        // positions. Returning the post-update offset (old + L) would shift shared
-        // layers by L in prefill and by 1 per decode step.
+        // Shared layers rotate their queries where this layer's sat, which is
+        // before the cache grows by this step's tokens.
         let offset = kv_cache.as_ref().map_or(0, KeyValueCache::offset);
-        let keys_roped = apply_rope(&k_normed, &self.rope, offset)?;
-
-        let (keys, values) = if let Some(cache) = kv_cache {
-            cache.update_and_fetch(keys_roped, values_new)?
-        } else {
-            (keys_roped, values_new)
+        let positions = kv_cache.as_ref().and_then(KeyValueCache::rope_positions);
+        let (queries, rotated_keys) =
+            rotate(&heads.queries, &heads.keys, &self.rope, kv_cache.as_deref())?;
+        let (keys, values) = match kv_cache {
+            Some(cache) => cache.update_and_fetch(rotated_keys, heads.values)?,
+            None => (rotated_keys, heads.values),
         };
 
-        let q_final = apply_rope(&q_normed, &self.rope, offset)?;
-
-        let sdpa_mask = mask.map(mlx_rs::fast::ScaledDotProductAttentionMask::Array);
-        let attn_raw = mlx_rs::fast::scaled_dot_product_attention(
-            q_final,
+        let attended = mlx_rs::fast::scaled_dot_product_attention(
+            queries,
             keys.clone(),
             values.clone(),
             1.0,
-            sdpa_mask,
+            mask.map(mlx_rs::fast::ScaledDotProductAttentionMask::Array),
             None::<&Array>,
-        )?
-        .transpose_axes(&[0, 2, 1, 3])?
-        .reshape(&[B, L, -1])?;
-
-        let attn_out = self.o_proj.forward(&attn_raw)?;
-        Ok((attn_out, (keys, values), offset))
+        )?;
+        let output = self.o_proj.forward(&merge_heads(&attended)?)?;
+        Ok((
+            output,
+            SharedKeyValues {
+                keys,
+                values,
+                offset,
+                positions,
+            },
+        ))
     }
 
-    /// Forward for shared layers — reuses pre-computed K/V from an owner layer.
-    #[allow(non_snake_case)]
+    /// Forward for shared layers: only queries are computed here, keys and
+    /// values come from the owner layer.
     fn forward_shared(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
-        shared_kv: &(Array, Array),
-        offset: i32,
+        shared: &SharedKeyValues,
     ) -> Result<Array, Exception> {
-        let shape = x.shape();
-        let B = *shape
-            .first()
-            .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
-        let L = *shape
-            .get(1)
-            .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
+        let unrotated = split_queries(
+            &self.q_proj.forward(x)?,
+            self.n_heads,
+            Some(&mut self.q_norm),
+        )?;
+        let queries = apply_rope_at(
+            &unrotated,
+            &self.rope,
+            shared.offset,
+            shared.positions.as_ref(),
+        )?;
 
-        let (keys, values) = shared_kv;
-
-        let q_reshaped = self
-            .q_proj
-            .forward(x)?
-            .reshape(&[B, L, self.n_heads, self.head_dim])?;
-        let q_normed = self
-            .q_norm
-            .forward(&q_reshaped)?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let q_final = apply_rope(&q_normed, &self.rope, offset)?;
-
-        let sdpa_mask = mask.map(mlx_rs::fast::ScaledDotProductAttentionMask::Array);
-        let attn_raw = mlx_rs::fast::scaled_dot_product_attention(
-            q_final,
-            keys.clone(),
-            values.clone(),
+        let attended = mlx_rs::fast::scaled_dot_product_attention(
+            queries,
+            shared.keys.clone(),
+            shared.values.clone(),
             1.0,
-            sdpa_mask,
+            mask.map(mlx_rs::fast::ScaledDotProductAttentionMask::Array),
             None::<&Array>,
-        )?
-        .transpose_axes(&[0, 2, 1, 3])?
-        .reshape(&[B, L, -1])?;
-
-        self.o_proj.forward(&attn_raw)
+        )?;
+        self.o_proj.forward(&merge_heads(&attended)?)
     }
+}
+
+/// Keys and values an owner layer attended over, with where its queries sat
+/// (one shared offset, or one position per row in a batch).
+struct SharedKeyValues {
+    keys: Array,
+    values: Array,
+    offset: i32,
+    positions: Option<Array>,
 }
 
 // ---------------------------------------------------------------------------
@@ -975,9 +941,9 @@ impl Gemma4Block {
         mask: Option<&Array>,
         kv_cache: Option<&mut C>,
         per_layer_input: Option<&Array>,
-    ) -> Result<(Array, (Array, Array), i32), Exception> {
+    ) -> Result<(Array, SharedKeyValues), Exception> {
         let normed = self.input_layernorm.forward(x)?;
-        let (attn_raw, kv, offset) = self.self_attn.forward_owner(&normed, mask, kv_cache)?;
+        let (attn_raw, shared) = self.self_attn.forward_owner(&normed, mask, kv_cache)?;
         let attn_normed = self.post_attention_layernorm.forward(&attn_raw)?;
         let mut h = x.add(attn_normed)?;
 
@@ -991,21 +957,18 @@ impl Gemma4Block {
         let scalar = self.layer_scalar.as_dtype(h.dtype())?;
         h = h.multiply(scalar)?;
 
-        Ok((h, kv, offset))
+        Ok((h, shared))
     }
 
     fn forward_shared(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
-        shared_kv: &(Array, Array),
-        offset: i32,
+        shared: &SharedKeyValues,
         per_layer_input: Option<&Array>,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(x)?;
-        let attn_raw = self
-            .self_attn
-            .forward_shared(&normed, mask, shared_kv, offset)?;
+        let attn_raw = self.self_attn.forward_shared(&normed, mask, shared)?;
         let attn_normed = self.post_attention_layernorm.forward(&attn_raw)?;
         let mut h = x.add(attn_normed)?;
 
@@ -1289,6 +1252,7 @@ impl Gemma4TextModel {
     fn forward_internal<C: KeyValueCache>(
         &mut self,
         inputs: &Array,
+        padding_mask: Option<&Array>,
         cache: &mut Vec<Option<C>>,
     ) -> Result<Array, Exception> {
         let mut h = self.embed_tokens.forward(inputs)?;
@@ -1330,23 +1294,35 @@ impl Gemma4TextModel {
             .find_map(Option::as_ref)
             .map_or(0, KeyValueCache::offset);
 
-        let full_mask = (T > 1)
-            .then(|| create_causal_mask(T, Some(offset)))
-            .transpose()?;
-        let sliding_mask = if T > 1 {
-            Some(create_windowed_causal_mask(T, offset, self.sliding_window)?)
+        let (full_mask, sliding_mask) = if let Some(padding) = padding_mask {
+            let window_mask = (T > 1 || offset + 1 > self.sliding_window)
+                .then(|| create_windowed_causal_mask(T, offset, self.sliding_window))
+                .transpose()?;
+            let sliding = match window_mask {
+                Some(window) => window.logical_and(padding)?,
+                None => padding.clone(),
+            };
+            (Some(padding.clone()), Some(sliding))
         } else {
-            let kv_len = offset + 1;
-            (kv_len > self.sliding_window)
-                .then(|| create_windowed_causal_mask(1, offset, self.sliding_window))
-                .transpose()?
+            let full_mask = (T > 1)
+                .then(|| create_causal_mask(T, Some(offset)))
+                .transpose()?;
+            let sliding_mask = if T > 1 {
+                Some(create_windowed_causal_mask(T, offset, self.sliding_window)?)
+            } else {
+                let kv_len = offset + 1;
+                (kv_len > self.sliding_window)
+                    .then(|| create_windowed_causal_mask(1, offset, self.sliding_window))
+                    .transpose()?
+            };
+            (full_mask, sliding_mask)
         };
 
         let pli_all = self.get_per_layer_inputs(inputs)?;
         let projected = self.project_per_layer_inputs(&h, pli_all)?;
 
         let n_layers = self.layers.len();
-        let mut intermediates: Vec<Option<((Array, Array), i32)>> = vec![None; n_layers];
+        let mut intermediates: Vec<Option<SharedKeyValues>> = (0..n_layers).map(|_| None).collect();
 
         for i in 0..n_layers {
             let i32_i = i32::try_from(i).map_err(|_| Exception::custom("layer idx overflow"))?;
@@ -1379,14 +1355,14 @@ impl Gemma4TextModel {
                     .ok_or_else(|| Exception::custom("cache slot out of bounds"))?
                     .as_mut();
 
-                let (new_h, kv, off) =
+                let (new_h, shared) =
                     layer.forward_owner(&h, mask, cache_ref, per_layer_in.as_ref())?;
                 h = new_h;
                 if let Some(slot) = intermediates.get_mut(i) {
-                    *slot = Some((kv, off));
+                    *slot = Some(shared);
                 }
             } else {
-                let (shared_kv, shared_offset) = intermediates
+                let shared = intermediates
                     .get(prev_idx)
                     .and_then(|opt| opt.as_ref())
                     .ok_or_else(|| {
@@ -1395,13 +1371,7 @@ impl Gemma4TextModel {
                         ))
                     })?;
 
-                h = layer.forward_shared(
-                    &h,
-                    mask,
-                    shared_kv,
-                    *shared_offset,
-                    per_layer_in.as_ref(),
-                )?;
+                h = layer.forward_shared(&h, mask, shared, per_layer_in.as_ref())?;
             }
         }
 
@@ -1490,8 +1460,7 @@ impl Gemma4CausalLM {
         mask: Option<&Array>,
         kv_cache: &mut Vec<Option<C>>,
     ) -> Result<Array, Exception> {
-        let _ = mask;
-        let hidden_all = self.model.forward_internal(inputs, kv_cache)?;
+        let hidden_all = self.model.forward_internal(inputs, mask, kv_cache)?;
         let seq_len = inputs.shape().get(1).copied().unwrap_or(1);
         let lm_input = if seq_len > 1 {
             hidden_all.index((.., -1.., ..))
@@ -1507,8 +1476,7 @@ impl Gemma4CausalLM {
         mask: Option<&Array>,
         kv_cache: &mut Vec<Option<C>>,
     ) -> Result<Array, Exception> {
-        let _ = mask;
-        let hidden = self.model.forward_internal(inputs, kv_cache)?;
+        let hidden = self.model.forward_internal(inputs, mask, kv_cache)?;
         self.project_hidden(&hidden)
     }
 
@@ -1518,8 +1486,7 @@ impl Gemma4CausalLM {
         mask: Option<&Array>,
         kv_cache: &mut Vec<Option<C>>,
     ) -> Result<Array, Exception> {
-        let _ = mask;
-        self.model.forward_internal(inputs, kv_cache)
+        self.model.forward_internal(inputs, mask, kv_cache)
     }
 }
 
@@ -1674,8 +1641,7 @@ fn load_gemma4_moe_expert_weights(
     let mut remapped = 0usize;
 
     for file_path in &files {
-        let loaded = Array::load_safetensors(file_path)
-            .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+        let loaded = crate::load_safetensors_shard(file_path)?;
 
         for (key, value) in loaded {
             if let Some(prefix) = key.strip_suffix(".experts.gate_up_proj") {
@@ -1795,7 +1761,10 @@ fn assign_param(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::SteppingKeyValueCache;
+    use crate::{
+        cache::SteppingKeyValueCache,
+        test_support::{ForwardOverCache, worst_batched_difference},
+    };
 
     fn small_args() -> Gemma4ModelArgs {
         Gemma4ModelArgs {
@@ -1848,6 +1817,55 @@ mod tests {
             // and can reference the last sliding owner (layer 2).
             sliding_window_pattern: 0,
             ..small_args()
+        }
+    }
+
+    struct BatchCheck(Gemma4CausalLM);
+
+    impl ForwardOverCache for BatchCheck {
+        fn num_layers(&self) -> usize {
+            usize::try_from(self.0.args.num_hidden_layers).unwrap()
+        }
+
+        fn forward_over<C: KeyValueCache>(
+            &mut self,
+            inputs: &Array,
+            mask: Option<&Array>,
+            cache: &mut Vec<Option<C>>,
+        ) -> Result<Array, Exception> {
+            self.0.forward(inputs, mask, cache)
+        }
+    }
+
+    /// Owner and shared layers, sliding and full attention, per-layer
+    /// inputs, and (in the second variant) keys reused as values.
+    fn batched_args(keys_equal_values: bool) -> Gemma4ModelArgs {
+        Gemma4ModelArgs {
+            num_hidden_layers: 6,
+            num_kv_shared_layers: 2,
+            sliding_window: 4,
+            sliding_window_pattern: 3,
+            hidden_size_per_layer_input: 16,
+            attention_k_eq_v: keys_equal_values,
+            ..small_model_args()
+        }
+    }
+
+    #[test]
+    fn batched_forward_matches_unbatched_past_the_sliding_window() {
+        for keys_equal_values in [false, true] {
+            let mut model =
+                BatchCheck(Gemma4CausalLM::new(batched_args(keys_equal_values)).unwrap());
+            let worst = worst_batched_difference(
+                &mut model,
+                &[&[3, 5, 7, 11, 13, 17, 19], &[23, 29, 31]],
+                &[37, 41, 43, 47],
+            )
+            .unwrap();
+            assert!(
+                worst < 1e-3,
+                "batched logits differ by {worst} (keys equal values: {keys_equal_values})"
+            );
         }
     }
 

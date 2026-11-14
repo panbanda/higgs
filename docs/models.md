@@ -34,16 +34,45 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
   weights; a checkpoint with quantized experts is rejected at load with a clear
   error rather than producing incorrect output.
 
-## Continuous Batching Support
+## Batched Decode Support
 
-`batch=true` enables true batched decode only for these `model_type` values:
+These `model_type` values decode concurrent requests together in one batched forward pass:
 
 - `llama`
 - `mistral`
 - `qwen2`
 - `qwen3`
+- `qwen3_moe`
+- `qwen3_5` (dense) and `qwen3_5_moe`
+- `phi3`
+- `starcoder2`
+- `gemma2`
+- `gemma3` (`gemma3_text`)
+- `gemma4` (`gemma4_text`, `gemma4_unified`), except the mixture-of-experts variant (`enable_moe_block`, e.g. 26B-A4B), which the batch engine serves one request at a time
 
-Other supported architectures still serve normally in simple mode, but Higgs now rejects `batch=true` during config load, `doctor`, and server startup.
+Every other architecture is served by the same engine but decodes one request at a time; requests
+queue in arrival order. So does any model configured with `kv_cache.mode = "turboquant"`, whose
+per-request quantized caches cannot share a batched cache, and a Qwen3.5 checkpoint that ships an MTP head, whose
+speculative decode drafts one sequence at a time. `batch = false` limits any model to one request at a time.
+
+Qwen3.5 hybrid models (`qwen3_5`, `qwen3_5_moe`) batch decode only: each prompt is prefilled on its own and then joins the decode batch, because left padding would corrupt the recurrent layers. Their prefix cache keeps a snapshot of the recurrent state at the end of the conversation history (before the generation prompt), since that state cannot be cut back to a shorter prefix. `qwen3_next` is not verified for batched decode.
+
+### Feature support
+
+| Feature | All models |
+|---|---|
+| Prefix cache (block-paged, generation prompt excluded from the key) | yes |
+| Reuse of the shared leading blocks when a prompt diverges mid-entry (dense KV) | yes |
+| Disk prefix store (`prefix_cache.disk_dir`) | yes |
+| Thinking budget and `reasoning_tokens` | yes |
+| Embeddings (`/v1/embeddings`) | yes (runs between decode rounds) |
+| Logprobs, stop sequences, structured/regex output | yes (a request with logprobs or a constraint steps the active requests one at a time) |
+| `return_progress` prefill events | once at the start, then per chunk when the prompt is chunked, ending at 100% |
+| Chunked prefill for long prompts (MLX profile thresholds) | yes |
+| Models without a chat template (`/v1/completions` only) | yes |
+| Vision inputs (LLaVA) | yes (the request prefills alone, skips the prefix cache, then decodes one request at a time) |
+| TurboQuant KV cache | yes (decodes one request at a time) |
+| MTP speculative decode, prompt-lookup decoding | while a request runs alone; see [Speculative decode](configuration.md#speculative-decode) |
 
 ## Representative Working MLX Model IDs
 

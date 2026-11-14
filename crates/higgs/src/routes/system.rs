@@ -7,7 +7,8 @@ use std::time::Instant;
 use axum::{Json, extract::State};
 use serde::Serialize;
 
-use crate::state::{Engine, SharedState};
+use crate::model_pool::ModelStatus;
+use crate::state::SharedState;
 
 /// Process start, captured on first touch. `build_router` touches it so
 /// uptime counts from server construction rather than the first request.
@@ -37,38 +38,40 @@ pub struct MemoryInfo {
     pub mlx_cache_bytes: Option<u64>,
 }
 
+/// A configured local model and its lifecycle state, loaded or not.
 #[derive(Debug, Serialize)]
 pub struct LoadedModel {
-    pub name: String,
     /// Configured checkpoint path or Hugging Face repo id.
     pub path: Option<String>,
-    /// `simple` (serialized) or `batch` (interleaved) engine.
-    pub engine: &'static str,
     pub mlx_profile: Option<String>,
     pub kv_cache: Option<String>,
+    /// Prompts the prefix cache keeps; `0` means the cache is off.
+    pub prefix_cache_entries: Option<u32>,
+    /// Name, state, engine kind and the rest of what `/v1/models/status` reports.
+    #[serde(flatten)]
+    pub status: ModelStatus,
 }
 
 pub async fn system(State(state): State<SharedState>) -> Json<SystemResponse> {
-    let mut models: Vec<LoadedModel> = state
+    let models = state
         .router
-        .local_engines()
-        .iter()
-        .map(|(name, engine)| {
-            let configured = state
-                .config
-                .models
-                .iter()
-                .find(|m| m.name.as_deref() == Some(name.as_str()) || m.path == *name);
+        .pool()
+        .statuses()
+        .into_iter()
+        .map(|status| {
+            let configured = state.config.models.iter().find(|m| {
+                m.name.as_deref() == Some(status.name.as_str())
+                    || crate::engine_loader::served_name(m) == status.name
+            });
             LoadedModel {
-                name: name.clone(),
                 path: configured.map(|m| m.path.clone()),
-                engine: engine_kind(engine),
-                mlx_profile: configured.and_then(|m| serialized_name(&m.mlx_profile)),
-                kv_cache: configured.and_then(|m| serialized_name(&m.kv_cache)),
+                mlx_profile: configured.map(|m| m.profile.as_str().to_owned()),
+                kv_cache: configured.and_then(|m| serialized_name(&m.kv_cache.mode)),
+                prefix_cache_entries: configured.map(|m| m.prefix_cache.max_entries),
+                status,
             }
         })
         .collect();
-    models.sort_by(|a, b| a.name.cmp(&b.name));
 
     Json(SystemResponse {
         version: env!("CARGO_PKG_VERSION"),
@@ -85,15 +88,6 @@ fn serialized_name<T: Serialize>(value: &T) -> Option<String> {
     serde_json::to_value(value)
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))
-}
-
-const fn engine_kind(engine: &Engine) -> &'static str {
-    match engine {
-        Engine::Simple(_) => "simple",
-        Engine::Batch(_) => "batch",
-        #[cfg(test)]
-        Engine::Stub(_) => "stub",
-    }
 }
 
 fn memory_info() -> MemoryInfo {
@@ -121,6 +115,11 @@ static PHYSICAL_MEMORY: LazyLock<Option<u64>> = LazyLock::new(|| {
         .ok()?;
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 });
+
+/// Unified memory installed on the machine.
+pub fn physical_memory_bytes() -> Option<u64> {
+    *PHYSICAL_MEMORY
+}
 
 fn process_rss_bytes() -> Option<u64> {
     let output = Command::new("ps")

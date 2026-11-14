@@ -130,6 +130,9 @@ pub fn cmd_stop(profile: Option<&str>, force: bool) -> i32 {
     0
 }
 
+/// The commented config `higgs init` writes. `__METRICS_PATH__` is the profile-specific log path.
+const INIT_TEMPLATE: &str = include_str!("config/init_template.toml");
+
 #[allow(clippy::print_stderr)]
 pub fn cmd_init(profile: Option<&str>) {
     let dir = config::config_dir();
@@ -154,103 +157,7 @@ pub fn cmd_init(profile: Option<&str>) {
         |name| format!("~/.config/higgs/logs/metrics.{name}.jsonl"),
     );
 
-    let default_config = format!(
-        r#"[server]
-# Bind to loopback by default. To expose on the network, set host = "0.0.0.0"
-# and set an api_key.
-host = "127.0.0.1"
-port = 8000
-# max_tokens = 32768
-# timeout = 300.0
-# api_key = "sk-..."
-# rate_limit = 0
-# CORS origin allow-list for browser clients. Unset = no CORS headers.
-# cors_origins = ["*"]
-
-# --- Local serving defaults ---
-# MLX profile applies to simple-engine local models. "auto" picks balanced for
-# small/medium models and throughput for large models.
-
-# [local]
-# mlx_profile = "auto"
-
-# --- Local models ---
-# Each [[models]] entry loads an MLX model into GPU memory.
-# Use a HuggingFace model ID or a local path.
-
-# [[models]]
-# path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
-# name = "llama"
-# mlx_profile = "throughput"
-# batch = false
-# kv_disk_dir = "/var/lib/higgs/prefix-kv" # optional durable prefix cache
-# kv_disk_space_mb = 4096                # LRU budget; minimum 64 MiB
-# prefill_yield_tokens = 512 # optional: interleave decode during long prefills
-# mla_latent_cache = true # DeepSeek-V2 only: compressed latent KV cache; cannot combine with kv_cache = "turboquant"
-
-# --- Remote providers ---
-# Forward requests to external APIs via proxy routes.
-
-# [provider.anthropic]
-# url = "https://api.anthropic.com"
-# format = "anthropic"
-
-# [provider.openai]
-# url = "https://api.openai.com"
-# format = "openai"
-
-# [provider.ollama]
-# url = "http://localhost:11434"
-# strip_auth = true
-# api_key = "ollama"
-# stub_count_tokens = true
-
-# --- Routes ---
-# Pattern routes match model names with regex. First match wins.
-
-# [[routes]]
-# pattern = "claude-.*"
-# provider = "anthropic"
-
-# [[routes]]
-# pattern = "gpt-.*"
-# provider = "openai"
-
-# --- Default route ---
-# When no pattern matches and the model isn't loaded locally.
-
-[default]
-provider = "higgs"
-
-# --- Auto router ---
-# Classify requests using a local model to pick the best route.
-
-# [auto_router]
-# enabled = true
-# model = "router"             # matches a [[models]] name
-# timeout_ms = 2000
-
-# --- Usage ---
-# eval "$(higgs shellenv)"  -- set env vars in current shell
-# higgs exec -- claude       -- exec a command with env vars set
-
-# --- Retention ---
-# How long to keep metrics in memory for the TUI dashboard.
-
-# [retention]
-# enabled = true
-# minutes = 60
-
-# --- Metrics logging ---
-# Append request metrics to a JSONL file for attach/TUI history.
-
-# [logging.metrics]
-# enabled = true
-# path = "{metrics_path_example}"
-# max_size_mb = 50
-# max_files = 5
-"#
-    );
+    let default_config = INIT_TEMPLATE.replace("__METRICS_PATH__", &metrics_path_example);
 
     if let Err(e) = config::write_private_file(&path, &default_config) {
         eprintln!("failed to write {}: {e}", path.display());
@@ -277,19 +184,36 @@ fn resolved_addr(config: &HiggsConfig) -> String {
     )
 }
 
+/// Connect to the first address of `addr` that accepts. A name such as `localhost` can
+/// resolve to `::1` while the server listens on `127.0.0.1` only.
 fn connect_with_timeout(addr: &str) -> Result<TcpStream, String> {
-    let socket_addr = addr
+    let socket_addrs: Vec<_> = addr
         .to_socket_addrs()
         .map_err(|e| format!("failed to resolve {addr}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("failed to resolve {addr}: no socket addresses found"))?;
-    TcpStream::connect_timeout(&socket_addr, Duration::from_secs(2))
-        .map_err(|e| format!("higgs is not running on {addr}: {e}"))
+        .collect();
+    let mut last_error = None;
+    for socket_addr in &socket_addrs {
+        match TcpStream::connect_timeout(socket_addr, Duration::from_secs(2)) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    last_error.map_or_else(
+        || {
+            Err(format!(
+                "failed to resolve {addr}: no socket addresses found"
+            ))
+        },
+        |error| Err(format!("higgs is not running on {addr}: {error}")),
+    )
 }
 
 fn check_health(config: &HiggsConfig) -> Result<(), String> {
-    let addr = resolved_addr(config);
-    let mut stream = connect_with_timeout(&addr)?;
+    check_health_at(&resolved_addr(config))
+}
+
+fn check_health_at(addr: &str) -> Result<(), String> {
+    let mut stream = connect_with_timeout(addr)?;
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .map_err(|e| format!("failed to set read timeout for {addr}: {e}"))?;
@@ -383,16 +307,124 @@ fn find_crlf(body: &[u8], offset: usize) -> Option<usize> {
         .map(|index| offset + index)
 }
 
-fn ensure_reachable(config: &HiggsConfig) -> Result<String, String> {
-    let addr = resolved_addr(config);
-    connect_with_timeout(&addr)?;
-    Ok(addr)
+/// The server that `higgs shellenv` and `higgs exec` point client tools at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientTarget {
+    addr: String,
+    origin: TargetOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetOrigin {
+    Config,
+    Flag,
+    SimpleModeAddress,
+}
+
+impl ClientTarget {
+    pub fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    pub const fn description(&self) -> &'static str {
+        match self.origin {
+            TargetOrigin::Config => "from config",
+            TargetOrigin::Flag => "from --url/--port",
+            TargetOrigin::SimpleModeAddress => "address of serve without a config",
+        }
+    }
+}
+
+/// Pick the server address for client tools.
+///
+/// `--url` and `--port` win, then the config file's `[server]` address. With neither, the
+/// address `higgs serve --model` binds to is used (`HIGGS_HOST` and `HIGGS_PORT`, else
+/// `127.0.0.1:8000`), so a server started with `--model` is found without any config.
+pub fn resolve_client_target(
+    config: Option<&HiggsConfig>,
+    environment: &config::Environment,
+    url_flag: Option<&str>,
+    port_flag: Option<u16>,
+) -> Result<ClientTarget, String> {
+    if let Some(url) = url_flag {
+        return Ok(ClientTarget {
+            addr: parse_client_url(url)?,
+            origin: TargetOrigin::Flag,
+        });
+    }
+    if let Some(loaded) = config.filter(|_| port_flag.is_none()) {
+        return Ok(ClientTarget {
+            addr: resolved_addr(loaded),
+            origin: TargetOrigin::Config,
+        });
+    }
+    // `--port` replaces `HIGGS_PORT`, so a bad value there must not fail the command.
+    let address_environment = if port_flag.is_some() {
+        environment.without("HIGGS_PORT")
+    } else {
+        environment.clone()
+    };
+    let (host, serve_port) = config::simple_mode_address(&address_environment)?;
+    Ok(ClientTarget {
+        addr: format!(
+            "{}:{}",
+            resolve_host(&host),
+            port_flag.unwrap_or(serve_port)
+        ),
+        origin: if port_flag.is_some() {
+            TargetOrigin::Flag
+        } else {
+            TargetOrigin::SimpleModeAddress
+        },
+    })
+}
+
+/// Reduce `http://host:port` (or bare `host:port`) to `host:port`.
+fn parse_client_url(url: &str) -> Result<String, String> {
+    let without_scheme = match url.split_once("://") {
+        Some(("http", rest)) => rest,
+        Some((scheme, _)) => {
+            return Err(format!(
+                "unsupported scheme '{scheme}' in --url {url}: only http:// is supported"
+            ));
+        }
+        None => url,
+    };
+    let authority = without_scheme.split('/').next().unwrap_or_default();
+    if authority.is_empty() {
+        return Err(format!("invalid --url {url}: missing host"));
+    }
+    let has_port = authority.rsplit_once(':').is_some_and(|(host, port)| {
+        port.parse::<u16>().is_ok() && (!host.contains(':') || host.ends_with(']'))
+    });
+    Ok(if has_port {
+        authority.to_owned()
+    } else {
+        format!("{authority}:80")
+    })
+}
+
+/// Confirm a server answers at the target. A config-derived target keeps the plain
+/// connection check; every other target must also pass `/health`, so a stray listener on
+/// the default port is not mistaken for Higgs.
+fn ensure_reachable(target: &ClientTarget) -> Result<(), String> {
+    let result = match target.origin {
+        TargetOrigin::Config => connect_with_timeout(&target.addr).map(|_| ()),
+        TargetOrigin::Flag | TargetOrigin::SimpleModeAddress => check_health_at(&target.addr),
+    };
+    result.map_err(|err| {
+        format!(
+            "{err}\nhint: start a server with 'higgs serve --model <path or hf id>', \
+             or pass --url or --port to use a server that runs elsewhere"
+        )
+    })
 }
 
 fn ensure_dashboard_ready(config: &HiggsConfig, profile: Option<&str>) -> Result<(), String> {
-    if !config.logging.metrics.enabled {
+    if !config.observability.metrics_log.enabled {
         return Err(
-            "cannot open dashboard: [logging.metrics] enabled = true required in config".to_owned(),
+            "cannot open dashboard: [observability.metrics_log] enabled = true required in config"
+                .to_owned(),
         );
     }
     let Some(pid) = read_pid(profile) else {
@@ -406,7 +438,7 @@ fn ensure_dashboard_ready(config: &HiggsConfig, profile: Option<&str>) -> Result
     }
     check_health(config)?;
 
-    let metrics_path = Path::new(&config.logging.metrics.path);
+    let metrics_path = Path::new(&config.observability.metrics_log.path);
     if !metrics_path.exists() {
         return Err(format!(
             "cannot open dashboard: metrics log not found at {}",
@@ -417,9 +449,9 @@ fn ensure_dashboard_ready(config: &HiggsConfig, profile: Option<&str>) -> Result
 }
 
 #[allow(clippy::print_stdout)]
-pub fn cmd_shellenv(config: &HiggsConfig) -> Result<(), String> {
-    let addr = ensure_reachable(config)?;
-    let base_url = format!("http://{addr}");
+pub fn cmd_shellenv(target: &ClientTarget) -> Result<(), String> {
+    ensure_reachable(target)?;
+    let base_url = target.base_url();
     println!("export ANTHROPIC_BASE_URL={base_url}");
     println!("export OPENAI_BASE_URL={base_url}");
     Ok(())
@@ -429,21 +461,22 @@ pub fn cmd_shellenv(config: &HiggsConfig) -> Result<(), String> {
 ///
 /// Forwards signals to the child and exits with its status. Never returns.
 #[allow(clippy::print_stderr, unsafe_code)]
-pub fn cmd_exec(config: &HiggsConfig, command: &[String]) -> ! {
+pub fn cmd_exec(target: &ClientTarget, command: &[String]) -> ! {
     let Some((program, args)) = command.split_first() else {
         eprintln!("no command specified");
         std::process::exit(1);
     };
 
-    let addr = resolved_addr(config);
-
-    if let Err(err) = ensure_reachable(config) {
+    if let Err(err) = ensure_reachable(target) {
         eprintln!("{err}");
-        eprintln!("hint: start with 'higgs start' or 'higgs serve'");
         std::process::exit(1);
     }
 
-    let base_url = format!("http://{addr}");
+    let base_url = target.base_url();
+    eprintln!(
+        "higgs: using server at {base_url} ({})",
+        target.description()
+    );
     let mut child = match std::process::Command::new(program)
         .args(args)
         .env("ANTHROPIC_BASE_URL", &base_url)
@@ -640,9 +673,9 @@ pub fn run_attached(config: &HiggsConfig, profile: Option<&str>) {
     let retention = retention_duration(config);
     let metrics = Arc::new(MetricsStore::new(retention));
 
-    attach::load_history(&config.logging.metrics, &metrics);
+    attach::load_history(&config.observability.metrics_log, &metrics);
 
-    let log_path_buf = PathBuf::from(&config.logging.metrics.path);
+    let log_path_buf = PathBuf::from(&config.observability.metrics_log.path);
     let stop = Arc::new(AtomicBool::new(false));
 
     let tail_store = Arc::clone(&metrics);
@@ -672,20 +705,19 @@ pub fn run_attached(config: &HiggsConfig, profile: Option<&str>) {
     stop.store(true, Ordering::Relaxed);
 }
 
-pub const fn retention_duration(config: &HiggsConfig) -> Duration {
-    if config.retention.enabled {
-        Duration::from_secs(config.retention.minutes.saturating_mul(60))
-    } else {
-        Duration::from_secs(DEFAULT_RETENTION_SECS)
-    }
+pub fn retention_duration(config: &HiggsConfig) -> Duration {
+    config
+        .observability
+        .retention
+        .unwrap_or(Duration::from_secs(DEFAULT_RETENTION_SECS))
 }
 
 pub fn create_metrics(config: &HiggsConfig) -> Arc<MetricsStore> {
     let retention = retention_duration(config);
-    Arc::new(if config.logging.metrics.enabled {
-        match MetricsLogger::new(&config.logging.metrics) {
+    Arc::new(if config.observability.metrics_log.enabled {
+        match MetricsLogger::new(&config.observability.metrics_log) {
             Ok(logger) => {
-                tracing::info!(path = %config.logging.metrics.path, "metrics logging enabled");
+                tracing::info!(path = %config.observability.metrics_log.path, "metrics logging enabled");
                 MetricsStore::with_logger(retention, logger)
             }
             Err(e) => {
@@ -739,6 +771,78 @@ mod tests {
         unsafe {
             std::env::remove_var("HIGGS_CONFIG_DIR");
         }
+    }
+
+    #[test]
+    fn client_url_accepts_scheme_and_bare_forms() {
+        for (input, expected) in [
+            ("http://127.0.0.1:8123", "127.0.0.1:8123"),
+            ("http://localhost:8123/", "localhost:8123"),
+            ("http://localhost:8123/v1", "localhost:8123"),
+            ("localhost:9000", "localhost:9000"),
+            ("http://example.test", "example.test:80"),
+            ("http://[::1]:8123", "[::1]:8123"),
+            ("http://[::1]", "[::1]:80"),
+        ] {
+            assert_eq!(parse_client_url(input).as_deref(), Ok(expected), "{input}");
+        }
+        assert!(parse_client_url("https://example.test").is_err());
+        assert!(parse_client_url("http://").is_err());
+    }
+
+    #[test]
+    fn client_target_prefers_flags_then_config_then_serve_address() {
+        let config = HiggsConfig {
+            server: config::ServerConfig {
+                host: "0.0.0.0".to_owned(),
+                port: 3100,
+                ..config::ServerConfig::default()
+            },
+            ..HiggsConfig::default()
+        };
+        let none = config::Environment::default();
+        let from_config = resolve_client_target(Some(&config), &none, None, None).unwrap();
+        assert_eq!(from_config.base_url(), "http://127.0.0.1:3100");
+        assert_eq!(from_config.origin, TargetOrigin::Config);
+
+        let by_port = resolve_client_target(Some(&config), &none, None, Some(9000)).unwrap();
+        assert_eq!(by_port.base_url(), "http://127.0.0.1:9000");
+
+        let by_url =
+            resolve_client_target(Some(&config), &none, Some("http://10.0.0.5:7"), None).unwrap();
+        assert_eq!(by_url.base_url(), "http://10.0.0.5:7");
+
+        let default = resolve_client_target(None, &none, None, None).unwrap();
+        assert_eq!(default.base_url(), "http://127.0.0.1:8000");
+        assert_eq!(default.origin, TargetOrigin::SimpleModeAddress);
+    }
+
+    #[test]
+    fn client_target_without_config_follows_the_serve_environment() {
+        let environment =
+            config::Environment::from_pairs([("HIGGS_HOST", "0.0.0.0"), ("HIGGS_PORT", "9000")]);
+        let target = resolve_client_target(None, &environment, None, None).unwrap();
+        assert_eq!(target.base_url(), "http://127.0.0.1:9000");
+        assert_eq!(target.origin, TargetOrigin::SimpleModeAddress);
+
+        let port_only = config::Environment::from_pairs([("HIGGS_PORT", "9001")]);
+        assert_eq!(
+            resolve_client_target(None, &port_only, None, None)
+                .unwrap()
+                .base_url(),
+            "http://127.0.0.1:9001"
+        );
+
+        let bad_port = config::Environment::from_pairs([("HIGGS_PORT", "abc")]);
+        assert!(resolve_client_target(None, &bad_port, None, None).is_err());
+        let flag_over_bad_port = resolve_client_target(None, &bad_port, None, Some(9100)).unwrap();
+        assert_eq!(flag_over_bad_port.base_url(), "http://127.0.0.1:9100");
+
+        let flag_wins = resolve_client_target(None, &environment, None, Some(9100)).unwrap();
+        assert_eq!(flag_wins.base_url(), "http://127.0.0.1:9100");
+
+        let invalid = config::Environment::from_pairs([("HIGGS_PORT", "abc")]);
+        assert!(resolve_client_target(None, &invalid, None, None).is_err());
     }
 
     #[test]
@@ -861,24 +965,21 @@ mod tests {
     #[test]
     fn retention_duration_uses_configured_minutes() {
         let config = HiggsConfig {
-            retention: crate::config::RetentionConfig {
-                enabled: true,
-                minutes: 30,
+            observability: crate::config::ObservabilityConfig {
+                retention: Some(Duration::from_secs(30 * 60)),
+                ..Default::default()
             },
             ..HiggsConfig::default()
         };
-        assert_eq!(
-            retention_duration(&config),
-            Duration::from_secs(config.retention.minutes.saturating_mul(60))
-        );
+        assert_eq!(retention_duration(&config), Duration::from_secs(30 * 60));
     }
 
     #[test]
     fn retention_duration_one_year_when_disabled() {
         let config = HiggsConfig {
-            retention: crate::config::RetentionConfig {
-                enabled: false,
-                minutes: 30,
+            observability: crate::config::ObservabilityConfig {
+                retention: None,
+                ..Default::default()
             },
             ..HiggsConfig::default()
         };
@@ -891,11 +992,12 @@ mod tests {
     #[test]
     fn create_metrics_without_logger() {
         let config = HiggsConfig {
-            logging: crate::config::LoggingConfig {
-                metrics: crate::config::MetricsLogConfig {
+            observability: crate::config::ObservabilityConfig {
+                metrics_log: crate::config::MetricsLogConfig {
                     enabled: false,
                     ..Default::default()
                 },
+                ..Default::default()
             },
             ..HiggsConfig::default()
         };
@@ -909,6 +1011,140 @@ mod tests {
             std::fs::create_dir_all(dir).unwrap();
             cmd_init(None);
             assert!(dir.join("config.toml").exists());
+        });
+    }
+
+    #[test]
+    fn cmd_init_template_documents_thinking_budget() {
+        with_temp_config_dir(|dir| {
+            std::fs::create_dir_all(dir).unwrap();
+            cmd_init(None);
+            let template = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+            assert_eq!(template.matches("# thinking_budget = 256").count(), 2);
+        });
+    }
+
+    /// The commented lines of the template section that starts at `heading`,
+    /// uncommented, up to the next `# ---` heading.
+    fn uncommented_section(template: &str, first_line: &str) -> String {
+        template
+            .lines()
+            .skip_while(|line| *line != first_line)
+            .take_while(|line| !line.starts_with("# ---"))
+            .map(|line| line.strip_prefix("# ").unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn load_text_with(toml: &str, environment: &crate::config::Environment) -> HiggsConfig {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, toml).unwrap();
+        crate::config::load_config_file_in(&path, None, environment)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn load_text(toml: &str) -> HiggsConfig {
+        load_text_with(toml, &crate::config::Environment::default())
+    }
+
+    const A_MODEL: &str = "\n[[models]]\npath = \"org/model\"\n";
+
+    #[test]
+    fn cmd_init_template_mcp_examples_are_valid_when_uncommented() {
+        with_temp_config_dir(|dir| {
+            std::fs::create_dir_all(dir).unwrap();
+            cmd_init(None);
+            let template = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+            assert!(template.contains("--mcp-config"));
+            let section = uncommented_section(&template, "# [mcp]");
+            let config = load_text(&format!("{section}{A_MODEL}"));
+            assert_eq!(config.mcp.servers.len(), 2);
+            let lookup = |name: &str| {
+                (name == "EXAMPLE_TOKEN" || name == "MCP_TOKEN").then(|| "x".to_owned())
+            };
+            assert!(config.mcp.problems(&lookup).is_empty());
+            assert!(config.notices.deprecations.is_empty());
+        });
+    }
+
+    #[test]
+    fn cmd_init_template_web_examples_are_valid_when_uncommented() {
+        with_temp_config_dir(|dir| {
+            std::fs::create_dir_all(dir).unwrap();
+            cmd_init(None);
+            let template = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+            let section = uncommented_section(&template, "# [web]");
+            let config = load_text(&format!("{section}{A_MODEL}"));
+            assert!(config.web.enabled);
+            assert!(config.web.problems().is_empty());
+            assert_eq!(config.web.search_provider, "duckduckgo");
+        });
+    }
+
+    /// Every commented line of the template that is a table header or `key = value`, uncommented.
+    fn uncomment_everything(template: &str) -> String {
+        let config_line = regex::Regex::new(r"^# (\[\[?[A-Za-z_.*]+\]\]?|[a-z_]+ = .+)$").unwrap();
+        template
+            .lines()
+            .filter(|line| !line.starts_with("# include ="))
+            .map(|line| {
+                if config_line.is_match(line) {
+                    line.strip_prefix("# ").unwrap_or(line)
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn cmd_init_template_loads_without_warnings_when_every_example_is_uncommented() {
+        with_temp_config_dir(|dir| {
+            std::fs::create_dir_all(dir).unwrap();
+            cmd_init(None);
+            let template = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+            let everything = uncomment_everything(&template);
+            let environment = crate::config::Environment::from_pairs([
+                ("HIGGS_API_KEY", "sk-test"),
+                ("ANTHROPIC_API_KEY", "sk-ant-test"),
+            ]);
+            let config = load_text_with(&everything, &environment);
+            assert!(
+                config.notices.deprecations.is_empty(),
+                "{:?}",
+                config.notices.deprecations
+            );
+            let model = config.models.first().unwrap();
+            assert_eq!(model.path, "mlx-community/Llama-3.2-1B-Instruct-4bit");
+            assert_eq!(model.aliases, ["default"]);
+            assert_eq!(config.providers.len(), 3);
+            assert!(config.web.enabled);
+            assert_eq!(config.experimental.chunked_prefill_threshold, Some(4096));
+        });
+    }
+
+    #[test]
+    fn cmd_init_template_has_no_deprecated_keys_and_loads_as_written() {
+        with_temp_config_dir(|dir| {
+            std::fs::create_dir_all(dir).unwrap();
+            cmd_init(None);
+            let template = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+            let config = load_text(&format!("{template}{A_MODEL}"));
+            assert!(config.notices.deprecations.is_empty());
+            assert!(!template.contains("__METRICS_PATH__"));
+        });
+    }
+
+    #[test]
+    fn cmd_init_template_uses_the_profile_specific_metrics_path() {
+        with_temp_config_dir(|dir| {
+            std::fs::create_dir_all(dir).unwrap();
+            cmd_init(Some("dev"));
+            let template = std::fs::read_to_string(dir.join("config.dev.toml")).unwrap();
+            assert!(template.contains("metrics.dev.jsonl"));
+            assert!(!template.contains("__METRICS_PATH__"));
         });
     }
 

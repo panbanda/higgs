@@ -1,4 +1,6 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { parse as parseToml } from "smol-toml";
+import { parseMigrationNotes, usesDeprecatedKeys } from "./config";
 import type {
   CommandOutput,
   ConfigFile,
@@ -138,8 +140,36 @@ export function listProfiles(): Promise<ProfileList> {
   return local("list_profiles");
 }
 
-export function readConfig(path: string): Promise<ConfigFile> {
-  return local("read_config", { path });
+type RawConfigFile = Omit<ConfigFile, "deprecations" | "migration_error">;
+
+/**
+ * Reads a config file. A file that uses keys deprecated by the server is
+ * migrated by `higgs config migrate` (the single source of truth for the old to
+ * new mapping), and `parsed` holds the migrated document; `raw` stays the text
+ * on disk.
+ */
+export async function readConfig(path: string, higgsBinary = ""): Promise<ConfigFile> {
+  const file = await local<RawConfigFile>("read_config", { path });
+  const plain: ConfigFile = { ...file, deprecations: [], migration_error: null };
+  if (!file.exists || file.parse_error || !usesDeprecatedKeys(file.parsed)) return plain;
+  try {
+    const output = await runHiggs(higgsBinary, ["config", "migrate", "--config", file.path]);
+    if (output.exit_code !== 0) {
+      return { ...plain, migration_error: output.stderr.trim() || "higgs config migrate failed" };
+    }
+    return {
+      ...plain,
+      parsed: parseToml(output.stdout),
+      deprecations: parseMigrationNotes(output.stderr),
+    };
+  } catch (error) {
+    return { ...plain, migration_error: String(error) };
+  }
+}
+
+/** Rewrites a file that uses deprecated keys in place; the server keeps a `.bak` copy. */
+export function migrateConfigFile(path: string, higgsBinary: string): Promise<CommandOutput> {
+  return runHiggs(higgsBinary, ["config", "migrate", "--write", "--config", path]);
 }
 
 export function writeConfigRaw(path: string, raw: string): Promise<void> {

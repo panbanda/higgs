@@ -102,7 +102,7 @@ async function isContainedStrict(root: string, candidate: string): Promise<boole
 }
 
 /**
- * `logging.metrics.path` from every config file in the config dir, resolved
+ * `observability.metrics_log.path` (or the deprecated `logging.metrics.path`) from every config file in the config dir, resolved
  * to an absolute path. Used to allow `read_metrics_log` to read a metrics
  * log configured outside the config dir (still constrained to the user's
  * home directory).
@@ -146,8 +146,11 @@ async function configuredMetricsLogPaths(): Promise<Set<string>> {
     if (name !== "config.toml" && !/^config\..+\.toml$/.test(name)) continue;
     try {
       const raw = await fs.readFile(path.join(dir, name), "utf8");
-      const parsed = parseToml(raw) as { logging?: { metrics?: { path?: unknown } } };
-      const metricsPath = parsed.logging?.metrics?.path;
+      const parsed = parseToml(raw) as {
+        observability?: { metrics_log?: { path?: unknown } };
+        logging?: { metrics?: { path?: unknown } };
+      };
+      const metricsPath = parsed.observability?.metrics_log?.path ?? parsed.logging?.metrics?.path;
       if (typeof metricsPath === "string" && metricsPath) {
         paths.add(path.resolve(expandHome(metricsPath)));
       }
@@ -268,8 +271,13 @@ async function assertValidConfigSubcommandArgs(rest: string[]): Promise<void> {
     if (value === undefined) throw new Error("`config set` requires a value");
     if (key.startsWith("--")) throw new Error(`unexpected argument in place of a key: ${key}`);
     await assertValidSelectorArgs(rest.slice(3));
-  } else if (sub === "path") {
+  } else if (sub === "path" || sub === "check") {
     await assertValidSelectorArgs(rest.slice(1));
+  } else if (sub === "migrate") {
+    await assertValidSelectorArgs(rest[1] === "--write" ? rest.slice(2) : rest.slice(1));
+  } else if (sub === "explain") {
+    const hasModel = rest[1] !== undefined && !rest[1].startsWith("--");
+    await assertValidSelectorArgs(rest.slice(hasModel ? 2 : 1));
   } else if (sub === undefined) {
     throw new Error("`config` requires a subcommand");
   } else {

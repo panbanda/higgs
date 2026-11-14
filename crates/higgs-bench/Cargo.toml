@@ -32,7 +32,12 @@ toml = "1.0"
 built = { version = "0.8", features = ["git2"] }
 
 [dev-dependencies]
+axum.workspace = true
 tempfile = "3"
+
+[[bin]]
+name = "bench_compare"
+path = "src/bin/bench_compare.rs"
 
 [[bin]]
 name = "bench_decode"

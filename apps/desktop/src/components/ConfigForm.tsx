@@ -1,28 +1,36 @@
 import { useState } from "react";
 import {
   CONFIG_DEFAULTS,
+  LOAD_MODES,
+  MEMORY_GUARDS,
   MLX_PROFILES,
+  MTP_MODES,
   PROVIDER_FORMATS,
   displayModelName,
   providerNames,
   type AutoRouterSection,
+  type ExperimentalSection,
   type HiggsConfig,
-  type LocalSection,
+  type MemorySection,
+  type MetricsLogSection,
   type ModelEntry,
+  type ModelSettings,
   type ProviderEntry,
   type RouteEntry,
   type ServerSection,
 } from "../lib/config";
 
-export type ConfigSection = "server" | "local" | "models" | "providers" | "routes" | "metrics";
+export type ConfigSection = "server" | "memory" | "defaults" | "models" | "providers" | "routes" | "observability" | "experimental";
 
 export const CONFIG_SECTIONS: Array<{ id: ConfigSection; label: string }> = [
   { id: "server", label: "Server" },
-  { id: "local", label: "Local defaults" },
+  { id: "memory", label: "Memory" },
+  { id: "defaults", label: "Model defaults" },
   { id: "models", label: "Models" },
   { id: "providers", label: "Providers" },
   { id: "routes", label: "Routes" },
-  { id: "metrics", label: "Metrics" },
+  { id: "observability", label: "Observability" },
+  { id: "experimental", label: "Experimental" },
 ];
 
 interface ConfigFormProps {
@@ -50,6 +58,11 @@ function TextField({ value, onChange, placeholder }: { value: string | undefined
       onChange={(event) => onChange(event.target.value === "" ? undefined : event.target.value)}
     />
   );
+}
+
+/** A size or duration written as a string such as "5m" or "4GB"; a bare number is kept as typed by the user. */
+function UnitField({ value, onChange, placeholder }: { value: string | number | undefined; onChange: (value: string | undefined) => void; placeholder?: string }) {
+  return <TextField value={value === undefined ? undefined : String(value)} onChange={onChange} placeholder={placeholder} />;
 }
 
 function PasswordField({ value, onChange }: { value: string | undefined; onChange: (value: string | undefined) => void }) {
@@ -93,12 +106,126 @@ function ReorderButtons({ index, count, onMove, onRemove }: { index: number; cou
   );
 }
 
+function Select({ value, options, onChange, inherit }: { value: string | undefined; options: readonly string[]; onChange: (value: string | undefined) => void; inherit?: string }) {
+  return (
+    <select value={value ?? ""} onChange={(event) => onChange(event.target.value || undefined)}>
+      <option value="">{inherit ?? "default"}</option>
+      {options.map((option) => (
+        <option key={option} value={option}>
+          {option}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+/** Keys of `[defaults]` and of every `[[models]]` entry that mean the same thing in both. */
+function ModelSettingsEditor({ settings, onChange, inherit }: { settings: ModelSettings; onChange: (patch: Partial<ModelSettings>) => void; inherit: string }) {
+  const kv = settings.kv_cache ?? {};
+  const prefix = settings.prefix_cache ?? {};
+  const setKv = (patch: NonNullable<ModelSettings["kv_cache"]>) => onChange({ kv_cache: { ...kv, ...patch } });
+  const setPrefix = (patch: NonNullable<ModelSettings["prefix_cache"]>) => onChange({ prefix_cache: { ...prefix, ...patch } });
+  return (
+    <>
+      <div className="form-row">
+        <div className="field">
+          <label>Load</label>
+          <Select value={settings.load} options={LOAD_MODES} onChange={(v) => onChange({ load: v })} inherit={inherit} />
+        </div>
+        <div className="field">
+          <label>Idle TTL</label>
+          <UnitField value={settings.idle_ttl} onChange={(v) => onChange({ idle_ttl: v })} placeholder="15m (0 = never)" />
+        </div>
+        <div className="field">
+          <label>MLX profile</label>
+          <Select value={settings.profile} options={MLX_PROFILES} onChange={(v) => onChange({ profile: v })} inherit={inherit} />
+        </div>
+        <div className="field">
+          <label>Concurrent requests</label>
+          <select
+            value={settings.batch === undefined ? "" : String(settings.batch)}
+            onChange={(event) => {
+              const choice = event.target.value;
+              onChange({ batch: choice === "" ? undefined : choice === "auto" ? "auto" : choice === "true" });
+            }}
+          >
+            <option value="">{inherit}</option>
+            <option value="auto">unlimited</option>
+            <option value="false">one at a time</option>
+          </select>
+        </div>
+        <div className="field">
+          <label>Thinking budget</label>
+          <NumberField value={settings.thinking_budget} onChange={(v) => onChange({ thinking_budget: v })} placeholder="256" />
+        </div>
+      </div>
+      <div className="form-row">
+        <Checkbox label="Pinned (never evicted or expired)" checked={settings.pinned ?? false} onChange={(v) => onChange({ pinned: v })} />
+      </div>
+      <details className="config-disclosure">
+        <summary>Advanced (KV cache, prefix cache, prefill)</summary>
+        <div className="form-row">
+          <div className="field">
+            <label>KV cache mode</label>
+            <Select value={kv.mode} options={["off", "turboquant"]} onChange={(v) => setKv({ mode: v })} inherit={inherit} />
+          </div>
+          <div className="field">
+            <label>Bits</label>
+            <NumberField value={kv.bits} onChange={(v) => setKv({ bits: v })} placeholder="3" />
+          </div>
+          <div className="field">
+            <label>Key bits</label>
+            <NumberField value={kv.key_bits} onChange={(v) => setKv({ key_bits: v })} />
+          </div>
+          <div className="field">
+            <label>Value bits</label>
+            <NumberField value={kv.value_bits} onChange={(v) => setKv({ value_bits: v })} />
+          </div>
+          <div className="field">
+            <label>Adaptive dense layers</label>
+            <NumberField value={kv.adaptive_dense_layers} onChange={(v) => setKv({ adaptive_dense_layers: v })} placeholder="0" />
+          </div>
+          <div className="field">
+            <label>Seed</label>
+            <NumberField value={kv.seed} onChange={(v) => setKv({ seed: v })} placeholder="0" />
+          </div>
+        </div>
+        <div className="form-row">
+          <Checkbox label="Norm correction" checked={kv.norm_correction ?? true} onChange={(v) => setKv({ norm_correction: v })} />
+          <Checkbox label="MLA latent cache (DeepSeek-V2)" checked={kv.mla_latent ?? false} onChange={(v) => setKv({ mla_latent: v })} />
+        </div>
+        <div className="form-row">
+          <div className="field">
+            <label>Prefix cache directory</label>
+            <TextField value={prefix.disk_dir} onChange={(v) => setPrefix({ disk_dir: v })} placeholder="~/.cache/higgs/kv" />
+          </div>
+          <div className="field">
+            <label>Prefix cache budget</label>
+            <UnitField value={prefix.disk_budget} onChange={(v) => setPrefix({ disk_budget: v })} placeholder="4GB" />
+          </div>
+          <div className="field">
+            <label>Prefill yield tokens</label>
+            <NumberField
+              value={settings.prefill?.yield_tokens}
+              onChange={(v) => onChange({ prefill: { ...settings.prefill, yield_tokens: v } })}
+              placeholder="0"
+            />
+          </div>
+        </div>
+      </details>
+    </>
+  );
+}
+
 export function ConfigForm({ draft, onChange, section }: ConfigFormProps) {
   const server = draft.server ?? {};
   const setServer = (patch: Partial<ServerSection>) => onChange({ ...draft, server: { ...server, ...patch } });
 
-  const local = draft.local ?? {};
-  const setLocal = (patch: Partial<LocalSection>) => onChange({ ...draft, local: { ...local, ...patch } });
+  const memory = draft.memory ?? {};
+  const setMemory = (patch: Partial<MemorySection>) => onChange({ ...draft, memory: { ...memory, ...patch } });
+
+  const defaults = draft.defaults ?? {};
+  const setDefaults = (patch: Partial<ModelSettings>) => onChange({ ...draft, defaults: { ...defaults, ...patch } });
 
   const models = draft.models ?? [];
   const setModels = (next: ModelEntry[]) => onChange({ ...draft, models: next });
@@ -113,11 +240,11 @@ export function ConfigForm({ draft, onChange, section }: ConfigFormProps) {
     setModels(next);
   };
 
-  const providerEntries = Object.entries(draft.provider ?? {});
+  const providerEntries = Object.entries(draft.providers ?? {});
   const setProviders = (entries: Array<[string, ProviderEntry]>) => {
     const map: Record<string, ProviderEntry> = {};
     for (const [name, entry] of entries) map[name] = entry;
-    onChange({ ...draft, provider: entries.length > 0 ? map : undefined });
+    onChange({ ...draft, providers: entries.length > 0 ? map : undefined });
   };
   const [duplicateProviderIndex, setDuplicateProviderIndex] = useState<number | null>(null);
   const updateProviderName = (index: number, name: string) => {
@@ -152,22 +279,26 @@ export function ConfigForm({ draft, onChange, section }: ConfigFormProps) {
     setRoutes(next);
   };
 
-  const autoRouter = draft.auto_router ?? {};
-  const setAutoRouter = (patch: Partial<AutoRouterSection>) => onChange({ ...draft, auto_router: { ...autoRouter, ...patch } });
+  const routing = draft.routing ?? {};
+  const autoRouter = routing.auto ?? {};
+  const setAutoRouter = (patch: Partial<AutoRouterSection>) => onChange({ ...draft, routing: { ...routing, auto: { ...autoRouter, ...patch } } });
 
-  const retention = draft.retention ?? {};
-  const setRetention = (patch: Partial<{ enabled?: boolean; minutes?: number }>) => onChange({ ...draft, retention: { ...retention, ...patch } });
+  const observability = draft.observability ?? {};
+  const metricsLog = observability.metrics_log ?? {};
+  const setMetricsLog = (patch: Partial<MetricsLogSection>) => onChange({ ...draft, observability: { ...observability, metrics_log: { ...metricsLog, ...patch } } });
+  const retentionOff = observability.retention === false;
 
-  const metrics = draft.logging?.metrics ?? {};
-  const setMetrics = (patch: Partial<{ enabled?: boolean; path?: string; max_size_mb?: number; max_files?: number }>) =>
-    onChange({ ...draft, logging: { ...draft.logging, metrics: { ...metrics, ...patch } } });
+  const experimental = draft.experimental ?? {};
+  const setExperimental = (patch: Partial<ExperimentalSection>) => onChange({ ...draft, experimental: { ...experimental, ...patch } });
 
   const providers = providerNames(draft);
   const modelNames = models.map((model) => displayModelName(model));
 
+  const panel = { padding: "16px 20px", display: "flex", flexDirection: "column", gap: 12 } as const;
+
   if (section === "server") {
     return (
-      <div className="panel" style={{ padding: "16px 20px", display: "flex", flexDirection: "column", gap: 12 }}>
+      <div className="panel" style={panel}>
         <span className="meta">Server</span>
         <div className="form-row">
           <div className="field">
@@ -182,7 +313,7 @@ export function ConfigForm({ draft, onChange, section }: ConfigFormProps) {
         <div className="field">
           <label>API key</label>
           <PasswordField value={server.api_key} onChange={(v) => setServer({ api_key: v })} />
-          <span className="field-hint">Required if host is 0.0.0.0.</span>
+          <span className="field-hint">Required if host is 0.0.0.0. Prefer an environment reference such as {"${HIGGS_API_KEY}"} over a literal key.</span>
         </div>
         <div className="form-row">
           <div className="field">
@@ -190,16 +321,12 @@ export function ConfigForm({ draft, onChange, section }: ConfigFormProps) {
             <NumberField value={server.max_tokens} onChange={(v) => setServer({ max_tokens: v })} placeholder={String(CONFIG_DEFAULTS.server.max_tokens)} />
           </div>
           <div className="field">
-            <label>Timeout (s)</label>
-            <NumberField value={server.timeout} onChange={(v) => setServer({ timeout: v })} placeholder={String(CONFIG_DEFAULTS.server.timeout)} />
+            <label>Request timeout</label>
+            <UnitField value={server.request_timeout} onChange={(v) => setServer({ request_timeout: v })} placeholder={CONFIG_DEFAULTS.server.request_timeout} />
           </div>
           <div className="field">
-            <label>Max body size (bytes)</label>
-            <NumberField
-              value={server.max_body_size}
-              onChange={(v) => setServer({ max_body_size: v })}
-              placeholder={String(CONFIG_DEFAULTS.server.max_body_size)}
-            />
+            <label>Max body size</label>
+            <UnitField value={server.max_body_size} onChange={(v) => setServer({ max_body_size: v })} placeholder={CONFIG_DEFAULTS.server.max_body_size} />
           </div>
           <div className="field">
             <label>Rate limit (req/min)</label>
@@ -226,37 +353,50 @@ export function ConfigForm({ draft, onChange, section }: ConfigFormProps) {
     );
   }
 
-  if (section === "local") {
+  if (section === "memory") {
     return (
-      <div className="panel" style={{ padding: "16px 20px", display: "flex", flexDirection: "column", gap: 12 }}>
-        <span className="meta">Local defaults</span>
+      <div className="panel" style={panel}>
+        <span className="meta">Memory</span>
         <div className="form-row">
           <div className="field">
-            <label>MLX profile</label>
-            <select value={local.mlx_profile ?? CONFIG_DEFAULTS.local.mlx_profile} onChange={(event) => setLocal({ mlx_profile: event.target.value })}>
-              {MLX_PROFILES.map((profile) => (
-                <option key={profile} value={profile}>
-                  {profile}
-                </option>
-              ))}
-            </select>
+            <label>Guard</label>
+            <Select value={memory.guard} options={MEMORY_GUARDS} onChange={(v) => setMemory({ guard: v })} inherit={CONFIG_DEFAULTS.memory.guard} />
+          </div>
+          <div className="field">
+            <label>Limit</label>
+            <UnitField value={memory.limit} onChange={(v) => setMemory({ limit: v })} placeholder="48GB" />
+          </div>
+          <div className="field">
+            <label>Max loaded models</label>
+            <NumberField value={memory.max_loaded_models} onChange={(v) => setMemory({ max_loaded_models: v })} />
           </div>
           <div className="field">
             <label>&nbsp;</label>
             <Checkbox
               label="Raise wired memory limit"
-              checked={local.raise_wired_limit ?? CONFIG_DEFAULTS.local.raise_wired_limit}
-              onChange={(v) => setLocal({ raise_wired_limit: v })}
+              checked={memory.raise_wired_limit ?? CONFIG_DEFAULTS.memory.raise_wired_limit}
+              onChange={(v) => setMemory({ raise_wired_limit: v })}
             />
           </div>
         </div>
+        <span className="field-hint">An explicit limit wins over the guard. Both bound MLX active memory across all loaded models.</span>
+      </div>
+    );
+  }
+
+  if (section === "defaults") {
+    return (
+      <div className="panel" style={panel}>
+        <span className="meta">Model defaults</span>
+        <span className="field-hint">Applies to every model; a model entry overrides it key by key.</span>
+        <ModelSettingsEditor settings={defaults} onChange={setDefaults} inherit="built-in" />
       </div>
     );
   }
 
   if (section === "models") {
     return (
-      <div className="panel" style={{ padding: "16px 20px", display: "flex", flexDirection: "column", gap: 12 }}>
+      <div className="panel" style={panel}>
         <div className="config-section-title">
           <span className="meta">Models</span>
           <button type="button" className="btn small" onClick={addModel}>
@@ -273,78 +413,26 @@ export function ConfigForm({ draft, onChange, section }: ConfigFormProps) {
               </div>
               <div className="field" style={{ flex: 1 }}>
                 <label>Name</label>
-                <TextField value={model.name} onChange={(v) => updateModel(index, { name: v })} placeholder="alias" />
+                <TextField value={model.name} onChange={(v) => updateModel(index, { name: v })} placeholder="name" />
               </div>
               <div className="field" style={{ flex: 1 }}>
-                <label>MLX profile</label>
-                <select value={model.mlx_profile ?? ""} onChange={(event) => updateModel(index, { mlx_profile: event.target.value || undefined })}>
-                  <option value="">inherit</option>
-                  {MLX_PROFILES.map((profile) => (
-                    <option key={profile} value={profile}>
-                      {profile}
-                    </option>
-                  ))}
-                </select>
+                <label>Aliases</label>
+                <input
+                  type="text"
+                  value={(model.aliases ?? []).join(", ")}
+                  placeholder="default, chat"
+                  onChange={(event) => {
+                    const list = event.target.value
+                      .split(",")
+                      .map((item) => item.trim())
+                      .filter(Boolean);
+                    updateModel(index, { aliases: list.length > 0 ? list : undefined });
+                  }}
+                />
               </div>
-              <Checkbox label="Batch" checked={model.batch ?? false} onChange={(v) => updateModel(index, { batch: v || undefined })} />
               <ReorderButtons index={index} count={models.length} onMove={(delta) => moveModel(index, delta)} onRemove={() => removeModel(index)} />
             </div>
-            <details className="config-disclosure">
-              <summary>Advanced (KV cache, prefill)</summary>
-              <div className="form-row">
-                <div className="field">
-                  <label>Prefill yield tokens</label>
-                  <NumberField value={model.prefill_yield_tokens} onChange={(v) => updateModel(index, { prefill_yield_tokens: v })} placeholder="0" />
-                </div>
-                <div className="field">
-                  <label>KV cache</label>
-                  <select value={model.kv_cache ?? ""} onChange={(event) => updateModel(index, { kv_cache: event.target.value || undefined })}>
-                    <option value="">off</option>
-                    <option value="turboquant">turboquant</option>
-                  </select>
-                </div>
-              </div>
-              <div className="form-row">
-                <div className="field">
-                  <label>KV bits</label>
-                  <NumberField value={model.kv_bits} onChange={(v) => updateModel(index, { kv_bits: v })} placeholder="3" />
-                </div>
-                <div className="field">
-                  <label>KV key bits</label>
-                  <NumberField value={model.kv_key_bits} onChange={(v) => updateModel(index, { kv_key_bits: v })} />
-                </div>
-                <div className="field">
-                  <label>KV value bits</label>
-                  <NumberField value={model.kv_value_bits} onChange={(v) => updateModel(index, { kv_value_bits: v })} />
-                </div>
-                <div className="field">
-                  <label>Adaptive dense layers</label>
-                  <NumberField value={model.kv_adaptive_dense_layers} onChange={(v) => updateModel(index, { kv_adaptive_dense_layers: v })} placeholder="0" />
-                </div>
-              </div>
-              <div className="form-row">
-                <div className="field">
-                  <label>KV seed</label>
-                  <NumberField value={model.kv_seed} onChange={(v) => updateModel(index, { kv_seed: v })} placeholder="0" />
-                </div>
-                <div className="field">
-                  <label>KV disk dir</label>
-                  <TextField value={model.kv_disk_dir} onChange={(v) => updateModel(index, { kv_disk_dir: v })} />
-                </div>
-                <div className="field">
-                  <label>KV disk space (MB)</label>
-                  <NumberField value={model.kv_disk_space_mb} onChange={(v) => updateModel(index, { kv_disk_space_mb: v })} />
-                </div>
-              </div>
-              <div className="form-row">
-                <Checkbox
-                  label="KV norm correction"
-                  checked={model.kv_norm_correction ?? true}
-                  onChange={(v) => updateModel(index, { kv_norm_correction: v })}
-                />
-                <Checkbox label="MLA latent cache" checked={model.mla_latent_cache ?? false} onChange={(v) => updateModel(index, { mla_latent_cache: v })} />
-              </div>
-            </details>
+            <ModelSettingsEditor settings={model} onChange={(patch) => updateModel(index, patch)} inherit="inherit" />
           </div>
         ))}
       </div>
@@ -353,7 +441,7 @@ export function ConfigForm({ draft, onChange, section }: ConfigFormProps) {
 
   if (section === "providers") {
     return (
-      <div className="panel" style={{ padding: "16px 20px", display: "flex", flexDirection: "column", gap: 12 }}>
+      <div className="panel" style={panel}>
         <div className="config-section-title">
           <span className="meta">Providers</span>
           <button type="button" className="btn small" onClick={addProvider}>
@@ -410,7 +498,7 @@ export function ConfigForm({ draft, onChange, section }: ConfigFormProps) {
   if (section === "routes") {
     return (
       <>
-        <div className="panel" style={{ padding: "16px 20px", display: "flex", flexDirection: "column", gap: 12 }}>
+        <div className="panel" style={panel}>
           <div className="config-section-title">
             <span className="meta">Routes</span>
             <button type="button" className="btn small" onClick={addRoute}>
@@ -422,8 +510,8 @@ export function ConfigForm({ draft, onChange, section }: ConfigFormProps) {
             <div className="config-list-item" key={index}>
               <div className="config-list-item-header">
                 <div className="field" style={{ flex: 2 }}>
-                  <label>Pattern</label>
-                  <TextField value={route.pattern} onChange={(v) => updateRoute(index, { pattern: v })} placeholder="claude-.*" />
+                  <label>Match (regex)</label>
+                  <TextField value={route.match} onChange={(v) => updateRoute(index, { match: v })} placeholder="claude-.*" />
                 </div>
                 <div className="field">
                   <label>Provider</label>
@@ -456,9 +544,12 @@ export function ConfigForm({ draft, onChange, section }: ConfigFormProps) {
         </div>
 
         <div className="grid-2">
-          <div className="panel" style={{ padding: "16px 20px", display: "flex", flexDirection: "column", gap: 12 }}>
-            <span className="meta">Default provider</span>
-            <select value={draft.default?.provider ?? "higgs"} onChange={(event) => onChange({ ...draft, default: { provider: event.target.value } })}>
+          <div className="panel" style={panel}>
+            <span className="meta">Default route</span>
+            <select
+              value={routing.default ?? CONFIG_DEFAULTS.routing.default}
+              onChange={(event) => onChange({ ...draft, routing: { ...routing, default: event.target.value } })}
+            >
               {providers.map((provider) => (
                 <option key={provider} value={provider}>
                   {provider}
@@ -467,14 +558,14 @@ export function ConfigForm({ draft, onChange, section }: ConfigFormProps) {
             </select>
           </div>
 
-          <div className="panel" style={{ padding: "16px 20px", display: "flex", flexDirection: "column", gap: 8 }}>
+          <div className="panel" style={{ ...panel, gap: 8 }}>
             <span className="meta">Auto router</span>
             <Checkbox
               label="Enabled"
-              checked={autoRouter.enabled ?? CONFIG_DEFAULTS.auto_router.enabled}
+              checked={autoRouter.enabled ?? CONFIG_DEFAULTS.routing.auto.enabled}
               onChange={(v) => setAutoRouter({ enabled: v })}
             />
-            <Checkbox label="Force" checked={autoRouter.force ?? CONFIG_DEFAULTS.auto_router.force} onChange={(v) => setAutoRouter({ force: v })} />
+            <Checkbox label="Force" checked={autoRouter.force ?? CONFIG_DEFAULTS.routing.auto.force} onChange={(v) => setAutoRouter({ force: v })} />
             <div className="field">
               <label>Classifier model</label>
               <select value={autoRouter.model ?? ""} onChange={(event) => setAutoRouter({ model: event.target.value || undefined })}>
@@ -487,12 +578,8 @@ export function ConfigForm({ draft, onChange, section }: ConfigFormProps) {
               </select>
             </div>
             <div className="field">
-              <label>Timeout (ms)</label>
-              <NumberField
-                value={autoRouter.timeout_ms}
-                onChange={(v) => setAutoRouter({ timeout_ms: v })}
-                placeholder={String(CONFIG_DEFAULTS.auto_router.timeout_ms)}
-              />
+              <label>Timeout</label>
+              <UnitField value={autoRouter.timeout} onChange={(v) => setAutoRouter({ timeout: v })} placeholder={CONFIG_DEFAULTS.routing.auto.timeout} />
             </div>
           </div>
         </div>
@@ -500,91 +587,93 @@ export function ConfigForm({ draft, onChange, section }: ConfigFormProps) {
     );
   }
 
+  if (section === "experimental") {
+    const chunked = experimental.chunked_prefill ?? {};
+    return (
+      <div className="panel" style={panel}>
+        <span className="meta">Experimental</span>
+        <span className="field-hint">Engine toggles with an environment-variable equivalent; the variable wins when set (see `higgs doctor`).</span>
+        <div className="form-row">
+          <div className="field">
+            <label>MTP head</label>
+            <Select value={experimental.mtp} options={MTP_MODES} onChange={(v) => setExperimental({ mtp: v })} inherit="auto" />
+          </div>
+          <div className="field">
+            <label>MTP draft tokens</label>
+            <NumberField value={experimental.mtp_draft_tokens} onChange={(v) => setExperimental({ mtp_draft_tokens: v })} placeholder="profile" />
+          </div>
+          <div className="field">
+            <label>Chunked prefill threshold</label>
+            <NumberField
+              value={chunked.threshold}
+              onChange={(v) => setExperimental({ chunked_prefill: { ...chunked, threshold: v } })}
+              placeholder="profile"
+            />
+          </div>
+          <div className="field">
+            <label>Chunked prefill chunk</label>
+            <NumberField value={chunked.chunk} onChange={(v) => setExperimental({ chunked_prefill: { ...chunked, chunk: v } })} placeholder="profile" />
+          </div>
+        </div>
+        <div className="form-row">
+          <Checkbox label="Prompt lookup" checked={experimental.prompt_lookup ?? false} onChange={(v) => setExperimental({ prompt_lookup: v })} />
+          <Checkbox label="MTP adaptive draft" checked={experimental.mtp_adaptive_draft ?? false} onChange={(v) => setExperimental({ mtp_adaptive_draft: v })} />
+          <Checkbox label="MTP prompt lookup" checked={experimental.mtp_prompt_lookup ?? false} onChange={(v) => setExperimental({ mtp_prompt_lookup: v })} />
+          <Checkbox
+            label="Clear cache after prefill"
+            checked={experimental.clear_cache_after_prefill ?? false}
+            onChange={(v) => setExperimental({ clear_cache_after_prefill: v })}
+          />
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="grid-2">
-      <div className="panel" style={{ padding: "16px 20px", display: "flex", flexDirection: "column", gap: 8 }}>
-        <span className="meta">Retention</span>
-        <Checkbox label="Enabled" checked={retention.enabled ?? CONFIG_DEFAULTS.retention.enabled} onChange={(v) => setRetention({ enabled: v })} />
+      <div className="panel" style={{ ...panel, gap: 8 }}>
+        <span className="meta">Dashboard retention</span>
+        <Checkbox
+          label="Keep metrics in memory"
+          checked={!retentionOff}
+          onChange={(on) => onChange({ ...draft, observability: { ...observability, retention: on ? undefined : false } })}
+        />
         <div className="field">
-          <label>Minutes</label>
-          <NumberField value={retention.minutes} onChange={(v) => setRetention({ minutes: v })} placeholder={String(CONFIG_DEFAULTS.retention.minutes)} />
+          <label>Window</label>
+          <UnitField
+            value={typeof observability.retention === "string" ? observability.retention : undefined}
+            onChange={(v) => onChange({ ...draft, observability: { ...observability, retention: v } })}
+            placeholder={CONFIG_DEFAULTS.observability.retention}
+          />
         </div>
       </div>
 
-      <div className="panel" style={{ padding: "16px 20px", display: "flex", flexDirection: "column", gap: 8 }}>
-        <span className="meta">Metrics logging</span>
-        <Checkbox label="Enabled" checked={metrics.enabled ?? CONFIG_DEFAULTS.metrics.enabled} onChange={(v) => setMetrics({ enabled: v })} />
+      <div className="panel" style={{ ...panel, gap: 8 }}>
+        <span className="meta">Metrics log</span>
+        <Checkbox
+          label="Enabled"
+          checked={metricsLog.enabled ?? CONFIG_DEFAULTS.observability.metrics.enabled}
+          onChange={(v) => setMetricsLog({ enabled: v })}
+        />
         <div className="field">
           <label>Path</label>
-          <TextField value={metrics.path} onChange={(v) => setMetrics({ path: v })} placeholder="~/.config/higgs/logs/metrics.jsonl" />
+          <TextField value={metricsLog.path} onChange={(v) => setMetricsLog({ path: v })} placeholder="~/.config/higgs/logs/metrics.jsonl" />
         </div>
         <div className="form-row">
           <div className="field">
-            <label>Max size (MB)</label>
-            <NumberField value={metrics.max_size_mb} onChange={(v) => setMetrics({ max_size_mb: v })} placeholder={String(CONFIG_DEFAULTS.metrics.max_size_mb)} />
+            <label>Max size</label>
+            <UnitField value={metricsLog.max_size} onChange={(v) => setMetricsLog({ max_size: v })} placeholder={CONFIG_DEFAULTS.observability.metrics.max_size} />
           </div>
           <div className="field">
             <label>Max files</label>
-            <NumberField value={metrics.max_files} onChange={(v) => setMetrics({ max_files: v })} placeholder={String(CONFIG_DEFAULTS.metrics.max_files)} />
+            <NumberField
+              value={metricsLog.max_files}
+              onChange={(v) => setMetricsLog({ max_files: v })}
+              placeholder={String(CONFIG_DEFAULTS.observability.metrics.max_files)}
+            />
           </div>
         </div>
       </div>
     </div>
   );
-}
-
-function omitEmpty(source: Record<string, unknown>): Record<string, unknown> {
-  const result: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(source)) {
-    if (value === undefined || value === null) continue;
-    if (typeof value === "string" && value === "") continue;
-    if (Array.isArray(value) && value.length === 0) continue;
-    result[key] = value;
-  }
-  return result;
-}
-
-/** Strips empty strings, null numbers, and empty collections before writing structured config. */
-export function sanitizeConfig(config: HiggsConfig): HiggsConfig {
-  const sanitized: HiggsConfig = {};
-
-  if (config.server) {
-    const server = omitEmpty(config.server as unknown as Record<string, unknown>);
-    if (Object.keys(server).length > 0) sanitized.server = server as ServerSection;
-  }
-  if (config.local) {
-    const local = omitEmpty(config.local as unknown as Record<string, unknown>);
-    if (Object.keys(local).length > 0) sanitized.local = local as LocalSection;
-  }
-  if (config.models && config.models.length > 0) {
-    sanitized.models = config.models.map((model) => omitEmpty(model as unknown as Record<string, unknown>) as unknown as ModelEntry);
-  }
-  if (config.provider && Object.keys(config.provider).length > 0) {
-    const provider: Record<string, ProviderEntry> = {};
-    for (const [name, entry] of Object.entries(config.provider)) {
-      if (!name) continue;
-      provider[name] = omitEmpty(entry as unknown as Record<string, unknown>) as unknown as ProviderEntry;
-    }
-    if (Object.keys(provider).length > 0) sanitized.provider = provider;
-  }
-  if (config.routes && config.routes.length > 0) {
-    sanitized.routes = config.routes.map((route) => omitEmpty(route as unknown as Record<string, unknown>) as unknown as RouteEntry);
-  }
-  if (config.default?.provider) {
-    sanitized.default = { provider: config.default.provider };
-  }
-  if (config.auto_router) {
-    const autoRouter = omitEmpty(config.auto_router as unknown as Record<string, unknown>);
-    if (Object.keys(autoRouter).length > 0) sanitized.auto_router = autoRouter as AutoRouterSection;
-  }
-  if (config.retention) {
-    const retention = omitEmpty(config.retention as unknown as Record<string, unknown>);
-    if (Object.keys(retention).length > 0) sanitized.retention = retention as { enabled?: boolean; minutes?: number };
-  }
-  if (config.logging?.metrics) {
-    const metrics = omitEmpty(config.logging.metrics as unknown as Record<string, unknown>);
-    if (Object.keys(metrics).length > 0) sanitized.logging = { metrics };
-  }
-
-  return sanitized;
 }

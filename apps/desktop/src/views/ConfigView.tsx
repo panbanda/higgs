@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
-import { readTextTail, runHiggs, writeConfigRaw, writeConfigStructured } from "../lib/api";
-import { CONFIG_DEFAULTS, type HiggsConfig } from "../lib/config";
+import { migrateConfigFile, readTextTail, runHiggs, writeConfigRaw, writeConfigStructured } from "../lib/api";
+import { CONFIG_DEFAULTS, sanitizeConfig, type HiggsConfig } from "../lib/config";
 import type { ServerData } from "../hooks/useServerData";
 import type { CommandOutput, Settings } from "../lib/types";
-import { CONFIG_SECTIONS, ConfigForm, sanitizeConfig, type ConfigSection } from "../components/ConfigForm";
+import { CONFIG_SECTIONS, ConfigForm, type ConfigSection } from "../components/ConfigForm";
 import { DoctorOutput } from "../components/DoctorOutput";
 import "./views.css";
 
@@ -51,6 +51,22 @@ export function ConfigView({ settings, onSettingsChange, data }: ConfigViewProps
   }, [data.configFile]);
 
   const configPath = data.configFile?.path ?? null;
+
+  const migrateFile = async () => {
+    if (!configPath) return;
+    setSaving(true);
+    setSaveNotice(null);
+    try {
+      const output = await migrateConfigFile(configPath, settings.higgsBinary);
+      if (output.exit_code !== 0) throw new Error(output.stderr.trim() || "higgs config migrate failed");
+      await data.reloadConfig();
+      setSaveNotice({ ok: true, text: output.stderr.trim() || "Migrated." });
+    } catch (error) {
+      setSaveNotice({ ok: false, text: String(error) });
+    } finally {
+      setSaving(false);
+    }
+  };
 
   const runDoctor = async () => {
     setDoctorBusy(true);
@@ -257,6 +273,33 @@ export function ConfigView({ settings, onSettingsChange, data }: ConfigViewProps
           <button type="button" className="btn hot" disabled={creatingDefault} onClick={() => void createDefaultConfig()}>
             {creatingDefault ? "Creating…" : "Create default config"}
           </button>
+        </div>
+      )}
+
+      {data.configFile && data.configFile.deprecations.length > 0 && (
+        <div className="panel" style={{ padding: "16px 20px", marginBottom: 16 }}>
+          <span className="meta">Deprecated keys</span>
+          <p className="field-hint">
+            This file still works, but uses {data.configFile.deprecations.length} key(s) written for an earlier version. The form shows the file in
+            the current schema; saving from the form writes it that way. To keep your comments, migrate the file instead (the previous version is saved as
+            a .bak).
+          </p>
+          <ul className="field-hint">
+            {data.configFile.deprecations.map((note) => (
+              <li key={note} className="mono">
+                {note}
+              </li>
+            ))}
+          </ul>
+          <button type="button" className="btn" disabled={saving} onClick={() => void migrateFile()}>
+            Migrate file
+          </button>
+        </div>
+      )}
+
+      {data.configFile?.migration_error && (
+        <div className="notice bad" style={{ marginBottom: 16 }}>
+          The server could not read this file: {data.configFile.migration_error}
         </div>
       )}
 

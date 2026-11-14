@@ -36,10 +36,46 @@ pub enum ServerError {
 
     #[error("Proxy error: {0}")]
     ProxyError(String),
+
+    /// A configured local model cannot serve right now: its load failed or was refused.
+    #[error("Model unavailable: {message}")]
+    ModelUnavailable { code: &'static str, message: String },
+
+    #[error("Conflict: {0}")]
+    Conflict(String),
+}
+
+impl From<crate::model_pool::ModelError> for ServerError {
+    fn from(error: crate::model_pool::ModelError) -> Self {
+        use crate::model_pool::ModelError;
+        let message = error.to_string();
+        match error {
+            ModelError::Unknown(_) => Self::ModelNotFound(message),
+            ModelError::LoadFailed { .. } => Self::ModelUnavailable {
+                code: "model_load_failed",
+                message,
+            },
+            ModelError::OverCapacity(_) => Self::ModelUnavailable {
+                code: "insufficient_memory",
+                message,
+            },
+            ModelError::InUse { .. } | ModelError::Busy { .. } => Self::Conflict(message),
+        }
+    }
+}
+
+impl From<crate::router::RouteError> for ServerError {
+    fn from(error: crate::router::RouteError) -> Self {
+        match error {
+            crate::router::RouteError::NotFound(message) => Self::ModelNotFound(message),
+            crate::router::RouteError::Model(model_error) => model_error.into(),
+        }
+    }
 }
 
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
+        let mut code = None;
         let (status, error_type, message) = match &self {
             Self::Engine(e) => {
                 tracing::error!(error = %e, "Engine error");
@@ -73,13 +109,25 @@ impl IntoResponse for ServerError {
                     "Upstream provider error".to_owned(),
                 )
             }
+            Self::ModelUnavailable {
+                code: error_code,
+                message,
+            } => {
+                code = Some((*error_code).to_owned());
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "model_unavailable",
+                    message.clone(),
+                )
+            }
+            Self::Conflict(message) => (StatusCode::CONFLICT, "conflict", message.clone()),
         };
 
         let body = Json(ErrorResponse {
             error: ErrorDetail {
                 message,
                 r#type: error_type.to_owned(),
-                code: None,
+                code,
             },
         });
 
@@ -257,5 +305,70 @@ mod tests {
             content_type.contains("application/json"),
             "Expected application/json, got: {content_type}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_model_unavailable_returns_503_with_message_and_code() {
+        let resp = ServerError::ModelUnavailable {
+            code: "model_load_failed",
+            message: "model 'a' failed to load: disk read error".to_owned(),
+        }
+        .into_response();
+        let (status, body) = response_status_and_body(resp).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["type"].as_str().unwrap(), "model_unavailable");
+        assert_eq!(body["error"]["code"].as_str().unwrap(), "model_load_failed");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("disk read error")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_conflict_returns_409_with_message() {
+        let resp = ServerError::Conflict("model 'a' has 2 request(s) in flight".to_owned())
+            .into_response();
+        let (status, body) = response_status_and_body(resp).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["type"].as_str().unwrap(), "conflict");
+        assert!(body["error"]["code"].is_null());
+    }
+
+    #[test]
+    fn test_model_errors_map_to_the_matching_server_errors() {
+        use crate::model_pool::{ModelError, ModelState};
+
+        assert!(matches!(
+            ServerError::from(ModelError::Unknown("x".to_owned())),
+            ServerError::ModelNotFound(_)
+        ));
+        assert!(matches!(
+            ServerError::from(ModelError::LoadFailed {
+                model: "x".to_owned(),
+                reason: "boom".to_owned()
+            }),
+            ServerError::ModelUnavailable {
+                code: "model_load_failed",
+                ..
+            }
+        ));
+        assert!(matches!(
+            ServerError::from(ModelError::InUse {
+                model: "x".to_owned(),
+                in_flight: 1
+            }),
+            ServerError::Conflict(_)
+        ));
+        assert!(matches!(
+            ServerError::from(ModelError::Busy {
+                model: "x".to_owned(),
+                state: ModelState::Loading
+            }),
+            ServerError::Conflict(_)
+        ));
     }
 }

@@ -3,6 +3,7 @@ use minijinja::{Environment, Value};
 use serde::Serialize;
 
 use crate::error::EngineError;
+use crate::tool_format::ToolCallFormat;
 
 /// A chat message for template rendering.
 #[derive(Debug, Clone, Serialize)]
@@ -24,6 +25,7 @@ pub struct ChatTemplateRenderer {
     /// Special tokens loaded from `tokenizer_config.json` for template rendering.
     bos_token: String,
     eos_token: String,
+    tool_call_format: ToolCallFormat,
 }
 
 impl ChatTemplateRenderer {
@@ -37,13 +39,21 @@ impl ChatTemplateRenderer {
         env.add_filter("tojson", tojson_filter);
         minijinja_contrib::add_to_environment(&mut env);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        env.add_template_owned("chat".to_owned(), template_source.into())
+        let source = template_source.into();
+        let tool_call_format = ToolCallFormat::detect(None, Some(&source));
+        env.add_template_owned("chat".to_owned(), source)
             .map_err(|e| EngineError::Template(e.to_string()))?;
         Ok(Self {
             env,
             bos_token: String::new(),
             eos_token: String::new(),
+            tool_call_format,
         })
+    }
+
+    /// The tool-call output format this model's template teaches.
+    pub const fn tool_call_format(&self) -> ToolCallFormat {
+        self.tool_call_format
     }
 
     /// Load template from a model directory (`chat_template.jinja` or `tokenizer_config.json`).
@@ -82,11 +92,15 @@ impl ChatTemplateRenderer {
                 .unwrap_or_default()
         };
 
-        let set_tokens = |renderer: &mut Self| {
+        let model_type = read_model_type(model_dir);
+
+        let set_tokens = |renderer: &mut Self, template: &str| {
             if let Some(ref cfg) = config {
                 renderer.bos_token = extract_token(cfg, "bos_token");
                 renderer.eos_token = extract_token(cfg, "eos_token");
             }
+            renderer.tool_call_format =
+                ToolCallFormat::detect(model_type.as_deref(), Some(template));
         };
 
         // Prefer standalone chat_template.jinja
@@ -95,7 +109,7 @@ impl ChatTemplateRenderer {
             let template = std::fs::read_to_string(&jinja_path)
                 .map_err(|e| EngineError::Template(format!("Failed to read template: {e}")))?;
             let mut renderer = Self::new(&template)?;
-            set_tokens(&mut renderer);
+            set_tokens(&mut renderer, &template);
             return Ok(Some(renderer));
         }
 
@@ -105,7 +119,7 @@ impl ChatTemplateRenderer {
                 // String template
                 if let Some(template) = ct.as_str() {
                     let mut renderer = Self::new(template)?;
-                    set_tokens(&mut renderer);
+                    set_tokens(&mut renderer, template);
                     return Ok(Some(renderer));
                 }
                 // Array of {name, template} objects -- use "default" or first entry
@@ -118,7 +132,7 @@ impl ChatTemplateRenderer {
                         .and_then(|v| v.as_str());
                     if let Some(template) = found {
                         let mut renderer = Self::new(template)?;
-                        set_tokens(&mut renderer);
+                        set_tokens(&mut renderer, template);
                         return Ok(Some(renderer));
                     }
                 }
@@ -179,6 +193,18 @@ impl ChatTemplateRenderer {
         tmpl.render(context)
             .map_err(|e| EngineError::Template(e.to_string()))
     }
+}
+
+/// The `model_type` from `config.json`, looking inside `text_config` for
+/// multimodal wrappers.
+fn read_model_type(model_dir: &std::path::Path) -> Option<String> {
+    let config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(model_dir.join("config.json")).ok()?).ok()?;
+    config
+        .get("model_type")
+        .or_else(|| config.get("text_config")?.get("model_type"))?
+        .as_str()
+        .map(ToOwned::to_owned)
 }
 
 /// Normalise a tool-call JSON object so Qwen-Hermes-style chat templates
@@ -884,5 +910,50 @@ TOOLS:{{ tools | length }}
         let mut tc = parsed(r#"{ "name": "f", "arguments": "[1,2,3]" }"#);
         normalize_tool_call_for_template(&mut tc);
         assert_eq!(tc.get("arguments"), Some(&parsed("{}")));
+    }
+
+    fn format_for_model_dir(config: &str, tokenizer_config: &str) -> ToolCallFormat {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), config).unwrap();
+        std::fs::write(dir.path().join("tokenizer_config.json"), tokenizer_config).unwrap();
+        ChatTemplateRenderer::from_model_dir(dir.path())
+            .unwrap()
+            .tool_call_format()
+    }
+
+    #[test]
+    fn tool_call_format_comes_from_the_template_in_tokenizer_config() {
+        let format = format_for_model_dir(
+            r#"{"model_type": "mistral"}"#,
+            r#"{"chat_template": "{{ '[TOOL_CALLS]' }}{{ '[ARGS]' }}"}"#,
+        );
+        assert_eq!(format, ToolCallFormat::MistralNameArguments);
+    }
+
+    #[test]
+    fn tool_call_format_falls_back_to_the_model_type() {
+        let format = format_for_model_dir(
+            r#"{"text_config": {"model_type": "qwen3_5"}}"#,
+            r#"{"chat_template": "{{ messages }}"}"#,
+        );
+        assert_eq!(format, ToolCallFormat::Qwen);
+    }
+
+    #[test]
+    fn tool_call_format_is_auto_without_any_hint() {
+        let format = format_for_model_dir("{}", r#"{"chat_template": "{{ messages }}"}"#);
+        assert_eq!(format, ToolCallFormat::Auto);
+    }
+
+    #[test]
+    fn standalone_template_file_decides_the_format() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "<tool_call><function=",
+        )
+        .unwrap();
+        let renderer = ChatTemplateRenderer::from_model_dir(dir.path()).unwrap();
+        assert_eq!(renderer.tool_call_format(), ToolCallFormat::Qwen);
     }
 }

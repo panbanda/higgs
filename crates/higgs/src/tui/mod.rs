@@ -77,12 +77,13 @@ impl TuiConfig {
             model_names,
             provider_names,
             routes,
-            default_provider: config.default.provider.clone(),
+            default_provider: config.routing.default_provider.clone(),
             auto_router: TuiAutoRouter {
-                enabled: config.auto_router.enabled,
-                force: config.auto_router.force,
-                model: config.auto_router.model.clone(),
-                timeout_ms: config.auto_router.timeout_ms,
+                enabled: config.routing.auto.enabled,
+                force: config.routing.auto.force,
+                model: config.routing.auto.model.clone(),
+                timeout_ms: u64::try_from(config.routing.auto.timeout.as_millis())
+                    .unwrap_or(u64::MAX),
             },
         }
     }
@@ -635,28 +636,16 @@ mod tests {
     // -- TuiConfig::from_higgs_config tests -----------------------------------
 
     use crate::config::{
-        AutoRouterConfig, DefaultRoute, HiggsConfig, ModelConfig, ProviderConfig, RouteConfig,
+        AutoRouterConfig, HiggsConfig, ModelConfig, ProviderConfig, RouteConfig, RoutingConfig,
     };
-    use std::collections::HashMap;
+    use std::collections::BTreeMap as HashMap;
 
     fn minimal_config() -> HiggsConfig {
         HiggsConfig {
             models: vec![ModelConfig {
                 path: "mlx-community/Llama-3.2-1B-Instruct-4bit".to_owned(),
-                name: None,
-                mlx_profile: None,
-                batch: false,
-                prefill_yield_tokens: None,
-                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                kv_bits: 3,
-                kv_seed: 0,
-                kv_key_bits: None,
-                kv_value_bits: None,
-                kv_norm_correction: true,
-                kv_adaptive_dense_layers: 0,
-                kv_disk_dir: None,
-                kv_disk_space_mb: 4096,
-                mla_latent_cache: None,
+                batch: crate::config::BatchMode::Off,
+                ..crate::config::ModelConfig::with_path("")
             }],
             ..HiggsConfig::default()
         }
@@ -762,9 +751,7 @@ mod tests {
     #[test]
     fn from_config_copies_default_provider() {
         let mut config = minimal_config();
-        config.default = DefaultRoute {
-            provider: "openai".to_owned(),
-        };
+        config.routing.default_provider = "openai".to_owned();
         let tui = TuiConfig::from_higgs_config(&config, None);
         assert_eq!(tui.default_provider, "openai");
     }
@@ -772,11 +759,14 @@ mod tests {
     #[test]
     fn from_config_copies_auto_router() {
         let mut config = minimal_config();
-        config.auto_router = AutoRouterConfig {
-            enabled: true,
-            force: true,
-            model: "my-router".to_owned(),
-            timeout_ms: 5000,
+        config.routing = RoutingConfig {
+            auto: AutoRouterConfig {
+                enabled: true,
+                force: true,
+                model: "my-router".to_owned(),
+                timeout: std::time::Duration::from_millis(5000),
+            },
+            ..RoutingConfig::default()
         };
         let tui = TuiConfig::from_higgs_config(&config, None);
         assert!(tui.auto_router.enabled);

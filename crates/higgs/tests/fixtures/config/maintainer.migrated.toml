@@ -1,0 +1,16 @@
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[models]]
+path = "/Users/example/models/Thinklite-27B-4bit"
+name = "thinklite"
+# Loading this model intermittently hits a Metal GPU timeout right after GDN projection fusion
+# (2 of 6 loads in testing). Start higgs with HIGGS_SEPARATE_GDN_PROJ=1 to skip that step.
+profile = "balanced"
+
+[routing]
+default = "higgs"
+
+[observability]
+retention = "1h"

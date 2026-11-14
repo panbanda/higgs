@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::io::IsTerminal;
 use std::net::SocketAddr;
@@ -8,17 +7,15 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use clap::Parser;
-use higgs_engine::mlx_tuning::resolve_runtime_tuning;
-
 use higgs::{
     build_router,
     config::{
         self, Cli, Commands, ConfigAction, HiggsConfig, MetricsLogConfig, ServeArgs, StartArgs,
         StopArgs,
     },
-    model_download, model_resolver,
+    engine_loader, model_download, model_resolver,
     router::Router,
-    state::{AppState, Engine},
+    state::AppState,
 };
 
 #[tokio::main]
@@ -62,47 +59,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             higgs::daemon::cmd_init(profile);
             Ok(())
         }
-        Commands::Shellenv => {
-            let config = load_config_for_command(&cli)?;
-            higgs::daemon::cmd_shellenv(&config)?;
+        Commands::Shellenv(ref client) => {
+            let target = resolve_client_target(&cli, client)?;
+            if let Err(message) = higgs::daemon::cmd_shellenv(&target) {
+                eprintln!("{message}");
+                std::process::exit(1);
+            }
             Ok(())
         }
-        Commands::Exec { ref command } => {
-            let config = load_config_for_command(&cli)?;
-            higgs::daemon::cmd_exec(&config, command);
+        Commands::Exec {
+            ref client,
+            ref command,
+        } => {
+            let target = resolve_client_target(&cli, client)?;
+            higgs::daemon::cmd_exec(&target, command);
         }
         Commands::Config { ref action } => {
             cmd_config(&cli, action);
             Ok(())
         }
-        Commands::Doctor(ref args) => {
-            init_tracing(cli.verbose);
-            let (config, config_path) = if let Some(ref path) = cli.config {
-                (
-                    config::load_config_file(path, Some(args))?,
-                    Some(path.clone()),
-                )
-            } else if cli.profile.is_some() {
-                let path = resolve_config_path(&cli)?;
-                let config = config::load_config_file(&path, Some(args))?;
-                (config, Some(path))
-            } else {
-                let default = config::default_config_path();
-                if default.exists() {
-                    let config = config::load_config_file(&default, Some(args))?;
-                    (config, Some(default))
-                } else if !args.models.is_empty() {
-                    (config::build_simple_config(args)?, None)
-                } else {
-                    return Err("no config to validate; use --config or 'higgs init'".into());
-                }
-            };
-            let result = higgs::doctor::run_doctor(&config, config_path.as_deref()).await;
-            if result.failures > 0 {
+        Commands::Bench(ref args) => {
+            higgs::bench_command::run_bench(&cli, args).await?;
+            Ok(())
+        }
+        Commands::Selftest(ref args) => {
+            if !higgs::bench_command::run_selftest_command(&cli, args).await? {
                 std::process::exit(1);
             }
             Ok(())
         }
+        Commands::Doctor(ref args) => {
+            init_tracing(cli.verbose);
+            let exit_code =
+                higgs::doctor::run_doctor_command(resolve_doctor_source(&cli, args)?, args).await;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Where `doctor` and `config check` read the configuration from.
+fn resolve_doctor_source(
+    cli: &Cli,
+    args: &ServeArgs,
+) -> Result<higgs::doctor::ConfigSource, Box<dyn std::error::Error>> {
+    use higgs::doctor::ConfigSource;
+    if let Some(ref path) = cli.config {
+        return Ok(ConfigSource::File(path.clone()));
+    }
+    if cli.profile.is_some() {
+        return Ok(ConfigSource::File(resolve_config_path(cli)?));
+    }
+    let default = config::default_config_path();
+    if default.exists() {
+        Ok(ConfigSource::File(default))
+    } else if !args.models.is_empty() {
+        Ok(ConfigSource::Flags)
+    } else {
+        Err("no config to validate; use --config or 'higgs init'".into())
     }
 }
 
@@ -145,20 +161,44 @@ fn resolve_config_path(cli: &Cli) -> Result<std::path::PathBuf, Box<dyn std::err
     }
 }
 
+/// Find the server for `shellenv` and `exec`: the flags, else the config file when one
+/// exists, else the default serve address. An explicit `--config` or `--profile` must load.
+fn resolve_client_target(
+    cli: &Cli,
+    client: &config::ClientArgs,
+) -> Result<higgs::daemon::ClientTarget, Box<dyn std::error::Error>> {
+    let flags_given = client.url.is_some() || client.port.is_some();
+    let explicit_config = cli.config.is_some() || cli.profile.is_some();
+    let config = if flags_given {
+        None
+    } else if explicit_config || config::default_config_path().exists() {
+        Some(load_config_for_command(cli)?)
+    } else {
+        None
+    };
+    higgs::daemon::resolve_client_target(
+        config.as_ref(),
+        &config::Environment::process(),
+        client.url.as_deref(),
+        client.port,
+    )
+    .map_err(Into::into)
+}
+
 /// Load config from CLI path or default location.
 fn load_config_for_command(cli: &Cli) -> Result<HiggsConfig, Box<dyn std::error::Error>> {
     let path = resolve_config_path(cli)?;
     config::load_config_file(&path, None).map_err(Into::into)
 }
 
-async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
-    init_tracing(cli.verbose);
-
-    let profile = cli.profile.as_deref();
-    let simple_mode = config::is_simple_mode(cli, args);
-
-    // Load config: simple mode (--model) or config file mode (--config)
-    let mut higgs_config = if simple_mode {
+/// Load the configuration `serve` runs with: from flags alone (simple mode), a chosen file or
+/// profile, or the default file.
+fn load_serve_config(
+    cli: &Cli,
+    args: &ServeArgs,
+    simple_mode: bool,
+) -> Result<HiggsConfig, Box<dyn std::error::Error>> {
+    Ok(if simple_mode {
         config::build_simple_config(args)?
     } else if let Some(ref path) = cli.config {
         config::load_config_file(path, Some(args))?
@@ -176,38 +216,65 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
         }
     } else {
         config::build_simple_config(args)?
-    };
+    })
+}
+
+async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing(cli.verbose);
+    if args.private_model.is_some() {
+        higgs::bench_command::exit_when_parent_closes_stdin();
+    }
+
+    let profile = cli.profile.as_deref();
+    let simple_mode = config::is_simple_mode(cli, args);
+
+    let mut higgs_config = load_serve_config(cli, args, simple_mode)?;
 
     // Rewrite metrics path for profile isolation if still at default
     if let Some(name) = profile {
         let default_path = config::default_metrics_log_path_for_profile(name);
         let generic_default = MetricsLogConfig::default().path;
-        if higgs_config.logging.metrics.path == generic_default {
-            higgs_config.logging.metrics.path = default_path;
+        if higgs_config.observability.metrics_log.path == generic_default {
+            higgs_config.observability.metrics_log.path = default_path;
         }
     }
 
+    if let Some(selector) = &args.private_model {
+        let api_key =
+            std::env::var(higgs::bench_command::PRIVATE_API_KEY_VARIABLE).map_err(|_| {
+                format!(
+                    "{} is not set",
+                    higgs::bench_command::PRIVATE_API_KEY_VARIABLE
+                )
+            })?;
+        higgs::bench_command::isolate_for_measurement(&mut higgs_config, selector, api_key)?;
+    }
+
+    log_config_notices(&higgs_config);
     ensure_local_runtime_ready(&higgs_config)?;
-    if higgs_config.local.raise_wired_limit && higgs_config.models.len() > 1 {
+    if higgs_config.memory.raise_wired_limit && higgs_config.models.len() > 1 {
         tracing::warn!(
             model_count = higgs_config.models.len(),
             "MLX wired-limit escalation is enabled with multiple resident local models; unified-memory pressure may spike"
         );
     }
 
-    // Load all local models and build router
-    let engines = load_engines(&higgs_config)?;
-    let router = Router::from_config(&higgs_config, engines)?;
+    // Models that load at startup are fetched and loaded before the server binds; the rest
+    // load when a request first routes to them.
+    download_missing_startup_models(&higgs_config)?;
+    let pool = engine_loader::build_pool(&higgs_config)?;
+    pool.load_startup_models().await?;
+    pool.spawn_idle_sweeper();
+    let router = Router::new(&higgs_config, pool)?;
 
-    // Validate timeout
-    let timeout_secs = higgs_config.server.timeout;
-    if !timeout_secs.is_finite() || timeout_secs <= 0.0 {
-        return Err("timeout must be a positive, finite number".into());
-    }
-
-    let api_key = higgs_config.server.api_key.clone();
+    let timeout_secs = higgs_config.server.request_timeout.as_secs_f64();
+    let api_key = higgs_config
+        .server
+        .api_key
+        .as_ref()
+        .map(|key| key.expose().to_owned());
     let rate_limit = higgs_config.server.rate_limit;
-    let max_body_size = higgs_config.server.max_body_size;
+    let max_body_size = usize::try_from(higgs_config.server.max_body_size.bytes())?;
     let cors_origins = higgs_config.server.cors_origins.clone();
     let bind_addr = format!("{}:{}", higgs_config.server.host, higgs_config.server.port);
 
@@ -222,11 +289,13 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
 
     // Create shared state
     let http_client = reqwest::Client::new();
+    let tools = Arc::new(higgs::tools::ToolHub::start(&higgs_config)?);
     let shared_state = Arc::new(AppState {
         router,
         config: higgs_config,
         http_client,
         metrics,
+        tools: Arc::clone(&tools),
     });
 
     // Build router with middleware
@@ -244,7 +313,9 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
 
     // Write PID file after bind succeeds so it's never stale on bind errors
-    higgs::daemon::write_pid_file(profile);
+    if args.private_model.is_none() {
+        higgs::daemon::write_pid_file(profile);
+    }
 
     axum::serve(
         listener,
@@ -253,77 +324,64 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
     .with_graceful_shutdown(higgs::daemon::await_shutdown_signal())
     .await?;
 
-    higgs::daemon::remove_pid_file(profile);
+    tools.shutdown().await;
+
+    if args.private_model.is_none() {
+        higgs::daemon::remove_pid_file(profile);
+    }
     Ok(())
 }
 
-fn load_engines(
-    config: &HiggsConfig,
-) -> Result<HashMap<String, Arc<Engine>>, Box<dyn std::error::Error>> {
-    let mut engines = HashMap::new();
+/// Say once, at startup, which keys are deprecated and which environment variables are in effect.
+fn log_config_notices(config: &HiggsConfig) {
+    for deprecation in &config.notices.deprecations {
+        tracing::warn!("{deprecation}");
+    }
+    for entry in &config.notices.env_overrides {
+        if entry.applied {
+            tracing::info!(
+                variable = entry.variable,
+                key = entry.key,
+                "environment variable overrides the config key"
+            );
+        } else {
+            tracing::warn!(
+                variable = entry.variable,
+                key = entry.key,
+                "environment variable has a value that cannot be used and is ignored"
+            );
+        }
+    }
+}
 
-    for model_cfg in &config.models {
+fn download_missing_startup_models(config: &HiggsConfig) -> Result<(), Box<dyn std::error::Error>> {
+    for model_cfg in engine_loader::startup_models(config) {
         let model_path = &model_cfg.path;
         tracing::info!(model = %model_path, "Resolving model path");
-        let resolved = match model_resolver::resolve(model_path) {
-            Ok(path) => path,
+        match model_resolver::resolve(model_path) {
+            Ok(_) => {}
             Err(resolve_err) if model_resolver::is_hf_model_id(model_path) => {
                 tracing::debug!(error = %resolve_err, "model not in cache; attempting download");
                 let is_interactive = std::io::stdin().is_terminal();
+                // Locking stdin only to answer a prompt: without a terminal nothing is asked.
+                let input: Box<dyn std::io::BufRead> = if is_interactive {
+                    Box::new(std::io::stdin().lock())
+                } else {
+                    Box::new(std::io::empty())
+                };
                 model_download::offer_download(
                     model_path,
                     is_interactive,
                     &mut std::io::stderr().lock(),
-                    std::io::stdin().lock(),
+                    input,
                     || download_via_hf_cli(model_path),
                 )?;
-                model_resolver::resolve(model_path)?
+                model_resolver::resolve(model_path)?;
             }
             Err(err) => return Err(err.into()),
-        };
-
-        tracing::info!(model = %model_path, resolved = %resolved.display(), "Loading model");
-        if model_cfg.batch && !config::resolved_model_supports_batch(&resolved)? {
-            return Err(format!(
-                "batch=true is only supported for transformer models (llama, mistral, qwen2, qwen3); {model_path} is not supported"
-            )
-            .into());
-        }
-        let kv_cache_config = model_cfg.kv_cache_config();
-        let engine = if model_cfg.batch {
-            Engine::load_batch(
-                &resolved,
-                kv_cache_config,
-                config.local.raise_wired_limit,
-                model_cfg.prefill_yield_tokens,
-            )?
-        } else {
-            let tuning =
-                resolve_runtime_tuning(&resolved, model_cfg.requested_mlx_profile(&config.local));
-            Engine::load_simple(
-                &resolved,
-                kv_cache_config,
-                tuning,
-                config.local.raise_wired_limit,
-                model_cfg.kv_disk_dir.as_deref().map(std::path::Path::new),
-                model_cfg.kv_disk_space_mb.saturating_mul(1024 * 1024),
-            )?
-        };
-        let name = model_cfg
-            .name
-            .clone()
-            .unwrap_or_else(|| engine.model_name().to_owned());
-        tracing::info!(model_name = %name, "Model loaded");
-
-        if engines.insert(name.clone(), Arc::new(engine)).is_some() {
-            return Err(format!(
-                "model name collision: two model paths resolve to the same name '{name}'"
-            )
-            .into());
         }
     }
-
-    Ok(engines)
+    Ok(())
 }
 
 fn ensure_local_runtime_ready(config: &HiggsConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -452,6 +510,15 @@ fn cmd_config(cli: &Cli, action: &ConfigAction) {
             {
                 println!("{}", config_path.display());
             }
+        }
+        ConfigAction::Migrate { write } => {
+            higgs::cli_config::config_migrate(&config_path, *write);
+        }
+        ConfigAction::Explain { target, flags } => {
+            higgs::cli_config::config_explain(&config_path, flags, target.as_deref());
+        }
+        ConfigAction::Check => {
+            higgs::cli_config::config_check(&config_path);
         }
     }
 }

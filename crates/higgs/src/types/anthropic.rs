@@ -47,6 +47,20 @@ pub struct CreateMessageRequest {
     pub stop_sequences: Option<Vec<String>>,
     #[serde(default)]
     pub tools: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub thinking: Option<ThinkingConfig>,
+    /// `{"type": "auto" | "any" | "none"}` or `{"type": "tool", "name": …}`,
+    /// optionally with `disable_parallel_tool_use`.
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+}
+
+/// Anthropic `thinking` request parameter. Only `budget_tokens` is honored;
+/// whether the model reasons at all stays a server-side decision.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ThinkingConfig {
+    #[serde(default)]
+    pub budget_tokens: Option<u32>,
 }
 
 /// A message in the Anthropic format.
@@ -145,10 +159,28 @@ pub struct CreateMessageResponse {
     #[serde(rename = "type")]
     pub message_type: &'static str,
     pub role: &'static str,
-    pub content: Vec<ContentBlockResponse>,
+    pub content: Vec<ResponseContentBlock>,
     pub model: String,
     pub stop_reason: Option<String>,
     pub usage: AnthropicUsage,
+}
+
+/// A block of the response's `content`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum ResponseContentBlock {
+    Text(ContentBlockResponse),
+    ToolUse(ToolUseBlock),
+}
+
+/// The model asking the client to run a tool.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolUseBlock {
+    #[serde(rename = "type")]
+    pub block_type: &'static str,
+    pub id: String,
+    pub name: String,
+    pub input: serde_json::Value,
 }
 
 /// A content block in the response.
@@ -162,8 +194,12 @@ pub struct ContentBlockResponse {
 /// Anthropic usage stats.
 #[derive(Debug, Clone, Serialize)]
 pub struct AnthropicUsage {
+    /// Total prompt tokens, including those served from the prefix cache.
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Prompt tokens served from the prefix cache, when the engine reported it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u32>,
 }
 
 /// POST `/v1/messages/count_tokens` request.
@@ -271,6 +307,7 @@ mod tests {
         AnthropicUsage {
             input_tokens: input,
             output_tokens: output,
+            cache_read_input_tokens: None,
         }
     }
 
@@ -350,10 +387,10 @@ mod tests {
             id: "msg_123".to_owned(),
             message_type: "message",
             role: "assistant",
-            content: vec![ContentBlockResponse {
+            content: vec![ResponseContentBlock::Text(ContentBlockResponse {
                 block_type: "text",
                 text: "Hello!".to_owned(),
-            }],
+            })],
             model: "test".to_owned(),
             stop_reason: Some("end_turn".to_owned()),
             usage: make_usage(5, 1),
