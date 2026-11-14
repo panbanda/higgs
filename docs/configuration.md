@@ -501,6 +501,7 @@ If no server answers, the command fails and the message tells you to start `higg
 | `higgs start` | Start a background daemon from config or profile |
 | `higgs stop` | Stop a running daemon (`--force` escalates to `SIGKILL`) |
 | `higgs attach` | Open the daemon metrics dashboard |
+| `higgs ui` | Open the desktop app (macOS) |
 | `higgs init` | Create the default config file |
 | `higgs shellenv [--url URL \| --port PORT]` | Print `export` lines for `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` |
 | `higgs exec [--url URL \| --port PORT] -- <cmd>` | Set env vars and exec a command |
@@ -511,6 +512,8 @@ If no server answers, the command fails and the message tells you to start `higg
 | `higgs config explain [model]` | Show every resolved setting and its source |
 | `higgs config migrate [--write]` | Rewrite deprecated keys in the current schema |
 | `higgs doctor` | Validate config, model paths, and providers |
+| `higgs bench <model>` | Measure decode, prefill, prefix-cache and concurrency speed of one model on a private server; `--scenarios`, `--trials`, `--warmup`, `--max-tokens`, `--prefill-tokens`, `--prefix-cache-tokens`, `--concurrency`, `--json <path>` |
+| `higgs selftest <model>` | Check one model for correct output (chat, streaming, prefix cache, JSON schema, tool calls, concurrency); exits non-zero when a check fails |
 
 ### Global flags
 
@@ -572,12 +575,14 @@ grammar compiler; patterns whose automaton is very large take time and memory to
 
 ### Tool choice and seed
 
-`tool_choice` on `/v1/chat/completions` accepts `"auto"` (the default, also used when the
-field is absent or `null`) and `"none"`. With `"none"` the `tools` array is dropped before
-the prompt is rendered and the output is never parsed for tool calls, streaming or not.
-`"required"`, a named function (`{"type": "function", ...}`) and any other value return `400`;
-they are not silently treated as `"auto"`. Requests routed to a remote provider are forwarded
-untouched, so the provider interprets `tool_choice` itself.
+`tool_choice` accepts `"auto"` (the default, also used when the field is absent or `null`), `"none"`,
+`"required"`, and a named function (`{"type": "function", "function": {"name": "..."}}`). With `"none"` the
+`tools` array is dropped before the prompt is rendered and the output is never parsed for tool calls,
+streaming or not. `"required"` and a named function force a call with constrained decoding for the model
+families whose tool-call format allows it and return `400` for the others; see
+[tool-calling.md](tool-calling.md#tool_choice-and-parallel_tool_calls). Any other value returns `400`.
+Requests routed to a remote provider are forwarded untouched, so the provider interprets `tool_choice`
+itself.
 
 `seed` must be an integer when present but has no effect: MLX samples from a process-wide
 random key, and sampling happens in several decode paths (single, pipelined, batched), so a

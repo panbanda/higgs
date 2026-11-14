@@ -1,5 +1,7 @@
 # Higgs
 
+@AGENTS.md
+
 ## Project Structure
 
 - `crates/higgs/` -- main binary crate (config, router, doctor, daemon, CLI)
