@@ -352,7 +352,7 @@ An unknown key is an error, and the error suggests the correct key. For example,
 | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models` | OpenAI |
 | `/v1/responses` (streaming, stored responses) | OpenAI Responses, local models and OpenAI-format providers; [docs/responses.md](docs/responses.md) |
 | `/v1/messages`, `/v1/messages/count_tokens` | Anthropic |
-| `/v1/tokenize`, `/v1/detokenize` | llama.cpp style, local models |
+| `/v1/tokenize`, `/v1/detokenize` | Tokenizer, local models only |
 | `/v1/models/{id}/load`, `/v1/models/{id}/unload`, `/v1/models/status` | Higgs model lifecycle |
 | `/v1/mcp/servers`, `/v1/mcp/tools`, `/v1/mcp/execute` | Higgs MCP client; [docs/mcp.md](docs/mcp.md) |
 | `/v1/web/search`, `/v1/web/fetch` | Higgs; off by default |
