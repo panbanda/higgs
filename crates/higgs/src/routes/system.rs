@@ -45,6 +45,8 @@ pub struct LoadedModel {
     pub path: Option<String>,
     pub mlx_profile: Option<String>,
     pub kv_cache: Option<String>,
+    /// Prompts the prefix cache keeps; `0` means the cache is off.
+    pub prefix_cache_entries: Option<u32>,
     /// Name, state, engine kind and the rest of what `/v1/models/status` reports.
     #[serde(flatten)]
     pub status: ModelStatus,
@@ -65,6 +67,7 @@ pub async fn system(State(state): State<SharedState>) -> Json<SystemResponse> {
                 path: configured.map(|m| m.path.clone()),
                 mlx_profile: configured.map(|m| m.profile.as_str().to_owned()),
                 kv_cache: configured.and_then(|m| serialized_name(&m.kv_cache.mode)),
+                prefix_cache_entries: configured.map(|m| m.prefix_cache.max_entries),
                 status,
             }
         })

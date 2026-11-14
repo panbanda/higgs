@@ -27,6 +27,7 @@ struct Behavior {
     report_cached_tokens: bool,
     engine: &'static str,
     render_tools: bool,
+    prefix_cache_entries: u64,
     seen_prompts: Arc<Mutex<Vec<String>>>,
 }
 
@@ -36,6 +37,7 @@ impl Behavior {
             report_cached_tokens: true,
             engine: "batched",
             render_tools: true,
+            prefix_cache_entries: 8,
             seen_prompts: Arc::default(),
         }
     }
@@ -142,6 +144,7 @@ async fn chat(State(behavior): State<Behavior>, Json(body): Json<Value>) -> Resp
 
 async fn start(behavior: Behavior) -> String {
     let engine = behavior.engine;
+    let entries = behavior.prefix_cache_entries;
     let app =
         Router::new()
             .route("/health", get(|| async { "ok" }))
@@ -153,6 +156,12 @@ async fn start(behavior: Behavior) -> String {
                 "/v1/models/status",
                 get(move || async move {
                     Json(json!({ "data": [{ "name": "mock", "engine": engine }] }))
+                }),
+            )
+            .route(
+                "/v1/system",
+                get(move || async move {
+                    Json(json!({ "models": [{ "name": "mock", "prefix_cache_entries": entries }] }))
                 }),
             )
             .route("/v1/chat/completions", post(chat))
@@ -202,6 +211,24 @@ mod tests {
             );
         }
         assert_eq!(results.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn the_prefix_check_skips_when_the_cache_is_off() {
+        let behavior = Behavior {
+            report_cached_tokens: false,
+            prefix_cache_entries: 0,
+            ..Behavior::healthy()
+        };
+        let endpoint = endpoint(start(behavior).await);
+        let facts = ModelFacts::discover(&endpoint, "mock").await;
+        assert_eq!(facts.prefix_cache_entries, Some(0));
+        let results = run_selftest(&endpoint, &facts, &|_| {}).await;
+        assert!(!has_failures(&results), "{results:?}");
+        assert!(matches!(
+            outcome_of(&results, "prefix cache hit"),
+            Outcome::Skip(reason) if reason.contains("prefix cache is off")
+        ));
     }
 
     #[tokio::test]

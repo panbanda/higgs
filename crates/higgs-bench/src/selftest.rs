@@ -59,27 +59,37 @@ pub struct CheckResult {
 pub struct ModelFacts {
     /// `batched` or `sequential` as reported by `/v1/models/status`, when known.
     pub decode_engine: Option<String>,
+    /// Prompts the prefix cache keeps, as reported by `/v1/system`; `Some(0)` means it is off.
+    pub prefix_cache_entries: Option<u64>,
 }
 
 impl ModelFacts {
-    /// Reads the decode engine kind of the model the server lists as `listed_name` from
-    /// `/v1/models/status`.
+    /// Reads what the server reports about the model it lists as `listed_name`, from
+    /// `/v1/models/status` and `/v1/system`. Anything it does not report stays unknown.
     pub async fn discover(endpoint: &Endpoint, listed_name: &str) -> Self {
+        let entry_of = |body: Value, list: &str, key: &str| {
+            body.get(list)?
+                .as_array()?
+                .iter()
+                .find(|entry| entry.get(key).and_then(Value::as_str) == Some(listed_name))
+                .cloned()
+        };
         let decode_engine = endpoint
             .get_json("/v1/models/status")
             .await
             .ok()
-            .and_then(|status| {
-                status
-                    .get("data")?
-                    .as_array()?
-                    .iter()
-                    .find(|entry| entry.get("name").and_then(Value::as_str) == Some(listed_name))?
-                    .get("engine")?
-                    .as_str()
-                    .map(str::to_owned)
-            });
-        Self { decode_engine }
+            .and_then(|status| entry_of(status, "data", "name"))
+            .and_then(|entry| entry.get("engine")?.as_str().map(str::to_owned));
+        let prefix_cache_entries = endpoint
+            .get_json("/v1/system")
+            .await
+            .ok()
+            .and_then(|system| entry_of(system, "models", "name"))
+            .and_then(|entry| entry.get("prefix_cache_entries")?.as_u64());
+        Self {
+            decode_engine,
+            prefix_cache_entries,
+        }
     }
 }
 
@@ -173,7 +183,12 @@ async fn check_stream_matches_non_stream(endpoint: &Endpoint) -> Result<Outcome>
     )))
 }
 
-async fn check_prefix_cache(endpoint: &Endpoint) -> Result<Outcome> {
+async fn check_prefix_cache(endpoint: &Endpoint, facts: &ModelFacts) -> Result<Outcome> {
+    if facts.prefix_cache_entries == Some(0) {
+        return Ok(Outcome::Skip(
+            "the prefix cache is off (max_entries = 0)".to_owned(),
+        ));
+    }
     let prompt = format!(
         "Reference {}.\n\n{}\n\nSummarize the text above in one sentence.",
         fresh_nonce(),
@@ -647,7 +662,7 @@ pub async fn run_selftest(
         )
         .await,
     );
-    record(timed("prefix cache hit", check_prefix_cache(endpoint)).await);
+    record(timed("prefix cache hit", check_prefix_cache(endpoint, facts)).await);
     record(timed("json schema", check_json_schema(endpoint)).await);
     record(timed("forced tool call", check_tool_call(endpoint)).await);
     record(timed("concurrent requests", check_concurrent(endpoint)).await);

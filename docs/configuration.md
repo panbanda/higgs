@@ -399,7 +399,7 @@ All use the same authentication as the rest of the API. None of them count as tr
 | `POST /v1/models/{id}/load` | Load the model if needed and return its status. `503` if the load fails or is refused, `404` for an unknown model |
 | `POST /v1/models/{id}/unload` | Unload the model and return its status. `409` while requests are in flight |
 | `POST /v1/models/{id}/unload?force=true` | Stop handing out the model, wait for in-flight requests to finish (streams are not cut), then unload |
-| `GET /v1/system` | Process and memory facts plus the same per-model fields for every configured model |
+| `GET /v1/system` | Process and memory facts plus the same per-model fields for every configured model, with `path`, `mlx_profile`, `kv_cache` and `prefix_cache_entries` (the prefix cache's `max_entries`; `0` means off) |
 
 Unloading a model that is already unloaded succeeds. Unloading a model that is loading or unloading returns `409`.
 
