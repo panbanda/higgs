@@ -42,14 +42,24 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// The logprob data of one generated token.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenLogprob {
+    pub token: String,
+    /// Logprobs of the most likely alternatives, highest first.
+    pub top: Vec<f64>,
+}
+
 /// A non-streaming reply.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Completion {
     pub content: String,
     pub reasoning: String,
     pub finish_reason: Option<String>,
     pub usage: UsageReport,
     pub tool_calls: Vec<ToolCall>,
+    /// Per-token logprobs; empty unless the request asked for them and the server sent them.
+    pub token_logprobs: Vec<TokenLogprob>,
 }
 
 impl Completion {
@@ -99,6 +109,38 @@ pub fn parse_completion(body: &Value) -> Result<Completion> {
                 .collect()
         })
         .unwrap_or_default();
+    let token_logprobs = body
+        .pointer("/choices/0/logprobs/content")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| {
+                    let mut top: Vec<f64> = entry
+                        .get("top_logprobs")
+                        .and_then(Value::as_array)
+                        .map(|alternatives| {
+                            alternatives
+                                .iter()
+                                .filter_map(|alternative| {
+                                    alternative.get("logprob").and_then(Value::as_f64)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    top.sort_by(|left, right| right.total_cmp(left));
+                    TokenLogprob {
+                        token: entry
+                            .get("token")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        top,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let count = |pointer: &str| {
         body.pointer(pointer)
             .and_then(Value::as_u64)
@@ -117,6 +159,7 @@ pub fn parse_completion(body: &Value) -> Result<Completion> {
             cached_tokens: count("/usage/prompt_tokens_details/cached_tokens"),
         },
         tool_calls,
+        token_logprobs,
     })
 }
 
@@ -308,6 +351,28 @@ mod tests {
             }]
         );
         assert_eq!(completion.usage, UsageReport::default());
+        Ok(())
+    }
+
+    #[test]
+    fn parses_token_logprobs_with_alternatives_sorted() -> Result<()> {
+        let completion = parse_completion(&json!({
+            "choices": [{
+                "message": {"content": "ab"},
+                "logprobs": {"content": [
+                    {"token": "a", "logprob": -0.1, "top_logprobs": [
+                        {"token": "b", "logprob": -2.0}, {"token": "a", "logprob": -0.1}]},
+                    {"token": "b", "logprob": -0.3, "top_logprobs": []}
+                ]}
+            }]
+        }))?;
+        assert_eq!(completion.token_logprobs.len(), 2);
+        let tokens = &completion.token_logprobs;
+        assert_eq!(
+            tokens.first().map(|token| token.top.clone()),
+            Some(vec![-0.1, -2.0])
+        );
+        assert_eq!(tokens.get(1).map(|token| token.token.as_str()), Some("b"));
         Ok(())
     }
 

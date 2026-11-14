@@ -12,11 +12,14 @@ use anyhow::{Context, Result};
 use futures::future::try_join;
 use serde_json::{Value, json};
 
-use crate::client::{Completion, Endpoint};
+use crate::client::{Completion, Endpoint, TokenLogprob};
 use crate::compare::{build_prompt_body, fresh_nonce};
 
 /// Tokens compared between a solo and a batched run; longer outputs may diverge legitimately.
 const BATCH_COMPARE_TOKENS: u32 = 16;
+/// A batched run may differ from the solo run only where the solo run's best token beat the
+/// runner-up by less than this many nats, since half-precision rounding can flip a near tie.
+pub const NEAR_TIE_NATS: f64 = 0.5;
 const SHORT_REPLY_TOKENS: u32 = 48;
 const PREFIX_PROMPT_TOKENS: usize = 300;
 const TOOL_NAME: &str = "get_weather";
@@ -371,11 +374,13 @@ async fn check_batched_matches_solo(endpoint: &Endpoint, facts: &ModelFacts) -> 
             ));
         }
     }
-    let subject = chat_body(
+    let with_logprobs =
+        |body: Value| with_fields(body, &json!({ "logprobs": true, "top_logprobs": 2 }));
+    let subject = with_logprobs(chat_body(
         endpoint.model(),
         "Count from one to twenty in words.",
         BATCH_COMPARE_TOKENS,
-    );
+    ));
     let companion = chat_body(
         endpoint.model(),
         "Write one sentence about the sea.",
@@ -392,16 +397,72 @@ async fn check_batched_matches_solo(endpoint: &Endpoint, facts: &ModelFacts) -> 
     if let Some(problem) = reply_problem(&other) {
         return Ok(Outcome::Fail(format!("companion request: {problem}")));
     }
-    if solo.full_text() != batched.full_text() {
-        return Ok(Outcome::Fail(format!(
-            "solo gave {:?}, batched gave {:?}",
-            solo.full_text(),
-            batched.full_text()
-        )));
+    Ok(match compare_with_solo(&solo, &batched) {
+        Comparison::Identical => Outcome::Pass(format!(
+            "{BATCH_COMPARE_TOKENS} tokens identical alone and batched"
+        )),
+        Comparison::NearTie { index, gap } => Outcome::Pass(format!(
+            "identical until token {index}, then diverged on a near tie (gap {gap:.2})"
+        )),
+        Comparison::Different(detail) => Outcome::Fail(detail),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Comparison {
+    Identical,
+    NearTie { index: usize, gap: f64 },
+    Different(String),
+}
+
+/// Margin of the best token over the runner-up at a position, when the server reported both.
+fn margin(token: &TokenLogprob) -> Option<f64> {
+    match token.top.as_slice() {
+        [best, runner_up, ..] => Some(best - runner_up),
+        [] | [_] => None,
     }
-    Ok(Outcome::Pass(format!(
-        "{BATCH_COMPARE_TOKENS} tokens identical alone and batched"
-    )))
+}
+
+/// Compares a batched reply with the solo one token by token. Without logprobs it falls back to
+/// requiring identical text.
+fn compare_with_solo(solo: &Completion, batched: &Completion) -> Comparison {
+    if solo.token_logprobs.is_empty() || batched.token_logprobs.is_empty() {
+        return if solo.full_text() == batched.full_text() {
+            Comparison::Identical
+        } else {
+            Comparison::Different(format!(
+                "solo gave {:?}, batched gave {:?}",
+                solo.full_text(),
+                batched.full_text()
+            ))
+        };
+    }
+    let pairs = solo.token_logprobs.iter().zip(&batched.token_logprobs);
+    for (index, (alone, together)) in pairs.enumerate() {
+        if alone.token == together.token {
+            continue;
+        }
+        return match margin(alone) {
+            Some(gap) if gap < NEAR_TIE_NATS => Comparison::NearTie { index, gap },
+            Some(gap) => Comparison::Different(format!(
+                "diverged at token {index} where the solo margin was {gap:.2} nats: solo {:?}, batched {:?}",
+                alone.token, together.token
+            )),
+            None => Comparison::Different(format!(
+                "diverged at token {index} with no runner-up reported: solo {:?}, batched {:?}",
+                alone.token, together.token
+            )),
+        };
+    }
+    if solo.token_logprobs.len() == batched.token_logprobs.len() {
+        Comparison::Identical
+    } else {
+        Comparison::Different(format!(
+            "solo produced {} tokens, batched {}",
+            solo.token_logprobs.len(),
+            batched.token_logprobs.len()
+        ))
+    }
 }
 
 /// The first way `value` fails to satisfy `schema`, for the schema keywords the self-test uses:
@@ -591,6 +652,78 @@ mod tests {
         assert!(
             schema_violation(&schema, &json!([1, "x"])).is_some_and(|text| text.starts_with("[1]"))
         );
+    }
+
+    fn run(tokens: &[(&str, &[f64])]) -> Completion {
+        Completion {
+            content: String::new(),
+            reasoning: String::new(),
+            finish_reason: None,
+            usage: crate::compare::UsageReport::default(),
+            tool_calls: Vec::new(),
+            token_logprobs: tokens
+                .iter()
+                .map(|(token, top)| TokenLogprob {
+                    token: (*token).to_owned(),
+                    top: top.to_vec(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_divergence_on_a_near_tie_is_accepted_and_a_clear_one_is_not() {
+        let solo = run(&[
+            ("a", &[-0.1, -3.0]),
+            ("b", &[-0.5, -0.62]),
+            ("c", &[-0.1, -2.0]),
+        ]);
+        let same = run(&[
+            ("a", &[-0.1, -3.0]),
+            ("b", &[-0.5, -0.62]),
+            ("c", &[-0.1, -2.0]),
+        ]);
+        assert_eq!(compare_with_solo(&solo, &same), Comparison::Identical);
+
+        let flipped = run(&[
+            ("a", &[-0.1, -3.0]),
+            ("x", &[-0.6, -0.5]),
+            ("y", &[-1.0, -2.0]),
+        ]);
+        assert!(matches!(
+            compare_with_solo(&solo, &flipped),
+            Comparison::NearTie { index: 1, gap } if (gap - 0.12).abs() < 1e-9
+        ));
+
+        let wrong_early = run(&[("z", &[-0.2, -0.3]), ("b", &[-0.5, -0.62])]);
+        assert!(matches!(
+            compare_with_solo(&solo, &wrong_early),
+            Comparison::Different(detail) if detail.contains("token 0")
+        ));
+    }
+
+    #[test]
+    fn missing_logprobs_fall_back_to_exact_text() {
+        let mut solo = run(&[]);
+        solo.content = "same".to_owned();
+        let mut batched = run(&[]);
+        batched.content = "same".to_owned();
+        assert_eq!(compare_with_solo(&solo, &batched), Comparison::Identical);
+        batched.content = "different".to_owned();
+        assert!(matches!(
+            compare_with_solo(&solo, &batched),
+            Comparison::Different(_)
+        ));
+    }
+
+    #[test]
+    fn a_length_difference_without_divergence_fails() {
+        let solo = run(&[("a", &[-0.1, -3.0]), ("b", &[-0.1, -3.0])]);
+        let short = run(&[("a", &[-0.1, -3.0])]);
+        assert!(matches!(
+            compare_with_solo(&solo, &short),
+            Comparison::Different(_)
+        ));
     }
 
     fn result(name: &'static str, outcome: Outcome) -> CheckResult {
