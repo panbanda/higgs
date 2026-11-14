@@ -460,7 +460,9 @@ fn chat_chunk_stream(
                     }
                 }
                 GenerationEvent::ToolLoop(progress) => {
-                    yield vendor_chunk(&request_id, created, &model, &progress);
+                    if let Some(chunk) = vendor_chunk(&request_id, created, &model, &progress) {
+                        yield chunk;
+                    }
                 }
                 GenerationEvent::Error(message) => {
                     yield serde_json::json!({
@@ -480,7 +482,7 @@ const TOOL_LOOP_KEY: &str = "higgs_mcp";
 
 /// A chunk with no choices that announces tool-loop progress. Standard
 /// clients ignore it, as they do usage chunks.
-fn vendor_chunk(id: &str, created: i64, model: &str, progress: &ToolLoopEvent) -> String {
+fn vendor_chunk(id: &str, created: i64, model: &str, progress: &ToolLoopEvent) -> Option<String> {
     let payload = match progress {
         ToolLoopEvent::Call {
             round,
@@ -508,6 +510,7 @@ fn vendor_chunk(id: &str, created: i64, model: &str, progress: &ToolLoopEvent) -
             "is_error": is_error,
             "content": content,
         }),
+        ToolLoopEvent::Messages(_) => return None,
         ToolLoopEvent::Summary(summary) => {
             let mut payload = summary.clone();
             if let Some(object) = payload.as_object_mut() {
@@ -516,15 +519,17 @@ fn vendor_chunk(id: &str, created: i64, model: &str, progress: &ToolLoopEvent) -
             payload
         }
     };
-    serde_json::json!({
-        "id": id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [],
-        TOOL_LOOP_KEY: payload,
-    })
-    .to_string()
+    Some(
+        serde_json::json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [],
+            TOOL_LOOP_KEY: payload,
+        })
+        .to_string(),
+    )
 }
 
 fn build_sampling_params(req: &ChatCompletionRequest) -> SamplingParams {
@@ -923,6 +928,35 @@ mod tests {
             let call = &recorded_calls(&engine)[0];
             assert!(!call.thinking_enabled);
             assert_eq!(call.thinking_budget, None);
+        }
+
+        #[tokio::test]
+        async fn a_failed_stream_ends_with_an_error_frame_then_done() {
+            let mut stub = stub_with_tokenizer();
+            stub.script.stream = vec![
+                token_event("par", 1, None),
+                crate::test_support::failure_event(),
+            ];
+            let (status, body, _engine) =
+                post_chat(stub, &serde_json::json!({"stream": true})).await;
+
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            let frames: Vec<&str> = body
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .collect();
+            assert_eq!(frames.last(), Some(&"[DONE]"), "{body}");
+            let error: serde_json::Value = serde_json::from_str(frames[frames.len() - 2]).unwrap();
+            assert_eq!(error["error"]["type"], "server_error", "{body}");
+            assert!(!body.contains("\"finish_reason\":\"error\""), "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_failed_generation_is_an_http_error_when_not_streaming() {
+            let (status, body, _engine) =
+                post_chat(stub_with_tokenizer(), &serde_json::json!({})).await;
+
+            assert_eq!(status, http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
         }
 
         fn tools_json() -> serde_json::Value {

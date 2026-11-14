@@ -24,7 +24,9 @@ use crate::router::RoutingMethod;
 use crate::state::SharedState;
 use crate::types::openai::CompletionUsage;
 
-pub use event::{Completed, EventStream, GeneratedToolCall, GenerationEvent, ToolLoopEvent};
+pub use event::{
+    Completed, EventStream, GeneratedToolCall, GenerationEvent, LoopMessage, ToolLoopEvent,
+};
 pub use request::{ChatPrompt, GenerationRequest, Prompt};
 pub use stream::StreamMetrics;
 

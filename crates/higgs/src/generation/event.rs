@@ -54,6 +54,22 @@ pub enum ToolLoopEvent {
         content: String,
     },
     Summary(Value),
+    /// What the loop added to the conversation, sent once before the summary.
+    Messages(Vec<LoopMessage>),
+}
+
+/// A message the tool loop appended to the conversation.
+#[derive(Debug, Clone)]
+pub enum LoopMessage {
+    /// An assistant turn that called server-side tools.
+    AssistantCalls {
+        text: String,
+        calls: Vec<GeneratedToolCall>,
+    },
+    ToolResult {
+        call_id: String,
+        content: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +105,9 @@ pub struct Completed {
     pub logprobs: Option<ChoiceLogprobs>,
     /// What the server-side tool loop did, when it ran tools.
     pub tool_loop: Option<Value>,
+    /// The messages the tool loop appended, for a caller that stores the
+    /// conversation.
+    pub loop_messages: Vec<LoopMessage>,
 }
 
 pub type EventStream = Pin<Box<dyn Stream<Item = GenerationEvent> + Send>>;

@@ -18,6 +18,9 @@ use crate::router::RoutingMethod;
 use crate::types::openai::ChoiceLogprobs;
 use crate::usage::{TokenCounts, build_usage, count_text_tokens};
 
+/// The finish reason the engine gives a generation that failed in its worker.
+const ENGINE_FAILURE_FINISH_REASON: &str = "error";
+
 /// Where a streamed generation reports its progress for the metrics page.
 #[derive(Clone)]
 pub struct StreamMetrics {
@@ -82,6 +85,13 @@ pub(super) fn stream_once(
             if timing.ttft_ms.is_none() {
                 timing.ttft_ms =
                     Some(u64::try_from(received_at.elapsed().as_millis()).unwrap_or(u64::MAX));
+            }
+            if output.finish_reason.as_deref() == Some(ENGINE_FAILURE_FINISH_REASON) {
+                if let Some((store, id)) = pending_metrics {
+                    store.finalize_stream(id, u64::from(output_tokens), received_at.elapsed(), timing);
+                }
+                yield GenerationEvent::Error("generation failed in the engine".to_owned());
+                return;
             }
             output_tokens = output.completion_tokens;
             for event in assembler.push(&output) {

@@ -504,6 +504,11 @@ pub fn token_event(
     }
 }
 
+/// The terminal event an engine sends when its worker failed mid-generation.
+pub fn failure_event() -> StreamingOutput {
+    token_event("", 0, Some("error"))
+}
+
 pub fn progress_event(cached: u32, total: u32) -> StreamingOutput {
     StreamingOutput {
         new_text: String::new(),

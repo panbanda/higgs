@@ -232,12 +232,19 @@ fn completion_chunk_stream(
                         }
                     }
                 }
+                GenerationEvent::Error(message) => {
+                    yield Ok(Event::default().data(
+                        serde_json::json!({
+                            "error": {"message": message, "type": "server_error"}
+                        })
+                        .to_string(),
+                    ));
+                }
                 GenerationEvent::Started { .. }
                 | GenerationEvent::PrefillProgress(_)
                 | GenerationEvent::ReasoningDelta(_)
                 | GenerationEvent::ToolCall(_)
-                | GenerationEvent::ToolLoop(_)
-                | GenerationEvent::Error(_) => {}
+                | GenerationEvent::ToolLoop(_) => {}
             }
         }
 
@@ -405,5 +412,31 @@ mod tests {
             matches!(first, Ok(Some(_))),
             "the first chunk must not wait for a second event"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_stream_ends_with_an_error_frame_then_done() {
+        let mut stub = stub();
+        stub.script.stream = vec![
+            token_event("par", 1, None),
+            crate::test_support::failure_event(),
+        ];
+        let (app, _engine) = app_with_stub(stub);
+
+        let (status, text) = post_json(
+            &app,
+            "/v1/completions",
+            &body(&serde_json::json!({"stream": true})),
+        )
+        .await;
+
+        assert_eq!(status, http::StatusCode::OK, "{text}");
+        let frames: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .collect();
+        assert_eq!(frames.last(), Some(&"[DONE]"), "{text}");
+        let error: serde_json::Value = serde_json::from_str(frames[frames.len() - 2]).unwrap();
+        assert_eq!(error["error"]["type"], "server_error", "{text}");
     }
 }

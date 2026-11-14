@@ -18,14 +18,15 @@ use crate::{
     backend::EngineLease,
     config::ApiFormat,
     error::{ErrorDetail, ErrorResponse, ServerError},
-    generation::{EventStream, StreamMetrics},
+    generation::{EventStream, GenerationEvent, StreamMetrics, ToolLoopEvent},
     metrics::{RequestMetricsContext, RequestRecord, RequestTiming},
     responses::{
         store::{ResponseStore, StoredResponse},
         stream::ResponseStreamBuilder,
         translate::{
-            ResponseContext, build_generation_request, outcome_from_completed,
-            output_to_input_items, parse_input, reject_unsupported_fields, routing_messages,
+            ResponseContext, build_generation_request, loop_messages_to_input_items,
+            outcome_from_completed, output_to_input_items, parse_input, reject_unsupported_fields,
+            routing_messages,
         },
     },
     router::ResolvedRoute,
@@ -249,7 +250,7 @@ async fn create_local_response(
     }
 
     let start = Instant::now();
-    let completed =
+    let mut completed =
         crate::generation::complete(Arc::clone(&state), generation, engine, received_at).await?;
     if let Some(ref metrics) = state.metrics {
         crate::generation::record_completion(
@@ -261,8 +262,10 @@ async fn create_local_response(
         );
         request_metrics.mark_recorded();
     }
+    let loop_messages = std::mem::take(&mut completed.loop_messages);
     let object = context.object(outcome_from_completed(completed));
     if let Some(response_store) = store_response {
+        conversation.extend(loop_messages_to_input_items(&loop_messages));
         store_completed(&response_store, &object, conversation);
     }
     Ok(Json(object).into_response())
@@ -325,10 +328,11 @@ fn response_event_stream(
     mut generated: EventStream,
     context: ResponseContext,
     store: Option<Arc<ResponseStore>>,
-    conversation: Vec<InputItem>,
+    mut conversation: Vec<InputItem>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
         let mut builder = ResponseStreamBuilder::new(context);
+        let mut loop_messages = Vec::new();
         for event in builder.start() {
             if let Some(frame) = sse_event(&event) {
                 yield Ok(frame);
@@ -336,6 +340,10 @@ fn response_event_stream(
         }
 
         while let Some(generation_event) = generated.next().await {
+            if let GenerationEvent::ToolLoop(ToolLoopEvent::Messages(messages)) = generation_event {
+                loop_messages = messages;
+                continue;
+            }
             for event in builder.ingest(generation_event) {
                 if let Some(frame) = sse_event(&event) {
                     yield Ok(frame);
@@ -345,6 +353,7 @@ fn response_event_stream(
 
         let finish = builder.finish();
         if let Some(ref response_store) = store {
+            conversation.extend(loop_messages_to_input_items(&loop_messages));
             store_completed(response_store, &finish.response, conversation);
         }
         for event in finish.events {
@@ -642,5 +651,141 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].status, 400);
         assert_eq!(records[0].model.as_deref(), Some(STUB_MODEL));
+    }
+
+    #[tokio::test]
+    async fn a_failed_stream_ends_with_response_failed_and_is_not_stored() {
+        use crate::test_support::{failure_event, post_json, sse_json_events, token_event};
+
+        let mut stub = StubEngine::named("stub");
+        stub.script.stream = vec![token_event("par", 1, None), failure_event()];
+        let (app, _engine) = crate::test_support::app_with_stub(stub);
+
+        let (status, text) = post_json(
+            &app,
+            "/v1/responses",
+            &json!({"model": "stub", "input": "hi", "stream": true}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let events = sse_json_events(&text);
+        let last = events.last().unwrap();
+        assert_eq!(last["type"], "response.failed", "{text}");
+        assert_eq!(last["response"]["status"], "failed");
+        assert_eq!(
+            last["response"]["error"]["message"],
+            "generation failed in the engine"
+        );
+        let id = last["response"]["id"].as_str().unwrap();
+        let (follow_up, _) = post(
+            &app,
+            &json!({"model": "stub", "input": "again", "previous_response_id": id}),
+        )
+        .await;
+        assert_eq!(follow_up, StatusCode::NOT_FOUND);
+    }
+
+    const CALL_ECHO: &str =
+        r#"<tool_call>{"name": "files__echo", "arguments": {"text": "hi"}}</tool_call>"#;
+
+    async fn tool_loop_app(configure: impl FnOnce(&mut StubEngine)) -> (axum::Router, StubEngine) {
+        use crate::mcp::testing::{CallBehavior, FakeMcp, ready_manager, text_result};
+
+        let fake = FakeMcp::new(&["echo"]);
+        fake.on_call("echo", CallBehavior::Reply(text_result("pong")));
+        let hub = crate::tools::ToolHub::new(
+            ready_manager(vec![("files", fake, Duration::from_secs(2))], 1).await,
+            crate::web::WebService::disabled(),
+        );
+        let mut stub = StubEngine::named("stub");
+        stub.script.prompt_tokens = vec![1, 2, 3];
+        configure(&mut stub);
+        crate::test_support::app_with_stub_config_and_tools(stub, "", hub)
+    }
+
+    fn last_prompt_has_tool_result(engine: &StubEngine, expected: &str) -> bool {
+        engine
+            .recorded_prompt_messages()
+            .last()
+            .is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|(role, content)| role == "tool" && content.contains(expected))
+            })
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_sees_tool_results_from_the_stored_non_streaming_response() {
+        let (app, engine) = tool_loop_app(|stub| {
+            stub.script.generations = vec![
+                crate::test_support::generation_output(CALL_ECHO, 5, 3),
+                crate::test_support::generation_output("The answer is pong", 5, 3),
+                crate::test_support::generation_output("noted", 5, 3),
+            ];
+        })
+        .await;
+        let (first_status, first) = post(
+            &app,
+            &json!({"model": "stub", "input": "use the tool", "mcp": {"enabled": true}}),
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::OK, "{first}");
+        let id = first["id"].as_str().unwrap();
+
+        let (second_status, second) = post(
+            &app,
+            &json!({"model": "stub", "input": "thanks", "previous_response_id": id}),
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::OK, "{second}");
+        assert!(
+            last_prompt_has_tool_result(&engine, "pong"),
+            "{:?}",
+            engine.recorded_prompt_messages()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_sees_tool_results_from_the_stored_streaming_response() {
+        use crate::test_support::{post_json, sse_json_events, token_event};
+
+        let (app, engine) = tool_loop_app(|stub| {
+            stub.script.streams = vec![
+                vec![
+                    token_event("Let me check. ", 3, None),
+                    token_event(CALL_ECHO, 12, Some("stop")),
+                ],
+                vec![token_event("Final answer", 5, Some("stop"))],
+                vec![token_event("noted", 2, Some("stop"))],
+            ];
+        })
+        .await;
+        let (first_status, first_text) = post_json(
+            &app,
+            "/v1/responses",
+            &json!({"model": "stub", "input": "use the tool", "stream": true,
+                    "mcp": {"enabled": true}}),
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::OK, "{first_text}");
+        let id = sse_json_events(&first_text)
+            .iter()
+            .find_map(|event| event.pointer("/response/id")?.as_str().map(str::to_owned))
+            .unwrap();
+
+        let (second_status, second_text) = post_json(
+            &app,
+            "/v1/responses",
+            &json!({"model": "stub", "input": "thanks", "stream": true,
+                    "previous_response_id": id}),
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::OK, "{second_text}");
+        assert!(
+            last_prompt_has_tool_result(&engine, "pong"),
+            "{:?}",
+            engine.recorded_prompt_messages()
+        );
     }
 }

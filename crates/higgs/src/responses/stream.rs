@@ -35,6 +35,8 @@ pub struct ResponseStreamBuilder {
     /// From prefill progress; superseded by the usage figure.
     cached_tokens: Option<u32>,
     reasoning_tokens: Option<u32>,
+    /// Why generation failed, when it did.
+    failure: Option<String>,
 }
 
 impl ResponseStreamBuilder {
@@ -48,6 +50,7 @@ impl ResponseStreamBuilder {
             usage: None,
             cached_tokens: None,
             reasoning_tokens: None,
+            failure: None,
         }
     }
 
@@ -104,9 +107,8 @@ impl ResponseStreamBuilder {
                 }
             }
             GenerationEvent::Finish { reason, .. } => self.finish_reason = Some(reason),
-            GenerationEvent::Started { .. }
-            | GenerationEvent::ToolLoop(_)
-            | GenerationEvent::Error(_) => {}
+            GenerationEvent::Error(message) => self.failure = Some(message),
+            GenerationEvent::Started { .. } | GenerationEvent::ToolLoop(_) => {}
         }
         events
     }
@@ -342,10 +344,13 @@ impl ResponseStreamBuilder {
     /// mid-stream, which is reported as `response.failed`.
     pub fn finish(mut self) -> StreamFinish {
         let mut events = Vec::new();
-        let (status, incomplete_reason) = self
-            .finish_reason
-            .as_deref()
-            .map_or((ResponseStatus::Failed, None), status_for_finish_reason);
+        let (status, incomplete_reason) = if self.failure.is_some() {
+            (ResponseStatus::Failed, None)
+        } else {
+            self.finish_reason
+                .as_deref()
+                .map_or((ResponseStatus::Failed, None), status_for_finish_reason)
+        };
         let item_status = if status == ResponseStatus::Incomplete {
             ResponseStatus::Incomplete
         } else {
@@ -371,7 +376,10 @@ impl ResponseStreamBuilder {
         });
         let error = (status == ResponseStatus::Failed).then(|| ResponseError {
             code: "server_error".to_owned(),
-            message: "generation ended before the response completed".to_owned(),
+            message: self
+                .failure
+                .take()
+                .unwrap_or_else(|| "generation ended before the response completed".to_owned()),
         });
         let response = self.context.object(Outcome {
             status,

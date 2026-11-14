@@ -404,10 +404,19 @@ fn message_event_stream(
                         .prompt_tokens_details
                         .map(|details| details.cached_tokens);
                 }
+                GenerationEvent::Error(message) => {
+                    yield Ok(Event::default().event("error").data(
+                        serde_json::json!({
+                            "type": "error",
+                            "error": {"type": "api_error", "message": message},
+                        })
+                        .to_string(),
+                    ));
+                    return;
+                }
                 GenerationEvent::PrefillProgress(_)
                 | GenerationEvent::ReasoningDelta(_)
-                | GenerationEvent::ToolLoop(_)
-                | GenerationEvent::Error(_) => {}
+                | GenerationEvent::ToolLoop(_) => {}
             }
         }
 
@@ -655,5 +664,22 @@ mod tests {
             "{text}"
         );
         assert!(engine.recorded_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_stream_ends_with_an_error_event_and_no_message_stop() {
+        let mut stub = StubEngine::named("stub");
+        stub.script.stream = vec![
+            token_event("par", 1, None),
+            crate::test_support::failure_event(),
+        ];
+        let (app, _engine) = app_with_stub(stub);
+
+        let (status, text) = post_json(&app, "/v1/messages", &body(true)).await;
+
+        assert_eq!(status, http::StatusCode::OK, "{text}");
+        assert!(text.contains("event: error"), "{text}");
+        assert!(text.contains("\"type\":\"api_error\""), "{text}");
+        assert!(!text.contains("message_stop"), "{text}");
     }
 }

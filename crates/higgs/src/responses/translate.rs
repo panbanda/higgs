@@ -8,7 +8,7 @@ use higgs_models::SamplingParams;
 use crate::constraint::ConstraintSpec;
 use crate::error::ServerError;
 use crate::generation::messages::prompt_messages;
-use crate::generation::{ChatPrompt, Completed, GenerationRequest, Prompt};
+use crate::generation::{ChatPrompt, Completed, GenerationRequest, LoopMessage, Prompt};
 use crate::tool_choice::ToolChoice;
 use crate::tool_policy::ToolPolicy;
 use crate::types::openai::{
@@ -715,6 +715,36 @@ pub fn chat_messages_to_input_items(messages: &[ChatCompletionMessage]) -> Vec<I
     items
 }
 
+/// The conversation items for what a server-side tool loop appended:
+/// assistant turns (text, then each tool call) and tool results.
+pub fn loop_messages_to_input_items(messages: &[LoopMessage]) -> Vec<InputItem> {
+    let mut items = Vec::new();
+    for message in messages {
+        match message {
+            LoopMessage::AssistantCalls { text, calls } => {
+                if !text.is_empty() {
+                    items.push(InputItem::Message {
+                        role: "assistant".to_owned(),
+                        content: vec![InputContent::Text(text.clone())],
+                    });
+                }
+                items.extend(calls.iter().map(|call| InputItem::FunctionCall {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.to_string(),
+                }));
+            }
+            LoopMessage::ToolResult { call_id, content } => {
+                items.push(InputItem::FunctionCallOutput {
+                    call_id: call_id.clone(),
+                    output: content.clone(),
+                });
+            }
+        }
+    }
+    items
+}
+
 /// Best-effort `role`/`content` view of the input for model auto-routing,
 /// which runs before strict validation (a remote provider may understand
 /// items that local translation rejects).
@@ -1197,6 +1227,7 @@ mod tests {
             usage: CompletionUsage::new(usage.0, usage.1),
             logprobs: None,
             tool_loop: None,
+            loop_messages: Vec::new(),
         }
     }
 

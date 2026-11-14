@@ -95,6 +95,7 @@ fn assemble(
         ),
         logprobs,
         tool_loop: None,
+        loop_messages: Vec::new(),
     }
 }
 

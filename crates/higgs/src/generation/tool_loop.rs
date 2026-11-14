@@ -21,7 +21,9 @@ use tokio_stream::StreamExt;
 
 use super::GenerationRequest;
 use super::complete::complete_once;
-use super::event::{Completed, EventStream, GeneratedToolCall, GenerationEvent, ToolLoopEvent};
+use super::event::{
+    Completed, EventStream, GeneratedToolCall, GenerationEvent, LoopMessage, ToolLoopEvent,
+};
 use super::messages::{template_tool_call, wire_tool_call};
 use super::stream::{StreamMetrics, stream_once};
 use crate::{
@@ -269,6 +271,7 @@ struct Trace {
     calls: Vec<Value>,
     rounds: u32,
     truncated: bool,
+    messages: Vec<LoopMessage>,
 }
 
 impl Trace {
@@ -288,6 +291,20 @@ impl Trace {
             "truncated": self.truncated,
             "tool_calls": self.calls,
         })
+    }
+
+    fn record_assistant(&mut self, text: String, calls: &[GeneratedToolCall]) {
+        self.messages.push(LoopMessage::AssistantCalls {
+            text,
+            calls: calls.to_vec(),
+        });
+    }
+
+    fn record_result(&mut self, call: &ExecutedCall) {
+        self.messages.push(LoopMessage::ToolResult {
+            call_id: call.id.clone(),
+            content: call.content.clone(),
+        });
     }
 
     const fn ran_tools(&self) -> bool {
@@ -335,23 +352,25 @@ pub(super) async fn complete(
 
         let (server_calls, client_calls) = split_calls(completed.tool_calls.clone(), &plan.names);
         if server_calls.is_empty() {
-            return Ok(finish(completed, &trace));
+            return Ok(finish(completed, trace));
         }
         let exhausted = round == plan.max_iterations;
         if !client_calls.is_empty() {
             completed.tool_calls = client_calls;
-            return Ok(finish(completed, &trace));
+            return Ok(finish(completed, trace));
         }
         if exhausted {
             trace.truncated = true;
-            return Ok(finish(completed, &trace));
+            return Ok(finish(completed, trace));
         }
 
         trace.rounds += 1;
+        trace.record_assistant(completed.text.clone(), &server_calls);
         extend_conversation(&mut conversation, completed.text, &server_calls);
         for call in &server_calls {
             let executed = execute_call(&state, call).await;
             trace.record(trace.rounds, &executed);
+            trace.record_result(&executed);
             push_tool_result(&mut conversation, &executed);
         }
     }
@@ -360,10 +379,11 @@ pub(super) async fn complete(
     ))
 }
 
-fn finish(mut completed: Completed, trace: &Trace) -> Completed {
+fn finish(mut completed: Completed, trace: Trace) -> Completed {
     if trace.ran_tools() {
         completed.tool_loop = Some(trace.to_value());
     }
+    completed.loop_messages = trace.messages;
     completed
 }
 
@@ -378,6 +398,8 @@ struct RoundState {
     next_call_index: u32,
     held_finish: Option<GenerationEvent>,
     held_usage: Option<CompletionUsage>,
+    /// The round ended with an error, which also ends the loop.
+    failed: bool,
 }
 
 impl RoundState {
@@ -417,12 +439,15 @@ impl RoundState {
                 self.next_call_index += 1;
                 Some(GenerationEvent::ToolCall(renumbered))
             }
+            GenerationEvent::Error(_) => {
+                self.failed = true;
+                Some(event)
+            }
             GenerationEvent::Started { .. } if self.later_round => None,
             GenerationEvent::Started { .. }
             | GenerationEvent::PrefillProgress(_)
             | GenerationEvent::ReasoningDelta(_)
-            | GenerationEvent::ToolLoop(_)
-            | GenerationEvent::Error(_) => Some(event),
+            | GenerationEvent::ToolLoop(_) => Some(event),
         }
     }
 }
@@ -501,6 +526,9 @@ pub(super) fn stream(
             if let Some(usage) = state_of_round.held_usage.take() {
                 merge_usage(&mut usage_total, usage);
             }
+            if state_of_round.failed {
+                break 'rounds;
+            }
             let run_tools = !state_of_round.server_calls.is_empty()
                 && !state_of_round.client_call_forwarded
                 && !final_round;
@@ -520,11 +548,9 @@ pub(super) fn stream(
             round += 1;
             trace.rounds = round;
             let calls = std::mem::take(&mut state_of_round.server_calls);
-            extend_conversation(
-                &mut conversation,
-                std::mem::take(&mut state_of_round.text),
-                &calls,
-            );
+            let text = std::mem::take(&mut state_of_round.text);
+            trace.record_assistant(text.clone(), &calls);
+            extend_conversation(&mut conversation, text, &calls);
             for call in &calls {
                 yield GenerationEvent::ToolLoop(ToolLoopEvent::Call {
                     round,
@@ -534,6 +560,7 @@ pub(super) fn stream(
                 });
                 let executed = execute_call(&state, call).await;
                 trace.record(round, &executed);
+                trace.record_result(&executed);
                 yield GenerationEvent::ToolLoop(ToolLoopEvent::Result {
                     round,
                     id: executed.id.clone(),
@@ -549,6 +576,7 @@ pub(super) fn stream(
             yield GenerationEvent::Usage(usage);
         }
         if trace.ran_tools() {
+            yield GenerationEvent::ToolLoop(ToolLoopEvent::Messages(trace.messages.clone()));
             yield GenerationEvent::ToolLoop(ToolLoopEvent::Summary(trace.to_value()));
         }
     })
