@@ -376,20 +376,25 @@ async fn check_batched_matches_solo(endpoint: &Endpoint, facts: &ModelFacts) -> 
             ));
         }
     }
-    let with_logprobs =
-        |body: Value| with_fields(body, &json!({ "logprobs": true, "top_logprobs": 2 }));
-    let subject = with_logprobs(chat_body(
+    let subject = chat_body(
         endpoint.model(),
         "Count from one to twenty in words.",
         BATCH_COMPARE_TOKENS,
-    ));
+    );
     let companion = chat_body(
         endpoint.model(),
         "Write one sentence about the sea.",
         BATCH_COMPARE_TOKENS,
     );
-    // The first solo run fills the prefix cache so the compared runs are both warm.
-    endpoint.complete_body(&subject).await?;
+    // Requests with logprobs never join a batched pass, so the compared runs send none. A
+    // separate run with logprobs supplies the margins that tell a near tie from a real fault, and
+    // fills the prefix cache so the compared runs are both warm.
+    let reference = endpoint
+        .complete_body(&with_fields(
+            subject.clone(),
+            &json!({ "logprobs": true, "top_logprobs": 2 }),
+        ))
+        .await?;
     let solo = endpoint.complete_body(&subject).await?;
     let (batched, other) = try_join(
         endpoint.complete_body(&subject),
@@ -399,15 +404,17 @@ async fn check_batched_matches_solo(endpoint: &Endpoint, facts: &ModelFacts) -> 
     if let Some(problem) = reply_problem(&other) {
         return Ok(Outcome::Fail(format!("companion request: {problem}")));
     }
-    Ok(match compare_with_solo(&solo, &batched) {
-        Comparison::Identical => Outcome::Pass(format!(
-            "{BATCH_COMPARE_TOKENS} tokens identical alone and batched"
-        )),
-        Comparison::NearTie { index, gap } => Outcome::Pass(format!(
-            "identical until token {index}, then diverged on a near tie (gap {gap:.2})"
-        )),
-        Comparison::Different(detail) => Outcome::Fail(detail),
-    })
+    Ok(
+        match compare_texts(&reference, &solo.full_text(), &batched.full_text()) {
+            Comparison::Identical => Outcome::Pass(format!(
+                "{BATCH_COMPARE_TOKENS} tokens identical alone and batched"
+            )),
+            Comparison::NearTie { index, gap } => Outcome::Pass(format!(
+                "identical until token {index}, then diverged on a near tie (gap {gap:.2})"
+            )),
+            Comparison::Different(detail) => Outcome::Fail(detail),
+        },
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -425,46 +432,50 @@ fn margin(token: &TokenLogprob) -> Option<f64> {
     }
 }
 
-/// Compares a batched reply with the solo one token by token. Without logprobs it falls back to
-/// requiring identical text.
-fn compare_with_solo(solo: &Completion, batched: &Completion) -> Comparison {
-    if solo.token_logprobs.is_empty() || batched.token_logprobs.is_empty() {
-        return if solo.full_text() == batched.full_text() {
-            Comparison::Identical
-        } else {
-            Comparison::Different(format!(
-                "solo gave {:?}, batched gave {:?}",
-                solo.full_text(),
-                batched.full_text()
-            ))
-        };
+/// Compares the batched text with the solo text. A difference is accepted only where the
+/// `reference` run (the same request with logprobs) shows a margin under `NEAR_TIE_NATS` for the
+/// token at the first differing position.
+fn compare_texts(reference: &Completion, solo: &str, batched: &str) -> Comparison {
+    if solo == batched {
+        return Comparison::Identical;
     }
-    let pairs = solo.token_logprobs.iter().zip(&batched.token_logprobs);
-    for (index, (alone, together)) in pairs.enumerate() {
-        if alone.token == together.token {
-            continue;
+    let offset = solo
+        .char_indices()
+        .zip(batched.chars())
+        .find(|((_, alone), together)| alone != together)
+        .map_or_else(|| solo.len().min(batched.len()), |((index, _), _)| index);
+    let describe = || format!("solo gave {solo:?}, batched gave {batched:?}");
+    let agrees = solo
+        .get(..offset)
+        .is_some_and(|prefix| reference.full_text().starts_with(prefix));
+    if !agrees {
+        return Comparison::Different(format!(
+            "texts differ at byte {offset}, which the logprob reference does not cover: {}",
+            describe()
+        ));
+    }
+    let mut start = 0;
+    for (index, token) in reference.token_logprobs.iter().enumerate() {
+        let end = start + token.token.len();
+        if offset < end {
+            return match margin(token) {
+                Some(gap) if gap < NEAR_TIE_NATS => Comparison::NearTie { index, gap },
+                Some(gap) => Comparison::Different(format!(
+                    "diverged at token {index} where the solo margin was {gap:.2} nats: {}",
+                    describe()
+                )),
+                None => Comparison::Different(format!(
+                    "diverged at token {index} with no runner-up reported: {}",
+                    describe()
+                )),
+            };
         }
-        return match margin(alone) {
-            Some(gap) if gap < NEAR_TIE_NATS => Comparison::NearTie { index, gap },
-            Some(gap) => Comparison::Different(format!(
-                "diverged at token {index} where the solo margin was {gap:.2} nats: solo {:?}, batched {:?}",
-                alone.token, together.token
-            )),
-            None => Comparison::Different(format!(
-                "diverged at token {index} with no runner-up reported: solo {:?}, batched {:?}",
-                alone.token, together.token
-            )),
-        };
+        start = end;
     }
-    if solo.token_logprobs.len() == batched.token_logprobs.len() {
-        Comparison::Identical
-    } else {
-        Comparison::Different(format!(
-            "solo produced {} tokens, batched {}",
-            solo.token_logprobs.len(),
-            batched.token_logprobs.len()
-        ))
-    }
+    Comparison::Different(format!(
+        "texts differ at byte {offset}, past the reference tokens: {}",
+        describe()
+    ))
 }
 
 /// The first way `value` fails to satisfy `schema`, for the schema keywords the self-test uses:
@@ -658,7 +669,7 @@ mod tests {
 
     fn run(tokens: &[(&str, &[f64])]) -> Completion {
         Completion {
-            content: String::new(),
+            content: tokens.iter().map(|(token, _)| *token).collect(),
             reasoning: String::new(),
             finish_reason: None,
             usage: crate::compare::UsageReport::default(),
@@ -675,56 +686,35 @@ mod tests {
 
     #[test]
     fn a_divergence_on_a_near_tie_is_accepted_and_a_clear_one_is_not() {
-        let solo = run(&[
+        let reference = run(&[
             ("a", &[-0.1, -3.0]),
             ("b", &[-0.5, -0.62]),
             ("c", &[-0.1, -2.0]),
         ]);
-        let same = run(&[
-            ("a", &[-0.1, -3.0]),
-            ("b", &[-0.5, -0.62]),
-            ("c", &[-0.1, -2.0]),
-        ]);
-        assert_eq!(compare_with_solo(&solo, &same), Comparison::Identical);
-
-        let flipped = run(&[
-            ("a", &[-0.1, -3.0]),
-            ("x", &[-0.6, -0.5]),
-            ("y", &[-1.0, -2.0]),
-        ]);
+        assert_eq!(
+            compare_texts(&reference, "abc", "abc"),
+            Comparison::Identical
+        );
         assert!(matches!(
-            compare_with_solo(&solo, &flipped),
+            compare_texts(&reference, "abc", "axy"),
             Comparison::NearTie { index: 1, gap } if (gap - 0.12).abs() < 1e-9
         ));
-
-        let wrong_early = run(&[("z", &[-0.2, -0.3]), ("b", &[-0.5, -0.62])]);
         assert!(matches!(
-            compare_with_solo(&solo, &wrong_early),
+            compare_texts(&reference, "abc", "zbc"),
             Comparison::Different(detail) if detail.contains("token 0")
         ));
     }
 
     #[test]
-    fn missing_logprobs_fall_back_to_exact_text() {
-        let mut solo = run(&[]);
-        solo.content = "same".to_owned();
-        let mut batched = run(&[]);
-        batched.content = "same".to_owned();
-        assert_eq!(compare_with_solo(&solo, &batched), Comparison::Identical);
-        batched.content = "different".to_owned();
+    fn a_difference_the_reference_does_not_cover_fails() {
+        let reference = run(&[("a", &[-0.1, -3.0]), ("b", &[-0.5, -0.52])]);
         assert!(matches!(
-            compare_with_solo(&solo, &batched),
-            Comparison::Different(_)
+            compare_texts(&reference, "xyz1", "xyz2"),
+            Comparison::Different(detail) if detail.contains("does not cover")
         ));
-    }
-
-    #[test]
-    fn a_length_difference_without_divergence_fails() {
-        let solo = run(&[("a", &[-0.1, -3.0]), ("b", &[-0.1, -3.0])]);
-        let short = run(&[("a", &[-0.1, -3.0])]);
         assert!(matches!(
-            compare_with_solo(&solo, &short),
-            Comparison::Different(_)
+            compare_texts(&reference, "ab", "abcd"),
+            Comparison::Different(detail) if detail.contains("past the reference")
         ));
     }
 
