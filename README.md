@@ -41,30 +41,13 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model":"mlx-community/Llama-3.2-1B-Instruct-4bit","messages":[{"role":"user","content":"Write one sentence about Cape Town."}]}'
 ```
 
-4. To use the model from Claude Code, save this file as `higgs.toml`:
-
-```toml
-[[models]]
-path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
-name = "local"
-
-[[routes]]
-match = "claude-.*"
-provider = "higgs"
-model = "local"
-```
-
-5. Stop the server from step 2. Start the server again with the file, and keep it running:
+4. To use the model from Claude Code, start Claude Code through Higgs in the second terminal:
 
 ```bash
-higgs --config higgs.toml serve
+ANTHROPIC_AUTH_TOKEN=higgs higgs exec -- claude
 ```
 
-6. In the second terminal, start Claude Code through Higgs:
-
-```bash
-ANTHROPIC_AUTH_TOKEN=higgs higgs --config higgs.toml exec -- claude
-```
+`higgs exec` finds the server on `127.0.0.1:8000`, unless a config file sets another address. If the server uses another port, add `--port <port>`. The server answers every model name with its one model. This works only while the server has one local model and no routes or providers. For more than one model, use a config file with routes. See the [Claude Code recipe](#use-it-from-claude-code).
 
 This 1B model is small, so the first run is fast. It is too small for good agent work. Choose a larger model for daily use. See [which model to start with](#which-model-should-i-start-with).
 
@@ -130,16 +113,38 @@ The numbers come from an Apple M4 Max with 128 GB. The [Performance](#performanc
 
 ## Recipes
 
-Each recipe is complete on its own. The commands `higgs exec`, `higgs shellenv` and `higgs doctor` read a config file. Create `~/.config/higgs/config.toml` with `higgs init` and edit it, or write your own file.
+Each recipe is complete on its own. A recipe with a config file needs `~/.config/higgs/config.toml`. Create it with `higgs init` and edit it, or pass your own file with `--config`.
 
 ### Use it from Claude Code
 
-Claude Code requests model names that Higgs does not know. This config serves one local model and sends each `claude-*` name to it:
+Claude Code sends model names such as `claude-sonnet-4-5`. A server with one local model and no routes or providers answers every name with that model.
+
+1. Start the server in one terminal:
+
+```bash
+higgs serve --model mlx-community/Qwen3.6-35B-A3B-4bit
+```
+
+2. In a second terminal, run Claude Code through Higgs:
+
+```bash
+ANTHROPIC_AUTH_TOKEN=higgs higgs exec -- claude
+```
+
+`higgs exec` finds the server and prints its address on stderr. It sets `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL`, then runs the command. `eval "$(higgs shellenv)"` exports the same variables into your shell. Both commands accept `--port <port>` or `--url <url>` for a server that is not on `127.0.0.1:8000`. Both methods work with Aider and with any other tool that reads these variables. Choose a model that calls tools well. Small models often fail with agent prompts.
+
+#### Several models
+
+With a second model, a route, or a provider, the server returns `model_not_found` for an unknown name. Add a route that sends each `claude-*` name to a local model:
 
 ```toml
 [[models]]
 path = "mlx-community/Qwen3.6-35B-A3B-4bit"
 name = "qwen"
+
+[[models]]
+path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
+name = "llama"
 
 [[routes]]
 match = "claude-.*"
@@ -147,14 +152,7 @@ provider = "higgs"      # the local models
 model = "qwen"          # rewrite the requested name
 ```
 
-1. Start the server in one terminal with `higgs serve`.
-2. In a second terminal, run Claude Code through Higgs:
-
-```bash
-ANTHROPIC_AUTH_TOKEN=higgs higgs exec -- claude
-```
-
-`higgs exec` checks that the server is reachable. It sets `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL`, then runs the command. `eval "$(higgs shellenv)"` exports the same variables into your shell. Both methods work with Aider and with any other tool that reads these variables. Choose a model that calls tools well. Small models often fail with agent prompts.
+Save the file as `higgs.toml`. Start the server with `higgs --config higgs.toml serve`. Then run `higgs --config higgs.toml exec -- claude`. Without `--config`, Higgs reads `~/.config/higgs/config.toml` when that file exists.
 
 ### Use it from the OpenAI SDK or any OpenAI client
 
@@ -372,8 +370,8 @@ An unknown key is an error, and the error suggests the correct key. For example,
 | `higgs doctor` | Validate config, model paths and providers |
 | `higgs config check\|explain\|migrate` | Validate a file, show where each value comes from, rewrite an old file |
 | `higgs config get\|set\|path` | Read or write a value, print the config path |
-| `higgs shellenv` | Print `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` after checking the server is reachable |
-| `higgs exec -- <cmd>` | Run a command with those variables set |
+| `higgs shellenv [--url URL \| --port PORT]` | Print `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` after checking the server is reachable |
+| `higgs exec [--url URL \| --port PORT] -- <cmd>` | Run a command with those variables set |
 | `higgs bench <model>` | Measure decode, prefill, prefix-cache and concurrency speed of one model on a private server |
 | `higgs selftest <model>` | Check one model for correct output: chat, streaming, prefix cache, JSON schema, tool calls and concurrency. Exits non-zero when a check fails |
 
@@ -441,11 +439,11 @@ The server needs `mlx.metallib` next to the executable. Release archives and Hom
 
 ### My request returns `model_not_found`.
 
-The `model` field must contain a name that the server knows. Use the configured `name`, one of its `aliases`, or the name that `GET /v1/models` shows. A name that matches no model and no route goes to `routing.default`. To support the names that other clients send, add `aliases` or a route with a `model` rewrite. The Claude Code recipe shows a route.
+A server with exactly one local model, no `[[routes]]` and no providers answers every model name with that model. Higgs writes one log line for each new name. With two or more local models, or with any route or provider, the server is strict. Then the `model` field must contain a name that the server knows. Use the configured `name`, one of its `aliases`, or the name that `GET /v1/models` shows. A name that matches no model and no route goes to `routing.default`. To support the names that other clients send, add `aliases` or a route with a `model` rewrite. The Claude Code recipe shows a route.
 
-### `higgs shellenv` or `higgs exec` says there is no model or provider.
+### `higgs shellenv` or `higgs exec` says that no server answers.
 
-These commands read a config file. They do not read `serve` flags. Run `higgs init` and add a `[[models]]` entry, or pass `--config <file>`. Then start the server with `higgs serve` or `higgs start`, so that the command can reach it.
+These commands need a running server. Start one with `higgs serve --model <id>` or `higgs start`. Without a flag, the commands use the address in your config file. If you have no config file, they use `127.0.0.1:8000`. For a server on another address, pass `--url http://HOST:PORT` or `--port <port>`. Use only one of these two flags.
 
 ### A model with thinking returns an empty answer.
 
