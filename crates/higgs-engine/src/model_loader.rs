@@ -80,8 +80,8 @@ pub fn derive_model_name(model_dir: &Path) -> String {
             if snapshots.to_string_lossy() == "snapshots" {
                 let gp_name = grandparent
                     .file_name()
-                    .map(|n| n.to_string_lossy())
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+                    .to_string_lossy();
                 if let Some(rest) = gp_name.strip_prefix("models--") {
                     // "org--model-name" -> "org/model-name"
                     if let Some(sep) = rest.find("--") {

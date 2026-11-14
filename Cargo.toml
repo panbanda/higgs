@@ -118,7 +118,6 @@ futures = "0.3"
 
 # Daemon + TUI
 nix = { version = "0.31", features = ["signal", "process"] }
-ctrlc = "3"
 ratatui = "0.30"
 crossterm = "0.29"
 

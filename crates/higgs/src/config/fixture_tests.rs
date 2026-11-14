@@ -215,7 +215,7 @@ fn migrated_files_load_without_deprecations_and_mean_the_same_thing() {
                 format!("{}{TEMPLATE_MODEL}", migration.text),
             )
         } else {
-            (original, migration.text.clone())
+            (original, migration.text)
         };
         let before = load_text(&before_text, &Environment::default());
         let after = load_text(&after_text, &Environment::default());

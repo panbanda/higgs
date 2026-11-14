@@ -2111,7 +2111,7 @@ mod tests {
         for dim in [4, 8, 32, 64, 128] {
             let original = random_vector(dim, 99);
             let norm_before = l2_norm(&original);
-            let mut x = original.clone();
+            let mut x = original;
             fwht_normalized(&mut x);
             let norm_after = l2_norm(&x);
             assert!(

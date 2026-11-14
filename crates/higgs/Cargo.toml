@@ -3,6 +3,7 @@ name = "higgs"
 version = "1.8.2"
 description = "OpenAI and Anthropic-compatible inference server for Apple Silicon, built on mlx-rs"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -43,7 +44,6 @@ http.workspace = true
 futures.workspace = true
 toml_edit.workspace = true
 nix.workspace = true
-ctrlc.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 
