@@ -931,6 +931,35 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_constrained_request_does_not_think() {
+            let extra = serde_json::json!({
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "answer", "schema": {
+                        "type": "object",
+                        "properties": {"a": {"type": "integer"}},
+                        "required": ["a"],
+                    }},
+                },
+            });
+            let mut stub = thinking_stub();
+            stub.tokenizer = crate::test_support::char_tokenizer();
+            stub.script.generation = Some(generation_output(r#"{"a":1}"#, 5, 5));
+            let (status, body, engine) = post_chat(stub, &extra).await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            let call = &recorded_calls(&engine)[0];
+            assert!(call.has_constraint);
+            assert!(!call.thinking_enabled);
+        }
+
+        #[tokio::test]
+        async fn an_unconstrained_request_still_thinks() {
+            let (status, _body, engine) = post_chat(thinking_stub(), &serde_json::json!({})).await;
+            assert_eq!(status, http::StatusCode::OK);
+            assert!(recorded_calls(&engine)[0].thinking_enabled);
+        }
+
+        #[tokio::test]
         async fn a_failed_stream_ends_with_an_error_frame_then_done() {
             let mut stub = stub_with_tokenizer();
             stub.script.stream = vec![

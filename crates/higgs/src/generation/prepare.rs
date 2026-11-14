@@ -51,12 +51,16 @@ fn prepare_chat(
         .tool_policy
         .forced_constraint(&chat.tools, tool_format)?;
     let constraint_spec = combine_constraints(request.constraint.clone(), forced)?;
-    let thinking_enabled = crate::reasoning::thinking_enabled_for_request(
-        engine,
-        &chat.tool_policy,
-        &request.model,
-        chat.reasoning.as_ref(),
-    );
+    // The engine applies a constraint from the first generated token, which a
+    // thinking prompt has already opened a `<think>` block for: the constrained
+    // output would land in the reasoning and the answer would be empty.
+    let thinking_enabled = constraint_spec.is_none()
+        && crate::reasoning::thinking_enabled_for_request(
+            engine,
+            &chat.tool_policy,
+            &request.model,
+            chat.reasoning.as_ref(),
+        );
 
     let mut prompt_tokens = engine
         .prepare_chat_prompt(&chat.messages, tools, thinking_enabled)
