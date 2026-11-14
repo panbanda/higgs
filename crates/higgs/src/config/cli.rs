@@ -251,6 +251,11 @@ pub struct ServeArgs {
     #[arg(long = "model", action = clap::ArgAction::Append)]
     pub models: Vec<String>,
 
+    /// Serve only this configured model, without daemon bookkeeping. Used by `bench` and
+    /// `selftest` for their private server.
+    #[arg(long, hide = true, value_name = "MODEL")]
+    pub private_model: Option<String>,
+
     /// Host to bind the server to.
     #[arg(long)]
     pub host: Option<String>,

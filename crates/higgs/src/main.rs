@@ -161,14 +161,14 @@ fn load_config_for_command(cli: &Cli) -> Result<HiggsConfig, Box<dyn std::error:
     config::load_config_file(&path, None).map_err(Into::into)
 }
 
-async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
-    init_tracing(cli.verbose);
-
-    let profile = cli.profile.as_deref();
-    let simple_mode = config::is_simple_mode(cli, args);
-
-    // Load config: simple mode (--model) or config file mode (--config)
-    let mut higgs_config = if simple_mode {
+/// Load the configuration `serve` runs with: from flags alone (simple mode), a chosen file or
+/// profile, or the default file.
+fn load_serve_config(
+    cli: &Cli,
+    args: &ServeArgs,
+    simple_mode: bool,
+) -> Result<HiggsConfig, Box<dyn std::error::Error>> {
+    Ok(if simple_mode {
         config::build_simple_config(args)?
     } else if let Some(ref path) = cli.config {
         config::load_config_file(path, Some(args))?
@@ -186,7 +186,16 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
         }
     } else {
         config::build_simple_config(args)?
-    };
+    })
+}
+
+async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing(cli.verbose);
+
+    let profile = cli.profile.as_deref();
+    let simple_mode = config::is_simple_mode(cli, args);
+
+    let mut higgs_config = load_serve_config(cli, args, simple_mode)?;
 
     // Rewrite metrics path for profile isolation if still at default
     if let Some(name) = profile {
@@ -195,6 +204,17 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
         if higgs_config.observability.metrics_log.path == generic_default {
             higgs_config.observability.metrics_log.path = default_path;
         }
+    }
+
+    if let Some(selector) = &args.private_model {
+        let api_key =
+            std::env::var(higgs::bench_command::PRIVATE_API_KEY_VARIABLE).map_err(|_| {
+                format!(
+                    "{} is not set",
+                    higgs::bench_command::PRIVATE_API_KEY_VARIABLE
+                )
+            })?;
+        higgs::bench_command::isolate_for_measurement(&mut higgs_config, selector, api_key)?;
     }
 
     log_config_notices(&higgs_config);
@@ -260,7 +280,9 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
 
     // Write PID file after bind succeeds so it's never stale on bind errors
-    higgs::daemon::write_pid_file(profile);
+    if args.private_model.is_none() {
+        higgs::daemon::write_pid_file(profile);
+    }
 
     axum::serve(
         listener,
@@ -271,7 +293,9 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
 
     tools.shutdown().await;
 
-    higgs::daemon::remove_pid_file(profile);
+    if args.private_model.is_none() {
+        higgs::daemon::remove_pid_file(profile);
+    }
     Ok(())
 }
 

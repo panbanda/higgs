@@ -274,6 +274,12 @@ higgs selftest ~/models/Qwen3-1.7B-4bit
 higgs --config config.toml bench my-model     # serve the model as configured
 ```
 
+With `--config` or `--profile`, the argument names a model in the file by its name, an alias or its
+path. The private server keeps only that model. It loads the model at startup, even when the file
+sets `load = "on_demand"`, so `--load-timeout` covers the load. It does not start other models,
+routes, providers or tool servers. It uses its own API key and has no rate limit. It does not
+write the daemon PID file or the metrics log. A daemon that runs from the same file is not affected.
+
 `higgs bench` defaults finish in about a minute on a 1-2B model: 3 trials after 1 warm-up, 128
 tokens per request, prefill prompts of 512 and 2048 tokens, a 2048-token first message for the
 prefix-cache follow-up, and 1, 2, 4 and 8 simultaneous requests. `--scenarios`, `--trials`,
