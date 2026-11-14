@@ -176,8 +176,13 @@ fn resolve_client_target(
     } else {
         None
     };
-    higgs::daemon::resolve_client_target(config.as_ref(), client.url.as_deref(), client.port)
-        .map_err(Into::into)
+    higgs::daemon::resolve_client_target(
+        config.as_ref(),
+        &config::Environment::process(),
+        client.url.as_deref(),
+        client.port,
+    )
+    .map_err(Into::into)
 }
 
 /// Load config from CLI path or default location.

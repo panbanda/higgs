@@ -56,6 +56,11 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
         .map_err(Into::into)
 }
 
+/// The host and port that `higgs serve --model` binds to without a config file.
+pub fn simple_mode_address(environment: &Environment) -> Result<(String, u16), String> {
+    load::simple_mode_address(environment).map_err(|error| error.to_string())
+}
+
 /// Load a `HiggsConfig` from a TOML file, with env and CLI overlays (config mode).
 pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsConfig, String> {
     load_config_file_in(path, args, &Environment::process())

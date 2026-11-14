@@ -144,7 +144,7 @@ default = "higgs"
 # --- Usage ---
 # eval "$(higgs shellenv)"  -- set env vars in current shell
 # higgs exec -- claude       -- exec a command with env vars set
-# Both find a server that runs without a config file at 127.0.0.1:8000.
+# Both find a server that runs without a config file at HIGGS_HOST:HIGGS_PORT (default 127.0.0.1:8000).
 # Use --url or --port when the server runs somewhere else.
 
 # --- Observability ---

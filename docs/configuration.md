@@ -489,7 +489,7 @@ Higgs finds the server this way:
 1. `--url http://HOST:PORT` or `--port PORT` (on `127.0.0.1`), if you give one of them. The config file is not read.
 2. The `[server]` address in the config file (`--config`, `--profile`, or `~/.config/higgs/config.toml`), if the file exists.
    A config file that does not load is an error.
-3. The default address, `127.0.0.1:8000`. Higgs sends `GET /health` and accepts only a Higgs answer.
+3. The address that `higgs serve --model` binds to: `HIGGS_HOST` and `HIGGS_PORT`, or `127.0.0.1:8000` if they are not set. Higgs sends `GET /health` and accepts only a Higgs answer.
 
 If no server answers, the command fails and the message tells you to start `higgs serve` or to use `--url` or `--port`.
 

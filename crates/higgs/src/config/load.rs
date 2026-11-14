@@ -550,6 +550,34 @@ fn apply_flags(raw: &mut RawConfig, args: &ServeArgs) -> Result<(), ConfigError>
     Ok(())
 }
 
+/// `HIGGS_HOST` and `HIGGS_PORT`, the bind address variables of simple mode.
+fn apply_simple_mode_address(
+    raw: &mut RawConfig,
+    environment: &Environment,
+) -> Result<(), ConfigError> {
+    if let Some(value) = environment.get("HIGGS_HOST") {
+        raw.server.host = Some(value.to_owned());
+    }
+    if let Some(value) = environment.get("HIGGS_PORT") {
+        raw.server.port = Some(value.trim().parse().map_err(|_| {
+            ConfigError::message("env overlay failed: HIGGS_PORT has an invalid value")
+        })?);
+    }
+    Ok(())
+}
+
+/// The host and port `higgs serve --model` binds to when it has no config file.
+pub fn simple_mode_address(environment: &Environment) -> Result<(String, u16), ConfigError> {
+    let mut raw = RawConfig::default();
+    apply_simple_mode_address(&mut raw, environment)?;
+    Ok((
+        raw.server
+            .host
+            .unwrap_or_else(|| super::settings::DEFAULT_HOST.to_owned()),
+        raw.server.port.unwrap_or(super::settings::DEFAULT_PORT),
+    ))
+}
+
 /// The server variables simple mode has always read (`HIGGS_PORT`, `HIGGS_API_KEY`, ...).
 fn apply_simple_mode_environment(
     raw: &mut RawConfig,
@@ -560,12 +588,7 @@ fn apply_simple_mode_environment(
             ConfigError::message(format!("env overlay failed: {name} has an invalid value"))
         })
     }
-    if let Some(value) = environment.get("HIGGS_HOST") {
-        raw.server.host = Some(value.to_owned());
-    }
-    if let Some(value) = environment.get("HIGGS_PORT") {
-        raw.server.port = Some(parse("HIGGS_PORT", value)?);
-    }
+    apply_simple_mode_address(raw, environment)?;
     if let Some(value) = environment.get("HIGGS_MAX_TOKENS") {
         raw.server.max_tokens = Some(parse("HIGGS_MAX_TOKENS", value)?);
     }

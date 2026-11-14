@@ -184,14 +184,28 @@ fn resolved_addr(config: &HiggsConfig) -> String {
     )
 }
 
+/// Connect to the first address of `addr` that accepts. A name such as `localhost` can
+/// resolve to `::1` while the server listens on `127.0.0.1` only.
 fn connect_with_timeout(addr: &str) -> Result<TcpStream, String> {
-    let socket_addr = addr
+    let socket_addrs: Vec<_> = addr
         .to_socket_addrs()
         .map_err(|e| format!("failed to resolve {addr}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("failed to resolve {addr}: no socket addresses found"))?;
-    TcpStream::connect_timeout(&socket_addr, Duration::from_secs(2))
-        .map_err(|e| format!("higgs is not running on {addr}: {e}"))
+        .collect();
+    let mut last_error = None;
+    for socket_addr in &socket_addrs {
+        match TcpStream::connect_timeout(socket_addr, Duration::from_secs(2)) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    last_error.map_or_else(
+        || {
+            Err(format!(
+                "failed to resolve {addr}: no socket addresses found"
+            ))
+        },
+        |error| Err(format!("higgs is not running on {addr}: {error}")),
+    )
 }
 
 fn check_health(config: &HiggsConfig) -> Result<(), String> {
@@ -304,7 +318,7 @@ pub struct ClientTarget {
 enum TargetOrigin {
     Config,
     Flag,
-    DefaultAddress,
+    SimpleModeAddress,
 }
 
 impl ClientTarget {
@@ -316,7 +330,7 @@ impl ClientTarget {
         match self.origin {
             TargetOrigin::Config => "from config",
             TargetOrigin::Flag => "from --url/--port",
-            TargetOrigin::DefaultAddress => "default address",
+            TargetOrigin::SimpleModeAddress => "address of serve without a config",
         }
     }
 }
@@ -324,10 +338,11 @@ impl ClientTarget {
 /// Pick the server address for client tools.
 ///
 /// `--url` and `--port` win, then the config file's `[server]` address. With neither, the
-/// default `higgs serve` address is used so a server started with `--model` is found
-/// without any config.
+/// address `higgs serve --model` binds to is used (`HIGGS_HOST` and `HIGGS_PORT`, else
+/// `127.0.0.1:8000`), so a server started with `--model` is found without any config.
 pub fn resolve_client_target(
     config: Option<&HiggsConfig>,
+    environment: &config::Environment,
     url_flag: Option<&str>,
     port_flag: Option<u16>,
 ) -> Result<ClientTarget, String> {
@@ -337,22 +352,25 @@ pub fn resolve_client_target(
             origin: TargetOrigin::Flag,
         });
     }
-    if let Some(port) = port_flag {
+    if let Some(loaded) = config.filter(|_| port_flag.is_none()) {
         return Ok(ClientTarget {
-            addr: format!("{}:{port}", config::DEFAULT_HOST),
-            origin: TargetOrigin::Flag,
-        });
-    }
-    Ok(config.map_or_else(
-        || ClientTarget {
-            addr: format!("{}:{}", config::DEFAULT_HOST, config::DEFAULT_PORT),
-            origin: TargetOrigin::DefaultAddress,
-        },
-        |loaded| ClientTarget {
             addr: resolved_addr(loaded),
             origin: TargetOrigin::Config,
+        });
+    }
+    let (host, serve_port) = config::simple_mode_address(environment)?;
+    Ok(ClientTarget {
+        addr: format!(
+            "{}:{}",
+            resolve_host(&host),
+            port_flag.unwrap_or(serve_port)
+        ),
+        origin: if port_flag.is_some() {
+            TargetOrigin::Flag
+        } else {
+            TargetOrigin::SimpleModeAddress
         },
-    ))
+    })
 }
 
 /// Reduce `http://host:port` (or bare `host:port`) to `host:port`.
@@ -386,7 +404,7 @@ fn parse_client_url(url: &str) -> Result<String, String> {
 fn ensure_reachable(target: &ClientTarget) -> Result<(), String> {
     let result = match target.origin {
         TargetOrigin::Config => connect_with_timeout(&target.addr).map(|_| ()),
-        TargetOrigin::Flag | TargetOrigin::DefaultAddress => check_health_at(&target.addr),
+        TargetOrigin::Flag | TargetOrigin::SimpleModeAddress => check_health_at(&target.addr),
     };
     result.map_err(|err| {
         format!(
@@ -767,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn client_target_prefers_flags_then_config_then_default_address() {
+    fn client_target_prefers_flags_then_config_then_serve_address() {
         let config = HiggsConfig {
             server: config::ServerConfig {
                 host: "0.0.0.0".to_owned(),
@@ -776,19 +794,44 @@ mod tests {
             },
             ..HiggsConfig::default()
         };
-        let from_config = resolve_client_target(Some(&config), None, None).unwrap();
+        let none = config::Environment::default();
+        let from_config = resolve_client_target(Some(&config), &none, None, None).unwrap();
         assert_eq!(from_config.base_url(), "http://127.0.0.1:3100");
         assert_eq!(from_config.origin, TargetOrigin::Config);
 
-        let by_port = resolve_client_target(Some(&config), None, Some(9000)).unwrap();
+        let by_port = resolve_client_target(Some(&config), &none, None, Some(9000)).unwrap();
         assert_eq!(by_port.base_url(), "http://127.0.0.1:9000");
 
-        let by_url = resolve_client_target(Some(&config), Some("http://10.0.0.5:7"), None).unwrap();
+        let by_url =
+            resolve_client_target(Some(&config), &none, Some("http://10.0.0.5:7"), None).unwrap();
         assert_eq!(by_url.base_url(), "http://10.0.0.5:7");
 
-        let default = resolve_client_target(None, None, None).unwrap();
+        let default = resolve_client_target(None, &none, None, None).unwrap();
         assert_eq!(default.base_url(), "http://127.0.0.1:8000");
-        assert_eq!(default.origin, TargetOrigin::DefaultAddress);
+        assert_eq!(default.origin, TargetOrigin::SimpleModeAddress);
+    }
+
+    #[test]
+    fn client_target_without_config_follows_the_serve_environment() {
+        let environment =
+            config::Environment::from_pairs([("HIGGS_HOST", "0.0.0.0"), ("HIGGS_PORT", "9000")]);
+        let target = resolve_client_target(None, &environment, None, None).unwrap();
+        assert_eq!(target.base_url(), "http://127.0.0.1:9000");
+        assert_eq!(target.origin, TargetOrigin::SimpleModeAddress);
+
+        let port_only = config::Environment::from_pairs([("HIGGS_PORT", "9001")]);
+        assert_eq!(
+            resolve_client_target(None, &port_only, None, None)
+                .unwrap()
+                .base_url(),
+            "http://127.0.0.1:9001"
+        );
+
+        let flag_wins = resolve_client_target(None, &environment, None, Some(9100)).unwrap();
+        assert_eq!(flag_wins.base_url(), "http://127.0.0.1:9100");
+
+        let invalid = config::Environment::from_pairs([("HIGGS_PORT", "abc")]);
+        assert!(resolve_client_target(None, &invalid, None, None).is_err());
     }
 
     #[test]
