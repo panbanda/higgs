@@ -15,7 +15,7 @@ use crate::backend::EngineLease;
 use crate::error::ServerError;
 use crate::metrics::{MetricsStore, RequestRecord, RequestTiming};
 use crate::router::RoutingMethod;
-use crate::types::openai::ChoiceLogprobs;
+use crate::types::openai::{ChoiceLogprobs, TokenLogprob};
 use crate::usage::{TokenCounts, build_usage, count_text_tokens};
 
 /// The finish reason the engine gives a generation that failed in its worker.
@@ -128,7 +128,9 @@ struct Assembler {
     tokenizer: Tokenizer,
     reasoning_text: String,
     /// Held until the trackers have drained, since a tool call changes the reason.
-    pending_finish: Option<(String, Option<ChoiceLogprobs>)>,
+    pending_finish: Option<String>,
+    /// Logprobs of tokens whose text the trackers still hold. They go out with the next text.
+    held_logprobs: Vec<TokenLogprob>,
 }
 
 impl Assembler {
@@ -152,22 +154,12 @@ impl Assembler {
             tokenizer,
             reasoning_text: String::new(),
             pending_finish: None,
+            held_logprobs: Vec::new(),
         }
     }
 
     fn push(&mut self, output: &StreamingOutput) -> Vec<GenerationEvent> {
         let mut events = Vec::new();
-        let Some(tracker) = self.reasoning.as_mut() else {
-            events.push(GenerationEvent::TextDelta {
-                text: output.new_text.clone(),
-                logprobs: None,
-            });
-            if let Some(reason) = &output.finish_reason {
-                self.pending_finish = Some((reason.clone(), None));
-            }
-            return events;
-        };
-
         let chunk_logprobs = output.token_logprob.as_ref().map(|info| {
             let logged = LoggedToken {
                 info: info.clone(),
@@ -175,6 +167,14 @@ impl Assembler {
             };
             decode_logprobs(std::slice::from_ref(&logged), &self.tokenizer)
         });
+        let Some(tracker) = self.reasoning.as_mut() else {
+            self.emit_text(output.new_text.clone(), chunk_logprobs, &mut events);
+            if let Some(reason) = &output.finish_reason {
+                self.pending_finish = Some(reason.clone());
+            }
+            return events;
+        };
+
         let (visible, reasoning) = tracker.process(&output.new_text);
         self.emit_reasoning(reasoning, &mut events);
         let tool_output = match self.tools.as_mut() {
@@ -184,15 +184,9 @@ impl Assembler {
                 new_tool_calls: Vec::new(),
             },
         };
-        let visible_was_empty = tool_output.visible.is_empty();
-        self.emit_tool_output(tool_output, chunk_logprobs.clone(), &mut events);
+        self.emit_tool_output(tool_output, chunk_logprobs, &mut events);
         if let Some(reason) = &output.finish_reason {
-            let logprobs = if visible_was_empty {
-                chunk_logprobs
-            } else {
-                None
-            };
-            self.pending_finish = Some((reason.clone(), logprobs));
+            self.pending_finish = Some(reason.clone());
         }
         events
     }
@@ -218,7 +212,10 @@ impl Assembler {
             let tail = tools.flush();
             self.emit_tool_output(tail, None, &mut events);
         }
-        if let Some((reason, logprobs)) = self.pending_finish.take() {
+        if let Some(reason) = self.pending_finish.take() {
+            let logprobs = (!self.held_logprobs.is_empty()).then(|| ChoiceLogprobs {
+                content: std::mem::take(&mut self.held_logprobs),
+            });
             let called_tools = self
                 .tools
                 .as_ref()
@@ -247,8 +244,29 @@ impl Assembler {
         events.push(GenerationEvent::ReasoningDelta(reasoning));
     }
 
+    /// Send `text` with its logprobs, or keep the logprobs for the next text when there is none.
+    /// Held logprobs go first, so the `bytes` of all chunks join to the text of all tokens.
+    fn emit_text(
+        &mut self,
+        text: String,
+        logprobs: Option<ChoiceLogprobs>,
+        events: &mut Vec<GenerationEvent>,
+    ) {
+        let new_content = logprobs.map(|entries| entries.content).unwrap_or_default();
+        if text.is_empty() {
+            self.held_logprobs.extend(new_content);
+            return;
+        }
+        let mut content = std::mem::take(&mut self.held_logprobs);
+        content.extend(new_content);
+        events.push(GenerationEvent::TextDelta {
+            text,
+            logprobs: (!content.is_empty()).then_some(ChoiceLogprobs { content }),
+        });
+    }
+
     fn emit_tool_output(
-        &self,
+        &mut self,
         output: StreamingToolOutput,
         logprobs: Option<ChoiceLogprobs>,
         events: &mut Vec<GenerationEvent>,
@@ -267,11 +285,90 @@ impl Assembler {
                 call.arguments,
             )));
         }
-        if !output.visible.is_empty() {
-            events.push(GenerationEvent::TextDelta {
-                text: output.visible,
-                logprobs,
-            });
+        self.emit_text(output.visible, logprobs, events);
+    }
+}
+
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[cfg(test)]
+mod tests {
+    use higgs_models::TokenLogprobInfo;
+
+    use super::*;
+
+    fn tokenizer() -> Tokenizer {
+        let json = r#"{
+            "version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+            "normalizer": null, "pre_tokenizer": null, "post_processor": null,
+            "decoder": null,
+            "model": { "type": "WordLevel", "vocab": {"a": 0, "b": 1}, "unk_token": "a" }
+        }"#;
+        Tokenizer::from_bytes(json.as_bytes()).unwrap()
+    }
+
+    fn step(text: &str, finish: Option<&str>) -> StreamingOutput {
+        StreamingOutput {
+            new_text: text.to_owned(),
+            finished: finish.is_some(),
+            finish_reason: finish.map(str::to_owned),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            token_logprob: Some(TokenLogprobInfo {
+                token_id: 0,
+                logprob: -0.1,
+                top_logprobs: Vec::new(),
+            }),
+            prefill_progress: None,
+        }
+    }
+
+    fn streamed(handling: ReasoningHandling, pieces: &[&str]) -> (String, String) {
+        let mut assembler = Assembler::new(handling, None, tokenizer());
+        let mut events = Vec::new();
+        for (index, piece) in pieces.iter().enumerate() {
+            let finish = (index + 1 == pieces.len()).then_some("stop");
+            events.extend(assembler.push(&step(piece, finish)));
+        }
+        events.extend(assembler.finish());
+        let (mut text, mut bytes) = (String::new(), Vec::new());
+        for event in events {
+            let chunk = match event {
+                GenerationEvent::TextDelta {
+                    text: delta,
+                    logprobs: found,
+                } => {
+                    text.push_str(&delta);
+                    found
+                }
+                GenerationEvent::Finish {
+                    logprobs: found, ..
+                } => found,
+                GenerationEvent::Started { .. }
+                | GenerationEvent::PrefillProgress(_)
+                | GenerationEvent::ReasoningDelta(_)
+                | GenerationEvent::ToolCall(_)
+                | GenerationEvent::Usage(_)
+                | GenerationEvent::ToolLoop(_)
+                | GenerationEvent::Error(_) => None,
+            };
+            for entry in chunk.into_iter().flat_map(|entries| entries.content) {
+                bytes.extend(entry.bytes);
+            }
+        }
+        (text, String::from_utf8(bytes).unwrap())
+    }
+
+    #[test]
+    fn streamed_bytes_join_to_the_text_even_when_a_tracker_holds_text_back() {
+        for handling in [
+            ReasoningHandling::Raw,
+            ReasoningHandling::Parsed {
+                thinking: false,
+                parse_without_thinking: true,
+            },
+        ] {
+            let (text, bytes) = streamed(handling, &["x", "<", "t", "h", "y", ""]);
+            assert_eq!(bytes, "x<thy", "text was {text:?}");
         }
     }
 }
