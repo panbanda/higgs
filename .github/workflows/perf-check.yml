@@ -1,0 +1,77 @@
+name: Performance check
+
+# Not part of CI: shared runners are too noisy to gate every pull request on a 10% threshold,
+# and the check needs a downloaded model. Run it by hand, or weekly to spot drift.
+on:
+  workflow_dispatch:
+    inputs:
+      threshold_percent:
+        description: Largest allowed drop in decode tokens/s, in percent
+        default: "10"
+  schedule:
+    - cron: "17 5 * * 1"
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -Dwarnings
+  MLX_RS_METAL_PATH: ${{ github.workspace }}/.mlx-metal
+  PERF_MODEL: mlx-community/Qwen3-0.6B-4bit
+  PERF_BASELINE: scripts/perf-baseline/ci-macos-15.json
+
+jobs:
+  perf:
+    name: Decode speed
+    runs-on: macos-15 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          prefix-key: "v2-mlx-air-macos15"
+          cache-directories: ${{ github.workspace }}/.mlx-metal
+
+      - name: Cache the model
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ env.PERF_MODEL }}
+
+      - name: Download the model
+        run: |
+          python3 -m pip install --quiet "huggingface_hub[cli]"
+          hf download "$PERF_MODEL"
+
+      - name: Build release
+        run: cargo build --release -p higgs
+
+      - name: Check decode speed against the baseline
+        env:
+          HIGGS_BIN: target/release/higgs
+          PERF_THRESHOLD_PERCENT: ${{ inputs.threshold_percent || '10' }}
+        run: |
+          if [[ -f "$PERF_BASELINE" ]]; then
+            scripts/perf-check.sh --model "$PERF_MODEL" --baseline "$PERF_BASELINE" --output perf-result.json
+          else
+            echo "::warning::$PERF_BASELINE does not exist; recording this run. Commit the uploaded perf-result.json there to turn the check on."
+            scripts/perf-check.sh --model "$PERF_MODEL" --baseline "$PERF_BASELINE" --output perf-result.json --record
+          fi
+
+      - name: Upload the result
+        if: success() || failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: perf-result
+          path: perf-result.json

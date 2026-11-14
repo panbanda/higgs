@@ -260,6 +260,49 @@ cargo run --release -p higgs-bench --bin bench_compare -- \
   --extra-body '{"chat_template_kwargs":{"enable_thinking":false}}'
 ```
 
+### `higgs bench` and `higgs selftest`
+
+Both subcommands start a private `higgs serve` child for one model (on `--port`, or any free
+port), wait for it to load (`--load-timeout`, default 900 s), drive it over HTTP and stop it. They
+use the same client code as `bench_compare` (`higgs_bench::runner`), so the numbers are comparable;
+only the defaults differ.
+
+```bash
+higgs bench ~/models/Qwen3-1.7B-4bit
+higgs bench mlx-community/Qwen3-1.7B-4bit --scenarios decode,prefix_cache --json result.json
+higgs selftest ~/models/Qwen3-1.7B-4bit
+higgs --config config.toml bench my-model     # serve the model as configured
+```
+
+`higgs bench` defaults finish in about a minute on a 1-2B model: 3 trials after 1 warm-up, 128
+tokens per request, prefill prompts of 512 and 2048 tokens, a 2048-token first message for the
+prefix-cache follow-up, and 1, 2, 4 and 8 simultaneous requests. `--scenarios`, `--trials`,
+`--warmup`, `--max-tokens`, `--prefill-tokens`, `--prefix-cache-tokens` and `--concurrency`
+change them. It prints one table (decode tok/s, time to first token, prefill tok/s, follow-up TTFT
+and cached tokens, aggregate tok/s per concurrency level, the server's peak RSS), and `--json`
+writes the same measurements in the `BenchOutput` envelope described above (`bench_name` is
+`higgs_bench`).
+
+`higgs selftest` prints PASS, FAIL or SKIP per check and exits 1 on any FAIL. All requests are
+greedy. The checks: a short chat completes with text and a sensible finish reason; a streamed
+reply equals the non-streamed one; a repeated prompt reports cached tokens and gives identical text;
+a `json_schema` response validates against its schema; a forced tool call returns a call with
+parseable arguments (skipped when the chat template does not render tool definitions, detected by
+the prompt not growing when tools are sent); two concurrent requests complete; and, for a model
+whose decode is batched, a 16-token reply is the same alone and batched with another request
+(skipped for models that decode one request at a time). Longer outputs are never compared, because
+half-precision rounding legitimately makes them diverge.
+
+### Performance check
+
+`scripts/perf-check.sh --model <dir|hf-id> --baseline <file>` runs `higgs bench` (decode and
+one prefill size) and fails when decode tokens/s is more than `--threshold` percent (default 10, or
+`PERF_THRESHOLD_PERCENT`) below the baseline. `--record` writes the run as the baseline instead.
+A baseline only holds on the kind of machine it was recorded on; the script warns when the CPU
+differs. `.github/workflows/perf-check.yml` runs it on a `macos-15` runner, only on manual dispatch
+and weekly (never per push), against `scripts/perf-baseline/ci-macos-15.json`; until that file is
+committed the workflow records a run and uploads it as an artifact.
+
 ### `bench_speculative`
 
 Starts a fresh Higgs server per speculative mode and compares baseline greedy
