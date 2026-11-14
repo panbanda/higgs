@@ -4,9 +4,9 @@ use std::sync::Arc;
 use regex::Regex;
 use tracing::warn;
 
+use crate::backend::{EngineLease, LoadedEngine};
 use crate::config::{ApiFormat, HiggsConfig, LoadMode};
 use crate::model_pool::{ModelError, ModelPool, ModelSpec};
-use crate::state::{Engine, EngineLease};
 
 /// Why a model name could not be resolved to a servable route.
 #[derive(Debug, thiserror::Error)]
@@ -96,7 +96,7 @@ struct AutoRouteEntry {
 /// 3. Pattern matching (first match wins)
 /// 4. Default provider fallback
 pub struct Router {
-    pool: Arc<ModelPool<Engine>>,
+    pool: Arc<ModelPool<LoadedEngine>>,
     compiled_routes: Vec<CompiledRoute>,
     auto_routes: Vec<AutoRouteEntry>,
     auto_candidates: Vec<RouteCandidate>,
@@ -110,7 +110,7 @@ pub struct Router {
 
 impl Router {
     /// Build a router from the unified config and the pool that serves its local models.
-    pub fn new(config: &HiggsConfig, pool: Arc<ModelPool<Engine>>) -> Result<Self, String> {
+    pub fn new(config: &HiggsConfig, pool: Arc<ModelPool<LoadedEngine>>) -> Result<Self, String> {
         let mut compiled_routes = Vec::new();
         let mut auto_routes = Vec::new();
         let mut auto_candidates = Vec::new();
@@ -253,9 +253,9 @@ impl Router {
     /// Such engines are pinned: the pool has no way to rebuild one once it is unloaded.
     pub fn from_config(
         config: &HiggsConfig,
-        engines: std::collections::HashMap<String, Arc<Engine>>,
+        engines: std::collections::HashMap<String, Arc<LoadedEngine>>,
     ) -> Result<Self, String> {
-        let mut resident: Vec<(ModelSpec, Arc<Engine>)> = engines
+        let mut resident: Vec<(ModelSpec, Arc<LoadedEngine>)> = engines
             .into_iter()
             .map(|(name, engine)| {
                 let spec = ModelSpec {
@@ -273,7 +273,7 @@ impl Router {
     }
 
     /// The pool that loads, tracks and unloads the configured local models.
-    pub const fn pool(&self) -> &Arc<ModelPool<Engine>> {
+    pub const fn pool(&self) -> &Arc<ModelPool<LoadedEngine>> {
         &self.pool
     }
 
@@ -303,7 +303,7 @@ impl Router {
         let timeout_result = tokio::time::timeout(
             timeout,
             tokio::task::spawn_blocking(move || {
-                crate::auto_router::classify_local(&classifier, &candidates, &messages_owned)
+                crate::auto_router::classify_local(&**classifier, &candidates, &messages_owned)
             }),
         )
         .await;
@@ -794,7 +794,7 @@ mod tests {
         let mut engines = HashMap::new();
         engines.insert(
             "llama".to_owned(),
-            Arc::new(crate::state::Engine::test_stub("llama")),
+            Arc::new(crate::test_support::StubEngine::named("llama").into_loaded()),
         );
 
         let router = Router::from_config(&config, engines).unwrap();
@@ -892,7 +892,7 @@ mod tests {
             path = "test/model-a"
             "#,
         );
-        let engine = crate::state::Engine::test_stub("test/model-a");
+        let engine = crate::test_support::StubEngine::named("test/model-a").into_loaded();
         let mut engines = HashMap::new();
         engines.insert("test/model-a".to_owned(), Arc::new(engine));
 
@@ -926,7 +926,7 @@ mod tests {
             model = "router"
             "#,
         );
-        let engine = crate::state::Engine::test_stub("router");
+        let engine = crate::test_support::StubEngine::named("router").into_loaded();
         let mut engines = HashMap::new();
         engines.insert("router".to_owned(), Arc::new(engine));
 
@@ -947,7 +947,7 @@ mod tests {
             model = "/Users/someone/models/Arch-Router-1.5B-4bit"
             "#,
         );
-        let engine = crate::state::Engine::test_stub("router");
+        let engine = crate::test_support::StubEngine::named("router").into_loaded();
         let mut engines = HashMap::new();
         engines.insert("router".to_owned(), Arc::new(engine));
 
@@ -969,7 +969,7 @@ mod tests {
             model = "/Users/someone/models/Arch-Router-1.5B-4bit"
             "#,
         );
-        let engine = crate::state::Engine::test_stub("Arch-Router-1.5B-4bit");
+        let engine = crate::test_support::StubEngine::named("Arch-Router-1.5B-4bit").into_loaded();
         let mut engines = HashMap::new();
         engines.insert("Arch-Router-1.5B-4bit".to_owned(), Arc::new(engine));
 

@@ -7,7 +7,6 @@
 use higgs_engine::tool_format::ToolCallFormat;
 use serde_json::{Value, json};
 
-use crate::state::Engine;
 use crate::test_support::{
     StubCall, StubEngine, app_with_stub, char_tokenizer, generation_output, post_json,
     progress_event, sse_json_events, token_event,
@@ -275,7 +274,7 @@ impl Route {
 
 fn stub(format: ToolCallFormat, text: &str) -> StubEngine {
     let mut stub = StubEngine::named("stub");
-    stub.tokenizer = Some(char_tokenizer());
+    stub.tokenizer = char_tokenizer();
     stub.script.prompt_tokens = vec![1, 2, 3];
     stub.script.stamp_times = true;
     stub.script.tool_call_format = format;
@@ -288,14 +287,14 @@ async fn send(
     stub: StubEngine,
     route: Route,
     body: &Value,
-) -> (http::StatusCode, String, std::sync::Arc<Engine>) {
+) -> (http::StatusCode, String, StubEngine) {
     let (app, engine) = app_with_stub(stub);
     let (status, text) = post_json(&app, route.path(), body).await;
     (status, text, engine)
 }
 
-fn recorded(engine: &Engine) -> Vec<StubCall> {
-    engine.stub_calls()
+fn recorded(engine: &StubEngine) -> Vec<StubCall> {
+    engine.recorded_calls()
 }
 
 fn weather_call() -> (String, Value) {
@@ -405,7 +404,7 @@ async fn auto_and_absent_choices_do_not_constrain() {
             .await;
             assert_eq!(status, http::StatusCode::OK, "{route:?}: {body}");
             assert!(!recorded(&engine)[0].has_constraint, "{route:?} {choice:?}");
-            assert_eq!(engine.stub_prompt_tools(), vec![Some(2)], "{route:?}");
+            assert_eq!(engine.recorded_prompt_tools(), vec![Some(2)], "{route:?}");
             let json: Value = serde_json::from_str(&body).unwrap();
             assert_eq!(route.calls(&json), vec![weather_call()], "{route:?}");
         }
@@ -423,7 +422,7 @@ async fn none_hides_tools_and_leaves_the_text_alone() {
         .await;
         assert_eq!(status, http::StatusCode::OK, "{route:?}: {body}");
         assert!(!recorded(&engine)[0].has_constraint, "{route:?}");
-        assert_eq!(engine.stub_prompt_tools(), vec![None], "{route:?}");
+        assert_eq!(engine.recorded_prompt_tools(), vec![None], "{route:?}");
         let json: Value = serde_json::from_str(&body).unwrap();
         assert!(route.calls(&json).is_empty(), "{route:?}: {body}");
         assert!(

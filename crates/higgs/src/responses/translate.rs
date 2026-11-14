@@ -1,13 +1,19 @@
-//! Translation between the Responses API and the internal chat request and
-//! response types that the shared generation path speaks.
+//! Translation between the Responses API and the shared generation request
+//! and result.
 
 use serde_json::{Value, json};
 
+use higgs_models::SamplingParams;
+
+use crate::constraint::ConstraintSpec;
 use crate::error::ServerError;
+use crate::generation::messages::prompt_messages;
+use crate::generation::{ChatPrompt, Completed, GenerationRequest, LoopMessage, Prompt};
 use crate::tool_choice::ToolChoice;
+use crate::tool_policy::ToolPolicy;
 use crate::types::openai::{
-    ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse, ContentPart as ChatPart,
-    ImageUrl, MessageContent, ResponseFormat, StreamOptions, ToolCall, ToolCallFunction,
+    ChatCompletionMessage, ContentPart as ChatPart, ImageUrl, MessageContent, ResponseFormat,
+    ToolCall, ToolCallFunction,
 };
 use crate::types::responses::{
     ContentPart, CreateResponseRequest, IncompleteDetails, InputContent, InputItem,
@@ -392,40 +398,55 @@ pub fn items_to_messages(
     messages
 }
 
-/// Build the chat request that drives generation for a Responses request.
-pub fn build_chat_request(
+/// Translate a Responses request, with the conversation so far, into the
+/// shared request.
+pub fn build_generation_request(
     request: &CreateResponseRequest,
     model: &str,
     conversation: &[InputItem],
-) -> Result<ChatCompletionRequest, ServerError> {
-    let streaming = request.stream == Some(true);
+    default_max_tokens: u32,
+) -> Result<GenerationRequest, ServerError> {
     let tool_choice = ToolChoice::from_responses(request.tool_choice.as_ref())?;
     let tools = if tool_choice == ToolChoice::Disabled {
-        None
+        Vec::new()
     } else {
         match request.tools.as_deref() {
-            Some(tools) if !tools.is_empty() => Some(convert_tools(tools)?),
-            Some(_) | None => None,
+            Some(tools) if !tools.is_empty() => convert_tools(tools)?,
+            Some(_) | None => Vec::new(),
         }
     };
-    Ok(ChatCompletionRequest {
+    let constraint = ConstraintSpec::from_request(
+        convert_text_format(request.text.as_ref())?.as_ref(),
+        None,
+        None,
+    )?;
+    let thinking_budget = crate::reasoning::requested_thinking_budget(request.reasoning.as_ref())?;
+    let (messages, images) = prompt_messages(&items_to_messages(
+        request.instructions.as_deref(),
+        conversation,
+    ));
+    Ok(GenerationRequest {
         model: model.to_owned(),
-        messages: items_to_messages(request.instructions.as_deref(), conversation),
-        max_tokens: request.max_output_tokens,
-        temperature: request.temperature,
-        top_p: request.top_p,
-        stream: Some(streaming),
-        stream_options: streaming.then_some(StreamOptions {
-            include_usage: Some(true),
+        prompt: Prompt::Chat(ChatPrompt {
+            messages,
+            images,
+            tools,
+            tool_policy: ToolPolicy::new(tool_choice, request.parallel_tool_calls.unwrap_or(true)),
+            reasoning: request.reasoning.clone(),
+            thinking_budget,
+            parse_reasoning_without_thinking: false,
         }),
-        tools,
-        tool_choice: Some(tool_choice.to_chat_value()),
-        parallel_tool_calls: request.parallel_tool_calls,
-        response_format: convert_text_format(request.text.as_ref())?,
-        reasoning: request.reasoning.clone(),
-        return_progress: streaming.then_some(true),
+        max_tokens: request.max_output_tokens.unwrap_or(default_max_tokens),
+        sampling: SamplingParams {
+            temperature: request.temperature.unwrap_or(1.0),
+            top_p: request.top_p.unwrap_or(1.0),
+            ..SamplingParams::default()
+        },
+        stop_sequences: Vec::new(),
+        logprobs: false,
+        top_logprobs: None,
+        constraint,
         mcp: request.mcp.clone(),
-        ..ChatCompletionRequest::default()
     })
 }
 
@@ -544,29 +565,16 @@ pub fn status_for_finish_reason(finish_reason: &str) -> (ResponseStatus, Option<
     }
 }
 
-/// Build the output items of a non-streaming chat response.
-pub fn outcome_from_chat(response: ChatCompletionResponse) -> Outcome {
-    let Some(choice) = response.choices.into_iter().next() else {
-        return Outcome {
-            status: ResponseStatus::Failed,
-            output: Vec::new(),
-            usage: None,
-            incomplete_reason: None,
-            error: Some(ResponseError {
-                code: "server_error".to_owned(),
-                message: "generation produced no output".to_owned(),
-            }),
-        };
-    };
-    let (status, incomplete_reason) = status_for_finish_reason(&choice.finish_reason);
-    let message = choice.message;
+/// Build the output items of a non-streaming generation.
+pub fn outcome_from_completed(completed: Completed) -> Outcome {
+    let (status, incomplete_reason) = status_for_finish_reason(&completed.finish_reason);
 
     let mut output = Vec::new();
-    let has_reasoning = message
-        .reasoning_content
+    let has_reasoning = completed
+        .reasoning
         .as_deref()
         .is_some_and(|text| !text.is_empty());
-    if let Some(reasoning) = message.reasoning_content.filter(|text| !text.is_empty()) {
+    if let Some(reasoning) = completed.reasoning.filter(|text| !text.is_empty()) {
         output.push(OutputItem::Reasoning {
             id: generate_item_id("rs"),
             summary: Vec::new(),
@@ -574,26 +582,20 @@ pub fn outcome_from_chat(response: ChatCompletionResponse) -> Outcome {
             status: ResponseStatus::Completed,
         });
     }
-    let text = message
-        .content
-        .as_ref()
-        .map(MessageContent::text)
-        .unwrap_or_default();
-    let calls = message.tool_calls.unwrap_or_default();
-    if !text.is_empty() || (!has_reasoning && calls.is_empty()) {
+    if !completed.text.is_empty() || (!has_reasoning && completed.tool_calls.is_empty()) {
         output.push(OutputItem::Message {
             id: generate_item_id("msg"),
             role: "assistant",
-            content: vec![ContentPart::output_text(text)],
+            content: vec![ContentPart::output_text(completed.text)],
             status: ResponseStatus::Completed,
         });
     }
-    for call in calls {
+    for call in completed.tool_calls {
         output.push(OutputItem::FunctionCall {
             id: generate_item_id("fc"),
             call_id: call.id,
-            name: call.function.name,
-            arguments: call.function.arguments,
+            name: call.name,
+            arguments: call.arguments.to_string(),
             status: ResponseStatus::Completed,
         });
     }
@@ -603,19 +605,20 @@ pub fn outcome_from_chat(response: ChatCompletionResponse) -> Outcome {
         set_item_status(last, ResponseStatus::Incomplete);
     }
 
+    let usage = completed.usage;
     Outcome {
         status,
         output,
         usage: Some(ResponseUsage {
-            input_tokens: response.usage.prompt_tokens,
-            output_tokens: response.usage.completion_tokens,
-            total_tokens: response.usage.total_tokens,
-            input_tokens_details: response.usage.prompt_tokens_details.map(|details| {
-                InputTokensDetails {
+            input_tokens: usage.prompt_tokens,
+            output_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            input_tokens_details: usage
+                .prompt_tokens_details
+                .map(|details| InputTokensDetails {
                     cached_tokens: details.cached_tokens,
-                }
-            }),
-            output_tokens_details: response.usage.completion_tokens_details.map(|details| {
+                }),
+            output_tokens_details: usage.completion_tokens_details.map(|details| {
                 OutputTokensDetails {
                     reasoning_tokens: details.reasoning_tokens,
                 }
@@ -712,6 +715,36 @@ pub fn chat_messages_to_input_items(messages: &[ChatCompletionMessage]) -> Vec<I
     items
 }
 
+/// The conversation items for what a server-side tool loop appended:
+/// assistant turns (text, then each tool call) and tool results.
+pub fn loop_messages_to_input_items(messages: &[LoopMessage]) -> Vec<InputItem> {
+    let mut items = Vec::new();
+    for message in messages {
+        match message {
+            LoopMessage::AssistantCalls { text, calls } => {
+                if !text.is_empty() {
+                    items.push(InputItem::Message {
+                        role: "assistant".to_owned(),
+                        content: vec![InputContent::Text(text.clone())],
+                    });
+                }
+                items.extend(calls.iter().map(|call| InputItem::FunctionCall {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.to_string(),
+                }));
+            }
+            LoopMessage::ToolResult { call_id, content } => {
+                items.push(InputItem::FunctionCallOutput {
+                    call_id: call_id.clone(),
+                    output: content.clone(),
+                });
+            }
+        }
+    }
+    items
+}
+
 /// Best-effort `role`/`content` view of the input for model auto-routing,
 /// which runs before strict validation (a remote provider may understand
 /// items that local translation rejects).
@@ -748,9 +781,8 @@ pub fn routing_messages(input: Option<&ResponseInput>) -> Option<Vec<Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::openai::{
-        ChatCompletionChoice, ChatCompletionMessage as ChatMessage, CompletionUsage,
-    };
+    use crate::generation::GeneratedToolCall;
+    use crate::types::openai::CompletionUsage;
 
     fn request(value: Value) -> CreateResponseRequest {
         serde_json::from_value(value).unwrap()
@@ -865,16 +897,19 @@ mod tests {
         ];
         let mut conversation = history;
         conversation.extend(parse(&json!("second")));
-        let chat = build_chat_request(
+        let generation = build_generation_request(
             &request(json!({"model": "m", "input": "second", "instructions": "sys"})),
             "m",
             &conversation,
+            100,
         )
         .unwrap();
-        let texts: Vec<(String, String)> = chat
+        let texts: Vec<(String, String)> = generation
+            .chat()
+            .unwrap()
             .messages
             .iter()
-            .map(|m| (m.role.clone(), m.content.as_ref().unwrap().text()))
+            .map(|m| (m.role.clone(), m.content.clone()))
             .collect();
         assert_eq!(
             texts,
@@ -1029,7 +1064,7 @@ mod tests {
         }
     }
 
-    fn chat_for(extra: &Value) -> Result<ChatCompletionRequest, ServerError> {
+    fn chat_for(extra: &Value) -> Result<ChatPrompt, ServerError> {
         let mut body = json!({
             "model": "m", "input": "hi",
             "tools": [{"type": "function", "name": "f", "parameters": {"type": "object"}}]
@@ -1037,32 +1072,34 @@ mod tests {
         if let (Some(target), Some(fields)) = (body.as_object_mut(), extra.as_object()) {
             target.extend(fields.clone());
         }
-        build_chat_request(&request(body), "m", &[])
+        build_generation_request(&request(body), "m", &[], 100)
+            .map(|generation| generation.chat().unwrap().clone())
     }
 
     #[test]
-    fn tool_choice_is_forwarded_in_chat_spelling() {
+    fn tool_choice_becomes_the_tool_policy() {
         let cases = [
-            (json!({}), json!("auto")),
-            (json!({"tool_choice": "auto"}), json!("auto")),
-            (json!({"tool_choice": "required"}), json!("required")),
+            (json!({}), ToolChoice::Auto),
+            (json!({"tool_choice": "auto"}), ToolChoice::Auto),
+            (json!({"tool_choice": "required"}), ToolChoice::Required),
             (
                 json!({"tool_choice": {"type": "function", "name": "f"}}),
-                json!({"type": "function", "function": {"name": "f"}}),
+                ToolChoice::Function("f".to_owned()),
             ),
         ];
         for (extra, expected) in cases {
             let chat = chat_for(&extra).unwrap();
-            assert_eq!(chat.tool_choice, Some(expected), "{extra}");
-            assert_eq!(chat.tools.as_ref().map(Vec::len), Some(1), "{extra}");
+            assert_eq!(chat.tool_policy, ToolPolicy::new(expected, true), "{extra}");
+            assert_eq!(chat.tools.len(), 1, "{extra}");
         }
     }
 
     #[test]
     fn parallel_tool_calls_is_forwarded() {
         let chat = chat_for(&json!({"parallel_tool_calls": false})).unwrap();
-        assert_eq!(chat.parallel_tool_calls, Some(false));
-        assert_eq!(chat_for(&json!({})).unwrap().parallel_tool_calls, None);
+        assert_eq!(chat.tool_policy, ToolPolicy::new(ToolChoice::Auto, false));
+        let default = chat_for(&json!({})).unwrap();
+        assert_eq!(default.tool_policy, ToolPolicy::new(ToolChoice::Auto, true));
     }
 
     #[test]
@@ -1077,17 +1114,18 @@ mod tests {
     }
 
     #[test]
-    fn tool_choice_none_drops_tools_from_the_chat_request() {
-        let chat = build_chat_request(
+    fn tool_choice_none_drops_tools_from_the_request() {
+        let generation = build_generation_request(
             &request(json!({
                 "model": "m", "input": "hi", "tool_choice": "none",
                 "tools": [{"type": "function", "name": "f"}]
             })),
             "m",
             &[],
+            100,
         )
         .unwrap();
-        assert!(chat.tools.is_none());
+        assert!(generation.chat().unwrap().tools.is_empty());
     }
 
     #[test]
@@ -1153,49 +1191,43 @@ mod tests {
     }
 
     #[test]
-    fn chat_request_carries_sampling_and_streaming_options() {
-        let chat = build_chat_request(
+    fn generation_request_carries_sampling_and_limits() {
+        let generation = build_generation_request(
             &request(json!({
                 "model": "m", "input": "hi", "stream": true, "max_output_tokens": 64,
                 "temperature": 0.2, "top_p": 0.9, "reasoning": {"effort": "low"}
             })),
             "resolved",
             &[],
+            100,
         )
         .unwrap();
-        assert_eq!(chat.model, "resolved");
-        assert_eq!(chat.max_tokens, Some(64));
-        assert_eq!(chat.stream, Some(true));
-        assert_eq!(chat.stream_options.unwrap().include_usage, Some(true));
-        assert_eq!(chat.return_progress, Some(true));
-        assert_eq!(chat.reasoning.unwrap().effort.as_deref(), Some("low"));
+        assert_eq!(generation.model, "resolved");
+        assert_eq!(generation.max_tokens, 64);
+        assert!((generation.sampling.temperature - 0.2).abs() < f32::EPSILON);
+        assert!((generation.sampling.top_p - 0.9).abs() < f32::EPSILON);
+        let reasoning = generation.chat().unwrap().reasoning.clone().unwrap();
+        assert_eq!(reasoning.effort.as_deref(), Some("low"));
+        let defaulted = build_generation_request(
+            &request(json!({"model": "m", "input": "hi"})),
+            "resolved",
+            &[],
+            100,
+        )
+        .unwrap();
+        assert_eq!(defaulted.max_tokens, 100);
     }
 
-    fn chat_response(
-        message: ChatMessage,
-        finish_reason: &str,
-        usage: (u32, u32),
-    ) -> ChatCompletionResponse {
-        ChatCompletionResponse {
-            id: "chatcmpl-1".to_owned(),
-            object: "chat.completion",
-            created: 0,
-            model: "m".to_owned(),
-            choices: vec![ChatCompletionChoice {
-                index: 0,
-                message,
-                finish_reason: finish_reason.to_owned(),
-                logprobs: None,
-            }],
+    fn completed(text: &str, finish_reason: &str, usage: (u32, u32)) -> Completed {
+        Completed {
+            text: text.to_owned(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            finish_reason: finish_reason.to_owned(),
             usage: CompletionUsage::new(usage.0, usage.1),
-            mcp: None,
-        }
-    }
-
-    fn assistant(content: Option<&str>) -> ChatMessage {
-        ChatMessage {
-            content: content.map(|text| MessageContent::Text(text.to_owned())),
-            ..chat_message("assistant")
+            logprobs: None,
+            tool_loop: None,
+            loop_messages: Vec::new(),
         }
     }
 
@@ -1211,7 +1243,7 @@ mod tests {
 
     #[test]
     fn text_response_builds_message_item_with_usage_and_echoes() {
-        let outcome = outcome_from_chat(chat_response(assistant(Some("Hello!")), "stop", (7, 3)));
+        let outcome = outcome_from_completed(completed("Hello!", "stop", (7, 3)));
         let object = context().object(outcome);
 
         assert!(object.id.starts_with("resp_"));
@@ -1233,7 +1265,7 @@ mod tests {
 
     #[test]
     fn measured_usage_details_are_carried_into_the_response() {
-        let mut chat = chat_response(assistant(Some("Hello!")), "stop", (7, 3));
+        let mut chat = completed("Hello!", "stop", (7, 3));
         chat.usage.prompt_tokens_details =
             Some(crate::types::openai::PromptTokensDetails { cached_tokens: 5 });
         chat.usage.completion_tokens_details =
@@ -1241,7 +1273,7 @@ mod tests {
                 reasoning_tokens: 2,
             });
 
-        let object = context().object(outcome_from_chat(chat));
+        let object = context().object(outcome_from_completed(chat));
 
         let usage = object.usage.as_ref().unwrap();
         assert_eq!(
@@ -1260,17 +1292,13 @@ mod tests {
 
     #[test]
     fn reasoning_and_tool_calls_become_separate_items_in_order() {
-        let mut message = assistant(Some("Let me check."));
-        message.reasoning_content = Some("need weather".to_owned());
-        message.tool_calls = Some(vec![ToolCall {
-            id: "call_0_x".to_owned(),
-            r#type: "function".to_owned(),
-            function: ToolCallFunction {
-                name: "get_weather".to_owned(),
-                arguments: "{\"city\":\"Paris\"}".to_owned(),
-            },
-        }]);
-        let outcome = outcome_from_chat(chat_response(message, "tool_calls", (1, 1)));
+        let mut generation = completed("Let me check.", "tool_calls", (1, 1));
+        generation.reasoning = Some("need weather".to_owned());
+        let mut call =
+            GeneratedToolCall::new(0, "get_weather".to_owned(), json!({"city": "Paris"}));
+        call.id = "call_0_x".to_owned();
+        generation.tool_calls = vec![call];
+        let outcome = outcome_from_completed(generation);
         let kinds: Vec<&str> = outcome
             .output
             .iter()
@@ -1299,23 +1327,16 @@ mod tests {
 
     #[test]
     fn tool_call_only_response_has_no_empty_message() {
-        let mut message = assistant(None);
-        message.tool_calls = Some(vec![ToolCall {
-            id: "c".to_owned(),
-            r#type: "function".to_owned(),
-            function: ToolCallFunction {
-                name: "f".to_owned(),
-                arguments: "{}".to_owned(),
-            },
-        }]);
-        let outcome = outcome_from_chat(chat_response(message, "tool_calls", (1, 1)));
+        let mut generation = completed("", "tool_calls", (1, 1));
+        generation.tool_calls = vec![GeneratedToolCall::new(0, "f".to_owned(), json!({}))];
+        let outcome = outcome_from_completed(generation);
         assert_eq!(outcome.output.len(), 1);
         assert!(matches!(outcome.output[0], OutputItem::FunctionCall { .. }));
     }
 
     #[test]
     fn length_stop_is_incomplete_with_details() {
-        let outcome = outcome_from_chat(chat_response(assistant(Some("cut")), "length", (1, 1)));
+        let outcome = outcome_from_completed(completed("cut", "length", (1, 1)));
         let object = context().object(outcome);
         assert_eq!(object.status, ResponseStatus::Incomplete);
         assert_eq!(
@@ -1330,7 +1351,7 @@ mod tests {
 
     #[test]
     fn empty_text_still_yields_a_message_item() {
-        let outcome = outcome_from_chat(chat_response(assistant(Some("")), "stop", (1, 0)));
+        let outcome = outcome_from_completed(completed("", "stop", (1, 0)));
         assert_eq!(outcome.output.len(), 1);
     }
 

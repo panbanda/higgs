@@ -48,6 +48,13 @@ impl ToolPolicy {
         ))
     }
 
+    /// The same call limits with the choice back to automatic: later rounds of
+    /// a tool loop must be free to answer after a forced first call.
+    #[must_use]
+    pub const fn without_forced_choice(&self) -> Self {
+        Self::new(ToolChoice::Auto, self.parallel_tool_calls)
+    }
+
     /// Whether the tools are shown to the model and parsed from its output.
     pub fn exposes_tools(&self) -> bool {
         self.choice != ToolChoice::Disabled
