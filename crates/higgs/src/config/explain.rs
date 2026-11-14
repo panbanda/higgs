@@ -353,6 +353,10 @@ pub fn global_entries(provenance: &Provenance<'_>) -> Vec<Entry> {
             "server.max_body_size",
             quote(&server.max_body_size.to_string()),
         ),
+        global(
+            "server.responses_store_size",
+            quote(&server.responses_store_size.to_string()),
+        ),
         global("server.max_tokens", server.max_tokens.to_string()),
         global("server.rate_limit", server.rate_limit.to_string()),
         global(

@@ -22,6 +22,7 @@ port = 8000
 # api_key = "${HIGGS_API_KEY}"
 # request_timeout = "5m"
 # max_body_size = "10MB"
+# responses_store_size = "256MB"  # memory for stored /v1/responses turns; a turn above max_body_size is not stored
 # max_tokens = 32768
 # rate_limit = 0            # requests per minute per client; 0 turns it off
 # CORS origin allow-list for browser clients. Unset = no CORS headers.

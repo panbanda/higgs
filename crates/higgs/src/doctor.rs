@@ -166,6 +166,31 @@ fn check_config_valid(result: &mut DoctorResult) {
     pass("config file is valid", result);
 }
 
+fn check_responses_store_size(server: &crate::config::ServerSection, result: &mut DoctorResult) {
+    if server.responses_store_size.bytes() == 0 {
+        warn(
+            "server.responses_store_size=0B stores no response; previous_response_id and GET /v1/responses/{id} always fail",
+            result,
+        );
+    } else if server.responses_store_size.bytes() < server.max_body_size.bytes() {
+        warn(
+            &format!(
+                "server.responses_store_size={} is below server.max_body_size={}; a larger turn is not stored",
+                server.responses_store_size, server.max_body_size
+            ),
+            result,
+        );
+    } else {
+        pass(
+            &format!(
+                "server.responses_store_size={}",
+                server.responses_store_size
+            ),
+            result,
+        );
+    }
+}
+
 fn check_server_section(config: &crate::config::HiggsConfig, result: &mut DoctorResult) {
     let server = &config.server;
 
@@ -209,6 +234,8 @@ fn check_server_section(config: &crate::config::HiggsConfig, result: &mut Doctor
             result,
         );
     }
+
+    check_responses_store_size(server, result);
 
     if server.host.parse::<std::net::IpAddr>().is_ok() || server.host == "localhost" {
         pass(&format!("server.host=\"{}\"", server.host), result);
@@ -1689,6 +1716,19 @@ mod tests {
         check_server_section(&config, &mut result);
         assert!(result.warnings >= 1);
         assert_eq!(result.failures, 0);
+    }
+
+    #[test]
+    fn test_responses_store_size_zero_or_below_the_body_limit_warns() {
+        for bytes in [0, 1 << 20] {
+            let config = server_with(|s| {
+                s.responses_store_size = crate::config::units::ByteSize::from_bytes(bytes);
+            });
+            let mut result = empty_result();
+            check_server_section(&config, &mut result);
+            assert_eq!(result.warnings, 1, "{bytes}");
+            assert_eq!(result.failures, 0);
+        }
     }
 
     #[test]

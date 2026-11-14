@@ -130,7 +130,7 @@ pub fn build_router(
         .route("/tokenize", post(routes::tokenize::tokenize))
         .route("/v1/detokenize", post(routes::tokenize::detokenize))
         .route("/detokenize", post(routes::tokenize::detokenize))
-        .merge(responses_routes());
+        .merge(responses_routes(&state.config.server));
 
     if let Some(rpm) = NonZeroU32::new(rate_limit) {
         let limiter: SharedRateLimiter = Arc::new(RateLimiter::keyed(Quota::per_minute(rpm)));
@@ -172,7 +172,9 @@ pub fn build_router(
     router.with_state(state)
 }
 
-fn responses_routes() -> Router<SharedState> {
+fn responses_routes(server: &config::ServerSection) -> Router<SharedState> {
+    let budget = usize::try_from(server.responses_store_size.bytes()).unwrap_or(usize::MAX);
+    let entry_limit = usize::try_from(server.max_body_size.bytes()).unwrap_or(usize::MAX);
     Router::new()
         .route("/v1/responses", post(routes::responses::create_response))
         .route(
@@ -180,7 +182,7 @@ fn responses_routes() -> Router<SharedState> {
             get(routes::responses::get_response).delete(routes::responses::delete_response),
         )
         .layer(Extension(Arc::new(
-            responses::store::ResponseStore::default(),
+            responses::store::ResponseStore::default().with_byte_limits(budget, entry_limit),
         )))
 }
 

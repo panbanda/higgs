@@ -37,6 +37,7 @@ pub struct RawServer {
     pub api_key: Option<String>,
     pub request_timeout: Option<HumanDuration>,
     pub max_body_size: Option<ByteSize>,
+    pub responses_store_size: Option<ByteSize>,
     pub max_tokens: Option<u32>,
     pub rate_limit: Option<u32>,
     pub cors_origins: Option<Vec<String>>,
