@@ -212,6 +212,12 @@ impl McpClient {
             lock(&self.shared.pending).remove(&id);
             return Err(ClientError::Closed(reason));
         }
+        let mut guard = PendingRequest {
+            shared: Arc::clone(&self.shared),
+            transport: Arc::clone(&self.transport),
+            id,
+            armed: true,
+        };
         let exchange = async {
             self.transport
                 .send(jsonrpc::request(id, method, params))
@@ -224,15 +230,16 @@ impl McpClient {
             }
         };
         let Ok(outcome) = tokio::time::timeout(timeout, exchange).await else {
+            guard.armed = false;
             lock(&self.shared.pending).remove(&id);
-            let cancel = jsonrpc::notification(
-                "notifications/cancelled",
-                Some(json!({"requestId": id, "reason": "timed out"})),
-            );
-            let _ =
-                tokio::time::timeout(CANCEL_DELIVERY_TIMEOUT, self.transport.send(cancel)).await;
+            let _ = tokio::time::timeout(
+                CANCEL_DELIVERY_TIMEOUT,
+                self.transport.send(cancellation(id, "timed out")),
+            )
+            .await;
             return Err(ClientError::Timeout(timeout));
         };
+        guard.armed = false;
         if outcome.is_err() {
             lock(&self.shared.pending).remove(&id);
         }
@@ -297,6 +304,40 @@ impl McpClient {
                 .unwrap_or(false),
         })
     }
+}
+
+/// Cleans up after a request future that is dropped before it completes, for
+/// example by a caller's own shorter timeout: the reply slot would otherwise
+/// leak and the server would keep working on a result nobody awaits.
+struct PendingRequest {
+    shared: Arc<Shared>,
+    transport: Arc<dyn Transport>,
+    id: u64,
+    armed: bool,
+}
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        lock(&self.shared.pending).remove(&self.id);
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let transport = Arc::clone(&self.transport);
+        let message = cancellation(self.id, "abandoned by caller");
+        runtime.spawn(async move {
+            let _ = tokio::time::timeout(CANCEL_DELIVERY_TIMEOUT, transport.send(message)).await;
+        });
+    }
+}
+
+fn cancellation(id: u64, reason: &str) -> Value {
+    jsonrpc::notification(
+        "notifications/cancelled",
+        Some(json!({"requestId": id, "reason": reason})),
+    )
 }
 
 impl Drop for McpClient {
@@ -574,6 +615,30 @@ mod tests {
         );
         assert!(lock(&client.shared.pending).is_empty());
         assert!(client.call_tool("echo", json!({}), TIMEOUT).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dropping_a_request_early_clears_it_and_cancels_it_on_the_server() {
+        let server = FakeMcp::new(&["slow"]);
+        server.on_call("slow", CallBehavior::Hang);
+        let client = connected(&server).await;
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(50),
+            client.call_tool("slow", json!({}), TIMEOUT),
+        )
+        .await;
+        assert!(outcome.is_err());
+        assert!(lock(&client.shared.pending).is_empty());
+        for _ in 0..100 {
+            if server
+                .received_methods()
+                .contains(&"notifications/cancelled".to_owned())
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the server never received a cancellation");
     }
 
     #[tokio::test]

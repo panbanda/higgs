@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use higgs_models::{
     AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties,
-    batched_cache::AnyBatchedCache, sample, siglip::PixelValues, turboquant::KvCacheConfig,
+    apply_penalties_with_pending, batched_cache::AnyBatchedCache, sample, siglip::PixelValues,
+    turboquant::KvCacheConfig,
 };
 use mlx_rs::{
     Array, Stream,
@@ -1394,18 +1395,27 @@ fn run_speculative_round(
 }
 
 /// Sample the token that follows `input`, building the graph without evaluating it.
+///
+/// `input_is_undelivered` marks an input that is not in `generated_tokens`
+/// yet; it still belongs in the penalty history.
 fn lookahead_step(
     model: &mut AnyModel,
     ar: &mut ActiveRequest,
     input: &Array,
+    input_is_undelivered: bool,
 ) -> Result<Array, EngineError> {
     let decode_input = input.index((.., NewAxis));
     let logits = model
         .forward(&decode_input, None, &mut ar.cache)
         .map_err(EngineError::Mlx)?;
     let sliced = logits.index((.., -1, ..));
-    let penalized =
-        apply_penalties(&sliced, &ar.generated_tokens, &ar.params).map_err(EngineError::Mlx)?;
+    let penalized = apply_penalties_with_pending(
+        &sliced,
+        &ar.generated_tokens,
+        input_is_undelivered.then_some(input),
+        &ar.params,
+    )
+    .map_err(EngineError::Mlx)?;
     sample(&penalized, &ar.params).map_err(EngineError::Mlx)
 }
 
@@ -1435,12 +1445,12 @@ fn run_lookahead_round(
         token
     } else {
         let current = ar.current_token.clone();
-        let sampled = lookahead_step(model, ar, &current)?;
+        let sampled = lookahead_step(model, ar, &current, false)?;
         let first = with_forced_close(ar, sampled)?;
         async_eval([&first]).map_err(EngineError::Mlx)?;
         first
     };
-    let following = lookahead_step(model, ar, &input)?;
+    let following = lookahead_step(model, ar, &input, true)?;
     async_eval([&following]).map_err(EngineError::Mlx)?;
 
     let token_id: u32 = input.item_cast();
@@ -1674,7 +1684,8 @@ fn run_batched_decode_round(
         .forward_batched(&input, &mut batch.cache)
         .map_err(EngineError::Mlx)?;
     let last_logits = logits.index((.., -1, ..));
-    let sampled = sample_batch(&last_logits, active)?;
+    let pending = batch.undelivered.then_some(&batch.tokens);
+    let sampled = sample_batch(&last_logits, active, pending)?;
     let next_tokens = match batch.thinking.as_mut() {
         Some(thinking) => thinking.apply(&sampled)?,
         None => sampled,
@@ -1692,7 +1703,14 @@ fn run_batched_decode_round(
 }
 
 /// Sample one token per row of `[B, vocab]` logits, as a `[B]` u32 array.
-fn sample_batch(last_logits: &Array, active: &[ActiveRequest]) -> Result<Array, EngineError> {
+///
+/// `pending` holds each row's input token when it is not yet in
+/// `generated_tokens`; it still belongs in the penalty history.
+fn sample_batch(
+    last_logits: &Array,
+    active: &[ActiveRequest],
+    pending: Option<&Array>,
+) -> Result<Array, EngineError> {
     #[allow(clippy::float_cmp)]
     let all_plain_greedy = active
         .iter()
@@ -1703,8 +1721,14 @@ fn sample_batch(last_logits: &Array, active: &[ActiveRequest]) -> Result<Array, 
         let mut row_tokens = Vec::with_capacity(active.len());
         for (ar, row) in active.iter().zip(0_i32..) {
             let row_logits = last_logits.index((row..row + 1, ..));
-            let penalized = apply_penalties(&row_logits, &ar.generated_tokens, &ar.params)
-                .map_err(EngineError::Mlx)?;
+            let row_pending = pending.map(|tokens| tokens.index(row..row + 1));
+            let penalized = apply_penalties_with_pending(
+                &row_logits,
+                &ar.generated_tokens,
+                row_pending.as_ref(),
+                &ar.params,
+            )
+            .map_err(EngineError::Mlx)?;
             row_tokens.push(sample(&penalized, &ar.params).map_err(EngineError::Mlx)?);
         }
         mlx_rs::ops::concatenate(&row_tokens.iter().collect::<Vec<_>>(), 0)
@@ -2941,6 +2965,27 @@ mod tests {
         assert!(ar.in_flight.is_none());
         assert_eq!(rx.try_recv().unwrap().completion_tokens, 1);
         assert!(!settle_in_flight(&mut ar, &make_tokenizer(), &[0]));
+    }
+
+    fn penalized_batch_choice(pending: Option<&Array>) -> u32 {
+        let (mut ar, _rx) = make_active_request(100, vec![]);
+        ar.generated_tokens = vec![0];
+        ar.params = SamplingParams {
+            temperature: 0.0,
+            repetition_penalty: Some(2.0),
+            ..SamplingParams::default()
+        };
+        let logits = Array::from_slice(&[1.0_f32, 5.0, 4.9], &[1, 3]);
+        let sampled = sample_batch(&logits, &[ar], pending).unwrap();
+        sampled.eval().unwrap();
+        sampled.as_slice::<u32>()[0]
+    }
+
+    #[test]
+    fn batched_sampling_penalizes_the_input_token_not_yet_delivered() {
+        assert_eq!(penalized_batch_choice(None), 1);
+        let in_flight = Array::from_slice(&[1_u32], &[1]);
+        assert_eq!(penalized_batch_choice(Some(&in_flight)), 2);
     }
 
     // -----------------------------------------------------------------------
