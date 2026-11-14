@@ -394,9 +394,9 @@ Install the app with `brew install --cask panbanda/brews/higgs-desktop` or from 
 
 ## Performance
 
-These values were measured on an Apple M4 Max with 128 GB. The `bench_compare` harness in `higgs-bench` produced them. It sent streaming requests, used the token counts that the server reported, and took the median of 3 trials after 1 warm-up. Temperature was 0 and thinking was off. `higgs bench <model>` measures the same four things for your own model and Mac: decode, prefill, prefix cache and concurrency.
+These values were measured on an Apple M4 Max with 128 GB. The `bench_compare` harness in `higgs-bench` produced them. It sent streaming requests, used the token counts that the server reported, and took the median of 3 trials after 1 warm-up. Temperature was 0 and thinking was off. `higgs bench <model>` reproduces these measurements for your own model and Mac. It covers decode, prefill, prefix cache and concurrency.
 
-<!-- BENCHMARK TABLE: every figure comes from docs/omlx-comparison.md. A new run is pending. Update both together. -->
+<!-- BENCHMARK TABLE: a new run is pending. Update this table and the benchmark documents together. -->
 
 | Model | Decode, 1 client (tok/s) | Total tok/s with 1, 2, 4, 8 clients | Follow-up turn, time to first token | Peak memory |
 |---|---|---|---|---|
@@ -413,13 +413,15 @@ Notes on the table:
 - A request on Thinklite-27B-4bit with 8 clients had a mean time to the first token of 3.7 s.
 - The measurements are a first pass. Differences under about 5% are noise.
 
-[docs/benchmarking.md](docs/benchmarking.md) describes the harnesses. [docs/omlx-comparison.md](docs/omlx-comparison.md) has head-to-head numbers against another MLX server. [docs/performance.md](docs/performance.md) has earlier measurements.
+[docs/benchmarking.md](docs/benchmarking.md) describes the harnesses. [docs/performance.md](docs/performance.md) has earlier measurements.
+
+Head-to-head numbers against other servers: [docs/omlx-comparison.md](docs/omlx-comparison.md)
 
 ## FAQ and troubleshooting
 
 ### Which model should I start with?
 
-Start with the 1B model from the quick start to check that everything works. For daily use, choose the largest 4-bit model that fits in unified memory with your other apps. A loaded model uses at least the size of its weight files on disk. The KV cache uses more memory. The [benchmarks](docs/omlx-comparison.md) used `Qwen3-1.7B-4bit`, `Thinklite-27B-4bit` and `Qwen3.6-35B-A3B-4bit`. [docs/models.md](docs/models.md) lists model IDs that are known to load. The Hub in the desktop app shows more models.
+Start with the 1B model from the quick start to check that everything works. For daily use, choose the largest 4-bit model that fits in unified memory with your other apps. A loaded model uses at least the size of its weight files on disk. The KV cache uses more memory. The [benchmarks](#performance) used `Qwen3-1.7B-4bit`, `Thinklite-27B-4bit` and `Qwen3.6-35B-A3B-4bit`. [docs/models.md](docs/models.md) lists model IDs that are known to load. The Hub in the desktop app shows more models.
 
 ### How much memory will it use?
 
