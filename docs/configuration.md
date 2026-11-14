@@ -106,7 +106,7 @@ max_files = 5
 - **Environment references.** String values that can hold a secret or a path (`server.host`, `server.api_key`,
   `server.cors_origins`, `models[].path`, `prefix_cache.disk_dir`, `providers.*.url`, `providers.*.api_key`,
   `observability.metrics_log.path`, `web.searxng_url`, `include` entries, and the `env` and `headers` of MCP
-  servers) may contain `${VAR}` or `${VAR:-default}`. A variable that is not set and has no default is an error
+  servers) may contain `${VAR}` or `${VAR:-default}`. An MCP stdio server gets only the variables that its `env` names, plus a short list of basic ones (see `docs/mcp.md`). A variable that is not set and has no default is an error
   that names the key and its line. Write `$${` for a literal `${`. Resolved values are never logged;
   `higgs doctor` and `higgs config explain` print references as written and mask literal secrets.
 - **`~/`** at the start of a path key expands to the home directory.

@@ -189,7 +189,7 @@ default = "higgs"
 # [mcp.servers.filesystem]
 # command = "npx"            # run directly, never through a shell
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/dir"]
-# env = { EXAMPLE_TOKEN = "${EXAMPLE_TOKEN}" }
+# env = { EXAMPLE_TOKEN = "${EXAMPLE_TOKEN}" }  # the server gets only these, plus PATH, HOME and a few basic variables
 # cwd = "/path/to/workdir"
 # timeout = "30s"            # connect, list and each tool call
 # enabled = true
