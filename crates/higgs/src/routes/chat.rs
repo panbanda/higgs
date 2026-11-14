@@ -363,7 +363,7 @@ struct ChunkOptions {
 
 /// Render generation events as chat completion chunks: raw SSE `data`
 /// payloads (JSON chunks, ending with the `[DONE]` sentinel).
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 fn chat_chunk_stream(
     mut events: EventStream,
     model: String,
