@@ -43,7 +43,31 @@ pub struct HttpTransport {
     tasks: Mutex<JoinSet<()>>,
 }
 
+impl HttpTransport {
+    /// Finished tasks are collected on every spawn so a long-lived connection
+    /// does not accumulate one entry per message.
+    fn spawn_task(&self, task: impl Future<Output = ()> + Send + 'static) {
+        let mut tasks = lock(&self.tasks);
+        while let Some(finished) = tasks.try_join_next() {
+            if let Err(error) = finished
+                && error.is_panic()
+            {
+                tracing::error!(%error, "MCP HTTP task panicked");
+            }
+        }
+        tasks.spawn(task);
+    }
+}
+
 pub fn connect(spec: &HttpSpec) -> Result<Connection, TransportError> {
+    let (transport, receiver) = build(spec)?;
+    Ok(Connection {
+        transport: Arc::new(transport),
+        incoming: receiver,
+    })
+}
+
+fn build(spec: &HttpSpec) -> Result<(HttpTransport, mpsc::Receiver<Incoming>), TransportError> {
     let mut headers = HeaderMap::new();
     for (name, value) in &spec.headers {
         let header_name = HeaderName::from_bytes(name.as_bytes())
@@ -74,10 +98,7 @@ pub fn connect(spec: &HttpSpec) -> Result<Connection, TransportError> {
         }),
         tasks: Mutex::new(JoinSet::new()),
     };
-    Ok(Connection {
-        transport: Arc::new(transport),
-        incoming: receiver,
-    })
+    Ok((transport, receiver))
 }
 
 #[derive(Debug)]
@@ -301,7 +322,7 @@ impl Transport for HttpTransport {
                 .and_then(|_| message.get("id"))
                 .filter(|id| !id.is_null())
                 .cloned();
-            lock(&self.tasks).spawn(async move {
+            self.spawn_task(async move {
                 let outcome = tokio::time::timeout(
                     shared.request_timeout,
                     shared.post(&message, request_id.as_ref()),
@@ -332,7 +353,7 @@ impl Transport for HttpTransport {
 
     fn start_notifications(&self) {
         let shared = Arc::clone(&self.shared);
-        lock(&self.tasks).spawn(async move { shared.listen().await });
+        self.spawn_task(async move { shared.listen().await });
     }
 
     fn close(&self) -> BoxFuture<'_, ()> {
@@ -574,6 +595,28 @@ mod tests {
         tokio::time::timeout(TIMEOUT, client.tools_changed())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn finished_message_tasks_are_reaped_instead_of_accumulating() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        let (transport, _incoming) = build(&spec(&server, Vec::new(), TIMEOUT)).unwrap();
+        for _ in 0..20 {
+            transport
+                .send(json!({"jsonrpc": "2.0", "method": "notifications/ping"}))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        transport
+            .send(json!({"jsonrpc": "2.0", "method": "notifications/ping"}))
+            .await
+            .unwrap();
+        assert!(lock(&transport.tasks).len() <= 2);
     }
 
     #[tokio::test]
