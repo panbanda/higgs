@@ -7,24 +7,13 @@
     clippy::tests_outside_test_module
 )]
 
+use super::higgs_bin;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-
-fn higgs_bin() -> std::path::PathBuf {
-    let mut path = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    path.push("higgs");
-    path
-}
 
 fn write_config(dir: &Path, contents: &str) {
     fs::write(dir.join("config.toml"), contents).unwrap();

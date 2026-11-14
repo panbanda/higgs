@@ -2,22 +2,10 @@
 
 #![allow(clippy::panic, clippy::unwrap_used, clippy::tests_outside_test_module)]
 
+use super::higgs_bin;
 use std::io::Write;
 use std::net::TcpListener;
 use std::process::Command;
-
-fn higgs_bin() -> std::path::PathBuf {
-    // cargo sets this during `cargo test`
-    let mut path = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    path.push("higgs");
-    path
-}
 
 #[test]
 fn exec_exits_with_error_when_server_not_running() {
