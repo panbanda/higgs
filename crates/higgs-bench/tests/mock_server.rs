@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -23,12 +24,14 @@ use higgs_bench::selftest::{ModelFacts, Outcome, has_failures, run_selftest};
 use serde_json::{Value, json};
 
 #[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)]
 struct Behavior {
     report_cached_tokens: bool,
     engine: &'static str,
     render_tools: bool,
     prefix_cache_entries: u64,
     blank_counting_replies: bool,
+    refuse_forced_tools: bool,
     seen_prompts: Arc<Mutex<Vec<String>>>,
 }
 
@@ -40,6 +43,7 @@ impl Behavior {
             render_tools: true,
             prefix_cache_entries: 8,
             blank_counting_replies: false,
+            refuse_forced_tools: false,
             seen_prompts: Arc::default(),
         }
     }
@@ -90,6 +94,10 @@ async fn chat(State(behavior): State<Behavior>, Json(body): Json<Value>) -> Resp
         usage["prompt_tokens_details"] = json!({ "cached_tokens": cached });
     }
 
+    if behavior.refuse_forced_tools && body.pointer("/tool_choice/function/name").is_some() {
+        let error = json!({ "error": { "message": "forcing a tool call is not supported for the gemma tool-call format" } });
+        return (StatusCode::BAD_REQUEST, Json(error)).into_response();
+    }
     let streaming = body.get("stream") == Some(&Value::Bool(true));
     let forced_tool = body
         .pointer("/tool_choice/function/name")
@@ -230,6 +238,22 @@ mod tests {
         assert!(matches!(
             outcome_of(&results, "batched equals solo"),
             Outcome::Fail(detail) if detail.contains("solo request")
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_format_that_cannot_force_a_tool_call_skips_the_tool_check() {
+        let behavior = Behavior {
+            refuse_forced_tools: true,
+            ..Behavior::healthy()
+        };
+        let endpoint = endpoint(start(behavior).await);
+        let facts = ModelFacts::discover(&endpoint, "mock").await;
+        let results = run_selftest(&endpoint, &facts, &|_| {}).await;
+        assert!(!has_failures(&results), "{results:?}");
+        assert!(matches!(
+            outcome_of(&results, "forced tool call"),
+            Outcome::Skip(reason) if reason.contains("cannot force")
         ));
     }
 

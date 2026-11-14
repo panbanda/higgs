@@ -290,6 +290,12 @@ async fn prompt_tokens(endpoint: &Endpoint, body: &Value) -> Result<u32> {
         .context("the server did not report prompt tokens")
 }
 
+/// Whether an error is the server's HTTP 400 saying the tool-call format cannot be forced. Any
+/// other error is a real failure.
+fn refuses_forced_choice(error: &str) -> bool {
+    error.contains("HTTP 400") && error.contains("forcing a tool call is not supported")
+}
+
 async fn check_tool_call(endpoint: &Endpoint) -> Result<Outcome> {
     let question = "What is the weather in Paris right now?";
     let plain = chat_body(endpoint.model(), question, 1);
@@ -310,7 +316,15 @@ async fn check_tool_call(endpoint: &Endpoint) -> Result<Outcome> {
             "tool_choice": { "type": "function", "function": { "name": TOOL_NAME } }
         }),
     );
-    let reply = endpoint.complete_body(&forced).await?;
+    let reply = match endpoint.complete_body(&forced).await {
+        Ok(reply) => reply,
+        Err(error) if refuses_forced_choice(&format!("{error:#}")) => {
+            return Ok(Outcome::Skip(
+                "the model's tool-call format cannot force a tool choice".to_owned(),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     let Some(call) = reply.tool_calls.first() else {
         return Ok(Outcome::Fail(format!(
             "no tool call; the reply was {:?} (finish={})",
@@ -825,6 +839,20 @@ mod tests {
                 "Let me thinkThe answer."
             ),
             Comparison::Different(_)
+        ));
+    }
+
+    #[test]
+    fn only_the_forced_choice_refusal_counts_as_unsupported() {
+        let refusal = "http://x/v1/chat/completions returned HTTP 400 Bad Request: \
+            {\"error\":{\"message\":\"forcing a tool call is not supported for the gemma \
+            tool-call format\"}}";
+        assert!(refuses_forced_choice(refusal));
+        assert!(!refuses_forced_choice(
+            "returned HTTP 400 Bad Request: {\"error\":\"max_tokens is too large\"}"
+        ));
+        assert!(!refuses_forced_choice(
+            "returned HTTP 500: forcing a tool call is not supported"
         ));
     }
 
