@@ -247,16 +247,19 @@ fn parse_tag(html: &str, start: usize) -> Option<Tag<'_>> {
 /// closing tag.
 fn raw_text_until<'a>(html: &'a str, position: usize, name: &str) -> (&'a str, usize) {
     let rest = html.get(position..).unwrap_or_default();
-    let needle = format!("</{name}");
-    let lowered = rest.to_ascii_lowercase();
-    lowered.find(&needle).map_or((rest, html.len()), |index| {
-        let after = position + index;
-        let end = html
-            .get(after..)
-            .and_then(|tail| tail.find('>'))
-            .map_or(html.len(), |close| after + close + 1);
-        (rest.get(..index).unwrap_or_default(), end)
-    })
+    let closing = format!("</{name}");
+    let needle = closing.as_bytes();
+    rest.as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle))
+        .map_or((rest, html.len()), |index| {
+            let after = position + index;
+            let end = html
+                .get(after..)
+                .and_then(|tail| tail.find('>'))
+                .map_or(html.len(), |close| after + close + 1);
+            (rest.get(..index).unwrap_or_default(), end)
+        })
 }
 
 fn heading_text(html: &str, position: usize, name: &str) -> String {
@@ -349,9 +352,8 @@ impl TextWriter {
 
     fn finish(self) -> String {
         let mut lines: Vec<&str> = self.output.lines().map(str::trim_end).collect();
-        while lines.first().is_some_and(|line| line.is_empty()) {
-            lines.remove(0);
-        }
+        let leading = lines.iter().take_while(|line| line.is_empty()).count();
+        lines.drain(..leading);
         while lines.last().is_some_and(|line| line.is_empty()) {
             lines.pop();
         }
@@ -544,6 +546,22 @@ mod tests {
             .unwrap();
         assert_eq!(extracted.title.as_deref(), Some("deep"));
         assert_eq!(extracted.text, "deep");
+    }
+
+    #[test]
+    fn hostile_pages_extract_in_linear_time() {
+        let limit = std::time::Duration::from_secs(10);
+        let pages = [
+            "<style></style>".repeat(2 * 1024 * 1024 / 15),
+            "<title></title>".repeat(2 * 1024 * 1024 / 15),
+            format!("<pre>{}x", "\n".repeat(2 * 1024 * 1024)),
+            "<script>".repeat(2 * 1024 * 1024 / 8),
+        ];
+        for page in pages {
+            let started = std::time::Instant::now();
+            let _ = extract(&page);
+            assert!(started.elapsed() < limit, "took {:?}", started.elapsed());
+        }
     }
 
     #[test]
