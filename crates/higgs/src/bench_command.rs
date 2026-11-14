@@ -189,7 +189,9 @@ fn plan_from(args: &BenchArgs) -> Plan {
         } else {
             args.concurrency.clone()
         },
-        concurrency_rounds: quick.concurrency_rounds,
+        concurrency_rounds: args.trials.map_or(quick.concurrency_rounds, |trials| {
+            usize::try_from(trials).unwrap_or(usize::MAX)
+        }),
     }
 }
 
@@ -446,6 +448,7 @@ mod tests {
         assert_eq!(plan.scenarios, quick.scenarios);
         assert_eq!(plan.prefill_tokens, quick.prefill_tokens);
         assert_eq!(plan.concurrency, quick.concurrency);
+        assert_eq!(plan.concurrency_rounds, quick.concurrency_rounds);
         assert!(plan.validate().is_ok());
     }
 
@@ -480,6 +483,7 @@ mod tests {
         assert_eq!(plan.prefill_tokens, [100, 200]);
         assert_eq!(plan.prefix_cache_tokens, 1000);
         assert_eq!(plan.concurrency, [2]);
+        assert_eq!(plan.concurrency_rounds, 5);
         assert_eq!(args.json.as_deref(), Some(Path::new("out.json")));
     }
 }
