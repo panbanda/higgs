@@ -23,6 +23,9 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "
 /// Code for requests failed because the connection closed.
 pub const CONNECTION_CLOSED: i64 = -32001;
 const MAX_LIST_PAGES: usize = 100;
+/// Cancellation is a courtesy; a server that stopped reading must not hold
+/// the caller up for it.
+const CANCEL_DELIVERY_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ServerInfo {
@@ -52,8 +55,14 @@ pub enum ClientError {
     Rpc(RpcError),
     #[error("no response within {0:?}")]
     Timeout(Duration),
+    /// The connection was already gone before the request was written, so
+    /// the server cannot have seen it.
     #[error("connection closed: {0}")]
     Closed(String),
+    /// The connection was lost after the request was written. The server may
+    /// or may not have acted on it.
+    #[error("connection lost before the reply, outcome unknown: {0}")]
+    Interrupted(String),
     #[error("protocol error: {0}")]
     Protocol(String),
 }
@@ -203,28 +212,31 @@ impl McpClient {
             lock(&self.shared.pending).remove(&id);
             return Err(ClientError::Closed(reason));
         }
-        if let Err(error) = self
-            .transport
-            .send(jsonrpc::request(id, method, params))
-            .await
-        {
-            lock(&self.shared.pending).remove(&id);
-            return Err(ClientError::Transport(error.to_string()));
-        }
-        match tokio::time::timeout(timeout, reply_receiver).await {
-            Ok(Ok(Ok(result))) => Ok(result),
-            Ok(Ok(Err(error))) => Err(classify(error)),
-            Ok(Err(_)) => Err(ClientError::Closed("reply channel dropped".to_owned())),
-            Err(_) => {
-                lock(&self.shared.pending).remove(&id);
-                let cancel = jsonrpc::notification(
-                    "notifications/cancelled",
-                    Some(json!({"requestId": id, "reason": "timed out"})),
-                );
-                let _ = self.transport.send(cancel).await;
-                Err(ClientError::Timeout(timeout))
+        let exchange = async {
+            self.transport
+                .send(jsonrpc::request(id, method, params))
+                .await
+                .map_err(|error| ClientError::Transport(error.to_string()))?;
+            match reply_receiver.await {
+                Ok(Ok(result)) => Ok(result),
+                Ok(Err(error)) => Err(classify(error)),
+                Err(_) => Err(ClientError::Interrupted("reply channel dropped".to_owned())),
             }
+        };
+        let Ok(outcome) = tokio::time::timeout(timeout, exchange).await else {
+            lock(&self.shared.pending).remove(&id);
+            let cancel = jsonrpc::notification(
+                "notifications/cancelled",
+                Some(json!({"requestId": id, "reason": "timed out"})),
+            );
+            let _ =
+                tokio::time::timeout(CANCEL_DELIVERY_TIMEOUT, self.transport.send(cancel)).await;
+            return Err(ClientError::Timeout(timeout));
+        };
+        if outcome.is_err() {
+            lock(&self.shared.pending).remove(&id);
         }
+        outcome
     }
 
     /// Fetch every page of `tools/list`.
@@ -299,7 +311,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 fn classify(error: RpcError) -> ClientError {
     match error.code {
-        CONNECTION_CLOSED => ClientError::Closed(error.message),
+        CONNECTION_CLOSED => ClientError::Interrupted(error.message),
         TRANSPORT_FAILURE => ClientError::Transport(error.message),
         _ => ClientError::Rpc(error),
     }
@@ -565,6 +577,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stalled_write_is_bounded_by_the_request_timeout() {
+        let server = FakeMcp::new(&["echo"]);
+        let client = connected(&server).await;
+        server.stall_sends.store(true, Ordering::SeqCst);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call_tool("echo", json!({}), Duration::from_millis(50)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome.unwrap_err(),
+            ClientError::Timeout(Duration::from_millis(50))
+        );
+        assert!(lock(&client.shared.pending).is_empty());
+    }
+
+    #[tokio::test]
     async fn crash_fails_pending_calls_and_marks_the_client_closed() {
         let server = FakeMcp::new(&["boom", "echo"]);
         server.on_call("boom", CallBehavior::Crash);
@@ -573,7 +603,7 @@ mod tests {
             .call_tool("boom", json!({}), TIMEOUT)
             .await
             .unwrap_err();
-        assert!(matches!(error, ClientError::Closed(_)), "{error:?}");
+        assert!(matches!(error, ClientError::Interrupted(_)), "{error:?}");
         assert!(client.closed().await.contains("exited"));
         assert!(client.is_closed());
         let after = client

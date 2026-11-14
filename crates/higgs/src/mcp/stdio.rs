@@ -404,8 +404,9 @@ mod tests {
             counter = counter.display()
         );
         let manager = manager_for(shell_server("sh", &script, Vec::new()));
-        // Whether the supervisor has already noticed the exit or not, the call
-        // must end up on a restarted process.
+        // Give the client time to notice the exit: a call written to a dying
+        // process has an unknown outcome and is not replayed.
+        tokio::time::sleep(Duration::from_millis(500)).await;
         let output = manager.call("sh__greet", json!({})).await.unwrap();
         assert_eq!(output.text, "second life");
         let starts = std::fs::read_to_string(&counter).unwrap().lines().count();

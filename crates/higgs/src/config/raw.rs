@@ -105,7 +105,10 @@ pub struct RawModel {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawProvider {
-    pub url: String,
+    /// Optional here because a provider's keys may come from different layers; resolution
+    /// reports a provider that still has none.
+    #[serde(default)]
+    pub url: Option<String>,
     #[serde(default)]
     pub format: Option<ApiFormat>,
     #[serde(default)]

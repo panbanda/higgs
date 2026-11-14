@@ -14,7 +14,7 @@
 
 use std::collections::HashSet;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use serde::Deserialize;
@@ -304,12 +304,29 @@ pub(crate) async fn complete(
     constraint_spec: Option<ConstraintSpec>,
     received_at: Instant,
 ) -> Result<ChatCompletionResponse, ServerError> {
+    complete_with_transcript(state, req, engine, constraint_spec, received_at)
+        .await
+        .map(|(response, _)| response)
+}
+
+/// [`complete`], also returning the messages the loop appended to the
+/// conversation: each executed round's assistant tool calls and the tool
+/// results. A caller that stores the conversation needs them to replay it.
+pub(crate) async fn complete_with_transcript(
+    state: SharedState,
+    req: ChatCompletionRequest,
+    engine: EngineLease,
+    constraint_spec: Option<ConstraintSpec>,
+    received_at: Instant,
+) -> Result<(ChatCompletionResponse, Vec<ChatCompletionMessage>), ServerError> {
     let Some(plan) = plan(&state, &req)? else {
         return chat_completions_non_streaming(state, req, engine, constraint_spec, received_at)
-            .await;
+            .await
+            .map(|response| (response, Vec::new()));
     };
 
     let mut conversation = req;
+    let original_message_count = conversation.messages.len();
     conversation.mcp = None;
     conversation.tools = Some(plan.injected_tools.clone());
     let mut first_lease = Some(engine);
@@ -349,18 +366,27 @@ pub(crate) async fn complete(
             .unwrap_or_default();
         let (server_calls, client_calls) = split_calls(calls, &plan.names);
         if server_calls.is_empty() {
-            return Ok(finish(response, &trace));
+            return Ok((
+                finish(response, &trace),
+                conversation.messages.split_off(original_message_count),
+            ));
         }
         let exhausted = round == plan.max_iterations;
         if !client_calls.is_empty() {
             if let Some(choice) = response.choices.first_mut() {
                 choice.message.tool_calls = Some(client_calls);
             }
-            return Ok(finish(response, &trace));
+            return Ok((
+                finish(response, &trace),
+                conversation.messages.split_off(original_message_count),
+            ));
         }
         if exhausted {
             trace.truncated = true;
-            return Ok(finish(response, &trace));
+            return Ok((
+                finish(response, &trace),
+                conversation.messages.split_off(original_message_count),
+            ));
         }
 
         trace.rounds += 1;
@@ -537,7 +563,6 @@ fn merge_usage(total: &mut Option<Value>, next: Value) {
 /// chunks with an empty `choices` array and a `higgs_mcp` field announce
 /// each call (`tool_call`), its outcome (`tool_result`) and the loop's end
 /// (`summary`). Standard clients ignore them, as they do usage chunks.
-#[allow(clippy::too_many_lines)]
 pub(crate) fn chunk_stream(
     state: SharedState,
     req: ChatCompletionRequest,
@@ -546,6 +571,45 @@ pub(crate) fn chunk_stream(
     metrics: Option<Arc<MetricsStore>>,
     routing_method: RoutingMethod,
     received_at: Instant,
+) -> Result<ChunkStream, ServerError> {
+    chunk_stream_with_transcript(
+        state,
+        req,
+        engine,
+        constraint_spec,
+        metrics,
+        routing_method,
+        received_at,
+        &Transcript::default(),
+    )
+}
+
+/// Messages a tool loop appended to the conversation, shared with the caller
+/// of a stream. Filled before the stream's last item is produced.
+#[derive(Clone, Default)]
+pub(crate) struct Transcript(Arc<Mutex<Vec<ChatCompletionMessage>>>);
+
+impl Transcript {
+    fn set(&self, messages: Vec<ChatCompletionMessage>) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = messages;
+    }
+
+    pub(crate) fn take(&self) -> Vec<ChatCompletionMessage> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+/// [`chunk_stream`], recording the loop's appended messages in `transcript`.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) fn chunk_stream_with_transcript(
+    state: SharedState,
+    req: ChatCompletionRequest,
+    engine: EngineLease,
+    constraint_spec: Option<ConstraintSpec>,
+    metrics: Option<Arc<MetricsStore>>,
+    routing_method: RoutingMethod,
+    received_at: Instant,
+    recorder: &Transcript,
 ) -> Result<ChunkStream, ServerError> {
     let Some(plan) = plan(&state, &req)? else {
         return Ok(Box::pin(chat_completions_chunk_stream(
@@ -560,8 +624,10 @@ pub(crate) fn chunk_stream(
     };
 
     let mut conversation = req;
+    let original_message_count = conversation.messages.len();
     conversation.mcp = None;
     conversation.tools = Some(plan.injected_tools.clone());
+    let transcript = recorder.clone();
 
     Ok(Box::pin(async_stream::stream! {
         let mut first_lease = Some(engine);
@@ -685,6 +751,7 @@ pub(crate) fn chunk_stream(
             }
         }
 
+        transcript.set(conversation.messages.split_off(original_message_count));
         if let Some(usage) = usage_total {
             yield usage.to_string();
         }
