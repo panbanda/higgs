@@ -40,8 +40,9 @@ pub fn free_port() -> Result<u16> {
 
 impl LocalServer {
     /// Starts `command`, which must serve on `127.0.0.1:port`, with its output going to a log file
-    /// shown if the server fails to start. Fails when something already listens on the port, so
-    /// a health reply can only come from the new process.
+    /// shown if the server fails to start. Fails when something already listens on the port, but
+    /// the child binds only after it loads its model, so another process can take the port in
+    /// between; callers must confirm who answers (see [`LocalServer::pid`]) before trusting it.
     pub fn spawn(command: &ServerCommand, port: u16) -> Result<Self> {
         drop(TcpListener::bind(("127.0.0.1", port)).with_context(|| {
             format!("port {port} is already in use; choose another with --port")

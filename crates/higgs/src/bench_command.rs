@@ -140,6 +140,30 @@ fn request_model(listed: &[String]) -> CommandResult<String> {
     }
 }
 
+/// Fails unless the reply to the authenticated `/v1/system` request came from the child. The
+/// child binds its port only after loading the model, so until then any listener on the port
+/// can answer the health probe; only the child accepts the private key and reports its own pid.
+fn confirm_server_identity(
+    system: Result<serde_json::Value, String>,
+    child_pid: u32,
+    port: u16,
+) -> CommandResult<()> {
+    let other = |detail: String| -> CommandResult<()> {
+        Err(format!(
+            "port {port} is answered by another server ({detail}), not the private one; choose another --port"
+        )
+        .into())
+    };
+    match system {
+        Err(error) => other(error),
+        Ok(reply) => match reply.get("pid").and_then(serde_json::Value::as_u64) {
+            Some(pid) if pid == u64::from(child_pid) => Ok(()),
+            Some(pid) => other(format!("its pid is {pid}")),
+            None => other("it reports no pid".to_owned()),
+        },
+    }
+}
+
 async fn start_session(
     cli: &Cli,
     target: &ModelTargetArgs,
@@ -172,6 +196,14 @@ async fn start_session(
         extra_body,
         timeout: REQUEST_TIMEOUT,
     })?;
+    confirm_server_identity(
+        endpoint
+            .get_json("/v1/system")
+            .await
+            .map_err(|error| format!("{error:#}")),
+        server.pid(),
+        port,
+    )?;
     let listed = endpoint.list_model_ids().await?;
     let model = request_model(&listed)?;
     eprintln!("[server] ready, serving {model}");
@@ -380,6 +412,27 @@ mod tests {
         assert_eq!(arguments.first().map(String::as_str), Some("--profile"));
         assert_eq!(arguments.get(1).map(String::as_str), Some("work"));
         assert!(!arguments.contains(&"--model".to_owned()));
+    }
+
+    #[test]
+    fn only_the_child_passes_the_identity_check() {
+        let child = serde_json::json!({ "pid": 4242 });
+        assert!(confirm_server_identity(Ok(child), 4242, 9).is_ok());
+
+        let stranger = serde_json::json!({ "pid": 17 });
+        let wrong_pid = confirm_server_identity(Ok(stranger), 4242, 9)
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_pid.contains("another server"), "{wrong_pid}");
+        assert!(wrong_pid.contains("pid is 17"), "{wrong_pid}");
+
+        let rejected = "http://127.0.0.1:9/v1/system returned HTTP 401".to_owned();
+        let refusal = confirm_server_identity(Err(rejected), 4242, 9)
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("401"), "{refusal}");
+
+        assert!(confirm_server_identity(Ok(serde_json::json!({})), 4242, 9).is_err());
     }
 
     #[test]

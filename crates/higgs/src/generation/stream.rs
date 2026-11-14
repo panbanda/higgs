@@ -168,10 +168,14 @@ impl Assembler {
             return events;
         };
 
-        let chunk_logprobs = output
-            .token_logprob
-            .as_ref()
-            .map(|info| decode_logprobs(std::slice::from_ref(info), &self.tokenizer));
+        let chunk_logprobs = output.token_logprob.as_ref().map(|info| {
+            let mut logprobs = decode_logprobs(std::slice::from_ref(info), &self.tokenizer);
+            // The detokenizer already decoded this token in context.
+            if let Some(entry) = logprobs.content.first_mut() {
+                entry.bytes = output.new_text.as_bytes().to_vec();
+            }
+            logprobs
+        });
         let (visible, reasoning) = tracker.process(&output.new_text);
         self.emit_reasoning(reasoning, &mut events);
         let tool_output = match self.tools.as_mut() {

@@ -53,17 +53,44 @@ impl RssSampler {
     }
 
     /// Stops sampling and returns the peak in mebibytes.
-    pub fn finish(mut self) -> f64 {
+    pub fn finish(self) -> f64 {
         self.sample_now();
+        self.peak_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0)
+    }
+}
+
+impl Drop for RssSampler {
+    fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
-        self.peak_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0)
     }
 }
 
 fn read_rss_bytes(system: &mut System, pid: Pid) -> Option<u64> {
     system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
     system.process(pid).map(sysinfo::Process::memory)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_a_sampler_stops_its_thread() -> Result<()> {
+        let sampler = RssSampler::start(std::process::id())?;
+        let stop = Arc::clone(&sampler.stop);
+        assert!(!stop.load(Ordering::Relaxed));
+        drop(sampler);
+        assert!(stop.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    #[test]
+    fn finishing_reports_a_positive_peak() -> Result<()> {
+        let sampler = RssSampler::start(std::process::id())?;
+        assert!(sampler.finish() > 0.0);
+        Ok(())
+    }
 }

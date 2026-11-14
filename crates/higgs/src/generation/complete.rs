@@ -129,22 +129,105 @@ fn split_reasoning(text: String, handling: ReasoningHandling) -> (String, Option
     }
 }
 
+/// The text each token adds to the output, decoded in context. Decoding a token alone drops the
+/// leading space a `SentencePiece` tokenizer marks and turns half of a multi-byte character into
+/// U+FFFD; decoding a window ending at the token and subtracting the window before it (as the
+/// streaming detokenizer does) gives the text the client actually receives. A token whose text
+/// is incomplete adds nothing; the token that completes it adds the whole character.
+fn token_deltas(token_ids: &[u32], tokenizer: &Tokenizer) -> Vec<String> {
+    let decode = |ids: &[u32]| tokenizer.decode(ids, false).unwrap_or_default();
+    let mut deltas = vec![String::new(); token_ids.len()];
+    let (mut prefix_offset, mut read_offset) = (0, 0);
+    for (index, delta) in deltas.iter_mut().enumerate() {
+        let before = decode(
+            token_ids
+                .get(prefix_offset..read_offset)
+                .unwrap_or_default(),
+        );
+        let window = decode(token_ids.get(prefix_offset..=index).unwrap_or_default());
+        if window.len() > before.len() && !window.ends_with('\u{FFFD}') {
+            if let Some(added) = window.get(before.len()..) {
+                added.clone_into(delta);
+            }
+            prefix_offset = read_offset;
+            read_offset = index + 1;
+        }
+    }
+    deltas
+}
+
 pub(super) fn decode_logprobs(infos: &[TokenLogprobInfo], tokenizer: &Tokenizer) -> ChoiceLogprobs {
     let decode = |token_id: u32| tokenizer.decode(&[token_id], false).unwrap_or_default();
+    let token_ids: Vec<u32> = infos.iter().map(|info| info.token_id).collect();
+    let deltas = token_deltas(&token_ids, tokenizer);
     let content = infos
         .iter()
-        .map(|info| TokenLogprob {
-            token: decode(info.token_id),
-            logprob: info.logprob,
-            top_logprobs: info
-                .top_logprobs
-                .iter()
-                .map(|entry| TopLogprob {
-                    token: decode(entry.token_id),
-                    logprob: entry.logprob,
-                })
-                .collect(),
+        .zip(deltas)
+        .map(|(info, delta)| {
+            let token = decode(info.token_id);
+            TokenLogprob {
+                bytes: delta.into_bytes(),
+                token,
+                logprob: info.logprob,
+                top_logprobs: info
+                    .top_logprobs
+                    .iter()
+                    .map(|entry| {
+                        let alternative = decode(entry.token_id);
+                        TopLogprob {
+                            bytes: alternative.clone().into_bytes(),
+                            token: alternative,
+                            logprob: entry.logprob,
+                        }
+                    })
+                    .collect(),
+            }
         })
         .collect();
     ChoiceLogprobs { content }
+}
+
+#[allow(clippy::unwrap_used)]
+#[cfg(test)]
+mod logprob_bytes_tests {
+    use super::*;
+
+    fn word_tokenizer(decoder: &str, vocab: &str) -> Tokenizer {
+        let json = format!(
+            r#"{{
+                "version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+                "normalizer": null, "pre_tokenizer": null, "post_processor": null,
+                "decoder": {decoder},
+                "model": {{ "type": "WordLevel", "vocab": {vocab}, "unk_token": "a" }}
+            }}"#
+        );
+        Tokenizer::from_bytes(json.as_bytes()).unwrap()
+    }
+
+    fn joined(deltas: &[String]) -> String {
+        deltas.concat()
+    }
+
+    #[test]
+    fn a_character_split_across_tokens_is_credited_to_the_token_that_completes_it() {
+        let tokenizer = word_tokenizer(
+            r#"{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true}"#,
+            r#"{"Hello": 0, "Ġworld": 1, "ðŁĺ": 3, "Ģ": 4}"#,
+        );
+        let deltas = token_deltas(&[0, 1, 3, 4], &tokenizer);
+        assert_eq!(deltas, ["Hello", " world", "", "\u{1F600}"]);
+    }
+
+    #[test]
+    fn a_sentencepiece_space_survives_in_context() {
+        let tokenizer = word_tokenizer(
+            r#"{"type":"Metaspace","replacement":"\u2581","prepend_scheme":"always","split":true}"#,
+            r#"{"\u2581Hello": 0, "\u2581world": 1}"#,
+        );
+        let alone = tokenizer.decode(&[1], false).unwrap();
+        assert_eq!(alone, "world", "a lone token loses its space");
+        let deltas = token_deltas(&[0, 1], &tokenizer);
+        assert_eq!(deltas, ["Hello", " world"]);
+        assert_eq!(joined(&deltas), tokenizer.decode(&[0, 1], false).unwrap());
+    }
 }

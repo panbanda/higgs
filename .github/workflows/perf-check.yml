@@ -51,8 +51,10 @@ jobs:
 
       - name: Download the model
         run: |
-          python3 -m pip install --quiet "huggingface_hub[cli]"
-          hf download "$PERF_MODEL"
+          # The runner's Homebrew Python refuses system-wide pip installs (PEP 668).
+          python3 -m venv "$RUNNER_TEMP/hf-venv"
+          "$RUNNER_TEMP/hf-venv/bin/python" -m pip install --quiet "huggingface_hub[cli]"
+          "$RUNNER_TEMP/hf-venv/bin/hf" download "$PERF_MODEL"
 
       - name: Build release
         run: cargo build --release -p higgs

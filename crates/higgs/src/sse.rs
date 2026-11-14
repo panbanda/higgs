@@ -322,9 +322,11 @@ mod tests {
             content: vec![TokenLogprob {
                 token: "x".to_owned(),
                 logprob: -0.5,
+                bytes: vec![b'x'],
                 top_logprobs: vec![TopLogprob {
                     token: "x".to_owned(),
                     logprob: -0.5,
+                    bytes: vec![b'x'],
                 }],
             }],
         };
