@@ -1302,7 +1302,8 @@ impl LogprobArrays {
             .as_dtype(mlx_rs::Dtype::Float32)?;
 
         // Top-N logprobs
-        let (top_indices, top_values) = if let Some(n) = top_n {
+        // An empty top list has no data pointer, which `as_slice` rejects.
+        let (top_indices, top_values) = if let Some(n) = top_n.filter(|&n| n > 0) {
             let vocab_size = *log_probs.shape().last().unwrap_or(&0);
             let clamped = i32::try_from(n)
                 .map_err(|_| Exception::custom("top_n overflow for i32"))?
@@ -1857,6 +1858,22 @@ fn remap_quantized_key(key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logprobs_without_a_top_list_materialize() {
+        let logits = mlx_rs::Array::from_slice(&[1.0_f32, 2.0, 3.0], &[1, 3]);
+        let sampled = mlx_rs::Array::from_slice(&[2_u32], &[1]);
+        for top_n in [None, Some(0), Some(2)] {
+            let arrays = LogprobArrays::compute(&logits, &sampled, top_n).unwrap();
+            mlx_rs::transforms::eval(arrays.eval_targets()).unwrap();
+            let info = arrays.materialize(2);
+            assert_eq!(
+                info.top_logprobs.len(),
+                usize::try_from(top_n.unwrap_or(0)).unwrap()
+            );
+            assert!(info.logprob < 0.0);
+        }
+    }
     use crate::cache::KeyValueCache;
     use crate::qwen3_next::QLinear;
     use mlx_rs::macros::ModuleParameters;

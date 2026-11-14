@@ -129,7 +129,8 @@ struct Assembler {
     reasoning_text: String,
     /// Held until the trackers have drained, since a tool call changes the reason.
     pending_finish: Option<String>,
-    /// Logprobs of tokens whose text the trackers still hold. They go out with the next text.
+    /// Logprobs of tokens whose text has not gone out yet. They leave with the next event of
+    /// any kind, so they stay with the text their tokens produced; leftovers go with the finish.
     held_logprobs: Vec<TokenLogprob>,
 }
 
@@ -160,15 +161,16 @@ impl Assembler {
 
     fn push(&mut self, output: &StreamingOutput) -> Vec<GenerationEvent> {
         let mut events = Vec::new();
-        let chunk_logprobs = output.token_logprob.as_ref().map(|info| {
+        if let Some(info) = &output.token_logprob {
             let logged = LoggedToken {
                 info: info.clone(),
                 text: output.new_text.clone(),
             };
-            decode_logprobs(std::slice::from_ref(&logged), &self.tokenizer)
-        });
+            self.held_logprobs
+                .extend(decode_logprobs(std::slice::from_ref(&logged), &self.tokenizer).content);
+        }
         let Some(tracker) = self.reasoning.as_mut() else {
-            self.emit_text(output.new_text.clone(), chunk_logprobs, &mut events);
+            self.emit_text(output.new_text.clone(), &mut events);
             if let Some(reason) = &output.finish_reason {
                 self.pending_finish = Some(reason.clone());
             }
@@ -184,7 +186,7 @@ impl Assembler {
                 new_tool_calls: Vec::new(),
             },
         };
-        self.emit_tool_output(tool_output, chunk_logprobs, &mut events);
+        self.emit_tool_output(tool_output, &mut events);
         if let Some(reason) = &output.finish_reason {
             self.pending_finish = Some(reason.clone());
         }
@@ -206,16 +208,14 @@ impl Assembler {
                     new_tool_calls: Vec::new(),
                 },
             };
-            self.emit_tool_output(tool_output, None, &mut events);
+            self.emit_tool_output(tool_output, &mut events);
         }
         if let Some(tools) = self.tools.as_mut() {
             let tail = tools.flush();
-            self.emit_tool_output(tail, None, &mut events);
+            self.emit_tool_output(tail, &mut events);
         }
         if let Some(reason) = self.pending_finish.take() {
-            let logprobs = (!self.held_logprobs.is_empty()).then(|| ChoiceLogprobs {
-                content: std::mem::take(&mut self.held_logprobs),
-            });
+            let logprobs = self.release_logprobs();
             let called_tools = self
                 .tools
                 .as_ref()
@@ -241,36 +241,31 @@ impl Assembler {
             return;
         }
         self.reasoning_text.push_str(&reasoning);
-        events.push(GenerationEvent::ReasoningDelta(reasoning));
-    }
-
-    /// Send `text` with its logprobs, or keep the logprobs for the next text when there is none.
-    /// Held logprobs go first, so the `bytes` of all chunks join to the text of all tokens.
-    fn emit_text(
-        &mut self,
-        text: String,
-        logprobs: Option<ChoiceLogprobs>,
-        events: &mut Vec<GenerationEvent>,
-    ) {
-        let new_content = logprobs.map(|entries| entries.content).unwrap_or_default();
-        if text.is_empty() {
-            self.held_logprobs.extend(new_content);
-            return;
-        }
-        let mut content = std::mem::take(&mut self.held_logprobs);
-        content.extend(new_content);
-        events.push(GenerationEvent::TextDelta {
-            text,
-            logprobs: (!content.is_empty()).then_some(ChoiceLogprobs { content }),
+        events.push(GenerationEvent::ReasoningDelta {
+            text: reasoning,
+            logprobs: self.release_logprobs(),
         });
     }
 
-    fn emit_tool_output(
-        &mut self,
-        output: StreamingToolOutput,
-        logprobs: Option<ChoiceLogprobs>,
-        events: &mut Vec<GenerationEvent>,
-    ) {
+    /// Everything held so far, for the event being emitted now. A step that emits several
+    /// events gives all of it to the first, which is the one for the earliest text.
+    fn release_logprobs(&mut self) -> Option<ChoiceLogprobs> {
+        (!self.held_logprobs.is_empty()).then(|| ChoiceLogprobs {
+            content: std::mem::take(&mut self.held_logprobs),
+        })
+    }
+
+    fn emit_text(&mut self, text: String, events: &mut Vec<GenerationEvent>) {
+        if text.is_empty() {
+            return;
+        }
+        events.push(GenerationEvent::TextDelta {
+            text,
+            logprobs: self.release_logprobs(),
+        });
+    }
+
+    fn emit_tool_output(&mut self, output: StreamingToolOutput, events: &mut Vec<GenerationEvent>) {
         // Calls are numbered across the whole response; this batch covers the
         // indices just before the tracker's running total.
         let completed = self
@@ -279,13 +274,16 @@ impl Assembler {
             .map_or(0, ToolCallTracker::completed_count);
         let first_index = completed.saturating_sub(output.new_tool_calls.len());
         for (offset, call) in output.new_tool_calls.into_iter().enumerate() {
-            events.push(GenerationEvent::ToolCall(GeneratedToolCall::new(
-                u32::try_from(first_index + offset).unwrap_or(u32::MAX),
-                call.name,
-                call.arguments,
-            )));
+            events.push(GenerationEvent::ToolCall {
+                call: GeneratedToolCall::new(
+                    u32::try_from(first_index + offset).unwrap_or(u32::MAX),
+                    call.name,
+                    call.arguments,
+                ),
+                logprobs: self.release_logprobs(),
+            });
         }
-        self.emit_text(output.visible, logprobs, events);
+        self.emit_text(output.visible, events);
     }
 }
 
@@ -322,7 +320,7 @@ mod tests {
         }
     }
 
-    fn streamed(handling: ReasoningHandling, pieces: &[&str]) -> (String, String) {
+    fn run(handling: ReasoningHandling, pieces: &[&str]) -> Vec<GenerationEvent> {
         let mut assembler = Assembler::new(handling, None, tokenizer());
         let mut events = Vec::new();
         for (index, piece) in pieces.iter().enumerate() {
@@ -330,32 +328,49 @@ mod tests {
             events.extend(assembler.push(&step(piece, finish)));
         }
         events.extend(assembler.finish());
-        let (mut text, mut bytes) = (String::new(), Vec::new());
-        for event in events {
-            let chunk = match event {
-                GenerationEvent::TextDelta {
-                    text: delta,
-                    logprobs: found,
-                } => {
-                    text.push_str(&delta);
-                    found
+        events
+    }
+
+    /// What each event carries: its text and the bytes of its logprobs.
+    fn carried(events: &[GenerationEvent]) -> Vec<(&'static str, String, String)> {
+        let joined = |found: &Option<ChoiceLogprobs>| {
+            let bytes: Vec<u8> = found
+                .iter()
+                .flat_map(|entries| entries.content.iter().flat_map(|entry| entry.bytes.clone()))
+                .collect();
+            String::from_utf8(bytes).unwrap()
+        };
+        events
+            .iter()
+            .filter_map(|event| match event {
+                GenerationEvent::TextDelta { text, logprobs } => {
+                    Some(("content", text.clone(), joined(logprobs)))
                 }
-                GenerationEvent::Finish {
-                    logprobs: found, ..
-                } => found,
+                GenerationEvent::ReasoningDelta { text, logprobs } => {
+                    Some(("reasoning", text.clone(), joined(logprobs)))
+                }
+                GenerationEvent::Finish { logprobs, .. } => {
+                    Some(("finish", String::new(), joined(logprobs)))
+                }
                 GenerationEvent::Started { .. }
                 | GenerationEvent::PrefillProgress(_)
-                | GenerationEvent::ReasoningDelta(_)
-                | GenerationEvent::ToolCall(_)
+                | GenerationEvent::ToolCall { .. }
                 | GenerationEvent::Usage(_)
                 | GenerationEvent::ToolLoop(_)
                 | GenerationEvent::Error(_) => None,
-            };
-            for entry in chunk.into_iter().flat_map(|entries| entries.content) {
-                bytes.extend(entry.bytes);
-            }
-        }
-        (text, String::from_utf8(bytes).unwrap())
+            })
+            .collect()
+    }
+
+    fn streamed(handling: ReasoningHandling, pieces: &[&str]) -> (String, String) {
+        let carried = carried(&run(handling, pieces));
+        let text = carried
+            .iter()
+            .filter(|(kind, ..)| *kind == "content")
+            .map(|(_, text, _)| text.as_str())
+            .collect();
+        let bytes = carried.iter().map(|(.., bytes)| bytes.as_str()).collect();
+        (text, bytes)
     }
 
     #[test]
@@ -370,5 +385,32 @@ mod tests {
             let (text, bytes) = streamed(handling, &["x", "<", "t", "h", "y", ""]);
             assert_eq!(bytes, "x<thy", "text was {text:?}");
         }
+    }
+
+    #[test]
+    fn logprobs_go_with_the_text_their_tokens_produced() {
+        let handling = ReasoningHandling::Parsed {
+            thinking: true,
+            parse_without_thinking: true,
+        };
+        let events = run(
+            handling,
+            &["reasoning one ", "reasoning two ", "</think>", "Paris", ""],
+        );
+        let carried = carried(&events);
+        let reasoning_bytes: String = carried
+            .iter()
+            .filter(|(kind, ..)| *kind == "reasoning")
+            .map(|(.., bytes)| bytes.as_str())
+            .collect();
+        assert_eq!(reasoning_bytes, "reasoning one reasoning two </think>");
+        let content: Vec<_> = carried
+            .iter()
+            .filter(|(kind, ..)| *kind == "content")
+            .map(|(_, text, bytes)| (text.as_str(), bytes.as_str()))
+            .collect();
+        assert_eq!(content, [("Paris", "Paris")]);
+        let all: String = carried.iter().map(|(.., bytes)| bytes.as_str()).collect();
+        assert_eq!(all, "reasoning one reasoning two </think>Paris");
     }
 }

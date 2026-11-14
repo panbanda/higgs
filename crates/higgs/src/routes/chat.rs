@@ -407,14 +407,14 @@ fn chat_chunk_stream(
                         yield json.to_owned();
                     }
                 }
-                GenerationEvent::ReasoningDelta(text) => {
+                GenerationEvent::ReasoningDelta { text, logprobs } => {
                     let delta = ChatCompletionDelta {
                         role: None,
                         content: None,
                         reasoning_content: Some(text),
                         tool_calls: None,
                     };
-                    emit_delta!(&delta, None, None);
+                    emit_delta!(&delta, None, logprobs.as_ref());
                 }
                 GenerationEvent::TextDelta { text, logprobs } => {
                     let delta = ChatCompletionDelta {
@@ -425,7 +425,7 @@ fn chat_chunk_stream(
                     };
                     emit_delta!(&delta, None, logprobs.as_ref());
                 }
-                GenerationEvent::ToolCall(call) => {
+                GenerationEvent::ToolCall { call, logprobs } => {
                     let delta = ChatCompletionDelta {
                         role: None,
                         content: None,
@@ -440,7 +440,7 @@ fn chat_chunk_stream(
                             }),
                         }]),
                     };
-                    emit_delta!(&delta, None, None);
+                    emit_delta!(&delta, None, logprobs.as_ref());
                 }
                 GenerationEvent::Finish { reason, logprobs } => {
                     let delta = ChatCompletionDelta {

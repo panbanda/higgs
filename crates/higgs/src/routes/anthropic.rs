@@ -394,7 +394,7 @@ fn message_event_stream(
                         Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
                     }
                 }
-                GenerationEvent::ToolCall(call) => tool_calls.push(call),
+                GenerationEvent::ToolCall { call, .. } => tool_calls.push(call),
                 GenerationEvent::Finish { reason, .. } => {
                     stop_reason = Some(openai_finish_to_anthropic_stop(&reason));
                 }
@@ -415,7 +415,7 @@ fn message_event_stream(
                     return;
                 }
                 GenerationEvent::PrefillProgress(_)
-                | GenerationEvent::ReasoningDelta(_)
+                | GenerationEvent::ReasoningDelta { .. }
                 | GenerationEvent::ToolLoop(_) => {}
             }
         }

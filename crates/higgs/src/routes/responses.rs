@@ -368,9 +368,9 @@ fn response_event_stream(
                 GenerationEvent::ToolLoop(_) => {}
                 GenerationEvent::Started { .. }
                 | GenerationEvent::PrefillProgress(_)
-                | GenerationEvent::ReasoningDelta(_)
+                | GenerationEvent::ReasoningDelta { .. }
                 | GenerationEvent::TextDelta { .. }
-                | GenerationEvent::ToolCall(_)
+                | GenerationEvent::ToolCall { .. }
                 | GenerationEvent::Finish { .. }
                 | GenerationEvent::Usage(_)
                 | GenerationEvent::Error(_) => final_round_events.push(generation_event.clone()),
