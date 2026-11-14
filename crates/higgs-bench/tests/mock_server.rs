@@ -32,6 +32,10 @@ struct Behavior {
     prefix_cache_entries: u64,
     blank_counting_replies: bool,
     refuse_forced_tools: bool,
+    /// A repeated prompt (served from the cache) gets a different last word.
+    vary_cached_replies: bool,
+    /// Gap between the best and second logprob the mock reports for every token.
+    logprob_margin: f64,
     seen_prompts: Arc<Mutex<Vec<String>>>,
 }
 
@@ -44,6 +48,8 @@ impl Behavior {
             prefix_cache_entries: 8,
             blank_counting_replies: false,
             refuse_forced_tools: false,
+            vary_cached_replies: false,
+            logprob_margin: 5.0,
             seen_prompts: Arc::default(),
         }
     }
@@ -110,6 +116,12 @@ async fn chat(State(behavior): State<Behavior>, Json(body): Json<Value>) -> Resp
     } else {
         reply_text(&body)
     };
+    let text = if behavior.vary_cached_replies && cached > 0 && !streaming {
+        text.rsplit_once(' ')
+            .map_or(text.clone(), |(head, _)| format!("{head} term"))
+    } else {
+        text
+    };
     let completion_tokens = text.split_whitespace().count().max(1);
     usage["completion_tokens"] = json!(completion_tokens);
 
@@ -148,8 +160,27 @@ async fn chat(State(behavior): State<Behavior>, Json(body): Json<Value>) -> Resp
     } else {
         "length"
     };
+    let mut choice = json!({ "message": message, "finish_reason": finish });
+    if body.get("logprobs") == Some(&Value::Bool(true)) {
+        let margin = behavior.logprob_margin;
+        let content: Vec<Value> = text
+            .split_inclusive(' ')
+            .map(|piece| {
+                json!({
+                    "token": piece,
+                    "bytes": piece.as_bytes(),
+                    "logprob": -0.1,
+                    "top_logprobs": [
+                        { "token": piece, "logprob": -0.1 },
+                        { "token": "other", "logprob": -0.1 - margin }
+                    ]
+                })
+            })
+            .collect();
+        choice["logprobs"] = json!({ "content": content });
+    }
     Json(json!({
-        "choices": [{ "message": message, "finish_reason": finish }],
+        "choices": [choice],
         "usage": usage
     }))
     .into_response()
@@ -255,6 +286,41 @@ mod tests {
             outcome_of(&results, "forced tool call"),
             Outcome::Skip(reason) if reason.contains("cannot force")
         ));
+    }
+
+    async fn prefix_outcome(behavior: Behavior) -> Outcome {
+        let endpoint = endpoint(start(behavior).await);
+        let facts = ModelFacts::discover(&endpoint, "mock").await;
+        let results = run_selftest(&endpoint, &facts, &|_| {}).await;
+        outcome_of(&results, "prefix cache hit").clone()
+    }
+
+    #[tokio::test]
+    async fn a_cached_reply_that_differs_on_a_near_tie_still_passes() {
+        let outcome = prefix_outcome(Behavior {
+            vary_cached_replies: true,
+            logprob_margin: 0.1,
+            ..Behavior::healthy()
+        })
+        .await;
+        assert!(
+            matches!(&outcome, Outcome::Pass(detail) if detail.contains("near tie")),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cached_reply_that_differs_with_a_clear_margin_fails() {
+        let outcome = prefix_outcome(Behavior {
+            vary_cached_replies: true,
+            logprob_margin: 5.0,
+            ..Behavior::healthy()
+        })
+        .await;
+        assert!(
+            matches!(&outcome, Outcome::Fail(detail) if detail.contains("cold versus cached")),
+            "{outcome:?}"
+        );
     }
 
     #[tokio::test]

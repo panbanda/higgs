@@ -1,8 +1,9 @@
 //! A quick correctness check of one model behind an OpenAI-compatible server.
 //!
 //! Every check uses greedy sampling and compares outputs only where a difference would be a
-//! real fault: the same request must give the same text whether streamed or not, cold or from
-//! the prefix cache, and (for a few tokens) alone or batched with another request. Long
+//! real fault: the same request must give the same text whether streamed or not, and (for a few tokens)
+//! alone or batched with another request, and the same text cold or from the prefix cache
+//! except where the logprobs show a near tie. Long
 //! outputs are never compared, because half-precision rounding legitimately makes them diverge.
 
 use std::fmt::Write as _;
@@ -194,7 +195,12 @@ async fn check_prefix_cache(endpoint: &Endpoint, facts: &ModelFacts) -> Result<O
         fresh_nonce(),
         build_prompt_body(PREFIX_PROMPT_TOKENS)
     );
-    let body = chat_body(endpoint.model(), &prompt, 24);
+    // With logprobs, so the cold run's margins can tell a near tie from a real fault if the
+    // cached run's text differs: a cached resume may round differently from a cold prefill.
+    let body = with_fields(
+        chat_body(endpoint.model(), &prompt, 24),
+        &json!({ "logprobs": true, "top_logprobs": 2 }),
+    );
     let first = endpoint.complete_body(&body).await?;
     let second = endpoint.complete_body(&body).await?;
     let Some(cached) = second.usage.cached_tokens else {
@@ -202,23 +208,26 @@ async fn check_prefix_cache(endpoint: &Endpoint, facts: &ModelFacts) -> Result<O
             "the server did not report cached tokens".to_owned(),
         ));
     };
+    let prompt_tokens = second.usage.prompt_tokens.unwrap_or_default();
     if cached == 0 {
         return Ok(Outcome::Fail(format!(
-            "the repeated prompt of {} tokens hit no cached tokens",
-            second.usage.prompt_tokens.unwrap_or_default()
+            "the repeated prompt of {prompt_tokens} tokens hit no cached tokens"
         )));
     }
-    if first.full_text() != second.full_text() {
-        return Ok(Outcome::Fail(format!(
-            "cold run gave {:?}, cached run gave {:?}",
-            first.full_text(),
-            second.full_text()
-        )));
-    }
-    Ok(Outcome::Pass(format!(
-        "cached {cached} of {} tokens, identical text",
-        second.usage.prompt_tokens.unwrap_or_default()
-    )))
+    Ok(
+        match compare_texts(&first, &first.full_text(), &second.full_text()) {
+            Comparison::Identical => Outcome::Pass(format!(
+                "cached {cached} of {prompt_tokens} tokens, identical text"
+            )),
+            Comparison::NearTie { index, gap } => Outcome::Pass(format!(
+                "cached {cached} of {prompt_tokens} tokens, text differs at token {index} on a near tie (gap {gap:.2})"
+            )),
+            Comparison::Different(detail) => Outcome::Fail(format!("cold versus cached: {detail}")),
+            Comparison::Unaligned(reason) => Outcome::Skip(format!(
+                "cache hit of {cached} tokens confirmed, text comparison unverified: {reason}"
+            )),
+        },
+    )
 }
 
 fn person_schema() -> Value {
