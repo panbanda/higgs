@@ -21,6 +21,10 @@ const BATCH_COMPARE_TOKENS: u32 = 16;
 /// A batched run may differ from the solo run only where the solo run's best token beat the
 /// runner-up by less than this many nats, since half-precision rounding can flip a near tie.
 pub const NEAR_TIE_NATS: f64 = 0.5;
+/// Length of the request the compared one runs alongside.
+const BATCH_COMPANION_TOKENS: u32 = 128;
+/// How long the companion runs alone before the compared request starts.
+const COMPANION_HEAD_START: Duration = Duration::from_millis(50);
 const SHORT_REPLY_TOKENS: u32 = 48;
 const PREFIX_PROMPT_TOKENS: usize = 300;
 const TOOL_NAME: &str = "get_weather";
@@ -422,10 +426,11 @@ async fn check_batched_matches_solo(endpoint: &Endpoint, facts: &ModelFacts) -> 
         "Count from one to twenty in words.",
         BATCH_COMPARE_TOKENS,
     );
+    // Much longer than the subject, and started first, so the subject runs inside its decode.
     let companion = chat_body(
         endpoint.model(),
-        "Write one sentence about the sea.",
-        BATCH_COMPARE_TOKENS,
+        "Write a long story about the sea.",
+        BATCH_COMPANION_TOKENS,
     );
     // Requests with logprobs never join a batched pass, so the compared runs send none. A
     // separate run with logprobs supplies the margins that tell a near tie from a real fault, and
@@ -437,11 +442,17 @@ async fn check_batched_matches_solo(endpoint: &Endpoint, facts: &ModelFacts) -> 
         ))
         .await?;
     let solo = endpoint.complete_body(&subject).await?;
-    let (batched, other) = try_join(
-        endpoint.complete_body(&subject),
-        endpoint.complete_body(&companion),
-    )
-    .await?;
+    let timed = |body: Value| async move {
+        let started = Instant::now();
+        let reply = endpoint.complete_body(&body).await?;
+        Ok::<_, anyhow::Error>((reply, started, Instant::now()))
+    };
+    let ((other, companion_start, companion_end), (batched, subject_start, subject_end)) =
+        try_join(timed(companion), async {
+            tokio::time::sleep(COMPANION_HEAD_START).await;
+            timed(subject.clone()).await
+        })
+        .await?;
     for (label, reply) in [
         ("solo", &solo),
         ("batched", &batched),
@@ -451,16 +462,21 @@ async fn check_batched_matches_solo(endpoint: &Endpoint, facts: &ModelFacts) -> 
             return Ok(Outcome::Fail(format!("{label} request: {problem}")));
         }
     }
+    let overlapped = subject_start > companion_start && subject_end < companion_end;
     Ok(
         match compare_texts(&reference, &solo.full_text(), &batched.full_text()) {
+            Comparison::Different(detail) => Outcome::Fail(detail),
+            Comparison::Unaligned(reason) => Outcome::Skip(format!("unverified: {reason}")),
+            _ if !overlapped => Outcome::Skip(
+                "unverified: the subject request did not run inside the longer companion request, so it may not have been batched"
+                    .to_owned(),
+            ),
             Comparison::Identical => Outcome::Pass(format!(
-                "{BATCH_COMPARE_TOKENS} tokens identical alone and batched"
+                "{BATCH_COMPARE_TOKENS} tokens identical alone and batched with a longer request"
             )),
             Comparison::NearTie { index, gap } => Outcome::Pass(format!(
                 "identical until token {index}, then diverged on a near tie (gap {gap:.2})"
             )),
-            Comparison::Different(detail) => Outcome::Fail(detail),
-            Comparison::Unaligned(reason) => Outcome::Skip(format!("unverified: {reason}")),
         },
     )
 }

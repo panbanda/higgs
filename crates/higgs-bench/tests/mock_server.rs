@@ -34,6 +34,8 @@ struct Behavior {
     refuse_forced_tools: bool,
     /// A repeated prompt (served from the cache) gets a different last word.
     vary_cached_replies: bool,
+    /// Time a non-streaming reply takes for each token the request allows.
+    delay_per_token: Duration,
     /// Gap between the best and second logprob the mock reports for every token.
     logprob_margin: f64,
     seen_prompts: Arc<Mutex<Vec<String>>>,
@@ -49,6 +51,7 @@ impl Behavior {
             blank_counting_replies: false,
             refuse_forced_tools: false,
             vary_cached_replies: false,
+            delay_per_token: Duration::from_millis(1),
             logprob_margin: 5.0,
             seen_prompts: Arc::default(),
         }
@@ -74,6 +77,7 @@ fn reply_text(body: &Value) -> String {
     vec!["word"; words].join(" ")
 }
 
+#[allow(clippy::too_many_lines)]
 async fn chat(State(behavior): State<Behavior>, Json(body): Json<Value>) -> Response {
     let prompt = prompt_of(&body);
     let is_counting_prompt = prompt.contains("Count from one");
@@ -84,17 +88,15 @@ async fn chat(State(behavior): State<Behavior>, Json(body): Json<Value>) -> Resp
         0
     };
     let prompt_tokens = 10 + prompt.len() / 4 + tool_tokens;
-    let mut seen = behavior.seen_prompts.lock().unwrap();
-    let cached = if seen
-        .iter()
-        .any(|earlier| prompt.starts_with(earlier.as_str()))
-    {
-        prompt_tokens - 1
-    } else {
-        0
+    let hit = {
+        let mut seen = behavior.seen_prompts.lock().unwrap();
+        let hit = seen
+            .iter()
+            .any(|earlier| prompt.starts_with(earlier.as_str()));
+        seen.push(prompt);
+        hit
     };
-    seen.push(prompt);
-    drop(seen);
+    let cached = if hit { prompt_tokens - 1 } else { 0 };
     let mut usage = json!({ "prompt_tokens": prompt_tokens, "completion_tokens": 0 });
     if behavior.report_cached_tokens {
         usage["prompt_tokens_details"] = json!({ "cached_tokens": cached });
@@ -109,7 +111,7 @@ async fn chat(State(behavior): State<Behavior>, Json(body): Json<Value>) -> Resp
         .pointer("/tool_choice/function/name")
         .and_then(Value::as_str);
     let wants_schema = body.pointer("/response_format/type") == Some(&json!("json_schema"));
-    let text = if wants_schema {
+    let plain_text = if wants_schema {
         r#"{"name":"Ada","age":36,"pet":"cat"}"#.to_owned()
     } else if behavior.blank_counting_replies && is_counting_prompt {
         String::new()
@@ -117,10 +119,11 @@ async fn chat(State(behavior): State<Behavior>, Json(body): Json<Value>) -> Resp
         reply_text(&body)
     };
     let text = if behavior.vary_cached_replies && cached > 0 && !streaming {
-        text.rsplit_once(' ')
-            .map_or(text.clone(), |(head, _)| format!("{head} term"))
+        plain_text
+            .rsplit_once(' ')
+            .map_or_else(|| plain_text.clone(), |(head, _)| format!("{head} term"))
     } else {
-        text
+        plain_text
     };
     let completion_tokens = text.split_whitespace().count().max(1);
     usage["completion_tokens"] = json!(completion_tokens);
@@ -160,6 +163,11 @@ async fn chat(State(behavior): State<Behavior>, Json(body): Json<Value>) -> Resp
     } else {
         "length"
     };
+    if !streaming {
+        let allowed = body.get("max_tokens").and_then(Value::as_u64).unwrap_or(16);
+        tokio::time::sleep(behavior.delay_per_token * u32::try_from(allowed).unwrap_or(u32::MAX))
+            .await;
+    }
     let mut choice = json!({ "message": message, "finish_reason": finish });
     if body.get("logprobs") == Some(&Value::Bool(true)) {
         let margin = behavior.logprob_margin;
@@ -288,11 +296,15 @@ mod tests {
         ));
     }
 
-    async fn prefix_outcome(behavior: Behavior) -> Outcome {
+    async fn prefix_outcome_of(check: &str, behavior: Behavior) -> Outcome {
         let endpoint = endpoint(start(behavior).await);
         let facts = ModelFacts::discover(&endpoint, "mock").await;
         let results = run_selftest(&endpoint, &facts, &|_| {}).await;
-        outcome_of(&results, "prefix cache hit").clone()
+        outcome_of(&results, check).clone()
+    }
+
+    async fn prefix_outcome(behavior: Behavior) -> Outcome {
+        prefix_outcome_of("prefix cache hit", behavior).await
     }
 
     #[tokio::test]
@@ -320,6 +332,24 @@ mod tests {
         assert!(
             matches!(&outcome, Outcome::Fail(detail) if detail.contains("cold versus cached")),
             "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn requests_that_overlap_pass_and_requests_that_do_not_are_unverified() {
+        let overlapping = prefix_outcome_of("batched equals solo", Behavior::healthy()).await;
+        assert!(
+            matches!(&overlapping, Outcome::Pass(detail) if detail.contains("longer request")),
+            "{overlapping:?}"
+        );
+        let instant = Behavior {
+            delay_per_token: Duration::ZERO,
+            ..Behavior::healthy()
+        };
+        let sequential = prefix_outcome_of("batched equals solo", instant).await;
+        assert!(
+            matches!(&sequential, Outcome::Skip(reason) if reason.contains("unverified")),
+            "{sequential:?}"
         );
     }
 
