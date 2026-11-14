@@ -419,8 +419,14 @@ async fn check_batched_matches_solo(endpoint: &Endpoint, facts: &ModelFacts) -> 
         endpoint.complete_body(&companion),
     )
     .await?;
-    if let Some(problem) = reply_problem(&other) {
-        return Ok(Outcome::Fail(format!("companion request: {problem}")));
+    for (label, reply) in [
+        ("solo", &solo),
+        ("batched", &batched),
+        ("companion", &other),
+    ] {
+        if let Some(problem) = reply_problem(reply) {
+            return Ok(Outcome::Fail(format!("{label} request: {problem}")));
+        }
     }
     Ok(
         match compare_texts(&reference, &solo.full_text(), &batched.full_text()) {

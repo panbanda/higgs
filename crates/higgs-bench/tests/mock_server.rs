@@ -28,6 +28,7 @@ struct Behavior {
     engine: &'static str,
     render_tools: bool,
     prefix_cache_entries: u64,
+    blank_counting_replies: bool,
     seen_prompts: Arc<Mutex<Vec<String>>>,
 }
 
@@ -38,6 +39,7 @@ impl Behavior {
             engine: "batched",
             render_tools: true,
             prefix_cache_entries: 8,
+            blank_counting_replies: false,
             seen_prompts: Arc::default(),
         }
     }
@@ -64,6 +66,7 @@ fn reply_text(body: &Value) -> String {
 
 async fn chat(State(behavior): State<Behavior>, Json(body): Json<Value>) -> Response {
     let prompt = prompt_of(&body);
+    let is_counting_prompt = prompt.contains("Count from one");
     let has_tools = body.get("tools").is_some_and(|tools| !tools.is_null());
     let tool_tokens = if has_tools && behavior.render_tools {
         40
@@ -94,6 +97,8 @@ async fn chat(State(behavior): State<Behavior>, Json(body): Json<Value>) -> Resp
     let wants_schema = body.pointer("/response_format/type") == Some(&json!("json_schema"));
     let text = if wants_schema {
         r#"{"name":"Ada","age":36,"pet":"cat"}"#.to_owned()
+    } else if behavior.blank_counting_replies && is_counting_prompt {
+        String::new()
     } else {
         reply_text(&body)
     };
@@ -211,6 +216,21 @@ mod tests {
             );
         }
         assert_eq!(results.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn the_batched_check_fails_when_both_compared_replies_are_empty() {
+        let behavior = Behavior {
+            blank_counting_replies: true,
+            ..Behavior::healthy()
+        };
+        let endpoint = endpoint(start(behavior).await);
+        let facts = ModelFacts::discover(&endpoint, "mock").await;
+        let results = run_selftest(&endpoint, &facts, &|_| {}).await;
+        assert!(matches!(
+            outcome_of(&results, "batched equals solo"),
+            Outcome::Fail(detail) if detail.contains("solo request")
+        ));
     }
 
     #[tokio::test]
