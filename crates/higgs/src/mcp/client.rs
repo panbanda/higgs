@@ -52,8 +52,14 @@ pub enum ClientError {
     Rpc(RpcError),
     #[error("no response within {0:?}")]
     Timeout(Duration),
+    /// The connection was already gone before the request was written, so
+    /// the server cannot have seen it.
     #[error("connection closed: {0}")]
     Closed(String),
+    /// The connection was lost after the request was written. The server may
+    /// or may not have acted on it.
+    #[error("connection lost before the reply, outcome unknown: {0}")]
+    Interrupted(String),
     #[error("protocol error: {0}")]
     Protocol(String),
 }
@@ -214,7 +220,7 @@ impl McpClient {
         match tokio::time::timeout(timeout, reply_receiver).await {
             Ok(Ok(Ok(result))) => Ok(result),
             Ok(Ok(Err(error))) => Err(classify(error)),
-            Ok(Err(_)) => Err(ClientError::Closed("reply channel dropped".to_owned())),
+            Ok(Err(_)) => Err(ClientError::Interrupted("reply channel dropped".to_owned())),
             Err(_) => {
                 lock(&self.shared.pending).remove(&id);
                 let cancel = jsonrpc::notification(
@@ -299,7 +305,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 fn classify(error: RpcError) -> ClientError {
     match error.code {
-        CONNECTION_CLOSED => ClientError::Closed(error.message),
+        CONNECTION_CLOSED => ClientError::Interrupted(error.message),
         TRANSPORT_FAILURE => ClientError::Transport(error.message),
         _ => ClientError::Rpc(error),
     }
@@ -573,7 +579,7 @@ mod tests {
             .call_tool("boom", json!({}), TIMEOUT)
             .await
             .unwrap_err();
-        assert!(matches!(error, ClientError::Closed(_)), "{error:?}");
+        assert!(matches!(error, ClientError::Interrupted(_)), "{error:?}");
         assert!(client.closed().await.contains("exited"));
         assert!(client.is_closed());
         let after = client

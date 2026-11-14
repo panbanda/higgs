@@ -502,7 +502,10 @@ mod tests {
         let client = client_for(&server, Vec::new()).await;
         let error = client.call_tool("t", json!({}), TIMEOUT).await.unwrap_err();
         assert!(
-            matches!(error, ClientError::Transport(_) | ClientError::Closed(_)),
+            matches!(
+                error,
+                ClientError::Transport(_) | ClientError::Closed(_) | ClientError::Interrupted(_)
+            ),
             "{error:?}"
         );
         assert!(
