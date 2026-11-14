@@ -191,6 +191,9 @@ fn load_serve_config(
 
 async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     init_tracing(cli.verbose);
+    if args.private_model.is_some() {
+        higgs::bench_command::exit_when_parent_closes_stdin();
+    }
 
     let profile = cli.profile.as_deref();
     let simple_mode = config::is_simple_mode(cli, args);

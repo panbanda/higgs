@@ -22,6 +22,10 @@ pub struct ServerCommand {
 }
 
 /// A running child server. It is killed when this value is dropped, and only that process.
+///
+/// The child's standard input is a pipe this value keeps open. When the parent dies without
+/// running its destructors (SIGTERM, SIGKILL), the operating system closes the pipe, which tells
+/// a child that watches it to exit.
 pub struct LocalServer {
     child: Child,
     base_url: String,
@@ -56,7 +60,7 @@ impl LocalServer {
                     .iter()
                     .map(|(name, value)| (name, value)),
             )
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::from(
                 log.try_clone().context("duplicate the server log handle")?,
             ))
@@ -219,6 +223,26 @@ mod tests {
             .err()
             .context("startup should fail")?;
         assert!(format!("{error:#}").contains("value=passed-through"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_child_stdin_stays_open_while_the_server_lives() -> Result<()> {
+        let command = ServerCommand {
+            executable: PathBuf::from("/bin/sh"),
+            arguments: vec!["-c".to_owned(), "read line; exit 5".to_owned()],
+            environment: Vec::new(),
+        };
+        let mut server = LocalServer::spawn(&command, free_port()?)?;
+        let error = server
+            .wait_ready(Duration::from_millis(700))
+            .await
+            .err()
+            .context("startup should time out")?;
+        assert!(
+            format!("{error:#}").contains("not ready within"),
+            "{error:#}"
+        );
         Ok(())
     }
 }

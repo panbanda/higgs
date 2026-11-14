@@ -69,6 +69,20 @@ fn server_arguments(cli: &Cli, target: &ModelTargetArgs, port: u16) -> Vec<Strin
     arguments
 }
 
+/// Exits this process when its standard input reaches end of file.
+///
+/// The bench and selftest parent holds the write end of the pipe, so the end of file means the
+/// parent is gone, however it died. A thread does the reading because the runtime may be busy
+/// loading the model.
+pub fn exit_when_parent_closes_stdin() {
+    std::thread::spawn(|| {
+        let mut sink = [0_u8; 256];
+        let mut stdin = std::io::stdin().lock();
+        while std::io::Read::read(&mut stdin, &mut sink).is_ok_and(|count| count > 0) {}
+        std::process::exit(0);
+    });
+}
+
 /// Whether `model` is the one `selector` names: its served name, an alias or its path.
 fn is_selected(model: &ModelConfig, selector: &str) -> bool {
     model.name.as_deref() == Some(selector)
