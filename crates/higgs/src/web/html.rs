@@ -49,6 +49,12 @@ struct Tag<'a> {
 }
 
 pub fn extract(html: &str) -> Extracted {
+    extract_text(html, true)
+}
+
+/// `track_heading` is off for the text of a heading, which has no heading of its own to look
+/// for. It keeps nested headings from recursing.
+fn extract_text(html: &str, track_heading: bool) -> Extracted {
     let mut writer = TextWriter::default();
     let mut title: Option<String> = None;
     let mut first_heading: Option<String> = None;
@@ -122,7 +128,7 @@ pub fn extract(html: &str) -> Extracted {
             continue;
         }
         if HEADINGS.contains(&tag.name.as_str()) {
-            if first_heading.is_none() {
+            if track_heading && first_heading.is_none() {
                 first_heading = Some(heading_text(html, position, &tag.name));
             }
             writer.block_break(2);
@@ -241,21 +247,24 @@ fn parse_tag(html: &str, start: usize) -> Option<Tag<'_>> {
 /// closing tag.
 fn raw_text_until<'a>(html: &'a str, position: usize, name: &str) -> (&'a str, usize) {
     let rest = html.get(position..).unwrap_or_default();
-    let needle = format!("</{name}");
-    let lowered = rest.to_ascii_lowercase();
-    lowered.find(&needle).map_or((rest, html.len()), |index| {
-        let after = position + index;
-        let end = html
-            .get(after..)
-            .and_then(|tail| tail.find('>'))
-            .map_or(html.len(), |close| after + close + 1);
-        (rest.get(..index).unwrap_or_default(), end)
-    })
+    let closing = format!("</{name}");
+    let needle = closing.as_bytes();
+    rest.as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle))
+        .map_or((rest, html.len()), |index| {
+            let after = position + index;
+            let end = html
+                .get(after..)
+                .and_then(|tail| tail.find('>'))
+                .map_or(html.len(), |close| after + close + 1);
+            (rest.get(..index).unwrap_or_default(), end)
+        })
 }
 
 fn heading_text(html: &str, position: usize, name: &str) -> String {
     let (content, _) = raw_text_until(html, position, name);
-    collapse_whitespace(&extract(content).text)
+    collapse_whitespace(&extract_text(content, false).text)
 }
 
 pub fn attribute(attributes: &str, wanted: &str) -> Option<String> {
@@ -343,9 +352,8 @@ impl TextWriter {
 
     fn finish(self) -> String {
         let mut lines: Vec<&str> = self.output.lines().map(str::trim_end).collect();
-        while lines.first().is_some_and(|line| line.is_empty()) {
-            lines.remove(0);
-        }
+        let leading = lines.iter().take_while(|line| line.is_empty()).count();
+        lines.drain(..leading);
         while lines.last().is_some_and(|line| line.is_empty()) {
             lines.pop();
         }
@@ -371,6 +379,10 @@ pub fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Longest entity name that is decoded, in bytes, without the `&` and the `;`. The search for
+/// the `;` stops there, so a page of bare `&` costs linear time.
+const MAX_ENTITY_NAME_BYTES: usize = 10;
+
 pub fn decode_entities(text: &str) -> String {
     if !text.contains('&') {
         return text.to_owned();
@@ -381,8 +393,10 @@ pub fn decode_entities(text: &str) -> String {
         output.push_str(rest.get(..index).unwrap_or_default());
         let candidate = rest.get(index + 1..).unwrap_or_default();
         let decoded = candidate
-            .find(';')
-            .filter(|end| *end <= 10)
+            .as_bytes()
+            .iter()
+            .take(MAX_ENTITY_NAME_BYTES + 1)
+            .position(|byte| *byte == b';')
             .and_then(|end| decode_entity(candidate.get(..end)?).map(|value| (value, end)));
         if let Some((value, end)) = decoded {
             output.push(value);
@@ -503,6 +517,51 @@ mod tests {
     fn quoted_attribute_values_may_contain_angle_brackets() {
         let page = extract(r#"<img alt="a > b" src="x"><p title="x>y">kept</p>"#);
         assert_eq!(page.text, "kept");
+    }
+
+    #[test]
+    fn a_page_of_ampersands_decodes_in_linear_time() {
+        let limit = std::time::Duration::from_secs(10);
+        for unit in ["&", "&amp", "&#x4", "&a;&b"] {
+            let page = unit.repeat(2 * 1024 * 1024 / unit.len());
+            let started = std::time::Instant::now();
+            let decoded = decode_entities(&page);
+            assert!(
+                started.elapsed() < limit,
+                "{unit:?} took {:?}",
+                started.elapsed()
+            );
+            assert_eq!(decoded, page);
+        }
+    }
+
+    #[test]
+    fn nested_headings_do_not_recurse() {
+        let page = format!("{}deep", "<h1>".repeat(100_000));
+        let extracted = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || extract(&page))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(extracted.title.as_deref(), Some("deep"));
+        assert_eq!(extracted.text, "deep");
+    }
+
+    #[test]
+    fn hostile_pages_extract_in_linear_time() {
+        let limit = std::time::Duration::from_secs(10);
+        let pages = [
+            "<style></style>".repeat(2 * 1024 * 1024 / 15),
+            "<title></title>".repeat(2 * 1024 * 1024 / 15),
+            format!("<pre>{}x", "\n".repeat(2 * 1024 * 1024)),
+            "<script>".repeat(2 * 1024 * 1024 / 8),
+        ];
+        for page in pages {
+            let started = std::time::Instant::now();
+            let _ = extract(&page);
+            assert!(started.elapsed() < limit, "took {:?}", started.elapsed());
+        }
     }
 
     #[test]
