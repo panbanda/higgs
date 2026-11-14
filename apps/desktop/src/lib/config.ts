@@ -234,3 +234,66 @@ export function serverUrl(config: HiggsConfig): string {
 export function providerNames(config: HiggsConfig): string[] {
   return ["higgs", ...Object.keys(config.providers ?? {})];
 }
+
+/** Top-level sections the config form edits; everything else passes through to the file untouched. */
+const FORM_MANAGED_SECTIONS = [
+  "server",
+  "memory",
+  "defaults",
+  "models",
+  "providers",
+  "routes",
+  "routing",
+  "observability",
+  "experimental",
+] as const;
+
+function isEmptyValue(value: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  if (typeof value === "string") return value === "";
+  if (Array.isArray(value)) return value.length === 0;
+  if (typeof value === "object") return Object.keys(value as Record<string, unknown>).length === 0;
+  return false;
+}
+
+/** Drops empty values, recursively, so the saved file only lists what was set. */
+function prune(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(prune);
+  }
+  if (typeof value === "object" && value !== null) {
+    const result: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      const cleaned = prune(entry);
+      if (!isEmptyValue(cleaned)) result[key] = cleaned;
+    }
+    return result;
+  }
+  return value;
+}
+
+/**
+ * Strips empty strings, unset numbers, and empty tables from the sections the form edits.
+ * Sections it does not edit (mcp, web, include, ...) are carried through unchanged, because
+ * empty values there can be meaningful: an empty `env` entry overrides the inherited value.
+ */
+export function sanitizeConfig(config: HiggsConfig): HiggsConfig {
+  const sanitized: HiggsConfig = {};
+  for (const [key, value] of Object.entries(config)) {
+    if (!(FORM_MANAGED_SECTIONS as readonly string[]).includes(key)) {
+      sanitized[key] = value;
+      continue;
+    }
+    if (key === "providers" && value && typeof value === "object") {
+      const providers: Record<string, unknown> = {};
+      for (const [name, entry] of Object.entries(value as Record<string, unknown>)) {
+        if (name) providers[name] = prune(entry);
+      }
+      if (Object.keys(providers).length > 0) sanitized.providers = providers as HiggsConfig["providers"];
+      continue;
+    }
+    const cleaned = prune(value);
+    if (!isEmptyValue(cleaned)) sanitized[key] = cleaned;
+  }
+  return sanitized;
+}
