@@ -242,8 +242,8 @@ fn completion_chunk_stream(
                 }
                 GenerationEvent::Started { .. }
                 | GenerationEvent::PrefillProgress(_)
-                | GenerationEvent::ReasoningDelta(_)
-                | GenerationEvent::ToolCall(_)
+                | GenerationEvent::ReasoningDelta { .. }
+                | GenerationEvent::ToolCall { .. }
                 | GenerationEvent::ToolLoop(_) => {}
             }
         }

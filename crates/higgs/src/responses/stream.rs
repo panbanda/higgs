@@ -95,12 +95,12 @@ impl ResponseStreamBuilder {
                     .completion_tokens_details
                     .map(|details| details.reasoning_tokens);
             }
-            GenerationEvent::ReasoningDelta(text) => {
+            GenerationEvent::ReasoningDelta { text, .. } => {
                 if !text.is_empty() {
                     self.reasoning_delta(&mut events, text);
                 }
             }
-            GenerationEvent::ToolCall(call) => self.tool_call(&mut events, &call),
+            GenerationEvent::ToolCall { call, .. } => self.tool_call(&mut events, &call),
             GenerationEvent::TextDelta { text, .. } => {
                 if !text.is_empty() {
                     self.message_delta(&mut events, text);
@@ -430,7 +430,10 @@ mod tests {
     }
 
     fn reasoning(text: &str) -> GenerationEvent {
-        GenerationEvent::ReasoningDelta(text.to_owned())
+        GenerationEvent::ReasoningDelta {
+            text: text.to_owned(),
+            logprobs: None,
+        }
     }
 
     fn finish(reason: &str) -> GenerationEvent {
@@ -455,7 +458,10 @@ mod tests {
     fn call(id: &str, name: &str, arguments: serde_json::Value) -> GenerationEvent {
         let mut generated = GeneratedToolCall::new(0, name.to_owned(), arguments);
         generated.id = id.to_owned();
-        GenerationEvent::ToolCall(generated)
+        GenerationEvent::ToolCall {
+            call: generated,
+            logprobs: None,
+        }
     }
 
     fn run(events: Vec<GenerationEvent>) -> (Vec<StreamEvent>, ResponseObject) {

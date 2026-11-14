@@ -424,7 +424,7 @@ impl RoundState {
                 self.text.push_str(text);
                 Some(event)
             }
-            GenerationEvent::ToolCall(call) => {
+            GenerationEvent::ToolCall { call, logprobs } => {
                 if !final_round && names.contains(&call.name) {
                     self.server_calls.push(call);
                     return None;
@@ -437,7 +437,10 @@ impl RoundState {
                     ..call
                 };
                 self.next_call_index += 1;
-                Some(GenerationEvent::ToolCall(renumbered))
+                Some(GenerationEvent::ToolCall {
+                    call: renumbered,
+                    logprobs,
+                })
             }
             GenerationEvent::Error(_) => {
                 self.failed = true;
@@ -446,7 +449,7 @@ impl RoundState {
             GenerationEvent::Started { .. } if self.later_round => None,
             GenerationEvent::Started { .. }
             | GenerationEvent::PrefillProgress(_)
-            | GenerationEvent::ReasoningDelta(_)
+            | GenerationEvent::ReasoningDelta { .. }
             | GenerationEvent::ToolLoop(_) => Some(event),
         }
     }

@@ -56,7 +56,10 @@ The endpoints Higgs serves, with the request fields and response details that ar
     `logprob`, `top_logprobs` and `bytes`. In Higgs, `bytes` is the UTF-8 text that the token
     added to the output. The `bytes` of all tokens, joined in order, give the generated text
     before reasoning and tool-call parsing. A streamed response and a non-streamed response give
-    the same `bytes`. This differs from OpenAI, where `bytes` holds the raw bytes of the token.
+    the same `bytes`. In a stream, the entries of a chunk are the tokens up to the text of that
+    chunk: reasoning tokens go with `reasoning_content`, tool-call tokens with the tool call,
+    and answer tokens with `content`. The trackers hold back a few characters, so an entry can
+    arrive a few tokens after its token. This differs from OpenAI, where `bytes` holds the raw bytes of the token.
     A token that holds half of a character has empty `bytes`. The token that completes the
     character holds the whole character. Each `top_logprobs` entry has `bytes` set to `null`.
   - `seed` is accepted for client compatibility but does not make sampling

@@ -18,13 +18,21 @@ pub enum GenerationEvent {
     },
     /// The engine evaluated part of the prompt.
     PrefillProgress(PrefillProgress),
-    ReasoningDelta(String),
+    /// Reasoning text, with the logprobs of the tokens that produced it.
+    ReasoningDelta {
+        text: String,
+        logprobs: Option<ChoiceLogprobs>,
+    },
     TextDelta {
         text: String,
         logprobs: Option<ChoiceLogprobs>,
     },
     /// A tool call, complete: the engine's output carries calls whole.
-    ToolCall(GeneratedToolCall),
+    ToolCall {
+        call: GeneratedToolCall,
+        /// The logprobs of the tokens that produced the call.
+        logprobs: Option<ChoiceLogprobs>,
+    },
     Finish {
         /// `OpenAI` vocabulary; `tool_calls` whenever the answer called a tool.
         reason: String,
