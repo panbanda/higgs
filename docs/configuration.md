@@ -416,7 +416,8 @@ Higgs resolves requests in this order:
 1. Auto-router when `model == "auto"` or force mode is enabled
 2. Direct local engine lookup by model name or alias
 3. Regex route (`match`), first match wins
-4. `routing.default` fallback
+4. The only local model, when Higgs has exactly one local model, no `[[routes]]`, and no `[provider.*]` entries
+5. `routing.default` fallback
 
 That means Higgs supports:
 
@@ -425,6 +426,13 @@ That means Higgs supports:
 - model alias rewriting before forwarding
 - auto-routing with a local classifier model
 - a default target when nothing else matches
+
+Step 4 lets clients that send fixed vendor model names (Claude Code sends names such as `claude-sonnet-4-5`) work
+with no route. Higgs writes one `info` log line for each different requested name, for example
+`unknown model name served by the only local model`. The response `model` field holds the name of the local model
+that served the request, as it does for a route. With two or more local models, or with any route or provider,
+an unknown name returns `404 model_not_found`. There is no switch for step 4: add a route, a provider, or a second
+model to turn it off.
 
 A local model name or alias always wins over a route, so a route whose `match` also matches a local name
 is never used for that name; `higgs doctor` warns about it.
@@ -459,7 +467,17 @@ higgs exec -- aider --model openai/gpt-4o
 ```
 
 `higgs exec` verifies that the server is reachable, sets `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL`, then execs the command.
-`higgs shellenv` uses the same strict config loading and reachability checks.
+It prints the server it found on stderr. `higgs shellenv` uses the same checks, but prints only the `export` lines.
+
+A config file is not necessary. After `higgs serve --model <path or hf id>`, both commands work with no extra flags.
+Higgs finds the server this way:
+
+1. `--url http://HOST:PORT` or `--port PORT` (on `127.0.0.1`), if you give one of them. The config file is not read.
+2. The `[server]` address in the config file (`--config`, `--profile`, or `~/.config/higgs/config.toml`), if the file exists.
+   A config file that does not load is an error.
+3. The default address, `127.0.0.1:8000`. Higgs sends `GET /health` and accepts only a Higgs answer.
+
+If no server answers, the command fails and the message tells you to start `higgs serve` or to use `--url` or `--port`.
 
 ## CLI Overview
 
@@ -470,8 +488,8 @@ higgs exec -- aider --model openai/gpt-4o
 | `higgs stop` | Stop a running daemon (`--force` escalates to `SIGKILL`) |
 | `higgs attach` | Open the daemon metrics dashboard |
 | `higgs init` | Create the default config file |
-| `higgs shellenv` | Print `export` lines for `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` |
-| `higgs exec -- <cmd>` | Set env vars and exec a command |
+| `higgs shellenv [--url URL \| --port PORT]` | Print `export` lines for `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` |
+| `higgs exec [--url URL \| --port PORT] -- <cmd>` | Set env vars and exec a command |
 | `higgs config get <key>` | Read a config value |
 | `higgs config set <key> <value>` | Write a config value |
 | `higgs config path` | Print the resolved config file path |

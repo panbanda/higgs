@@ -59,14 +59,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             higgs::daemon::cmd_init(profile);
             Ok(())
         }
-        Commands::Shellenv => {
-            let config = load_config_for_command(&cli)?;
-            higgs::daemon::cmd_shellenv(&config)?;
+        Commands::Shellenv(ref client) => {
+            let target = resolve_client_target(&cli, client)?;
+            higgs::daemon::cmd_shellenv(&target)?;
             Ok(())
         }
-        Commands::Exec { ref command } => {
-            let config = load_config_for_command(&cli)?;
-            higgs::daemon::cmd_exec(&config, command);
+        Commands::Exec {
+            ref client,
+            ref command,
+        } => {
+            let target = resolve_client_target(&cli, client)?;
+            higgs::daemon::cmd_exec(&target, command);
         }
         Commands::Config { ref action } => {
             cmd_config(&cli, action);
@@ -143,6 +146,25 @@ fn resolve_config_path(cli: &Cli) -> Result<std::path::PathBuf, Box<dyn std::err
         )
         .into())
     }
+}
+
+/// Find the server for `shellenv` and `exec`: the flags, else the config file when one
+/// exists, else the default serve address. An explicit `--config` or `--profile` must load.
+fn resolve_client_target(
+    cli: &Cli,
+    client: &config::ClientArgs,
+) -> Result<higgs::daemon::ClientTarget, Box<dyn std::error::Error>> {
+    let flags_given = client.url.is_some() || client.port.is_some();
+    let explicit_config = cli.config.is_some() || cli.profile.is_some();
+    let config = if flags_given {
+        None
+    } else if explicit_config || config::default_config_path().exists() {
+        Some(load_config_for_command(cli)?)
+    } else {
+        None
+    };
+    higgs::daemon::resolve_client_target(config.as_ref(), client.url.as_deref(), client.port)
+        .map_err(Into::into)
 }
 
 /// Load config from CLI path or default location.
