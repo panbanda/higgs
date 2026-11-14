@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use regex::Regex;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::backend::{EngineLease, LoadedEngine};
 use crate::config::{ApiFormat, HiggsConfig, LoadMode};
@@ -94,7 +94,8 @@ struct AutoRouteEntry {
 /// 1. If `model == "auto"`, try auto-routing classification
 /// 2. Direct engine lookup by model name
 /// 3. Pattern matching (first match wins)
-/// 4. Default provider fallback
+/// 4. With one local model and nothing else configured, that model
+/// 5. Default provider fallback
 pub struct Router {
     pool: Arc<ModelPool<LoadedEngine>>,
     compiled_routes: Vec<CompiledRoute>,
@@ -106,7 +107,15 @@ pub struct Router {
     default_target: RouteTarget,
     /// Extra request names (`aliases`) mapped to the served name of their model.
     aliases: HashMap<String, String>,
+    /// True when the config has no routes and no remote providers, so a request for an
+    /// unknown name can only mean the one local model, if there is exactly one.
+    local_only: bool,
+    /// Requested names already logged as mapped to the single local model.
+    announced_fallback_names: Mutex<HashSet<String>>,
 }
+
+/// Cap on remembered names, so clients that invent names cannot grow the set without bound.
+const MAX_ANNOUNCED_FALLBACK_NAMES: usize = 64;
 
 impl Router {
     /// Build a router from the unified config and the pool that serves its local models.
@@ -195,6 +204,10 @@ impl Router {
             auto_router_timeout: config.routing.auto.timeout,
             default_target,
             aliases,
+            local_only: config.routes.is_empty()
+                && config.providers.is_empty()
+                && config.routing.default_provider == crate::config::DEFAULT_ROUTING_PROVIDER,
+            announced_fallback_names: Mutex::new(HashSet::new()),
         })
     }
 
@@ -238,9 +251,44 @@ impl Router {
             }
         }
 
+        if let Some(only_model) = self.sole_local_model() {
+            self.announce_fallback(model, only_model);
+            return Ok(ResolvedRoute::Higgs {
+                engine: self.pool.acquire(only_model).await?,
+                model_name: only_model.to_owned(),
+                routing_method: RoutingMethod::Default,
+            });
+        }
+
         // Default fallback
         self.resolve_target(&self.default_target, model, RoutingMethod::Default)
             .await
+    }
+
+    /// The only local model, when the server is configured for local serving alone and
+    /// has exactly one. Clients such as Claude Code send fixed vendor model names that
+    /// no local model carries; there is nothing else such a request could mean.
+    fn sole_local_model(&self) -> Option<&str> {
+        if !self.local_only {
+            return None;
+        }
+        let mut names = self.pool.names();
+        let only = names.next()?;
+        names.next().is_none().then_some(only)
+    }
+
+    fn announce_fallback(&self, requested: &str, served: &str) {
+        let mut announced = self
+            .announced_fallback_names
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if announced.len() < MAX_ANNOUNCED_FALLBACK_NAMES && announced.insert(requested.to_owned())
+        {
+            info!(
+                requested,
+                served, "unknown model name served by the only local model"
+            );
+        }
     }
 
     /// The served name a request name refers to: itself, or the model it is an alias of.
@@ -813,6 +861,64 @@ mod tests {
         }
     }
 
+    fn stub_engines(names: &[&str]) -> HashMap<String, Arc<LoadedEngine>> {
+        names
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_owned(),
+                    Arc::new(crate::test_support::StubEngine::named(name).into_loaded()),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn only_local_model_serves_unknown_names() {
+        let config = config_from_toml("[[models]]\npath = \"some/model\"\nname = \"solo\"\n");
+        let router = Router::from_config(&config, stub_engines(&["solo"])).unwrap();
+        for requested in ["claude-sonnet-4-5", "gpt-4o", "claude-sonnet-4-5"] {
+            match router.resolve(requested, None).await.unwrap() {
+                ResolvedRoute::Higgs { model_name, .. } => assert_eq!(model_name, "solo"),
+                ResolvedRoute::Remote { .. } => panic!("expected the local model"),
+            }
+        }
+        assert_eq!(router.announced_fallback_names.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn two_local_models_keep_unknown_names_not_found() {
+        let config = config_from_toml(
+            "[[models]]\npath = \"some/a\"\nname = \"a\"\n[[models]]\npath = \"some/b\"\nname = \"b\"\n",
+        );
+        let router = Router::from_config(&config, stub_engines(&["a", "b"])).unwrap();
+        assert!(matches!(
+            router.resolve("gpt-4o", None).await,
+            Err(RouteError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_or_route_disables_the_single_model_fallback() {
+        for extra in [
+            "[provider.remote]\nurl = \"http://127.0.0.1:9\"\n",
+            "[provider.remote]\nurl = \"http://127.0.0.1:9\"\n[[routes]]\npattern = \"^r-\"\nprovider = \"remote\"\n",
+            "[[routes]]\npattern = \"^r-\"\nprovider = \"higgs\"\nmodel = \"solo\"\n",
+        ] {
+            let config = config_from_toml(&format!(
+                "[[models]]\npath = \"some/model\"\nname = \"solo\"\n{extra}"
+            ));
+            let router = Router::from_config(&config, stub_engines(&["solo"])).unwrap();
+            assert!(
+                matches!(
+                    router.resolve("gpt-4o", None).await,
+                    Err(RouteError::NotFound(_))
+                ),
+                "config: {extra}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn higgs_default_errors_when_model_not_found() {
         let config = config_from_toml(
@@ -1099,6 +1205,9 @@ mod tests {
             path = "some/model"
             name = "lazy"
             aliases = ["default", "chat"]
+
+            [provider.remote]
+            url = "http://127.0.0.1:9"
             "#,
         );
         let router = Router::new(&config, pool).unwrap();
@@ -1205,7 +1314,9 @@ mod tests {
     #[tokio::test]
     async fn unknown_model_is_not_found_and_loads_nothing() {
         let (pool, loader) = stub_pool_with(vec![stub_spec("lazy")], PoolLimits::default());
-        let router = Router::new(&HiggsConfig::default(), pool).unwrap();
+        // A provider turns off the single-model fallback, which would serve "other".
+        let config = config_from_toml("[provider.remote]\nurl = \"http://127.0.0.1:9\"\n");
+        let router = Router::new(&config, pool).unwrap();
 
         let result = router.resolve("other", None).await;
 

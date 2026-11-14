@@ -32,8 +32,8 @@ use crate::{
     router::ResolvedRoute,
     state::SharedState,
     types::responses::{
-        CreateResponseRequest, DeletedResponse, InputItem, ResponseObject, ResponseStatus,
-        StreamEvent,
+        CreateResponseRequest, DeletedResponse, InputItem, OutputItem, ResponseObject,
+        ResponseStatus, StreamEvent,
     },
 };
 
@@ -266,7 +266,7 @@ async fn create_local_response(
     let object = context.object(outcome_from_completed(completed));
     if let Some(response_store) = store_response {
         conversation.extend(loop_messages_to_input_items(&loop_messages));
-        store_completed(&response_store, &object, conversation);
+        store_completed(&response_store, &object, &object.output, conversation);
     }
     Ok(Json(object).into_response())
 }
@@ -296,15 +296,19 @@ pub async fn delete_response(
     }
 }
 
+/// Record `response` and the conversation behind it. `output` is what to
+/// append to the conversation: the whole response output, except when a tool
+/// loop already recorded the earlier rounds' text in `conversation`.
 fn store_completed(
     store: &ResponseStore,
     response: &ResponseObject,
+    output: &[OutputItem],
     mut conversation: Vec<InputItem>,
 ) {
     if response.status == ResponseStatus::Failed {
         return;
     }
-    conversation.extend(output_to_input_items(&response.output));
+    conversation.extend(output_to_input_items(output));
     store.insert(StoredResponse {
         response: response.clone(),
         conversation,
@@ -321,6 +325,17 @@ fn sse_event(event: &StreamEvent) -> Option<Event> {
     }
 }
 
+/// The output items of the last tool-loop round alone. The stream builder
+/// merges every round's text into one message, but the loop's recorded
+/// messages already carry the earlier rounds' text.
+fn final_round_output(context: ResponseContext, events: Vec<GenerationEvent>) -> Vec<OutputItem> {
+    let mut builder = ResponseStreamBuilder::new(context);
+    for event in events {
+        builder.ingest(event);
+    }
+    builder.finish().response.output
+}
+
 /// Render generation events as Responses events, storing the finished
 /// response before the terminal event goes out so a client can chain
 /// immediately.
@@ -331,8 +346,10 @@ fn response_event_stream(
     mut conversation: Vec<InputItem>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
+        let round_context = context.clone();
         let mut builder = ResponseStreamBuilder::new(context);
         let mut loop_messages = Vec::new();
+        let mut final_round_events = Vec::new();
         for event in builder.start() {
             if let Some(frame) = sse_event(&event) {
                 yield Ok(frame);
@@ -344,6 +361,20 @@ fn response_event_stream(
                 loop_messages = messages;
                 continue;
             }
+            match &generation_event {
+                GenerationEvent::ToolLoop(ToolLoopEvent::Call { .. } | ToolLoopEvent::Result { .. }) => {
+                    final_round_events.clear();
+                }
+                GenerationEvent::ToolLoop(_) => {}
+                GenerationEvent::Started { .. }
+                | GenerationEvent::PrefillProgress(_)
+                | GenerationEvent::ReasoningDelta(_)
+                | GenerationEvent::TextDelta { .. }
+                | GenerationEvent::ToolCall(_)
+                | GenerationEvent::Finish { .. }
+                | GenerationEvent::Usage(_)
+                | GenerationEvent::Error(_) => final_round_events.push(generation_event.clone()),
+            }
             for event in builder.ingest(generation_event) {
                 if let Some(frame) = sse_event(&event) {
                     yield Ok(frame);
@@ -354,7 +385,12 @@ fn response_event_stream(
         let finish = builder.finish();
         if let Some(ref response_store) = store {
             conversation.extend(loop_messages_to_input_items(&loop_messages));
-            store_completed(response_store, &finish.response, conversation);
+            let output = if loop_messages.is_empty() {
+                finish.response.output.clone()
+            } else {
+                final_round_output(round_context, final_round_events)
+            };
+            store_completed(response_store, &finish.response, &output, conversation);
         }
         for event in finish.events {
             if let Some(frame) = sse_event(&event) {
@@ -386,11 +422,18 @@ mod tests {
     const STUB_MODEL: &str = "stub-model";
 
     fn local_state(metrics: Option<Arc<MetricsStore>>) -> SharedState {
+        local_state_with_config(metrics, "")
+    }
+
+    fn local_state_with_config(
+        metrics: Option<Arc<MetricsStore>>,
+        extra_config: &str,
+    ) -> SharedState {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "[[models]]\npath = \"stub/model\"\nname = \"stub-model\"\n",
+            format!("[[models]]\npath = \"stub/model\"\nname = \"stub-model\"\n{extra_config}"),
         )
         .unwrap();
         let config = crate::config::load_config_file(&path, None).unwrap();
@@ -497,7 +540,7 @@ mod tests {
             role: "user".to_owned(),
             content: vec![crate::types::responses::InputContent::Text("hi".to_owned())],
         };
-        store_completed(&store, &response, vec![user_turn]);
+        store_completed(&store, &response, &response.output, vec![user_turn]);
 
         let kept = store.get("resp_a").unwrap();
         assert_eq!(kept.conversation.len(), 2);
@@ -512,7 +555,7 @@ mod tests {
         let store = ResponseStore::default();
         let mut response = stored("resp_a").response;
         response.status = ResponseStatus::Failed;
-        store_completed(&store, &response, Vec::new());
+        store_completed(&store, &response, &response.output, Vec::new());
         assert!(store.is_empty());
     }
 
@@ -627,8 +670,12 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_model_is_404_model_not_found() {
+        // A lone local model would serve any name, so a provider keeps names strict.
+        let state =
+            local_state_with_config(None, "\n[provider.remote]\nurl = \"http://127.0.0.1:1\"\n");
+        let strict_app = crate::build_router(state, 300.0, None, 0, 1024 * 1024, None);
         let (status, body) = post(
-            &app(None),
+            &strict_app,
             &json!({"model": "no-such-model", "input": "hi"}),
         )
         .await;
@@ -743,6 +790,62 @@ mod tests {
             last_prompt_has_tool_result(&engine, "pong"),
             "{:?}",
             engine.recorded_prompt_messages()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_streamed_follow_up_replays_each_round_s_text_once_and_in_order() {
+        use crate::test_support::{post_json, sse_json_events, token_event};
+
+        let (app, engine) = tool_loop_app(|stub| {
+            stub.script.streams = vec![
+                vec![
+                    token_event("Let me check. ", 3, None),
+                    token_event(CALL_ECHO, 12, Some("stop")),
+                ],
+                vec![token_event("Final answer", 5, Some("stop"))],
+                vec![token_event("noted", 2, Some("stop"))],
+            ];
+        })
+        .await;
+        let (_, first_text) = post_json(
+            &app,
+            "/v1/responses",
+            &json!({"model": "stub", "input": "use the tool", "stream": true,
+                    "mcp": {"enabled": true}}),
+        )
+        .await;
+        let id = sse_json_events(&first_text)
+            .iter()
+            .find_map(|event| event.pointer("/response/id")?.as_str().map(str::to_owned))
+            .unwrap();
+        post_json(
+            &app,
+            "/v1/responses",
+            &json!({"model": "stub", "input": "thanks", "stream": true,
+                    "previous_response_id": id}),
+        )
+        .await;
+
+        let prompts = engine.recorded_prompt_messages();
+        let follow_up = prompts.last().unwrap();
+        let position = |needle: &str| -> Vec<usize> {
+            follow_up
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, content))| content.contains(needle))
+                .map(|(index, _)| index)
+                .collect()
+        };
+        let intermediate = position("Let me check.");
+        let result = position("pong");
+        let last_text = position("Final answer");
+        assert_eq!(intermediate.len(), 1, "{follow_up:?}");
+        assert_eq!(result.len(), 1, "{follow_up:?}");
+        assert_eq!(last_text.len(), 1, "{follow_up:?}");
+        assert!(
+            intermediate[0] < result[0] && result[0] < last_text[0],
+            "{follow_up:?}"
         );
     }
 

@@ -51,9 +51,11 @@ pub enum Commands {
     /// Create a default config file at ~/.config/higgs/config.toml.
     Init,
     /// Print shell environment variables (for eval).
-    Shellenv,
+    Shellenv(ClientArgs),
     /// Set shell environment and exec a command.
     Exec {
+        #[command(flatten)]
+        client: ClientArgs,
         /// Command and arguments to execute.
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
@@ -65,6 +67,21 @@ pub enum Commands {
     },
     /// Validate config, check model paths, and probe providers.
     Doctor(ServeArgs),
+}
+
+/// How `shellenv` and `exec` find the running server.
+///
+/// Without these flags the server address comes from the config file when one exists,
+/// otherwise from the default `higgs serve` address.
+#[derive(Args, Debug, Default)]
+pub struct ClientArgs {
+    /// Base URL of the running server, for example `http://127.0.0.1:8000`.
+    #[arg(long, value_name = "URL", conflicts_with = "port")]
+    pub url: Option<String>,
+
+    /// Port of the running server on 127.0.0.1.
+    #[arg(long, value_name = "PORT")]
+    pub port: Option<u16>,
 }
 
 #[derive(Subcommand, Debug)]

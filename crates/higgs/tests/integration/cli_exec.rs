@@ -175,3 +175,118 @@ fn exec_sigint_terminates_child() {
         "expected exit code 143 or signal 2, got: {status}"
     );
 }
+
+/// Serve `GET /health` with the Higgs health body on a random port until the process ends.
+fn fake_health_server() -> u16 {
+    use std::io::Read;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for connection in listener.incoming() {
+            let Ok(mut stream) = connection else { continue };
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let body = r#"{"status":"ok"}"#;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    port
+}
+
+#[test]
+fn exec_without_config_uses_url_flag_and_names_the_server() {
+    let port = fake_health_server();
+    let empty_config_dir = tempfile::tempdir().unwrap();
+
+    let output = Command::new(higgs_bin())
+        .args(["exec", "--url", &format!("http://127.0.0.1:{port}")])
+        .args([
+            "--",
+            "sh",
+            "-c",
+            "echo $ANTHROPIC_BASE_URL $OPENAI_BASE_URL",
+        ])
+        .env("HIGGS_CONFIG_DIR", empty_config_dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let base_url = format!("http://127.0.0.1:{port}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        format!("{base_url} {base_url}")
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("using server at {base_url}")),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn shellenv_without_config_uses_port_flag_and_keeps_stdout_clean() {
+    let port = fake_health_server();
+    let empty_config_dir = tempfile::tempdir().unwrap();
+
+    let output = Command::new(higgs_bin())
+        .args(["shellenv", "--port", &port.to_string()])
+        .env("HIGGS_CONFIG_DIR", empty_config_dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let base_url = format!("http://127.0.0.1:{port}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("export ANTHROPIC_BASE_URL={base_url}\nexport OPENAI_BASE_URL={base_url}\n")
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
+fn exec_without_server_says_how_to_start_one() {
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let empty_config_dir = tempfile::tempdir().unwrap();
+
+    let output = Command::new(higgs_bin())
+        .args(["exec", "--port", &port.to_string(), "--", "true"])
+        .env("HIGGS_CONFIG_DIR", empty_config_dir.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not running"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains("higgs serve --model"),
+        "stderr was: {stderr}"
+    );
+    assert!(stderr.contains("--url or --port"), "stderr was: {stderr}");
+}
+
+#[test]
+fn exec_rejects_url_and_port_together() {
+    let output = Command::new(higgs_bin())
+        .args([
+            "exec",
+            "--url",
+            "http://127.0.0.1:1",
+            "--port",
+            "1",
+            "--",
+            "true",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+}

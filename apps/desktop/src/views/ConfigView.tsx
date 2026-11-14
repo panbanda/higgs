@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
 import { migrateConfigFile, readTextTail, runHiggs, writeConfigRaw, writeConfigStructured } from "../lib/api";
-import { CONFIG_DEFAULTS, type HiggsConfig } from "../lib/config";
+import { CONFIG_DEFAULTS, sanitizeConfig, type HiggsConfig } from "../lib/config";
 import type { ServerData } from "../hooks/useServerData";
 import type { CommandOutput, Settings } from "../lib/types";
-import { CONFIG_SECTIONS, ConfigForm, sanitizeConfig, type ConfigSection } from "../components/ConfigForm";
+import { CONFIG_SECTIONS, ConfigForm, type ConfigSection } from "../components/ConfigForm";
 import { DoctorOutput } from "../components/DoctorOutput";
 import "./views.css";
 
