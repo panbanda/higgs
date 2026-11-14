@@ -137,6 +137,9 @@ pub struct ParsedChunk {
     pub carries_token: bool,
     /// Visible `content` text of the delta (reasoning is excluded).
     pub content: String,
+    /// Reasoning text of the delta, from either `reasoning_content` or `reasoning`.
+    pub reasoning: String,
+    pub finish_reason: Option<String>,
     pub usage: Option<UsageReport>,
     pub error: Option<String>,
 }
@@ -187,6 +190,11 @@ pub fn parse_sse_line(line: &[u8]) -> Option<ParsedChunk> {
     Some(ParsedChunk {
         carries_token,
         content: content.to_owned(),
+        reasoning: [text_field("reasoning_content"), text_field("reasoning")].concat(),
+        finish_reason: value
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         usage: value
             .get("usage")
             .filter(|usage| usage.is_object())
@@ -233,6 +241,8 @@ pub fn prefill_tokps(prompt_tokens: u32, ttft_ms: f64) -> Option<f64> {
 pub struct StreamOutcome {
     pub metrics: TrialMetrics,
     pub text: String,
+    pub reasoning: String,
+    pub finish_reason: Option<String>,
 }
 
 /// Incrementally digests SSE lines, stamping the first token-bearing delta.
@@ -242,6 +252,8 @@ pub struct StreamAccumulator {
     token_chunks: u32,
     usage: UsageReport,
     text: String,
+    reasoning: String,
+    finish_reason: Option<String>,
     error: Option<String>,
 }
 
@@ -256,6 +268,10 @@ impl StreamAccumulator {
             self.token_chunks += 1;
         }
         self.text.push_str(&chunk.content);
+        self.reasoning.push_str(&chunk.reasoning);
+        if chunk.finish_reason.is_some() {
+            self.finish_reason = chunk.finish_reason;
+        }
         if let Some(usage) = chunk.usage {
             self.usage.merge(usage);
         }
@@ -296,6 +312,8 @@ impl StreamAccumulator {
         Ok(StreamOutcome {
             metrics,
             text: self.text,
+            reasoning: self.reasoning,
+            finish_reason: self.finish_reason,
         })
     }
 }
@@ -514,6 +532,41 @@ mod tests {
             let chunk = parse_sse_line(&line(json)).context("chunk")?;
             assert!(!chunk.carries_token, "{json}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn parses_reasoning_text_and_finish_reason() -> Result<()> {
+        let chunk = parse_sse_line(&line(
+            r#"{"choices":[{"delta":{"reasoning_content":"hm"},"finish_reason":"length"}]}"#,
+        ))
+        .context("chunk")?;
+        assert_eq!(chunk.reasoning, "hm");
+        assert_eq!(chunk.finish_reason.as_deref(), Some("length"));
+        let plain =
+            parse_sse_line(&line(r#"{"choices":[{"delta":{"content":"a"}}]}"#)).context("chunk")?;
+        assert!(plain.finish_reason.is_none());
+        assert!(plain.reasoning.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn accumulator_keeps_reasoning_and_the_last_finish_reason() -> Result<()> {
+        let mut accumulator = StreamAccumulator::default();
+        feed(
+            &mut accumulator,
+            r#"{"choices":[{"delta":{"reasoning_content":"think "}}]}"#,
+            10,
+        );
+        feed(
+            &mut accumulator,
+            r#"{"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}"#,
+            20,
+        );
+        let outcome = accumulator.finish(Duration::from_millis(30))?;
+        assert_eq!(outcome.reasoning, "think ");
+        assert_eq!(outcome.text, "done");
+        assert_eq!(outcome.finish_reason.as_deref(), Some("stop"));
         Ok(())
     }
 
