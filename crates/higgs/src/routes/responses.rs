@@ -309,10 +309,18 @@ fn store_completed(
         return;
     }
     conversation.extend(output_to_input_items(output));
-    store.insert(StoredResponse {
+    let stored = StoredResponse {
         response: response.clone(),
         conversation,
-    });
+    };
+    if let Err(refused) = store.insert(stored) {
+        tracing::warn!(
+            response_id = %response.id,
+            bytes = refused.bytes,
+            limit = refused.limit,
+            "response is too large to store; previous_response_id will not find it"
+        );
+    }
 }
 
 fn sse_event(event: &StreamEvent) -> Option<Event> {
@@ -500,7 +508,7 @@ mod tests {
     #[tokio::test]
     async fn get_returns_a_stored_response_and_delete_removes_it() {
         let store = Arc::new(ResponseStore::default());
-        store.insert(stored("resp_a"));
+        store.insert(stored("resp_a")).unwrap();
 
         let Json(found) = get_response(Extension(Arc::clone(&store)), Path("resp_a".to_owned()))
             .await

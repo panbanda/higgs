@@ -56,6 +56,7 @@ const SERVER: &[Field] = &[
     leaf("api_key"),
     leaf("request_timeout"),
     leaf("max_body_size"),
+    leaf("responses_store_size"),
     leaf("max_tokens"),
     leaf("rate_limit"),
     leaf("cors_origins"),

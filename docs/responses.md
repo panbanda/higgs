@@ -119,13 +119,12 @@ needs the complete call before it can emit one.
 With `store` true (the default) a finished response and the conversation that
 produced it are kept in memory. Failed responses are not stored.
 
-- At most 256 responses are kept; the least recently used is evicted first.
+- At most 256 responses are kept. The turns together use at most `server.responses_store_size` of memory (default `256MB`), measured as the JSON size of each response and its conversation. When a limit is reached, the response that was used longest ago is evicted first.
+- A single turn larger than `server.max_body_size` (or larger than `server.responses_store_size`) is not stored. The request still succeeds and returns the full response, and Higgs writes a warning to the log. A later request that names this response in `previous_response_id`, or `GET /v1/responses/{id}`, gets a 404. The reason for this choice: the model has already done the work, so an error would discard a good answer.
 - A response expires one hour after it was stored.
 - The store is per server process and is lost on restart.
 
-These limits are constants in `crates/higgs/src/responses/store.rs`, not
-configuration. A response can only be named in `previous_response_id` if it
-was stored, so leave `store` true on turns you want to continue from.
+The count limit and the expiry time are constants in `crates/higgs/src/responses/store.rs`. The two size limits come from the `[server]` keys above. A response can only be named in `previous_response_id` if it was stored, so leave `store` true on turns you want to continue from. A long conversation grows with each turn, because each stored turn holds all earlier items. Set `store` to `false` on a request to keep it out of the store.
 
 ## Server-side MCP tools
 

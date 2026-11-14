@@ -165,7 +165,8 @@ variable > file > built-in (they have no flag and no per-model level). Any key c
 | `port` | integer | `8000` | Bind port |
 | `api_key` | string | *(none)* | Bearer token required on API routes. Use `"${HIGGS_API_KEY}"` |
 | `request_timeout` | duration | `"5m"` | Per-request timeout; must be longer than zero |
-| `max_body_size` | size | `"10MB"` | Largest request body |
+| `max_body_size` | size | `"10MB"` | Largest request body. Also the largest turn that the Responses API stores |
+| `responses_store_size` | size | `"256MB"` | Memory for the stored turns of `/v1/responses`. When it is full, the turn that was used longest ago is dropped |
 | `max_tokens` | integer | `32768` | Default maximum generation tokens |
 | `rate_limit` | integer | `0` | Requests per minute per client; `0` turns it off |
 | `cors_origins` | array of strings | *(unset)* | CORS allow-list; unset sends no CORS headers, `["*"]` allows any origin |

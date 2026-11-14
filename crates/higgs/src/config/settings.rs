@@ -23,6 +23,7 @@ pub const DEFAULT_PORT: u16 = 8000;
 pub const DEFAULT_MAX_TOKENS: u32 = 32768;
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 pub const DEFAULT_MAX_BODY_SIZE: ByteSize = ByteSize::from_bytes(10 * 1024 * 1024);
+pub const DEFAULT_RESPONSES_STORE_SIZE: ByteSize = ByteSize::from_bytes(256 * 1024 * 1024);
 pub const DEFAULT_KV_BITS: u8 = 3;
 pub const CHECKPOINT_BUDGET_VARIABLE: &str = "HIGGS_PREFIX_CHECKPOINT_BUDGET_MB";
 pub const DEFAULT_PREFIX_DISK_BUDGET: ByteSize = ByteSize::from_bytes(4 * 1024 * 1024 * 1024);
@@ -76,6 +77,8 @@ pub struct ServerSection {
     pub rate_limit: u32,
     pub request_timeout: Duration,
     pub max_body_size: ByteSize,
+    /// Total memory of the stored Responses API turns; the oldest unused turns go first.
+    pub responses_store_size: ByteSize,
     /// `None` sends no CORS headers; `["*"]` allows any origin.
     pub cors_origins: Option<Vec<String>>,
 }
@@ -90,6 +93,7 @@ impl Default for ServerSection {
             rate_limit: 0,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_body_size: DEFAULT_MAX_BODY_SIZE,
+            responses_store_size: DEFAULT_RESPONSES_STORE_SIZE,
             cors_origins: None,
         }
     }
@@ -751,6 +755,10 @@ pub fn resolve(raw: &RawConfig, context: &ResolveContext) -> Result<HiggsConfig,
             .request_timeout
             .map_or(DEFAULT_REQUEST_TIMEOUT, super::units::HumanDuration::get),
         max_body_size: raw.server.max_body_size.unwrap_or(DEFAULT_MAX_BODY_SIZE),
+        responses_store_size: raw
+            .server
+            .responses_store_size
+            .unwrap_or(DEFAULT_RESPONSES_STORE_SIZE),
         cors_origins: raw.server.cors_origins.clone(),
     };
     let memory = MemoryConfig {
