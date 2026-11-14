@@ -457,8 +457,8 @@ fn mlx_sys_output_dirs(build_dir: &Path) -> Vec<PathBuf> {
     };
     let mut directories = Vec::new();
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
             continue;
         };
         if name == "mlx-sys" {
