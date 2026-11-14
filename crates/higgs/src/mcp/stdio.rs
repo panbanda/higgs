@@ -54,8 +54,9 @@ const INHERITED_VARIABLES: &[&str] = &[
 ];
 
 fn is_inherited(name: &OsStr) -> bool {
-    name.to_str()
-        .is_some_and(|name| INHERITED_VARIABLES.contains(&name) || name.starts_with("LC_"))
+    name.to_str().is_some_and(|variable| {
+        INHERITED_VARIABLES.contains(&variable) || variable.starts_with("LC_")
+    })
 }
 
 fn build_command(
