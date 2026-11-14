@@ -46,6 +46,9 @@ pub struct ToolCall {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TokenLogprob {
     pub token: String,
+    /// The bytes the token adds to the output. Servers that report `bytes` give the exact text
+    /// in context; without it, the token string is the best available.
+    pub bytes: Vec<u8>,
     /// Logprobs of the most likely alternatives, highest first.
     pub top: Vec<f64>,
 }
@@ -129,14 +132,23 @@ pub fn parse_completion(body: &Value) -> Result<Completion> {
                         })
                         .unwrap_or_default();
                     top.sort_by(|left, right| right.total_cmp(left));
-                    TokenLogprob {
-                        token: entry
-                            .get("token")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                        top,
-                    }
+                    let token = entry
+                        .get("token")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let bytes = entry.get("bytes").and_then(Value::as_array).map_or_else(
+                        || token.clone().into_bytes(),
+                        |values| {
+                            values
+                                .iter()
+                                .filter_map(|value| {
+                                    value.as_u64().and_then(|byte| u8::try_from(byte).ok())
+                                })
+                                .collect()
+                        },
+                    );
+                    TokenLogprob { token, bytes, top }
                 })
                 .collect()
         })
@@ -380,5 +392,25 @@ mod tests {
     fn rejects_error_bodies_and_empty_choices() {
         assert!(parse_completion(&json!({"error": {"message": "boom"}})).is_err());
         assert!(parse_completion(&json!({"choices": []})).is_err());
+    }
+
+    #[test]
+    fn logprob_bytes_are_read_and_default_to_the_token_text() -> Result<()> {
+        let completion = parse_completion(&json!({
+            "choices": [{
+                "message": {"content": " ab"},
+                "logprobs": {"content": [
+                    {"token": "ab", "bytes": [32, 97, 98], "top_logprobs": []},
+                    {"token": "c", "top_logprobs": []}
+                ]}
+            }]
+        }))?;
+        let bytes: Vec<&[u8]> = completion
+            .token_logprobs
+            .iter()
+            .map(|token| token.bytes.as_slice())
+            .collect();
+        assert_eq!(bytes, [b" ab".as_slice(), b"c".as_slice()]);
+        Ok(())
     }
 }

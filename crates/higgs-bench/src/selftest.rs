@@ -506,16 +506,17 @@ fn surviving_pieces(raw: &str) -> Vec<(usize, usize)> {
 }
 
 /// Where byte `offset` of the reference's parsed text (reasoning then content) sits in the raw
-/// token text the logprobs describe, which still holds the `<think>` delimiters and the
-/// whitespace the parse removed. `None` when the parsed text is not what the raw text parses to.
+/// text the logprobs describe, which still holds the `<think>` delimiters and the whitespace the
+/// parse removed. `None` when the parsed text is not what the raw text parses to.
 fn raw_offset(reference: &Completion, offset: usize) -> Option<usize> {
-    let raw: String = reference
+    let raw_bytes: Vec<u8> = reference
         .token_logprobs
         .iter()
-        .map(|token| token.token.as_str())
+        .flat_map(|token| token.bytes.iter().copied())
         .collect();
+    let raw = String::from_utf8(raw_bytes).ok()?;
     let parsed = reference.full_text();
-    if raw == parsed {
+    if raw.starts_with(&parsed) {
         return Some(offset);
     }
     let pieces = surviving_pieces(&raw);
@@ -523,7 +524,8 @@ fn raw_offset(reference: &Completion, offset: usize) -> Option<usize> {
         .iter()
         .filter_map(|&(start, length)| raw.get(start..start + length))
         .collect();
-    if rebuilt != parsed {
+    // A stop token at the end is in the raw text but not in the parsed one.
+    if !rebuilt.starts_with(&parsed) {
         return None;
     }
     let mut parsed_start = 0;
@@ -566,7 +568,7 @@ fn compare_texts(reference: &Completion, solo: &str, batched: &str) -> Compariso
     };
     let mut start = 0;
     for (index, token) in reference.token_logprobs.iter().enumerate() {
-        let end = start + token.token.len();
+        let end = start + token.bytes.len();
         if raw_position < end {
             return match margin(token) {
                 Some(gap) if gap < NEAR_TIE_NATS => Comparison::NearTie { index, gap },
@@ -788,6 +790,7 @@ mod tests {
                 .iter()
                 .map(|(token, top)| TokenLogprob {
                     token: (*token).to_owned(),
+                    bytes: token.as_bytes().to_vec(),
                     top: top.to_vec(),
                 })
                 .collect(),
@@ -853,6 +856,26 @@ mod tests {
         ));
         assert!(!refuses_forced_choice(
             "returned HTTP 500: forcing a tool call is not supported"
+        ));
+    }
+
+    #[test]
+    fn token_bytes_stand_in_for_tokens_a_lone_decode_mangles() {
+        // A SentencePiece lone-token decode drops the space and splits a character in two.
+        let mut reference = run(&[
+            ("Hello", &[-0.1, -5.0]),
+            ("world", &[-0.5, -0.6]),
+            ("\u{fffd}", &[-0.1, -5.0]),
+            ("\u{fffd}", &[-0.1, -5.0]),
+        ]);
+        let pieces: [&[u8]; 4] = [b"Hello", b" world", b"", "\u{e9}".as_bytes()];
+        for (token, piece) in reference.token_logprobs.iter_mut().zip(pieces) {
+            token.bytes = piece.to_vec();
+        }
+        reference.content = "Hello world\u{e9}".to_owned();
+        assert!(matches!(
+            compare_texts(&reference, "Hello world\u{e9}", "Hello there\u{e9}"),
+            Comparison::NearTie { index: 1, .. }
         ));
     }
 
