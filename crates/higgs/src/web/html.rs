@@ -49,6 +49,12 @@ struct Tag<'a> {
 }
 
 pub fn extract(html: &str) -> Extracted {
+    extract_text(html, true)
+}
+
+/// `track_heading` is off for the text of a heading, which has no heading of its own to look
+/// for. It keeps nested headings from recursing.
+fn extract_text(html: &str, track_heading: bool) -> Extracted {
     let mut writer = TextWriter::default();
     let mut title: Option<String> = None;
     let mut first_heading: Option<String> = None;
@@ -122,7 +128,7 @@ pub fn extract(html: &str) -> Extracted {
             continue;
         }
         if HEADINGS.contains(&tag.name.as_str()) {
-            if first_heading.is_none() {
+            if track_heading && first_heading.is_none() {
                 first_heading = Some(heading_text(html, position, &tag.name));
             }
             writer.block_break(2);
@@ -255,7 +261,7 @@ fn raw_text_until<'a>(html: &'a str, position: usize, name: &str) -> (&'a str, u
 
 fn heading_text(html: &str, position: usize, name: &str) -> String {
     let (content, _) = raw_text_until(html, position, name);
-    collapse_whitespace(&extract(content).text)
+    collapse_whitespace(&extract_text(content, false).text)
 }
 
 pub fn attribute(attributes: &str, wanted: &str) -> Option<String> {
@@ -525,6 +531,19 @@ mod tests {
             );
             assert_eq!(decoded, page);
         }
+    }
+
+    #[test]
+    fn nested_headings_do_not_recurse() {
+        let page = format!("{}deep", "<h1>".repeat(100_000));
+        let extracted = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || extract(&page))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(extracted.title.as_deref(), Some("deep"));
+        assert_eq!(extracted.text, "deep");
     }
 
     #[test]
