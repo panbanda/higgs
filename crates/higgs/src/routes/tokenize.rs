@@ -277,9 +277,15 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_model_is_not_found() {
-        let (status, _json) = call(
+        // A lone local model would serve any name, so a provider keeps names strict.
+        let (app, _engine) = crate::test_support::app_with_stub_and_config(
+            stub(),
+            "\n[provider.remote]\nurl = \"http://127.0.0.1:1\"\n",
+        );
+        let (status, _text) = post_json(
+            &app,
             "/v1/tokenize",
-            serde_json::json!({"model": "nonexistent", "text": "hi"}),
+            &serde_json::json!({"model": "nonexistent", "text": "hi"}),
         )
         .await;
         assert_eq!(status, http::StatusCode::NOT_FOUND);

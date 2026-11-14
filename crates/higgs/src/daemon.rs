@@ -195,8 +195,11 @@ fn connect_with_timeout(addr: &str) -> Result<TcpStream, String> {
 }
 
 fn check_health(config: &HiggsConfig) -> Result<(), String> {
-    let addr = resolved_addr(config);
-    let mut stream = connect_with_timeout(&addr)?;
+    check_health_at(&resolved_addr(config))
+}
+
+fn check_health_at(addr: &str) -> Result<(), String> {
+    let mut stream = connect_with_timeout(addr)?;
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .map_err(|e| format!("failed to set read timeout for {addr}: {e}"))?;
@@ -290,10 +293,107 @@ fn find_crlf(body: &[u8], offset: usize) -> Option<usize> {
         .map(|index| offset + index)
 }
 
-fn ensure_reachable(config: &HiggsConfig) -> Result<String, String> {
-    let addr = resolved_addr(config);
-    connect_with_timeout(&addr)?;
-    Ok(addr)
+/// The server that `higgs shellenv` and `higgs exec` point client tools at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientTarget {
+    addr: String,
+    origin: TargetOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetOrigin {
+    Config,
+    Flag,
+    DefaultAddress,
+}
+
+impl ClientTarget {
+    pub fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    pub const fn description(&self) -> &'static str {
+        match self.origin {
+            TargetOrigin::Config => "from config",
+            TargetOrigin::Flag => "from --url/--port",
+            TargetOrigin::DefaultAddress => "default address",
+        }
+    }
+}
+
+/// Pick the server address for client tools.
+///
+/// `--url` and `--port` win, then the config file's `[server]` address. With neither, the
+/// default `higgs serve` address is used so a server started with `--model` is found
+/// without any config.
+pub fn resolve_client_target(
+    config: Option<&HiggsConfig>,
+    url_flag: Option<&str>,
+    port_flag: Option<u16>,
+) -> Result<ClientTarget, String> {
+    if let Some(url) = url_flag {
+        return Ok(ClientTarget {
+            addr: parse_client_url(url)?,
+            origin: TargetOrigin::Flag,
+        });
+    }
+    if let Some(port) = port_flag {
+        return Ok(ClientTarget {
+            addr: format!("{}:{port}", config::DEFAULT_HOST),
+            origin: TargetOrigin::Flag,
+        });
+    }
+    Ok(config.map_or_else(
+        || ClientTarget {
+            addr: format!("{}:{}", config::DEFAULT_HOST, config::DEFAULT_PORT),
+            origin: TargetOrigin::DefaultAddress,
+        },
+        |loaded| ClientTarget {
+            addr: resolved_addr(loaded),
+            origin: TargetOrigin::Config,
+        },
+    ))
+}
+
+/// Reduce `http://host:port` (or bare `host:port`) to `host:port`.
+fn parse_client_url(url: &str) -> Result<String, String> {
+    let without_scheme = match url.split_once("://") {
+        Some(("http", rest)) => rest,
+        Some((scheme, _)) => {
+            return Err(format!(
+                "unsupported scheme '{scheme}' in --url {url}: only http:// is supported"
+            ));
+        }
+        None => url,
+    };
+    let authority = without_scheme.split('/').next().unwrap_or_default();
+    if authority.is_empty() {
+        return Err(format!("invalid --url {url}: missing host"));
+    }
+    let has_port = authority.rsplit_once(':').is_some_and(|(host, port)| {
+        port.parse::<u16>().is_ok() && (!host.contains(':') || host.ends_with(']'))
+    });
+    Ok(if has_port {
+        authority.to_owned()
+    } else {
+        format!("{authority}:80")
+    })
+}
+
+/// Confirm a server answers at the target. A config-derived target keeps the plain
+/// connection check; every other target must also pass `/health`, so a stray listener on
+/// the default port is not mistaken for Higgs.
+fn ensure_reachable(target: &ClientTarget) -> Result<(), String> {
+    let result = match target.origin {
+        TargetOrigin::Config => connect_with_timeout(&target.addr).map(|_| ()),
+        TargetOrigin::Flag | TargetOrigin::DefaultAddress => check_health_at(&target.addr),
+    };
+    result.map_err(|err| {
+        format!(
+            "{err}\nhint: start a server with 'higgs serve --model <path or hf id>', \
+             or pass --url or --port to use a server that runs elsewhere"
+        )
+    })
 }
 
 fn ensure_dashboard_ready(config: &HiggsConfig, profile: Option<&str>) -> Result<(), String> {
@@ -325,9 +425,9 @@ fn ensure_dashboard_ready(config: &HiggsConfig, profile: Option<&str>) -> Result
 }
 
 #[allow(clippy::print_stdout)]
-pub fn cmd_shellenv(config: &HiggsConfig) -> Result<(), String> {
-    let addr = ensure_reachable(config)?;
-    let base_url = format!("http://{addr}");
+pub fn cmd_shellenv(target: &ClientTarget) -> Result<(), String> {
+    ensure_reachable(target)?;
+    let base_url = target.base_url();
     println!("export ANTHROPIC_BASE_URL={base_url}");
     println!("export OPENAI_BASE_URL={base_url}");
     Ok(())
@@ -337,21 +437,22 @@ pub fn cmd_shellenv(config: &HiggsConfig) -> Result<(), String> {
 ///
 /// Forwards signals to the child and exits with its status. Never returns.
 #[allow(clippy::print_stderr, unsafe_code)]
-pub fn cmd_exec(config: &HiggsConfig, command: &[String]) -> ! {
+pub fn cmd_exec(target: &ClientTarget, command: &[String]) -> ! {
     let Some((program, args)) = command.split_first() else {
         eprintln!("no command specified");
         std::process::exit(1);
     };
 
-    let addr = resolved_addr(config);
-
-    if let Err(err) = ensure_reachable(config) {
+    if let Err(err) = ensure_reachable(target) {
         eprintln!("{err}");
-        eprintln!("hint: start with 'higgs start' or 'higgs serve'");
         std::process::exit(1);
     }
 
-    let base_url = format!("http://{addr}");
+    let base_url = target.base_url();
+    eprintln!(
+        "higgs: using server at {base_url} ({})",
+        target.description()
+    );
     let mut child = match std::process::Command::new(program)
         .args(args)
         .env("ANTHROPIC_BASE_URL", &base_url)
@@ -646,6 +747,48 @@ mod tests {
         unsafe {
             std::env::remove_var("HIGGS_CONFIG_DIR");
         }
+    }
+
+    #[test]
+    fn client_url_accepts_scheme_and_bare_forms() {
+        for (input, expected) in [
+            ("http://127.0.0.1:8123", "127.0.0.1:8123"),
+            ("http://localhost:8123/", "localhost:8123"),
+            ("http://localhost:8123/v1", "localhost:8123"),
+            ("localhost:9000", "localhost:9000"),
+            ("http://example.test", "example.test:80"),
+            ("http://[::1]:8123", "[::1]:8123"),
+            ("http://[::1]", "[::1]:80"),
+        ] {
+            assert_eq!(parse_client_url(input).as_deref(), Ok(expected), "{input}");
+        }
+        assert!(parse_client_url("https://example.test").is_err());
+        assert!(parse_client_url("http://").is_err());
+    }
+
+    #[test]
+    fn client_target_prefers_flags_then_config_then_default_address() {
+        let config = HiggsConfig {
+            server: config::ServerConfig {
+                host: "0.0.0.0".to_owned(),
+                port: 3100,
+                ..config::ServerConfig::default()
+            },
+            ..HiggsConfig::default()
+        };
+        let from_config = resolve_client_target(Some(&config), None, None).unwrap();
+        assert_eq!(from_config.base_url(), "http://127.0.0.1:3100");
+        assert_eq!(from_config.origin, TargetOrigin::Config);
+
+        let by_port = resolve_client_target(Some(&config), None, Some(9000)).unwrap();
+        assert_eq!(by_port.base_url(), "http://127.0.0.1:9000");
+
+        let by_url = resolve_client_target(Some(&config), Some("http://10.0.0.5:7"), None).unwrap();
+        assert_eq!(by_url.base_url(), "http://10.0.0.5:7");
+
+        let default = resolve_client_target(None, None, None).unwrap();
+        assert_eq!(default.base_url(), "http://127.0.0.1:8000");
+        assert_eq!(default.origin, TargetOrigin::DefaultAddress);
     }
 
     #[test]

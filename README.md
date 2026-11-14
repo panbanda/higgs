@@ -56,12 +56,16 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model":"mlx-community/Qwen3.6-35B-A3B-4bit","messages":[{"role":"user","content":"Write one sentence about Cape Town."}]}'
 ```
 
-Point your tools at it:
+Point your tools at it. No config file is needed:
 
 ```bash
 eval "$(higgs shellenv)"      # exports OPENAI_BASE_URL and ANTHROPIC_BASE_URL
 higgs exec -- claude          # or aider, or anything OpenAI/Anthropic compatible
 ```
+
+Both commands find the server at `127.0.0.1:8000`, or at the address in your config file. Use `--url` or `--port` for a server on another address.
+With one local model and no routes or providers, Higgs serves any model name with that model.
+So Claude Code, which sends names such as `claude-sonnet-4-5`, works without a `[[routes]]` entry.
 
 For a persistent setup with several models, providers, and routes, create a config and run the daemon:
 
@@ -237,8 +241,8 @@ traffic in metrics. The read-only ones never load a model.
 - `higgs init`: create `~/.config/higgs/config.toml`
 - `higgs doctor`: validate config, model paths, and providers
 - `higgs config check|explain|migrate`: validate a config file, show where each resolved value comes from, rewrite a file written for an earlier version
-- `higgs shellenv`: print `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` after verifying the server is reachable
-- `higgs exec -- <cmd>`: run a tool with those variables set after the same reachability check
+- `higgs shellenv [--url URL | --port PORT]`: print `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` after verifying the server is reachable
+- `higgs exec [--url URL | --port PORT] -- <cmd>`: run a tool with those variables set after the same reachability check, and print the server it found on stderr
 
 
 ## Apple Silicon Notes

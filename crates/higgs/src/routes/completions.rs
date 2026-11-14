@@ -75,7 +75,7 @@ pub async fn completions(
                     .stream_options
                     .as_ref()
                     .is_some_and(|opts| opts.include_usage.unwrap_or(false));
-                let sse = Sse::new(completion_chunk_stream(events, req.model, include_usage))
+                let sse = Sse::new(completion_chunk_stream(events, model_name, include_usage))
                     .keep_alive(KeepAlive::default());
                 if state.metrics.is_some() {
                     request_metrics.mark_recorded();
@@ -96,7 +96,7 @@ pub async fn completions(
                     );
                     request_metrics.mark_recorded();
                 }
-                let response = completion_response(completed, req.model);
+                let response = completion_response(completed, model_name);
                 Ok(Json(response).into_response())
             }
         }

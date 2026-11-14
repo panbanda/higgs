@@ -123,6 +123,8 @@ port = 8000
 
 # --- Routing ---
 # `default` is where a request goes when no model or route matches.
+# Exception: with exactly one local model, no [[routes]] and no providers, a request for
+# any other model name is served by that model.
 
 [routing]
 default = "higgs"
@@ -138,6 +140,8 @@ default = "higgs"
 # --- Usage ---
 # eval "$(higgs shellenv)"  -- set env vars in current shell
 # higgs exec -- claude       -- exec a command with env vars set
+# Both find a server that runs without a config file at 127.0.0.1:8000.
+# Use --url or --port when the server runs somewhere else.
 
 # --- Observability ---
 # How long to keep metrics in memory for the dashboard ("0" or false turns it off), and the

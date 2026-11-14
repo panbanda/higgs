@@ -30,13 +30,14 @@ mod load_tests;
 
 use std::path::{Path, PathBuf};
 
-pub use cli::{Cli, Commands, ConfigAction, ServeArgs, StartArgs, StopArgs};
+pub use cli::{Cli, ClientArgs, Commands, ConfigAction, ServeArgs, StartArgs, StopArgs};
 pub use document::{ConfigError, Diagnostic};
 pub use environment::Environment;
 pub use settings::{
-    AutoRouterConfig, EnvOverride, ExperimentalConfig, HiggsConfig, MemoryConfig, MetricsLogConfig,
-    ModelConfig, Notices, ObservabilityConfig, PrefixCacheConfig, ProviderConfig, RouteConfig,
-    RoutingConfig, ServerConfig, ServerSection,
+    AutoRouterConfig, DEFAULT_HOST, DEFAULT_PORT, DEFAULT_ROUTING_PROVIDER, EnvOverride,
+    ExperimentalConfig, HiggsConfig, MemoryConfig, MetricsLogConfig, ModelConfig, Notices,
+    ObservabilityConfig, PrefixCacheConfig, ProviderConfig, RouteConfig, RoutingConfig,
+    ServerConfig, ServerSection,
 };
 pub use types::{ApiFormat, BatchMode, LoadMode, MemoryGuard, MlxProfile, MtpMode, Secret};
 

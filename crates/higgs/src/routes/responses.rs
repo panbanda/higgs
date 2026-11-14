@@ -422,11 +422,18 @@ mod tests {
     const STUB_MODEL: &str = "stub-model";
 
     fn local_state(metrics: Option<Arc<MetricsStore>>) -> SharedState {
+        local_state_with_config(metrics, "")
+    }
+
+    fn local_state_with_config(
+        metrics: Option<Arc<MetricsStore>>,
+        extra_config: &str,
+    ) -> SharedState {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "[[models]]\npath = \"stub/model\"\nname = \"stub-model\"\n",
+            format!("[[models]]\npath = \"stub/model\"\nname = \"stub-model\"\n{extra_config}"),
         )
         .unwrap();
         let config = crate::config::load_config_file(&path, None).unwrap();
@@ -663,8 +670,12 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_model_is_404_model_not_found() {
+        // A lone local model would serve any name, so a provider keeps names strict.
+        let state =
+            local_state_with_config(None, "\n[provider.remote]\nurl = \"http://127.0.0.1:1\"\n");
+        let strict_app = crate::build_router(state, 300.0, None, 0, 1024 * 1024, None);
         let (status, body) = post(
-            &app(None),
+            &strict_app,
             &json!({"model": "no-such-model", "input": "hi"}),
         )
         .await;
