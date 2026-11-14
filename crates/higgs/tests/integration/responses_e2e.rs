@@ -70,7 +70,7 @@ fn build_app(state: Arc<AppState>) -> axum::Router {
 }
 
 fn metrics_store() -> Arc<MetricsStore> {
-    Arc::new(MetricsStore::new(Duration::from_secs(60)))
+    Arc::new(MetricsStore::new(Duration::from_mins(1)))
 }
 
 fn post_json(uri: &str, body: &serde_json::Value) -> Request<Body> {

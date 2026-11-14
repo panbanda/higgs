@@ -98,7 +98,7 @@ const LEGACY_ROWS: &[LegacyRow] = &[
         toml: "[local]\nidle_ttl_seconds = 900\n",
         old: "local.idle_ttl_seconds",
         new: "defaults.idle_ttl",
-        check: |c| assert_eq!(model_of(c).idle_ttl, Some(Duration::from_secs(900))),
+        check: |c| assert_eq!(model_of(c).idle_ttl, Some(Duration::from_mins(15))),
     },
     LegacyRow {
         toml: "[local]\nmax_loaded_models = 3\n",
@@ -319,10 +319,7 @@ const LEGACY_ROWS: &[LegacyRow] = &[
         old: "retention.minutes",
         new: "observability.retention",
         check: |c| {
-            assert_eq!(
-                c.observability.retention,
-                Some(Duration::from_secs(30 * 60))
-            );
+            assert_eq!(c.observability.retention, Some(Duration::from_mins(30)));
         },
     },
     LegacyRow {
@@ -430,7 +427,7 @@ fn a_file_using_only_current_keys_has_no_deprecations() {
     let config = load_ok(
         "[server]\nrequest_timeout = \"2m\"\n[defaults]\nidle_ttl = \"5m\"\n[[models]]\npath = \"org/m\"\n[models.kv_cache]\nbits = 4\n",
     );
-    assert!(config.notices.deprecations.is_empty());
+    assert_eq!(config.notices.deprecations, []);
 }
 
 #[test]
@@ -613,7 +610,7 @@ fn built_in_values_apply_when_nothing_is_set() {
         ByteSize::from_bytes(4 << 30)
     );
     assert_eq!(model.prefill_yield_tokens, None);
-    assert_eq!(config.server.request_timeout, Duration::from_secs(300));
+    assert_eq!(config.server.request_timeout, Duration::from_mins(5));
     assert_eq!(config.server.max_body_size, ByteSize::from_bytes(10 << 20));
 }
 
@@ -641,7 +638,7 @@ fn every_per_model_key_inherits_from_defaults_and_is_overridden_by_the_entry() {
             key: "idle_ttl",
             defaults: "idle_ttl = \"15m\"",
             model: "idle_ttl = \"0\"",
-            check_defaults: |m| assert_eq!(m.idle_ttl, Some(Duration::from_secs(900))),
+            check_defaults: |m| assert_eq!(m.idle_ttl, Some(Duration::from_mins(15))),
             check_model: |m| assert_eq!(m.idle_ttl, None),
         },
         InheritanceRow {
@@ -907,7 +904,7 @@ fn experimental_keys_follow_environment_then_file_then_built_in() {
     assert_eq!(from_file.experimental.mtp_draft_tokens, Some(3));
     assert!(from_file.experimental.prompt_lookup);
     assert_eq!(from_file.experimental.chunked_prefill_threshold, Some(4096));
-    assert!(from_file.notices.env_overrides.is_empty());
+    assert_eq!(from_file.notices.env_overrides, []);
 
     let environment = Environment::from_pairs([
         ("HIGGS_MTP", "1"),

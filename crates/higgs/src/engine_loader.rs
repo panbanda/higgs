@@ -290,7 +290,7 @@ mod tests {
         let overridden = specs.get(1).unwrap();
 
         assert_eq!(default.load, LoadMode::OnDemand);
-        assert_eq!(default.idle_ttl, Some(std::time::Duration::from_secs(300)));
+        assert_eq!(default.idle_ttl, Some(std::time::Duration::from_mins(5)));
         assert!(!default.pinned);
         assert_eq!(overridden.load, LoadMode::Startup);
         assert_eq!(overridden.idle_ttl, None);

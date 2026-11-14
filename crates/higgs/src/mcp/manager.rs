@@ -32,7 +32,7 @@ impl Default for BackoffPolicy {
     fn default() -> Self {
         Self {
             initial: Duration::from_secs(1),
-            maximum: Duration::from_secs(60),
+            maximum: Duration::from_mins(1),
         }
     }
 }
@@ -707,7 +707,8 @@ mod tests {
             manager.call("fake__echo", json!([1])).await,
             Err(ToolCallError::InvalidArguments(_))
         ));
-        assert!(server.received_calls().is_empty());
+        let found = &server.received_calls();
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[tokio::test]
@@ -945,7 +946,8 @@ mod tests {
     fn an_oversized_non_text_block_is_dropped_whole() {
         let image = json!({"type": "image", "data": "A".repeat(100), "mimeType": "image/png"});
         let output = build_output(result(vec![image], None), 50);
-        assert!(output.content.is_empty());
+        let found = &output.content;
+        assert!(found.is_empty(), "{found:?}");
         assert!(output.truncated);
     }
 

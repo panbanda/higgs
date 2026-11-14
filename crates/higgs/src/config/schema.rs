@@ -402,9 +402,9 @@ mod tests {
 
     #[test]
     fn a_valid_document_has_no_unknown_keys() {
-        assert!(
-            unknown("[server]\nport = 1\n[[models]]\npath = \"a\"\n[models.kv_cache]\nbits = 3\n")
-                .is_empty()
+        assert_eq!(
+            unknown("[server]\nport = 1\n[[models]]\npath = \"a\"\n[models.kv_cache]\nbits = 3\n"),
+            []
         );
     }
 
@@ -477,7 +477,12 @@ mod tests {
 
     #[test]
     fn free_form_tables_accept_any_key() {
-        assert!(unknown("[mcp.servers.fs]\ncommand = \"x\"\nenv = { ANY_NAME = \"1\" }\n[mcp.servers.fs.headers]\nX-Whatever = \"1\"\n").is_empty());
+        assert_eq!(
+            unknown(
+                "[mcp.servers.fs]\ncommand = \"x\"\nenv = { ANY_NAME = \"1\" }\n[mcp.servers.fs.headers]\nX-Whatever = \"1\"\n"
+            ),
+            []
+        );
     }
 
     #[test]

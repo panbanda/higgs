@@ -883,7 +883,7 @@ fn inactive_tracker_passes_text_through() {
     let mut tracker = parser.tracker(false);
     let text = r#"[TOOL_CALLS]get_time[ARGS]{"zone": "X"}"#;
     assert_eq!(tracker.process(text).visible, text);
-    assert!(tracker.flush().visible.is_empty());
+    assert_eq!(tracker.flush().visible, "");
     assert!(!tracker.has_tool_calls());
 }
 

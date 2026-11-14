@@ -214,8 +214,8 @@ mod tests {
 
     #[test]
     fn no_servers_means_no_findings() {
-        assert!(mcp_findings(&McpConfig::default(), &no_env, &always).is_empty());
-        assert!(web_findings(&HiggsConfig::default()).is_empty());
+        assert_eq!(mcp_findings(&McpConfig::default(), &no_env, &always), []);
+        assert_eq!(web_findings(&HiggsConfig::default()), []);
     }
 
     #[test]

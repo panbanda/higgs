@@ -387,11 +387,8 @@ mod tests {
 
     #[test]
     fn a_disabled_policy_plans_nothing() {
-        assert!(
-            CheckpointPolicy::disabled()
-                .positions(0, 100_000)
-                .is_empty()
-        );
+        let found = &CheckpointPolicy::disabled().positions(0, 100_000);
+        assert!(found.is_empty(), "{found:?}");
         assert!(!CheckpointPolicy::disabled().is_enabled());
         assert!(!CheckpointPolicy::new(512, 8, 0).is_enabled());
     }

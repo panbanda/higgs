@@ -3013,7 +3013,8 @@ mod tests {
     fn handover_ignores_a_request_that_is_not_speculating() {
         let (mut ar, mut rx) = make_active_request(100, vec![]);
         assert!(!hand_over_speculation(&mut ar, &make_tokenizer(), &[0]));
-        assert!(ar.generated_tokens.is_empty());
+        let found = &ar.generated_tokens;
+        assert!(found.is_empty(), "{found:?}");
         assert!(rx.try_recv().is_err());
     }
 

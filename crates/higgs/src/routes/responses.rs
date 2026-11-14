@@ -685,7 +685,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_requests_are_recorded_in_metrics_with_the_model() {
-        let metrics = Arc::new(MetricsStore::new(Duration::from_secs(60)));
+        let metrics = Arc::new(MetricsStore::new(Duration::from_mins(1)));
         let app = app(Some(Arc::clone(&metrics)));
         let (status, _) = post(
             &app,

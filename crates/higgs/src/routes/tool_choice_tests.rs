@@ -501,7 +501,7 @@ async fn formats_that_cannot_be_constrained_say_so_and_still_parse_when_not_forc
                 "{route:?} {format:?}: {body}"
             );
             assert!(body.contains(label), "{route:?} {format:?}: {body}");
-            assert!(recorded(&engine).is_empty());
+            assert_eq!(recorded(&engine), []);
 
             let (plain_status, plain_body, _) =
                 send(stub(format, text), route, &route.request(None, false)).await;
@@ -528,7 +528,7 @@ async fn forced_choice_cannot_be_combined_with_another_constraint() {
         send(stub(ToolCallFormat::Qwen, QWEN_WEATHER), Route::Chat, &body).await;
     assert_eq!(status, http::StatusCode::BAD_REQUEST, "{text}");
     assert!(text.contains("cannot be combined"), "{text}");
-    assert!(recorded(&engine).is_empty());
+    assert_eq!(recorded(&engine), []);
 }
 
 #[tokio::test]

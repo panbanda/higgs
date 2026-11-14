@@ -266,7 +266,7 @@ mod tests {
         let mut next_id = 1u32;
         let printable: Vec<u8> = std::iter::once(b'\n').chain(0x20..=0x7e).collect();
         let mut tokens: Vec<Vec<u8>> = printable.iter().map(|byte| vec![*byte]).collect();
-        for first in [b'\n', b'[', b'<', b'{', b' '] {
+        for first in *b"\n[<{ " {
             for second in &printable {
                 tokens.push(vec![first, *second]);
             }

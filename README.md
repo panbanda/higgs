@@ -81,7 +81,7 @@ From the [latest release](https://github.com/panbanda/higgs/releases/latest):
 
 The Homebrew formula also installs the `hf` CLI. Higgs uses it to download models. With any other install method, run `brew install hf`. In scripts and other non-interactive runs, download the model first with `hf download <model-id>`.
 
-To build from source, use Rust 1.88 or newer and the Xcode Command Line Tools:
+To build from source, use Rust 1.91 or newer and the Xcode Command Line Tools:
 
 ```bash
 git clone https://github.com/panbanda/higgs && cd higgs

@@ -764,7 +764,7 @@ mod tests {
                 enabled: true,
                 force: true,
                 model: "my-router".to_owned(),
-                timeout: std::time::Duration::from_millis(5000),
+                timeout: std::time::Duration::from_secs(5),
             },
             ..RoutingConfig::default()
         };

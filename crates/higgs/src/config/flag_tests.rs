@@ -71,7 +71,7 @@ fn simple_mode_server_flags_override_the_built_in_values() {
     assert_eq!(config.server.max_tokens, 1024);
     assert_eq!(config.server.api_key.as_ref().unwrap().expose(), "sk-test");
     assert_eq!(config.server.rate_limit, 60);
-    assert_eq!(config.server.request_timeout, Duration::from_secs(60));
+    assert_eq!(config.server.request_timeout, Duration::from_mins(1));
 }
 
 #[test]
@@ -519,7 +519,8 @@ fn web_defaults_off_and_every_field_parses() {
         Some("http://localhost:8888")
     );
     assert_eq!(config.web.timeout, Duration::from_secs(7));
-    assert!(config.web.problems().is_empty());
+    let found = &config.web.problems();
+    assert!(found.is_empty(), "{found:?}");
 }
 
 // -- Other defaults -----------------------------------------------------------------------------
@@ -531,13 +532,13 @@ fn the_default_configuration_matches_the_documented_defaults() {
     assert_eq!(config.server.host, "127.0.0.1");
     assert_eq!(config.server.port, 8000);
     assert_eq!(config.server.max_tokens, 32768);
-    assert_eq!(config.server.request_timeout, Duration::from_secs(300));
+    assert_eq!(config.server.request_timeout, Duration::from_mins(5));
     assert!(config.server.api_key.is_none());
     assert_eq!(config.server.rate_limit, 0);
     assert_eq!(config.routing.default_provider, "higgs");
     assert_eq!(
         config.observability.retention,
-        Some(Duration::from_secs(3600))
+        Some(Duration::from_hours(1))
     );
     assert!(config.observability.metrics_log.enabled);
     assert_eq!(config.observability.metrics_log.max_files, 5);

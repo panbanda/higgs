@@ -792,7 +792,7 @@ mod tests {
             0,
             Some("Hello, how can I help you?"),
         );
-        assert!(result.tool_calls.is_empty());
+        assert_eq!(result.tool_calls, []);
     }
 
     #[test]
@@ -950,7 +950,7 @@ After last."#;
         // The parser finds the first <tool_call>, then looks for first </tool_call>.
         // Content between them: "\n<tool_call>\n{\"name\": \"inner\", \"arguments\": {}}\n"
         // This is not valid JSON (starts with <tool_call>), so it's preserved as raw text.
-        assert!(result.tool_calls.is_empty());
+        assert_eq!(result.tool_calls, []);
         assert!(result.text.contains("<tool_call>"));
     }
 
@@ -1045,7 +1045,7 @@ After last."#;
             vis, "hello <tool_call>{\"name\":\"x\"}</tool_call> world",
             "inactive tracker must pass every chunk through verbatim",
         );
-        assert!(calls.is_empty());
+        assert_eq!(calls, []);
         assert!(!t.has_tool_calls());
         assert_eq!(t.completed_count(), 0);
     }
@@ -1116,7 +1116,7 @@ After last."#;
         assert!(vis.contains("not json"));
         assert!(vis.contains("</tool_call>"));
         assert!(vis.contains("after"));
-        assert!(calls.is_empty());
+        assert_eq!(calls, []);
         assert_eq!(t.completed_count(), 0);
     }
 
@@ -1128,7 +1128,7 @@ After last."#;
         // emitted as visible (otherwise tokens vanish silently).
         assert!(vis.contains("<tool_call>"));
         assert!(vis.contains("partial"));
-        assert!(calls.is_empty());
+        assert_eq!(calls, []);
     }
 
     #[test]
@@ -1141,7 +1141,7 @@ After last."#;
             drain_visible_and_calls(&mut t, &["caf", "\u{00e9}", " and more text here"]);
         assert!(vis.contains("caf\u{00e9}"));
         assert!(vis.contains("more text"));
-        assert!(calls.is_empty());
+        assert_eq!(calls, []);
     }
 
     #[test]
@@ -1500,7 +1500,7 @@ After last."#;
     fn minicpm_function_without_name_is_not_parsed() {
         let input = "<function ><param name=\"city\">Paris</param></function>";
         let result = parse_tool_calls(input, None);
-        assert!(result.tool_calls.is_empty());
+        assert_eq!(result.tool_calls, []);
         assert!(result.text.contains("<param name=\"city\">"));
     }
 

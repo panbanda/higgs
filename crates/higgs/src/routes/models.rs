@@ -299,7 +299,8 @@ mod tests {
         ] {
             assert!(plain.get(field).is_some(), "missing {field}");
         }
-        assert!(fx.events().is_empty());
+        let found = &fx.events();
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[tokio::test]
@@ -493,7 +494,8 @@ mod tests {
             let (denied, _) = fx.send(method, uri).await;
             assert_eq!(denied, StatusCode::UNAUTHORIZED, "{method} {uri}");
         }
-        assert!(fx.events().is_empty());
+        let found = &fx.events();
+        assert!(found.is_empty(), "{found:?}");
 
         let (allowed, _) = fx
             .send_with_auth("POST", "/v1/models/a/load", Some("secret"))
@@ -504,7 +506,7 @@ mod tests {
     #[tokio::test]
     async fn dashboard_and_control_endpoints_are_not_counted_as_traffic() {
         let metrics = Arc::new(crate::metrics::MetricsStore::new(
-            std::time::Duration::from_secs(60),
+            std::time::Duration::from_mins(1),
         ));
         let fx = harness_with(
             vec![stub_spec("a")],

@@ -184,7 +184,7 @@ fn check_server_section(config: &crate::config::HiggsConfig, result: &mut Doctor
             "server.request_timeout must be longer than zero (e.g. \"5m\")",
             result,
         );
-    } else if server.request_timeout > std::time::Duration::from_secs(600) {
+    } else if server.request_timeout > std::time::Duration::from_mins(10) {
         warn(
             &format!("server.request_timeout={timeout} is unusually high (>10 min); check intent"),
             result,
@@ -899,7 +899,7 @@ fn check_observability(config: &HiggsConfig, result: &mut DoctorResult) {
             "observability.retention is off; the dashboard keeps no history",
             result,
         ),
-        Some(window) if window < std::time::Duration::from_secs(60) => warn(
+        Some(window) if window < std::time::Duration::from_mins(1) => warn(
             &format!(
                 "observability.retention={} is under a minute; the dashboard will show little",
                 HumanDuration::new(window)
@@ -1664,7 +1664,7 @@ mod tests {
 
     #[test]
     fn test_request_timeout_unusually_high_warns() {
-        let config = server_with(|s| s.request_timeout = Duration::from_secs(3600));
+        let config = server_with(|s| s.request_timeout = Duration::from_hours(1));
         let mut result = empty_result();
         check_server_section(&config, &mut result);
         assert!(result.warnings >= 1);
@@ -1851,7 +1851,7 @@ mod tests {
                     enabled: false,
                     force: false,
                     model: String::new(),
-                    timeout: Duration::from_millis(2000),
+                    timeout: Duration::from_secs(2),
                 },
                 ..RoutingConfig::default()
             },
@@ -1872,7 +1872,7 @@ mod tests {
                     enabled: true,
                     force: false,
                     model: String::new(),
-                    timeout: Duration::from_millis(2000),
+                    timeout: Duration::from_secs(2),
                 },
                 ..RoutingConfig::default()
             },
@@ -1891,7 +1891,7 @@ mod tests {
                     enabled: true,
                     force: false,
                     model: "nonexistent/model".to_owned(),
-                    timeout: Duration::from_millis(2000),
+                    timeout: Duration::from_secs(2),
                 },
                 ..RoutingConfig::default()
             },
@@ -1916,7 +1916,7 @@ mod tests {
                     enabled: true,
                     force: false,
                     model: "org/router-model".to_owned(),
-                    timeout: Duration::from_millis(2000),
+                    timeout: Duration::from_secs(2),
                 },
                 ..RoutingConfig::default()
             },
@@ -1943,7 +1943,7 @@ mod tests {
                     enabled: true,
                     force: false,
                     model: "org/router-model".to_owned(),
-                    timeout: Duration::from_millis(2000),
+                    timeout: Duration::from_secs(2),
                 },
                 ..RoutingConfig::default()
             },
@@ -2397,7 +2397,7 @@ mod tests {
             vec![
                 named_model("a", |m| {
                     m.pinned = true;
-                    m.idle_ttl = Some(Duration::from_secs(60));
+                    m.idle_ttl = Some(Duration::from_mins(1));
                 }),
                 named_model("b", |_| {}),
             ],

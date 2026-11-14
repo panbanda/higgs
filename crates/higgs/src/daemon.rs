@@ -966,12 +966,12 @@ mod tests {
     fn retention_duration_uses_configured_minutes() {
         let config = HiggsConfig {
             observability: crate::config::ObservabilityConfig {
-                retention: Some(Duration::from_secs(30 * 60)),
+                retention: Some(Duration::from_mins(30)),
                 ..Default::default()
             },
             ..HiggsConfig::default()
         };
-        assert_eq!(retention_duration(&config), Duration::from_secs(30 * 60));
+        assert_eq!(retention_duration(&config), Duration::from_mins(30));
     }
 
     #[test]
@@ -1063,8 +1063,9 @@ mod tests {
             let lookup = |name: &str| {
                 (name == "EXAMPLE_TOKEN" || name == "MCP_TOKEN").then(|| "x".to_owned())
             };
-            assert!(config.mcp.problems(&lookup).is_empty());
-            assert!(config.notices.deprecations.is_empty());
+            let found = &config.mcp.problems(&lookup);
+            assert!(found.is_empty(), "{found:?}");
+            assert_eq!(config.notices.deprecations, []);
         });
     }
 
@@ -1077,7 +1078,8 @@ mod tests {
             let section = uncommented_section(&template, "# [web]");
             let config = load_text(&format!("{section}{A_MODEL}"));
             assert!(config.web.enabled);
-            assert!(config.web.problems().is_empty());
+            let found = &config.web.problems();
+            assert!(found.is_empty(), "{found:?}");
             assert_eq!(config.web.search_provider, "duckduckgo");
         });
     }
@@ -1132,7 +1134,7 @@ mod tests {
             cmd_init(None);
             let template = std::fs::read_to_string(dir.join("config.toml")).unwrap();
             let config = load_text(&format!("{template}{A_MODEL}"));
-            assert!(config.notices.deprecations.is_empty());
+            assert_eq!(config.notices.deprecations, []);
             assert!(!template.contains("__METRICS_PATH__"));
         });
     }

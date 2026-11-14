@@ -185,8 +185,7 @@ mod tests {
             .args(["-0", &pid.to_string()])
             .stderr(Stdio::null())
             .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
+            .is_ok_and(|status| status.success());
         assert!(!still_running, "dropping the server must kill its process");
         Ok(())
     }

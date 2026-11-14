@@ -663,7 +663,7 @@ mod tests {
             text.contains("thinking.budget_tokens must be at least 1"),
             "{text}"
         );
-        assert!(engine.recorded_calls().is_empty());
+        assert_eq!(engine.recorded_calls(), []);
     }
 
     #[tokio::test]
