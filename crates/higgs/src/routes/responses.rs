@@ -251,28 +251,19 @@ async fn create_local_response(
     let start = Instant::now();
     let completed =
         crate::generation::complete(Arc::clone(&state), generation, engine, received_at).await?;
-    let input_tokens = u64::from(completed.usage.prompt_tokens);
-    let output_tokens = u64::from(completed.usage.completion_tokens);
+    if let Some(ref metrics) = state.metrics {
+        crate::generation::record_completion(
+            metrics,
+            &context.model,
+            routing_method,
+            start,
+            &completed.usage,
+        );
+        request_metrics.mark_recorded();
+    }
     let object = context.object(outcome_from_completed(completed));
     if let Some(response_store) = store_response {
         store_completed(&response_store, &object, conversation);
-    }
-    if let Some(ref metrics) = state.metrics {
-        metrics.record(RequestRecord {
-            id: 0,
-            timestamp: Instant::now(),
-            wallclock: chrono::Utc::now(),
-            model: Some(object.model.clone()),
-            provider: Some("higgs".to_owned()),
-            routing_method: routing_method.into(),
-            status: 200,
-            duration: start.elapsed(),
-            input_tokens,
-            output_tokens,
-            error_body: None,
-            timing: RequestTiming::default(),
-        });
-        request_metrics.mark_recorded();
     }
     Ok(Json(object).into_response())
 }

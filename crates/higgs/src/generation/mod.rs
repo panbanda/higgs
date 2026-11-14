@@ -19,11 +19,38 @@ use std::time::Instant;
 
 use crate::backend::EngineLease;
 use crate::error::ServerError;
+use crate::metrics::{MetricsStore, RequestRecord, RequestTiming};
+use crate::router::RoutingMethod;
 use crate::state::SharedState;
+use crate::types::openai::CompletionUsage;
 
 pub use event::{Completed, EventStream, GeneratedToolCall, GenerationEvent, ToolLoopEvent};
 pub use request::{ChatPrompt, GenerationRequest, Prompt};
 pub use stream::StreamMetrics;
+
+/// Record a finished local generation on the metrics page.
+pub fn record_completion(
+    metrics: &MetricsStore,
+    model: &str,
+    routing_method: RoutingMethod,
+    started: Instant,
+    usage: &CompletionUsage,
+) {
+    metrics.record(RequestRecord {
+        id: 0,
+        timestamp: Instant::now(),
+        wallclock: chrono::Utc::now(),
+        model: Some(model.to_owned()),
+        provider: Some("higgs".to_owned()),
+        routing_method: routing_method.into(),
+        status: 200,
+        duration: started.elapsed(),
+        input_tokens: u64::from(usage.prompt_tokens),
+        output_tokens: u64::from(usage.completion_tokens),
+        error_body: None,
+        timing: RequestTiming::default(),
+    });
+}
 
 /// Generate a complete answer, running server-side tools if the request asks.
 pub async fn complete(

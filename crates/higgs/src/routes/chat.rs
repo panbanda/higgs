@@ -113,24 +113,17 @@ pub async fn chat_completions(
                 let completed =
                     crate::generation::complete(Arc::clone(&state), request, engine, received_at)
                         .await?;
-                let response = chat_response(completed, req.model);
                 if let Some(ref metrics) = state.metrics {
-                    metrics.record(RequestRecord {
-                        id: 0,
-                        timestamp: Instant::now(),
-                        wallclock: chrono::Utc::now(),
-                        model: Some(response.model.clone()),
-                        provider: Some("higgs".to_owned()),
-                        routing_method: routing_method.into(),
-                        status: 200,
-                        duration: start.elapsed(),
-                        input_tokens: u64::from(response.usage.prompt_tokens),
-                        output_tokens: u64::from(response.usage.completion_tokens),
-                        error_body: None,
-                        timing: crate::metrics::RequestTiming::default(),
-                    });
+                    crate::generation::record_completion(
+                        metrics,
+                        &req.model,
+                        routing_method,
+                        start,
+                        &completed.usage,
+                    );
                     request_metrics.mark_recorded();
                 }
+                let response = chat_response(completed, req.model);
                 Ok(Json(response).into_response())
             }
         }
