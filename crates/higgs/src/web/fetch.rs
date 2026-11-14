@@ -256,12 +256,14 @@ async fn read_page(
         body.extend_from_slice(&chunk);
     }
 
-    let decoded = String::from_utf8_lossy(&body);
+    let decoded = String::from_utf8_lossy(&body).into_owned();
     let (title, full_text) = if is_html {
-        let extracted = html::extract(&decoded);
+        let extracted = tokio::task::spawn_blocking(move || html::extract(&decoded))
+            .await
+            .map_err(|error| FetchError::Network(format!("reading the page failed: {error}")))?;
         (extracted.title, extracted.text)
     } else {
-        (None, decoded.into_owned())
+        (None, decoded)
     };
     let (text, text_truncated) = truncate_chars(full_text, max_chars);
     Ok(FetchedPage {
