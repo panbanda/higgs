@@ -2,7 +2,7 @@
 
 <img src="docs/images/higgs-header.png" alt="Higgs: model router for Apple hardware" width="920">
 
-**Run open-weight LLMs on your Mac and point your existing tools at them. One Rust binary, OpenAI and Anthropic compatible APIs, built on MLX for Apple Silicon.**
+**One Rust binary that serves local models on Apple Silicon and routes to cloud providers, behind OpenAI and Anthropic compatible APIs.**
 
 [![CI](https://github.com/panbanda/higgs/actions/workflows/ci.yml/badge.svg)](https://github.com/panbanda/higgs/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/panbanda/higgs)](https://github.com/panbanda/higgs/releases)
@@ -13,24 +13,27 @@
 
 </div>
 
-Higgs serves MLX models from Hugging Face on your Mac. It uses the same endpoints that OpenAI and Anthropic clients already use: chat completions, completions, Responses, embeddings and messages. It can also route requests to remote providers and run MCP tools for the model. It shows how fast each request ran. There is no Python environment to manage.
-
-Use Higgs when you want local models behind a real API. Typical uses are coding agents, scripts, apps, and several models on one machine.
+Higgs is for developers who run models on a Mac. Use it behind coding agents, scripts and apps that already speak the OpenAI or Anthropic API. It runs MLX models from Hugging Face on the Mac. It sends other requests to cloud providers. It needs no Python environment.
 
 ## Quick start
 
 You need an Apple Silicon Mac.
 
-1. Install Higgs and start a model:
+1. Install Higgs:
 
 ```bash
 brew install panbanda/brews/higgs
+```
+
+2. Start a model. Use a Hugging Face ID or a local path:
+
+```bash
 higgs serve --model mlx-community/Llama-3.2-1B-Instruct-4bit
 ```
 
 If the model is not in your Hugging Face cache, Higgs asks before it downloads the model with the `hf` CLI. Answer `y`.
 
-2. In a second terminal, send a request:
+3. In a second terminal, send a request:
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
@@ -38,67 +41,46 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model":"mlx-community/Llama-3.2-1B-Instruct-4bit","messages":[{"role":"user","content":"Write one sentence about Cape Town."}]}'
 ```
 
-This 1B model is small, so the first run is fast. When it works, use a larger model. See [which model to start with](#which-model-should-i-start-with). To use Higgs from Claude Code, the OpenAI SDK or an app, see [Recipes](#recipes).
+4. To use the model from Claude Code, save this file as `higgs.toml`:
+
+```toml
+[[models]]
+path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
+name = "local"
+
+[[routes]]
+match = "claude-.*"
+provider = "higgs"
+model = "local"
+```
+
+5. Stop the server from step 2. Start the server again with the file, and keep it running:
+
+```bash
+higgs --config higgs.toml serve
+```
+
+6. In the second terminal, start Claude Code through Higgs:
+
+```bash
+ANTHROPIC_AUTH_TOKEN=higgs higgs --config higgs.toml exec -- claude
+```
+
+This 1B model is small, so the first run is fast. It is too small for good agent work. Choose a larger model for daily use. See [which model to start with](#which-model-should-i-start-with).
 
 ## Contents
 
-- [Why Higgs](#why-higgs)
 - [Install](#install)
+- [What you get](#what-you-get)
 - [Recipes](#recipes)
 - [Supported models](#supported-models)
 - [Configuration](#configuration)
-- [API surface](#api-surface)
-- [Commands](#commands)
+- [API and CLI reference](#api-and-cli-reference)
 - [Desktop app](#desktop-app)
+- [Performance](#performance)
 - [FAQ and troubleshooting](#faq-and-troubleshooting)
-- [Development](#development)
+- [Contributing](#contributing)
 - [License](#license)
-
-## Why Higgs
-
-- **Fast under load.** Concurrent requests decode together in batched forward passes. This includes the large Qwen3.5 and Qwen3.6 hybrid models. With four simultaneous clients, Higgs gave 1.1x to 1.6x the throughput of oMLX on every model tested.
-- **Fast follow-up turns.** Higgs keeps prefix KV state in memory. A chat or agent loop that repeats its history skips the prefill.
-- **Hybrid models reuse their cache.** The recurrent layers of Qwen3.5 and Qwen3.6 cannot cut a cache back to a shorter prefix. Higgs saves checkpoints of that state during prefill. A new question over a 3,850-token shared context took 3.7 s to the first token, not 20.1 s.
-- **Memory you control.** Load a model on its first request. Unload it when it is idle. Limit how many models stay loaded, pin the important ones, and set a memory guard. Peak memory was lower than oMLX on every model measured.
-- **One endpoint for local and remote models.** Local models and remote providers (OpenAI, Anthropic, Ollama and others) use one URL. Higgs has regex routes, aliases, an optional auto-router, and OpenAI and Anthropic format translation.
-- **Tool calling.** Higgs parses tool calls in the Qwen, Mistral, Llama, Gemma, GLM and MiniMax formats, also when streaming. `tool_choice` can force a valid call. An MCP client and web search and fetch let the server run tools for the model.
-- **Strict config.** Unknown keys are errors, and the error suggests the correct key. `higgs config explain` shows where each value comes from. `higgs doctor` checks models and providers before you start.
-- **Visible performance.** Higgs records time to first token, decode speed and prefix-cache hits for each request. You can see them in `/metrics`, in a terminal dashboard and in a desktop app.
-- **One binary.** There is no Python and no virtual environment. Release builds include the Metal shader library.
-
-### Numbers against oMLX
-
-The numbers come from an Apple M4 Max with 128 GB. The same client harness ran against both servers, one server at a time. Each value is the median of 3 trials at temperature 0. The method and the steps to reproduce are in [docs/omlx-comparison.md](docs/omlx-comparison.md). That document is a first pass. Differences under about 5% are noise. A new benchmark run is pending. When it finishes, update this table and the comparison document together.
-
-<!-- BENCHMARK TABLE: every figure below is copied from docs/omlx-comparison.md. Update both together. -->
-
-| Measure | Model | Higgs | oMLX |
-|---|---|---|---|
-| Time to first token, follow-up turn (about 3,000 tokens of history) | Llama-3.2-1B-4bit | 32 ms | 117 ms |
-| | Qwen3-1.7B-4bit | 57 ms | 219 ms |
-| | Thinklite-27B-4bit | 389 ms | 457 ms |
-| | Qwen3.6-35B-A3B-4bit | 84 ms | 156 ms |
-| Aggregate tokens/s, 4 concurrent clients | Llama-3.2-1B-4bit | 1105 | 931 |
-| | Qwen3-1.7B-4bit | 787 | 708 |
-| | Thinklite-27B-4bit | 69 | 43 |
-| | Qwen3.6-35B-A3B-4bit | 255 | 165 to 175 |
-| Peak server memory | Llama-3.2-1B-4bit | 1.2 GB | 1.9 GB |
-| | Qwen3-1.7B-4bit | 1.3 GB | 5.5 GB |
-| | Thinklite-27B-4bit | 14.9 GB | 16.2 GB |
-| Single-stream decode, tokens/s | Llama-3.2-1B-4bit | 480 | 472 |
-| | Qwen3-1.7B-4bit | 329 | 325 |
-| | Thinklite-27B-4bit | 29.0 | 29.6 |
-| | Qwen3.6-35B-A3B-4bit | 134 | 130 to 185 |
-
-<!-- END BENCHMARK TABLE -->
-
-Where Higgs does not win:
-
-- **Qwen3.6-35B-A3B single-stream decode.** oMLX reaches about 184 tok/s on most requests and 86 to 130 tok/s on others. Higgs reaches 134 tok/s. oMLX has fused Metal kernels for the MoE block of this architecture. Higgs does not have them yet.
-- **An 8-client burst on 1B to 2B models.** Higgs is level or slightly behind. On Llama-1B the result is 1350 against 1385 tok/s. On Qwen3-1.7B it is 952 against 1016 tok/s.
-- **Features.** oMLX has more features: audio, rerank, EBNF grammars, broad vision support, an admin web UI and clustering. The comparison document has the full table.
-
-Single-stream decode of dense models and cold prefill are level. Both servers use the same MLX kernels and reach the memory-bandwidth limit.
 
 ## Install
 
@@ -125,6 +107,26 @@ cargo build --release
 ```
 
 Higgs is not on crates.io, because it depends on a pinned git revision of `mlx-rs`. The release process produces Apple Silicon macOS builds only.
+
+## What you get
+
+**Many requests at once.** Higgs decodes concurrent requests together with continuous batching. With 1, 2, 4 and 8 clients, Llama-3.2-1B-4bit gave 455, 775, 1105 and 1350 tok/s in total. Qwen3.6-35B-A3B-4bit gave 109, 178, 255 and 326 tok/s.
+
+**Fast follow-up turns.** Higgs keeps prefix KV state in memory. A follow-up turn after about 3,000 tokens of history needed 32 ms to the first token on Llama-3.2-1B-4bit and 84 ms on Qwen3.6-35B-A3B-4bit. Hybrid Qwen3.5 and Qwen3.6 models cannot cut a cache back to a shorter prefix, so Higgs saves checkpoints of their recurrent state. A new question over a 3,850-token shared context took 3.7 s to the first token, not 20.1 s.
+
+**Many models in one server.** Load a model on its first request, and unload it when it is idle. Limit how many models stay loaded, pin the important ones, and set a memory guard. Higgs evicts the least recently used idle model first.
+
+**Drop-in APIs.** Higgs serves OpenAI chat completions, completions, Responses and embeddings. It also serves Anthropic messages. Higgs parses tool calls in the Qwen, Mistral, Llama, Gemma, GLM and MiniMax formats. Higgs can also constrain output to a JSON schema or a regex.
+
+**Built-in tools.** Higgs is an MCP client for stdio and Streamable HTTP servers. It has web search and fetch endpoints. A server-side tool loop runs the tools and continues the generation, also when streaming.
+
+**Local and cloud in one endpoint.** Define providers and regex routes. A request goes to a local model, to a provider, or to the default target. Higgs translates between the OpenAI and Anthropic formats.
+
+**A config that tells you what is wrong.** An unknown key is an error with a suggestion. `higgs config explain` shows where each value comes from. `higgs doctor` checks models and providers. `higgs selftest <model>` checks that a model gives correct output. `higgs bench <model>` measures its speed.
+
+**One binary and low memory.** There is no Python runtime. Peak memory of the server was 1.2 GB for Llama-3.2-1B-4bit, 1.3 GB for Qwen3-1.7B-4bit and 14.9 GB for Thinklite-27B-4bit.
+
+The numbers come from an Apple M4 Max with 128 GB. The [Performance](#performance) section has the details.
 
 ## Recipes
 
@@ -341,7 +343,9 @@ An unknown key is an error, and the error suggests the correct key. For example,
 
 [docs/configuration.md](docs/configuration.md) has the complete reference. It covers every flag and environment variable, routing precedence, the auto-router, KV cache and prefill options, speculative decoding, profiles, includes and metrics.
 
-## API surface
+## API and CLI reference
+
+### API
 
 | Endpoint | Compatibility |
 |---|---|
@@ -356,7 +360,7 @@ An unknown key is an error, and the error suggests the correct key. For example,
 
 [docs/api.md](docs/api.md) describes the request options. These include streaming, `stream_options.include_usage`, the cached-token and timing fields in `usage`, `return_progress` and the reasoning-token budget. Higgs accepts `seed`, but the output is not yet reproducible.
 
-## Commands
+### CLI
 
 | Command | What it does |
 |---|---|
@@ -387,6 +391,29 @@ The desktop app is a native macOS dashboard for a running server. It is the grap
 - The chat has an inspector. It traces each span of a request: prefill and cache hits, thinking, generation and tool calls. It also offers Replay and Copy as curl.
 
 Install the app with `brew install --cask panbanda/brews/higgs-desktop` or from the release page. `higgs ui` opens it. Metrics need a start from a config file: `higgs start`, or `higgs serve --config <file>`. For details, see [docs/desktop.md](docs/desktop.md).
+
+## Performance
+
+These values were measured on an Apple M4 Max with 128 GB. The `bench_compare` harness in `higgs-bench` produced them. It sent streaming requests, used the token counts that the server reported, and took the median of 3 trials after 1 warm-up. Temperature was 0 and thinking was off. `higgs bench <model>` measures the same four things for your own model and Mac: decode, prefill, prefix cache and concurrency.
+
+<!-- BENCHMARK TABLE: every figure comes from docs/omlx-comparison.md. A new run is pending. Update both together. -->
+
+| Model | Decode, 1 client (tok/s) | Total tok/s with 1, 2, 4, 8 clients | Follow-up turn, time to first token | Peak memory |
+|---|---|---|---|---|
+| Llama-3.2-1B-4bit | 480 | 455, 775, 1105, 1350 | 32 ms | 1.2 GB |
+| Qwen3-1.7B-4bit | 329 | 305, 544, 787, 952 | 57 ms | 1.3 GB |
+| Thinklite-27B-4bit | 29.0 | 27, 50, 69, 74 | 389 ms | 14.9 GB |
+| Qwen3.6-35B-A3B-4bit | 134 | 109, 178, 255, 326 | 84 ms | not recorded |
+
+<!-- END BENCHMARK TABLE -->
+
+Notes on the table:
+
+- The follow-up turn repeats about 3,000 tokens of history and adds a short message.
+- A request on Thinklite-27B-4bit with 8 clients had a mean time to the first token of 3.7 s.
+- The measurements are a first pass. Differences under about 5% are noise.
+
+[docs/benchmarking.md](docs/benchmarking.md) describes the harnesses. [docs/omlx-comparison.md](docs/omlx-comparison.md) has head-to-head numbers against another MLX server. [docs/performance.md](docs/performance.md) has earlier measurements.
 
 ## FAQ and troubleshooting
 
@@ -432,13 +459,11 @@ See [Thinking budget](docs/configuration.md#thinking-budget).
 
 Run `higgs config check`. It validates the file and does not touch models. Then run `higgs doctor`. It also checks model paths, providers and memory settings.
 
-### How does it compare with Ollama, LM Studio and oMLX?
+### How do I use Higgs with Claude Code, other tools and the OpenAI SDKs?
 
-- **oMLX** is another MLX server. It is written in Python. [docs/omlx-comparison.md](docs/omlx-comparison.md) compares it with Higgs directly, including the areas where oMLX is ahead.
-- **Ollama.** In the earlier single-stream decode measurements, Higgs reached 448 tok/s on Llama-3.2-1B-4bit and 305 tok/s on Qwen3-1.7B-4bit. Ollama reached 305 and 183 tok/s with `Q4_K_M` quantization. On the Qwen3-30B-A3B MoE model at 8-bit, the results were close: 75 and 73 tok/s. See [docs/performance.md](docs/performance.md).
-- **LM Studio.** Higgs has not been benchmarked against it. LM Studio is a closed-source desktop application. Higgs is an open-source server and CLI with a companion desktop app.
+Higgs serves the OpenAI API at `http://localhost:8000/v1` and the Anthropic API at `http://localhost:8000`. Set the base URL of your tool to one of them. Use any API key, unless you set `server.api_key`. For Claude Code, Aider and tools that read `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL`, use `higgs exec -- <command>`. See the [recipes](#recipes). A tool that sends requests from a remote service cannot reach `127.0.0.1`.
 
-## Development
+## Contributing
 
 ```bash
 cargo clippy -p higgs                         # must be clean
