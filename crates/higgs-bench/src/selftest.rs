@@ -591,6 +591,16 @@ fn compare_texts(reference: &Completion, solo: &str, batched: &str) -> Compariso
             "the texts differ at byte {offset}, but the logprob run does not share the text before it"
         ));
     }
+    // The solo run stopped by itself where the other run went on: the stop token was the choice
+    // that differed, and its margin is the last one the reference recorded.
+    if offset == solo.len()
+        && solo == parsed
+        && reference.finish_reason.as_deref() == Some("stop")
+        && !reference.token_logprobs.is_empty()
+    {
+        let last = reference.token_logprobs.len() - 1;
+        return judge_margins(reference, &[last], &describe());
+    }
     if offset >= solo.len().min(parsed.len()) {
         return Comparison::Different(format!(
             "texts differ at byte {offset}, past the reference tokens: {}",
@@ -971,6 +981,29 @@ mod tests {
         assert!(matches!(
             compare_texts(&reference, "Hello world\u{e9}", "Hello there\u{e9}"),
             Comparison::NearTie { index: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn a_run_that_goes_on_past_the_solo_stop_is_judged_by_the_stop_token() {
+        let mut reference = run(&[("Hi", &[-0.1, -5.0]), ("<eos>", &[-0.5, -0.6])]);
+        reference.content = "Hi".to_owned();
+        reference.finish_reason = Some("stop".to_owned());
+        assert!(matches!(
+            compare_texts(&reference, "Hi", "Hi there"),
+            Comparison::NearTie { index: 1, .. }
+        ));
+        if let Some(stop) = reference.token_logprobs.get_mut(1) {
+            stop.top = vec![-0.1, -5.0];
+        }
+        assert!(matches!(
+            compare_texts(&reference, "Hi", "Hi there"),
+            Comparison::Different(_)
+        ));
+        reference.finish_reason = Some("length".to_owned());
+        assert!(matches!(
+            compare_texts(&reference, "Hi", "Hi there"),
+            Comparison::Different(_)
         ));
     }
 
