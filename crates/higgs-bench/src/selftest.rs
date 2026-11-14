@@ -148,14 +148,17 @@ async fn check_stream_matches_non_stream(endpoint: &Endpoint) -> Result<Outcome>
         ))
         .await?;
     let whole = endpoint.complete_body(&body).await?;
-    let streamed_text = [streamed.reasoning.as_str(), streamed.text.as_str()].concat();
-    // The non-streaming path trims the visible text after tool-call parsing; a stream cannot,
-    // so surrounding whitespace is the one legitimate difference.
-    if streamed_text.trim() != whole.full_text().trim() {
-        return Ok(Outcome::Fail(format!(
-            "streamed {streamed_text:?} but non-streaming gave {:?}",
-            whole.full_text()
-        )));
+    // The non-streaming path trims the reasoning and the visible text separately after parsing;
+    // a stream cannot, so surrounding whitespace in each field is the one legitimate difference.
+    for (field, streamed_field, whole_field) in [
+        ("reasoning", &streamed.reasoning, &whole.reasoning),
+        ("text", &streamed.text, &whole.content),
+    ] {
+        if streamed_field.trim() != whole_field.trim() {
+            return Ok(Outcome::Fail(format!(
+                "streamed {field} {streamed_field:?} but non-streaming gave {whole_field:?}"
+            )));
+        }
     }
     if streamed.finish_reason != whole.finish_reason {
         return Ok(Outcome::Fail(format!(
@@ -166,7 +169,7 @@ async fn check_stream_matches_non_stream(endpoint: &Endpoint) -> Result<Outcome>
     }
     Ok(Outcome::Pass(format!(
         "{} characters identical",
-        streamed_text.chars().count()
+        whole.full_text().chars().count()
     )))
 }
 
