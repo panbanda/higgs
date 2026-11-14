@@ -184,14 +184,24 @@ fn resolved_addr(config: &HiggsConfig) -> String {
     )
 }
 
+/// Connect to the first address of `addr` that accepts. A name such as `localhost` can
+/// resolve to `::1` while the server listens on `127.0.0.1` only.
 fn connect_with_timeout(addr: &str) -> Result<TcpStream, String> {
-    let socket_addr = addr
+    let socket_addrs: Vec<_> = addr
         .to_socket_addrs()
         .map_err(|e| format!("failed to resolve {addr}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("failed to resolve {addr}: no socket addresses found"))?;
-    TcpStream::connect_timeout(&socket_addr, Duration::from_secs(2))
-        .map_err(|e| format!("higgs is not running on {addr}: {e}"))
+        .collect();
+    let mut last_error = None;
+    for socket_addr in &socket_addrs {
+        match TcpStream::connect_timeout(socket_addr, Duration::from_secs(2)) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    last_error.map_or_else(
+        || Err(format!("failed to resolve {addr}: no socket addresses found")),
+        |error| Err(format!("higgs is not running on {addr}: {error}")),
+    )
 }
 
 fn check_health(config: &HiggsConfig) -> Result<(), String> {
@@ -789,6 +799,24 @@ mod tests {
         let default = resolve_client_target(None, None, None).unwrap();
         assert_eq!(default.base_url(), "http://127.0.0.1:8000");
         assert_eq!(default.origin, TargetOrigin::DefaultAddress);
+    }
+
+    #[test]
+    fn connect_reaches_an_ipv4_listener_through_localhost() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        connect_with_timeout(&format!("localhost:{port}")).unwrap();
+    }
+
+    #[test]
+    fn connect_failure_names_the_address() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let error = connect_with_timeout(&format!("localhost:{port}")).unwrap_err();
+        assert!(error.contains("not running"), "{error}");
     }
 
     #[test]
