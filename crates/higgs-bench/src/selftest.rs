@@ -451,6 +451,7 @@ async fn check_batched_matches_solo(endpoint: &Endpoint, facts: &ModelFacts) -> 
                 "identical until token {index}, then diverged on a near tie (gap {gap:.2})"
             )),
             Comparison::Different(detail) => Outcome::Fail(detail),
+            Comparison::Unaligned(reason) => Outcome::Skip(format!("unverified: {reason}")),
         },
     )
 }
@@ -458,8 +459,13 @@ async fn check_batched_matches_solo(endpoint: &Endpoint, facts: &ModelFacts) -> 
 #[derive(Debug, Clone, PartialEq)]
 enum Comparison {
     Identical,
-    NearTie { index: usize, gap: f64 },
+    NearTie {
+        index: usize,
+        gap: f64,
+    },
     Different(String),
+    /// The texts differ but the logprob run cannot say where; nothing can be concluded.
+    Unaligned(String),
 }
 
 /// Margin of the best token over the runner-up at a position, when the server reported both.
@@ -551,36 +557,38 @@ fn compare_texts(reference: &Completion, solo: &str, batched: &str) -> Compariso
         .find(|((_, alone), together)| alone != together)
         .map_or_else(|| solo.len().min(batched.len()), |((index, _), _)| index);
     let describe = || format!("solo gave {solo:?}, batched gave {batched:?}");
-    let agrees = solo
+    let parsed = reference.full_text();
+    if !solo
         .get(..offset)
-        .is_some_and(|prefix| reference.full_text().starts_with(prefix));
-    if !agrees {
+        .is_some_and(|prefix| parsed.starts_with(prefix))
+    {
+        return Comparison::Unaligned(format!(
+            "the texts differ at byte {offset}, but the logprob run does not share the text before it"
+        ));
+    }
+    if offset >= solo.len().min(parsed.len()) {
         return Comparison::Different(format!(
-            "texts differ at byte {offset}, which the logprob reference does not cover: {}",
+            "texts differ at byte {offset}, past the reference tokens: {}",
             describe()
         ));
     }
     let Some(raw_position) = raw_offset(reference, offset) else {
-        return Comparison::Different(format!(
-            "texts differ at byte {offset}, past the reference tokens: {}",
-            describe()
+        return Comparison::Unaligned(format!(
+            "the texts differ at byte {offset}, but the logprob tokens cannot be aligned with the text"
         ));
     };
     let mut start = 0;
     for (index, token) in reference.token_logprobs.iter().enumerate() {
         let end = start + token.bytes.len();
         if raw_position < end {
-            return match margin(token) {
-                Some(gap) if gap < NEAR_TIE_NATS => Comparison::NearTie { index, gap },
-                Some(gap) => Comparison::Different(format!(
-                    "diverged at token {index} where the solo margin was {gap:.2} nats: {}",
-                    describe()
-                )),
-                None => Comparison::Different(format!(
-                    "diverged at token {index} with no runner-up reported: {}",
-                    describe()
-                )),
+            // On a token boundary the other run may have taken a longer token at the previous
+            // position, or a different one at this position; either is a decision to check.
+            let candidates = if raw_position == start && index > 0 {
+                vec![index - 1, index]
+            } else {
+                vec![index]
             };
+            return judge_margins(reference, &candidates, &describe());
         }
         start = end;
     }
@@ -588,6 +596,35 @@ fn compare_texts(reference: &Completion, solo: &str, batched: &str) -> Compariso
         "texts differ at byte {offset}, past the reference tokens: {}",
         describe()
     ))
+}
+
+/// A near tie when any of the `candidates` tokens had a margin under `NEAR_TIE_NATS` (the one
+/// with the smallest margin is reported); otherwise a difference.
+fn judge_margins(reference: &Completion, candidates: &[usize], description: &str) -> Comparison {
+    let margins: Vec<(usize, f64)> = candidates
+        .iter()
+        .filter_map(|&index| {
+            reference
+                .token_logprobs
+                .get(index)
+                .and_then(margin)
+                .map(|gap| (index, gap))
+        })
+        .collect();
+    let closest = margins
+        .iter()
+        .copied()
+        .min_by(|left, right| left.1.total_cmp(&right.1));
+    match closest {
+        Some((index, gap)) if gap < NEAR_TIE_NATS => Comparison::NearTie { index, gap },
+        Some((index, gap)) => Comparison::Different(format!(
+            "diverged at token {index} where the solo margin was {gap:.2} nats: {description}"
+        )),
+        None => Comparison::Different(format!(
+            "diverged at token {} with no runner-up reported: {description}",
+            candidates.first().copied().unwrap_or_default()
+        )),
+    }
 }
 
 /// The first way `value` fails to satisfy `schema`, for the schema keywords the self-test uses:
@@ -860,6 +897,39 @@ mod tests {
     }
 
     #[test]
+    fn a_divergence_on_a_token_boundary_checks_the_previous_token_too() {
+        // Solo: "The" then " answer". A run that picked "There" differs first at the start of
+        // " answer", but the decision was made at "The".
+        let near_then_clear = {
+            let mut reference = run(&[("The", &[-0.5, -0.6]), (" answer", &[-0.1, -5.0])]);
+            reference.content = "The answer".to_owned();
+            reference
+        };
+        assert!(matches!(
+            compare_texts(&near_then_clear, "The answer", "There"),
+            Comparison::NearTie { index: 0, .. }
+        ));
+        let clear_then_near = {
+            let mut reference = run(&[("The", &[-0.1, -5.0]), (" answer", &[-0.5, -0.6])]);
+            reference.content = "The answer".to_owned();
+            reference
+        };
+        assert!(matches!(
+            compare_texts(&clear_then_near, "The answer", "The reply"),
+            Comparison::NearTie { index: 1, .. }
+        ));
+        let both_clear = {
+            let mut reference = run(&[("The", &[-0.1, -5.0]), (" answer", &[-0.1, -5.0])]);
+            reference.content = "The answer".to_owned();
+            reference
+        };
+        assert!(matches!(
+            compare_texts(&both_clear, "The answer", "There"),
+            Comparison::Different(_)
+        ));
+    }
+
+    #[test]
     fn token_bytes_stand_in_for_tokens_a_lone_decode_mangles() {
         // A SentencePiece lone-token decode drops the space and splits a character in two.
         let mut reference = run(&[
@@ -884,7 +954,7 @@ mod tests {
         let reference = run(&[("a", &[-0.1, -3.0]), ("b", &[-0.5, -0.52])]);
         assert!(matches!(
             compare_texts(&reference, "xyz1", "xyz2"),
-            Comparison::Different(detail) if detail.contains("does not cover")
+            Comparison::Unaligned(detail) if detail.contains("does not share")
         ));
         assert!(matches!(
             compare_texts(&reference, "ab", "abcd"),
