@@ -17,6 +17,8 @@ const LOG_TAIL_LINES: usize = 25;
 pub struct ServerCommand {
     pub executable: PathBuf,
     pub arguments: Vec<String>,
+    /// Variables set for the child on top of the inherited environment.
+    pub environment: Vec<(String, String)>,
 }
 
 /// A running child server. It is killed when this value is dropped, and only that process.
@@ -34,8 +36,12 @@ pub fn free_port() -> Result<u16> {
 
 impl LocalServer {
     /// Starts `command`, which must serve on `127.0.0.1:port`, with its output going to a log file
-    /// shown if the server fails to start.
+    /// shown if the server fails to start. Fails when something already listens on the port, so
+    /// a health reply can only come from the new process.
     pub fn spawn(command: &ServerCommand, port: u16) -> Result<Self> {
+        drop(TcpListener::bind(("127.0.0.1", port)).with_context(|| {
+            format!("port {port} is already in use; choose another with --port")
+        })?);
         let log_path = std::env::temp_dir().join(format!(
             "higgs-local-server-{}-{port}.log",
             std::process::id()
@@ -44,6 +50,12 @@ impl LocalServer {
             .with_context(|| format!("create server log {}", log_path.display()))?;
         let child = Command::new(&command.executable)
             .args(&command.arguments)
+            .envs(
+                command
+                    .environment
+                    .iter()
+                    .map(|(name, value)| (name, value)),
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::from(
                 log.try_clone().context("duplicate the server log handle")?,
@@ -85,6 +97,12 @@ impl LocalServer {
             }
             let slice = remaining.min(Duration::from_secs(2));
             if wait_until_ready(&self.base_url, slice).await.is_ok() {
+                if let Some(status) = self.child.try_wait().context("check the server process")? {
+                    bail!(
+                        "the server exited during startup ({status})\n{}",
+                        self.log_tail()
+                    );
+                }
                 return Ok(());
             }
         }
@@ -128,6 +146,7 @@ mod tests {
                 "-c".to_owned(),
                 "echo boom-from-server >&2; exit 3".to_owned(),
             ],
+            environment: Vec::new(),
         };
         let mut server = LocalServer::spawn(&command, free_port()?)?;
         let error = server
@@ -146,6 +165,7 @@ mod tests {
         let command = ServerCommand {
             executable: PathBuf::from("/bin/sleep"),
             arguments: vec!["30".to_owned()],
+            environment: Vec::new(),
         };
         let mut server = LocalServer::spawn(&command, free_port()?)?;
         let pid = server.pid();
@@ -163,6 +183,42 @@ mod tests {
             .map(|status| status.success())
             .unwrap_or(false);
         assert!(!still_running, "dropping the server must kill its process");
+        Ok(())
+    }
+
+    #[test]
+    fn an_occupied_port_is_refused_before_anything_starts() -> Result<()> {
+        let occupant = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = occupant.local_addr()?.port();
+        let command = ServerCommand {
+            executable: PathBuf::from("/bin/sleep"),
+            arguments: vec!["30".to_owned()],
+            environment: Vec::new(),
+        };
+        let error = LocalServer::spawn(&command, port)
+            .err()
+            .context("an occupied port must be refused")?;
+        assert!(format!("{error:#}").contains("already in use"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_child_receives_the_given_environment() -> Result<()> {
+        let command = ServerCommand {
+            executable: PathBuf::from("/bin/sh"),
+            arguments: vec![
+                "-c".to_owned(),
+                "echo \"value=$PROBE_VARIABLE\" >&2; exit 4".to_owned(),
+            ],
+            environment: vec![("PROBE_VARIABLE".to_owned(), "passed-through".to_owned())],
+        };
+        let mut server = LocalServer::spawn(&command, free_port()?)?;
+        let error = server
+            .wait_ready(Duration::from_secs(10))
+            .await
+            .err()
+            .context("startup should fail")?;
+        assert!(format!("{error:#}").contains("value=passed-through"));
         Ok(())
     }
 }
