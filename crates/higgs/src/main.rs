@@ -333,11 +333,17 @@ fn download_missing_startup_models(config: &HiggsConfig) -> Result<(), Box<dyn s
             Err(resolve_err) if model_resolver::is_hf_model_id(model_path) => {
                 tracing::debug!(error = %resolve_err, "model not in cache; attempting download");
                 let is_interactive = std::io::stdin().is_terminal();
+                // Locking stdin only to answer a prompt: without a terminal nothing is asked.
+                let input: Box<dyn std::io::BufRead> = if is_interactive {
+                    Box::new(std::io::stdin().lock())
+                } else {
+                    Box::new(std::io::empty())
+                };
                 model_download::offer_download(
                     model_path,
                     is_interactive,
                     &mut std::io::stderr().lock(),
-                    std::io::stdin().lock(),
+                    input,
                     || download_via_hf_cli(model_path),
                 )?;
                 model_resolver::resolve(model_path)?;
