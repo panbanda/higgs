@@ -138,6 +138,9 @@ async fn check_stream_matches_non_stream(endpoint: &Endpoint) -> Result<Outcome>
         fresh_nonce()
     );
     let body = chat_body(endpoint.model(), &prompt, 32);
+    // A cold prefill and a prefix-cache resume can round differently, so run both compared
+    // requests warm; the cold-versus-cached comparison is its own check.
+    endpoint.complete_body(&body).await?;
     let streamed = endpoint
         .stream_body(&with_fields(
             body.clone(),
@@ -146,7 +149,9 @@ async fn check_stream_matches_non_stream(endpoint: &Endpoint) -> Result<Outcome>
         .await?;
     let whole = endpoint.complete_body(&body).await?;
     let streamed_text = [streamed.reasoning.as_str(), streamed.text.as_str()].concat();
-    if streamed_text != whole.full_text() {
+    // The non-streaming path trims the visible text after tool-call parsing; a stream cannot,
+    // so surrounding whitespace is the one legitimate difference.
+    if streamed_text.trim() != whole.full_text().trim() {
         return Ok(Outcome::Fail(format!(
             "streamed {streamed_text:?} but non-streaming gave {:?}",
             whole.full_text()
@@ -220,9 +225,6 @@ async fn check_json_schema(endpoint: &Endpoint) -> Result<Outcome> {
             160,
         ),
         &json!({
-            // With reasoning left on, a thinking model's constrained output is returned as
-            // reasoning_content and `content` stays empty.
-            "reasoning": { "effort": "none" },
             "response_format": {
                 "type": "json_schema",
                 "json_schema": { "name": "person", "schema": schema }
