@@ -2,7 +2,7 @@
 name = "higgs-desktop"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88.0"
+rust-version = "1.91.0"
 license = "MIT"
 description = "Desktop chat UI for the Higgs inference server"
 
