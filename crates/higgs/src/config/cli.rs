@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+use higgs_bench::runner::Scenario;
+
 use super::types::{LoadMode, MemoryGuard, MlxProfile};
 
 #[derive(Parser, Debug)]
@@ -65,6 +67,74 @@ pub enum Commands {
     },
     /// Validate config, check model paths, and probe providers.
     Doctor(ServeArgs),
+    /// Measure decode, prefill, prefix-cache and concurrency speed of one model.
+    Bench(BenchArgs),
+    /// Check one model for correct output: chat, streaming, prefix cache, JSON schema, tool
+    /// calls and concurrency. Exits non-zero when a check fails.
+    Selftest(SelftestArgs),
+}
+
+/// How `bench` and `selftest` reach the model: they start a private server for it.
+#[derive(Args, Debug)]
+pub struct ModelTargetArgs {
+    /// Model directory or Hugging Face ID. With --config or --profile, the name or alias of a
+    /// model in that file, which is then served as configured.
+    #[arg(value_name = "MODEL")]
+    pub model: String,
+
+    /// Port for the private server (default: any free port).
+    #[arg(long)]
+    pub port: Option<u16>,
+
+    /// Seconds to wait for the model to load and the server to start.
+    #[arg(long, value_name = "SECONDS", default_value_t = 900)]
+    pub load_timeout: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct BenchArgs {
+    #[command(flatten)]
+    pub target: ModelTargetArgs,
+
+    /// Scenarios to run, comma-separated: decode, prefill, `prefix_cache`, concurrency (default:
+    /// all).
+    #[arg(long, value_enum, value_delimiter = ',')]
+    pub scenarios: Vec<Scenario>,
+
+    /// Measured trials per scenario (default: 3).
+    #[arg(long)]
+    pub trials: Option<u32>,
+
+    /// Unmeasured warm-up runs before each scenario (default: 1).
+    #[arg(long)]
+    pub warmup: Option<u32>,
+
+    /// Tokens generated per request in the decode and concurrency scenarios (default: 128).
+    #[arg(long)]
+    pub max_tokens: Option<u32>,
+
+    /// Prompt sizes in tokens for the prefill scenario, comma-separated (default: 512,2048).
+    #[arg(long, value_delimiter = ',')]
+    pub prefill_tokens: Vec<usize>,
+
+    /// Size in tokens of the first message of the prefix-cache scenario (default: 2048).
+    #[arg(long)]
+    pub prefix_cache_tokens: Option<usize>,
+
+    /// Simultaneous request counts for the concurrency scenario, comma-separated (default:
+    /// 1,2,4,8).
+    #[arg(long, value_delimiter = ',')]
+    pub concurrency: Vec<usize>,
+
+    /// Also write the results as JSON to this file.
+    #[arg(long, value_name = "PATH")]
+    pub json: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct SelftestArgs {
+    #[command(flatten)]
+    pub target: ModelTargetArgs,
 }
 
 #[derive(Subcommand, Debug)]

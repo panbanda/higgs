@@ -1657,6 +1657,7 @@ dependencies = [
  "figment",
  "futures",
  "governor",
+ "higgs-bench",
  "higgs-engine",
  "higgs-models",
  "http",
@@ -1689,6 +1690,7 @@ name = "higgs-bench"
 version = "1.0.4"
 dependencies = [
  "anyhow",
+ "axum",
  "built",
  "chrono",
  "clap",

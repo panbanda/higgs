@@ -2,6 +2,7 @@ pub mod anthropic_adapter;
 pub mod anthropic_tools;
 pub mod attach;
 pub mod auto_router;
+pub mod bench_command;
 pub mod cli_config;
 pub mod config;
 pub mod constraint;

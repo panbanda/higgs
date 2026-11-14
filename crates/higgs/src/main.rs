@@ -72,6 +72,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cmd_config(&cli, action);
             Ok(())
         }
+        Commands::Bench(ref args) => {
+            higgs::bench_command::run_bench(&cli, args).await?;
+            Ok(())
+        }
+        Commands::Selftest(ref args) => {
+            if !higgs::bench_command::run_selftest_command(&cli, args).await? {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Commands::Doctor(ref args) => {
             init_tracing(cli.verbose);
             let exit_code =
