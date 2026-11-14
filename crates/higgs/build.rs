@@ -48,7 +48,7 @@ fn copy_metallib() -> Result<(), String> {
     Ok(())
 }
 
-/// The directory that holds the binary. OUT_DIR is `<profile>/build/<crate>-<hash>/out` with older
+/// The directory that holds the binary. `OUT_DIR` is `<profile>/build/<crate>-<hash>/out` with older
 /// Cargo and `<profile>/build/<crate>/<hash>/out` with the newer layout, so the profile directory
 /// is the parent of the nearest `build` ancestor.
 ///
