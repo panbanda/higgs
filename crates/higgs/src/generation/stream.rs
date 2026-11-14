@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use higgs_engine::engine::{GenerationStats, StreamingOutput};
+use higgs_engine::engine::{GenerationStats, LoggedToken, StreamingOutput};
 use higgs_engine::reasoning_parser::StreamingReasoningTracker;
 use higgs_engine::tokenizers::Tokenizer;
 use higgs_engine::tool_format::{ToolCallParser, ToolCallTracker};
@@ -169,12 +169,11 @@ impl Assembler {
         };
 
         let chunk_logprobs = output.token_logprob.as_ref().map(|info| {
-            let mut logprobs = decode_logprobs(std::slice::from_ref(info), &self.tokenizer);
-            // The detokenizer already decoded this token in context.
-            if let Some(entry) = logprobs.content.first_mut() {
-                entry.bytes = output.new_text.as_bytes().to_vec();
-            }
-            logprobs
+            let logged = LoggedToken {
+                info: info.clone(),
+                text: output.new_text.clone(),
+            };
+            decode_logprobs(std::slice::from_ref(&logged), &self.tokenizer)
         });
         let (visible, reasoning) = tracker.process(&output.new_text);
         self.emit_reasoning(reasoning, &mut events);

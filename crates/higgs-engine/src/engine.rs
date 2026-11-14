@@ -72,6 +72,17 @@ impl GenerationStats {
     }
 }
 
+/// A generated token's logprobs with the text it added to the output.
+///
+/// The text is what the detokenizer emitted with the token, so it follows the same filtering,
+/// stop truncation and flushing as the streamed text: a token that completes half a character
+/// adds nothing, and the one that finishes it adds the whole character.
+#[derive(Debug, Clone)]
+pub struct LoggedToken {
+    pub info: TokenLogprobInfo,
+    pub text: String,
+}
+
 /// Output from a generation request.
 #[derive(Debug, Clone)]
 pub struct GenerationOutput {
@@ -79,7 +90,7 @@ pub struct GenerationOutput {
     pub finish_reason: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
-    pub token_logprobs: Option<Vec<TokenLogprobInfo>>,
+    pub token_logprobs: Option<Vec<LoggedToken>>,
     pub stats: GenerationStats,
 }
 
@@ -263,26 +274,30 @@ mod tests {
             finish_reason: "stop".to_owned(),
             prompt_tokens: 5,
             completion_tokens: 1,
-            token_logprobs: Some(vec![TokenLogprobInfo {
-                token_id: 42,
-                logprob: -0.5,
-                top_logprobs: vec![
-                    TopLogprobEntry {
-                        token_id: 42,
-                        logprob: -0.5,
-                    },
-                    TopLogprobEntry {
-                        token_id: 99,
-                        logprob: -1.2,
-                    },
-                ],
+            token_logprobs: Some(vec![LoggedToken {
+                info: TokenLogprobInfo {
+                    token_id: 42,
+                    logprob: -0.5,
+                    top_logprobs: vec![
+                        TopLogprobEntry {
+                            token_id: 42,
+                            logprob: -0.5,
+                        },
+                        TopLogprobEntry {
+                            token_id: 99,
+                            logprob: -1.2,
+                        },
+                    ],
+                },
+                text: "hello".to_owned(),
             }]),
             stats: GenerationStats::default(),
         };
         let lps = output.token_logprobs.unwrap();
         assert_eq!(lps.len(), 1);
-        assert_eq!(lps[0].token_id, 42);
-        assert_eq!(lps[0].top_logprobs.len(), 2);
+        assert_eq!(lps[0].info.token_id, 42);
+        assert_eq!(lps[0].info.top_logprobs.len(), 2);
+        assert_eq!(lps[0].text, "hello");
     }
 
     fn progress_output(cached: u32) -> StreamingOutput {

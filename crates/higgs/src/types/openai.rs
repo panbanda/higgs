@@ -255,8 +255,10 @@ pub struct ChoiceLogprobs {
 pub struct TokenLogprob {
     pub token: String,
     pub logprob: f32,
-    /// The text this token adds to the output, as UTF-8 bytes. Unlike `token`, it is decoded in
-    /// context, so the bytes of all tokens concatenate to the generated text.
+    /// The UTF-8 bytes of the text this token added to the output. The `bytes` of all tokens,
+    /// joined in order, give the generated text. This differs from `OpenAI`, where `bytes` holds
+    /// the raw bytes of the token. A token that holds half of a character has empty `bytes`.
+    /// The token that completes the character holds the whole character.
     pub bytes: Vec<u8>,
     pub top_logprobs: Vec<TopLogprob>,
 }
@@ -266,7 +268,8 @@ pub struct TokenLogprob {
 pub struct TopLogprob {
     pub token: String,
     pub logprob: f32,
-    pub bytes: Vec<u8>,
+    /// Always `null`: an alternative token added nothing to the output, so it has no bytes.
+    pub bytes: Option<Vec<u8>>,
 }
 
 /// Streaming chunk for /v1/chat/completions.
