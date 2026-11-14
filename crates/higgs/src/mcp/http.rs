@@ -217,7 +217,7 @@ impl Shared {
             if total > MAX_MESSAGE_BYTES * 2 {
                 return Err(PostFailure::new("response stream is too large"));
             }
-            for event in parser.feed(&String::from_utf8_lossy(&bytes)) {
+            for event in parser.feed_bytes(&bytes) {
                 answered |= self.forward_event(&event, expected_id).await;
             }
             if answered {
@@ -259,7 +259,7 @@ impl Shared {
         }
         let mut parser = SseParser::default();
         while let Ok(Some(bytes)) = response.chunk().await {
-            for event in parser.feed(&String::from_utf8_lossy(&bytes)) {
+            for event in parser.feed_bytes(&bytes) {
                 if let Ok(value) = serde_json::from_str::<Value>(&event.data) {
                     self.deliver(value).await;
                 }

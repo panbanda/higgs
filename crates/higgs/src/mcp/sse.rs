@@ -9,11 +9,43 @@ pub struct SseEvent {
 #[derive(Debug, Default)]
 pub struct SseParser {
     pending: String,
+    /// Trailing bytes of a UTF-8 sequence cut off by a chunk boundary.
+    partial_character: Vec<u8>,
     event: Option<String>,
     data: Vec<String>,
 }
 
 impl SseParser {
+    /// Feed raw bytes from the wire. A multibyte character split across two
+    /// chunks is held back until its remaining bytes arrive; bytes that can
+    /// never be valid UTF-8 become U+FFFD.
+    pub fn feed_bytes(&mut self, bytes: &[u8]) -> Vec<SseEvent> {
+        let mut buffer = std::mem::take(&mut self.partial_character);
+        buffer.extend_from_slice(bytes);
+        let mut text = String::new();
+        let mut remaining = buffer.as_slice();
+        loop {
+            match std::str::from_utf8(remaining) {
+                Ok(valid) => {
+                    text.push_str(valid);
+                    break;
+                }
+                Err(error) => {
+                    let (valid, rest) = remaining.split_at(error.valid_up_to());
+                    text.push_str(&String::from_utf8_lossy(valid));
+                    if let Some(invalid_length) = error.error_len() {
+                        text.push(char::REPLACEMENT_CHARACTER);
+                        remaining = rest.get(invalid_length..).unwrap_or_default();
+                    } else {
+                        self.partial_character = rest.to_vec();
+                        break;
+                    }
+                }
+            }
+        }
+        self.feed(&text)
+    }
+
     /// Feed more text; returns the events completed by it.
     pub fn feed(&mut self, chunk: &str) -> Vec<SseEvent> {
         self.pending.push_str(chunk);
@@ -39,6 +71,10 @@ impl SseParser {
 
     /// Flush a final event not terminated by a blank line.
     pub fn finish(&mut self) -> Option<SseEvent> {
+        if !self.partial_character.is_empty() {
+            self.partial_character.clear();
+            self.pending.push(char::REPLACEMENT_CHARACTER);
+        }
         if !self.pending.is_empty() {
             let line = std::mem::take(&mut self.pending);
             if let Some(event) = self.accept_line(line.trim_end_matches(['\r', '\n'])) {
@@ -116,6 +152,25 @@ mod tests {
         let events = parser.feed("\n\r\n");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "x");
+    }
+
+    #[test]
+    fn multibyte_characters_split_across_chunks_survive() {
+        let payload = "data: h\u{e9}llo \u{1f600} w\u{4e16}rld\n\n".as_bytes();
+        for split in 1..payload.len() {
+            let mut parser = SseParser::default();
+            let mut events = parser.feed_bytes(&payload[..split]);
+            events.extend(parser.feed_bytes(&payload[split..]));
+            assert_eq!(events.len(), 1, "split at {split}");
+            assert_eq!(events[0].data, "h\u{e9}llo \u{1f600} w\u{4e16}rld");
+        }
+    }
+
+    #[test]
+    fn invalid_bytes_become_replacement_characters_without_stalling() {
+        let mut parser = SseParser::default();
+        let events = parser.feed_bytes(b"data: a\xffb\n\n");
+        assert_eq!(events[0].data, "a\u{fffd}b");
     }
 
     #[test]
