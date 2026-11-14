@@ -8,7 +8,7 @@ use super::cli::ServeArgs;
 use super::env_ref;
 use super::environment::Environment;
 use super::load::{Layers, Loaded};
-use super::settings::{HiggsConfig, ModelConfig};
+use super::settings::{CHECKPOINT_BUDGET_VARIABLE, HiggsConfig, ModelConfig};
 use super::types::Secret;
 use super::units::{ByteSize, HumanDuration};
 
@@ -213,6 +213,16 @@ impl<'a> Provenance<'a> {
 
     /// The source of a per-model key such as `kv_cache.bits` for the model at `index`.
     pub fn model(&self, index: usize, key: &str) -> Source {
+        if key == "prefix_cache.checkpoint_budget"
+            && self
+                .config
+                .notices
+                .env_overrides
+                .iter()
+                .any(|entry| entry.variable == CHECKPOINT_BUDGET_VARIABLE && entry.applied)
+        {
+            return Source::Environment(CHECKPOINT_BUDGET_VARIABLE.to_owned());
+        }
         let is_file_model = index < self.layers.file_model_count;
         if !is_file_model {
             if let Some(flag) = self.flags.and_then(|flags| cli_model_flag(key, flags)) {
@@ -465,6 +475,7 @@ pub fn global_entries(provenance: &Provenance<'_>) -> Vec<Entry> {
 }
 
 /// The settings of one model with their sources.
+#[allow(clippy::too_many_lines)]
 pub fn model_entries(provenance: &Provenance<'_>, index: usize, model: &ModelConfig) -> Vec<Entry> {
     let source = |key: &str| provenance.model(index, key);
     let at = |key: &str, value: String| entry(key, value, source(key));
@@ -547,6 +558,22 @@ pub fn model_entries(provenance: &Provenance<'_>, index: usize, model: &ModelCon
         at(
             "prefix_cache.disk_budget",
             quote(&model.prefix_cache.disk_budget.to_string()),
+        ),
+        at(
+            "prefix_cache.max_entries",
+            model.prefix_cache.max_entries.to_string(),
+        ),
+        at(
+            "prefix_cache.checkpoint_interval_tokens",
+            model.prefix_cache.checkpoint_interval_tokens.to_string(),
+        ),
+        at(
+            "prefix_cache.max_checkpoints_per_entry",
+            model.prefix_cache.max_checkpoints_per_entry.to_string(),
+        ),
+        at(
+            "prefix_cache.checkpoint_budget",
+            quote(&model.prefix_cache.checkpoint_budget.to_string()),
         ),
         at(
             "prefill.yield_tokens",

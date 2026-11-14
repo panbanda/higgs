@@ -45,10 +45,6 @@ pub const MAX_CHECKPOINTS_PER_ENTRY: usize = 8;
 /// least recently used entries lose their checkpoints first.
 pub const DEFAULT_CHECKPOINT_BUDGET_BYTES: usize = 2 << 30;
 
-/// Overrides [`DEFAULT_CHECKPOINT_BUDGET_BYTES`], in mebibytes. `0` turns
-/// checkpointing off, leaving hybrid entries resumable only at their end.
-pub const CHECKPOINT_BUDGET_ENV: &str = "HIGGS_PREFIX_CHECKPOINT_BUDGET_MB";
-
 /// Where checkpoints are taken and how many are kept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CheckpointPolicy {
@@ -70,18 +66,17 @@ impl CheckpointPolicy {
         Self::new(DEFAULT_CHECKPOINT_INTERVAL_TOKENS, 0, 0)
     }
 
-    /// The default policy for a model prefilling in `chunk_tokens` chunks,
-    /// with the budget overridden by [`CHECKPOINT_BUDGET_ENV`].
-    pub fn resolve(chunk_tokens: usize) -> Self {
-        let budget_bytes = std::env::var(CHECKPOINT_BUDGET_ENV)
-            .ok()
-            .and_then(|text| text.trim().parse::<usize>().ok())
-            .map_or(DEFAULT_CHECKPOINT_BUDGET_BYTES, |megabytes| {
-                megabytes.saturating_mul(1 << 20)
-            });
+    /// A policy whose interval is rounded up to a multiple of the prefill chunk and of the cache
+    /// block size, so checkpoints land on chunk and block boundaries alike.
+    pub fn aligned(
+        interval_tokens: usize,
+        max_per_entry: usize,
+        budget_bytes: usize,
+        chunk_tokens: usize,
+    ) -> Self {
         Self::new(
-            aligned_interval(DEFAULT_CHECKPOINT_INTERVAL_TOKENS, chunk_tokens),
-            MAX_CHECKPOINTS_PER_ENTRY,
+            aligned_interval(interval_tokens, chunk_tokens),
+            max_per_entry,
             budget_bytes,
         )
     }
@@ -409,6 +404,27 @@ mod tests {
         assert_eq!(aligned_interval(512, 1024), 1024);
         assert_eq!(aligned_interval(512, 100), 800);
         assert_eq!(aligned_interval(512, 32), 512);
+    }
+
+    #[test]
+    fn aligned_policy_rounds_the_interval_and_keeps_the_other_limits() {
+        let policy = CheckpointPolicy::aligned(1000, 3, 777, 512);
+        assert_eq!(policy.interval_tokens(), 1024);
+        assert_eq!(policy.max_per_entry(), 3);
+        assert_eq!(policy.budget_bytes(), 777);
+    }
+
+    #[test]
+    fn default_options_reproduce_the_historical_policy() {
+        let options = crate::inference::PrefixCacheOptions::default();
+        assert_eq!(options.max_entries, 8);
+        let policy = CheckpointPolicy::aligned(
+            options.checkpoint_interval_tokens,
+            options.max_checkpoints_per_entry,
+            options.checkpoint_budget_bytes,
+            512,
+        );
+        assert_eq!(policy, CheckpointPolicy::new(512, 8, 2 << 30));
     }
 
     /// Largest absolute difference relative to the largest magnitude in `expected`.

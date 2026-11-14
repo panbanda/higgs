@@ -355,6 +355,54 @@ fn model_label(model: &crate::config::ModelConfig) -> String {
     )
 }
 
+/// Fail on out-of-range prefix-cache sizing and warn about settings that do less than they say.
+/// Returns whether the model passed.
+fn check_prefix_cache(
+    label: &str,
+    prefix_cache: &crate::config::PrefixCacheConfig,
+    result: &mut DoctorResult,
+) -> bool {
+    let problems = prefix_cache.range_problems();
+    for problem in &problems {
+        fail(&format!("model {label} {problem}"), result);
+    }
+    if !problems.is_empty() {
+        return false;
+    }
+    let block_size =
+        u32::try_from(higgs_engine::paged_prefix_cache::DEFAULT_BLOCK_SIZE).unwrap_or(u32::MAX);
+    if prefix_cache.checkpoint_interval_tokens < block_size {
+        warn(
+            &format!(
+                "model {label} prefix_cache.checkpoint_interval_tokens={} is below the cache block size of {block_size}; the engine rounds it up to a multiple of the prefill chunk",
+                prefix_cache.checkpoint_interval_tokens
+            ),
+            result,
+        );
+    }
+    if prefix_cache.max_entries == 0 {
+        warn(
+            &format!(
+                "model {label} sets prefix_cache.max_entries=0, which turns the prefix cache off"
+            ),
+            result,
+        );
+    }
+    if let Some(physical) = crate::routes::system::physical_memory_bytes() {
+        if prefix_cache.checkpoint_budget.bytes() > physical / 2 {
+            warn(
+                &format!(
+                    "model {label} prefix_cache.checkpoint_budget={} is more than half of this machine's {} of memory",
+                    prefix_cache.checkpoint_budget,
+                    gib_label(physical)
+                ),
+                result,
+            );
+        }
+    }
+    true
+}
+
 fn check_prefill_yield_tokens(
     label: &str,
     prefill_yield_tokens: Option<u32>,
@@ -480,6 +528,9 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                 &format!("model {label} disk prefix store is writable"),
                 result,
             );
+        }
+        if !check_prefix_cache(&label, &model.prefix_cache, result) {
+            continue;
         }
         if !check_prefill_yield_tokens(&label, model.prefill_yield_tokens, result) {
             continue;
@@ -1285,6 +1336,61 @@ mod tests {
         assert!(check_prefill_yield_tokens("test", Some(0), &mut result));
         assert_eq!(result.failures, 0);
         assert_eq!(result.warnings, 0);
+    }
+
+    fn prefix_cache_with(
+        modify: impl FnOnce(&mut crate::config::PrefixCacheConfig),
+    ) -> crate::config::PrefixCacheConfig {
+        let mut config = crate::config::PrefixCacheConfig::default();
+        modify(&mut config);
+        config
+    }
+
+    #[test]
+    fn default_prefix_cache_settings_pass_cleanly() {
+        let mut result = empty_result();
+        assert!(check_prefix_cache(
+            "test",
+            &crate::config::PrefixCacheConfig::default(),
+            &mut result
+        ));
+        assert_eq!((result.warnings, result.failures), (0, 0));
+    }
+
+    #[test]
+    fn prefix_cache_ranges_are_enforced() {
+        for config in [
+            prefix_cache_with(|c| c.checkpoint_interval_tokens = 0),
+            prefix_cache_with(|c| c.checkpoint_interval_tokens = (1 << 20) + 1),
+            prefix_cache_with(|c| c.max_checkpoints_per_entry = 65),
+            prefix_cache_with(|c| c.max_entries = 1025),
+        ] {
+            let mut result = empty_result();
+            assert!(!check_prefix_cache("test", &config, &mut result));
+            assert_eq!(result.failures, 1, "{config:?}");
+        }
+    }
+
+    #[test]
+    fn prefix_cache_settings_that_turn_features_off_are_accepted() {
+        let mut result = empty_result();
+        let config = prefix_cache_with(|c| {
+            c.max_checkpoints_per_entry = 0;
+            c.checkpoint_budget = crate::config::units::ByteSize::from_bytes(0);
+        });
+        assert!(check_prefix_cache("test", &config, &mut result));
+        assert_eq!((result.warnings, result.failures), (0, 0));
+    }
+
+    #[test]
+    fn a_disabled_prefix_cache_and_a_tiny_interval_warn() {
+        let mut result = empty_result();
+        let config = prefix_cache_with(|c| {
+            c.max_entries = 0;
+            c.checkpoint_interval_tokens = 16;
+        });
+        assert!(check_prefix_cache("test", &config, &mut result));
+        assert_eq!((result.warnings, result.failures), (2, 0));
     }
 
     // -- Duplicate model detection --

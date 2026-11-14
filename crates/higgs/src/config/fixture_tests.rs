@@ -425,6 +425,37 @@ fn explain_for_a_model_shows_defaults_model_and_built_in_sources() {
         ("0", &Source::BuiltIn)
     );
     assert_eq!(value_and_source(&entries, "batch").1, &Source::BuiltIn);
+    assert_eq!(
+        value_and_source(&entries, "prefix_cache.checkpoint_interval_tokens"),
+        ("512", &Source::BuiltIn)
+    );
+    assert_eq!(
+        value_and_source(&entries, "prefix_cache.checkpoint_budget"),
+        ("\"2GB\"", &Source::BuiltIn)
+    );
+}
+
+#[test]
+fn explain_credits_the_checkpoint_budget_variable() {
+    let environment = Environment::from_pairs([("HIGGS_PREFIX_CHECKPOINT_BUDGET_MB", "256")]);
+    let loaded = load_text(
+        "[[models]]\npath = \"org/m\"\nname = \"m\"\n[models.prefix_cache]\ncheckpoint_budget = \"1GB\"\nmax_entries = 3\n",
+        &environment,
+    );
+    let provenance = explain::Provenance::new(&loaded, &environment, None);
+    let (index, model) = explain::find_model(&loaded.config, "m").unwrap();
+    let entries = explain::model_entries(&provenance, index, model);
+    assert_eq!(
+        value_and_source(&entries, "prefix_cache.checkpoint_budget"),
+        (
+            "\"256MB\"",
+            &Source::Environment("HIGGS_PREFIX_CHECKPOINT_BUDGET_MB".to_owned())
+        )
+    );
+    assert_eq!(
+        value_and_source(&entries, "prefix_cache.max_entries"),
+        ("3", &Source::Model)
+    );
 }
 
 #[test]

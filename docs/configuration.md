@@ -214,6 +214,17 @@ Keys valid in both. A `[[models]]` entry additionally needs `path` and may set `
 |---|---|---|---|
 | `disk_dir` | path | *(none)* | Directory for durable, disk-backed prefix KV entries, retained across restarts |
 | `disk_budget` | size | `"4GB"` | LRU budget of the disk tier; at least `64MB` |
+| `max_entries` | integer 0-1024 | `8` | Prompts the in-memory prefix cache keeps, least recently used first out; `0` turns the cache off |
+| `checkpoint_interval_tokens` | integer 1-1048576 | `512` | Hybrid models: tokens between recurrent-state checkpoints. The engine rounds it up to a multiple of the prefill chunk (512 tokens for the large hybrids) and of the 32-token cache block, so a smaller value than the chunk behaves like the chunk |
+| `max_checkpoints_per_entry` | integer 0-64 | `8` | Hybrid models: checkpoints one cached prompt keeps (the newest half of the allowance goes to the latest boundaries, the rest is spread over earlier ones); `0` turns checkpoints off |
+| `checkpoint_budget` | size | `"2GB"` | Hybrid models: checkpoint state kept across all entries, least recently used entries losing theirs first; `0` turns checkpoints off. The `HIGGS_PREFIX_CHECKPOINT_BUDGET_MB` variable (whole mebibytes) replaces it for every model |
+
+A hybrid model (one with recurrent linear-attention layers, such as Qwen3-Next) can only resume a prompt
+that shares part of a cached prompt from a recurrent-state checkpoint, because that state cannot be
+cut back to an arbitrary token. A checkpoint of a 27B hybrid is about 150 MB, so a smaller interval
+buys finer reuse at the price of memory. `checkpoint_interval_tokens`, `max_checkpoints_per_entry`
+and `checkpoint_budget` have no effect on other architectures. `higgs config explain <model>` shows
+each value and where it came from.
 
 `[models.prefill]`:
 
@@ -437,6 +448,9 @@ is never used for that name; `higgs doctor` warns about it.
 - For a local model, set `prefix_cache.disk_dir` to retain block-aligned prefix KV state across restarts.
   `prefix_cache.disk_budget` controls its on-disk LRU budget (default `4GB`, minimum `64MB`). The disk tier is
   model, quantization, configuration, tokenizer, and chat-template bound; incompatible entries are ignored.
+- `prefix_cache.max_entries` bounds the in-memory prefix cache of every model; hybrid models also keep
+  recurrent-state checkpoints per entry, sized by `prefix_cache.checkpoint_interval_tokens`,
+  `max_checkpoints_per_entry` and `checkpoint_budget` (see the `[models.prefix_cache]` table).
 - For DeepSeek-V2 models, set `kv_cache.mla_latent = true` to store the MLA KV cache as compressed latent rows
   instead of dense per-head tensors (default off). It cannot be combined with `kv_cache.mode = "turboquant"`, and
   is a no-op for non-DeepSeek-V2 architectures. The `HIGGS_MLA_LATENT_CACHE` env var, when set to a recognized

@@ -4,11 +4,12 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use higgs_engine::inference::{DiskPrefixConfig, EngineOptions};
+use higgs_engine::inference::{DiskPrefixConfig, EngineOptions, PrefixCacheOptions};
 use higgs_engine::mlx_tuning::resolve_runtime_tuning_with;
 
 use crate::config::{
     BatchMode, ExperimentalConfig, HiggsConfig, LoadMode, MemoryConfig, ModelConfig,
+    PrefixCacheConfig,
 };
 use crate::decode_strategy::{DecodeFacts, DecodeStrategy, decode_strategy, planned_strategy};
 use crate::model_pool::{ModelLoader, ModelPool, ModelSpec, PoolLimits};
@@ -108,12 +109,24 @@ pub fn load_engine(
                     dir: Path::new(dir).to_path_buf(),
                     budget: model.prefix_cache.disk_budget.bytes(),
                 }),
+            prefix_cache: prefix_cache_options(&model.prefix_cache),
             max_concurrent_requests: (model.batch == BatchMode::Off).then_some(1),
         },
     )
     .map_err(|error| error.to_string())?;
     tracing::info!(model_name = %engine.model_name(), "Model loaded");
     Ok(engine)
+}
+
+fn prefix_cache_options(config: &PrefixCacheConfig) -> PrefixCacheOptions {
+    let count = |value: u32| usize::try_from(value).unwrap_or(usize::MAX);
+    PrefixCacheOptions {
+        max_entries: count(config.max_entries),
+        checkpoint_interval_tokens: count(config.checkpoint_interval_tokens),
+        max_checkpoints_per_entry: count(config.max_checkpoints_per_entry),
+        checkpoint_budget_bytes: usize::try_from(config.checkpoint_budget.bytes())
+            .unwrap_or(usize::MAX),
+    }
 }
 
 /// The name API clients use for a model: its configured name, else the name its engine reports.
@@ -195,6 +208,26 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, toml).unwrap();
         load_config_file(&path, None).unwrap()
+    }
+
+    #[test]
+    fn default_prefix_cache_config_maps_to_the_engine_defaults() {
+        assert_eq!(
+            prefix_cache_options(&PrefixCacheConfig::default()),
+            PrefixCacheOptions::default()
+        );
+    }
+
+    #[test]
+    fn configured_prefix_cache_sizes_reach_the_engine_options() {
+        let config = config_from_toml(
+            "[[models]]\npath = \"org/m\"\n[models.prefix_cache]\nmax_entries = 3\ncheckpoint_interval_tokens = 2048\nmax_checkpoints_per_entry = 5\ncheckpoint_budget = \"1GB\"\n",
+        );
+        let options = prefix_cache_options(&config.models.first().unwrap().prefix_cache);
+        assert_eq!(options.max_entries, 3);
+        assert_eq!(options.checkpoint_interval_tokens, 2048);
+        assert_eq!(options.max_checkpoints_per_entry, 5);
+        assert_eq!(options.checkpoint_budget_bytes, 1 << 30);
     }
 
     #[test]

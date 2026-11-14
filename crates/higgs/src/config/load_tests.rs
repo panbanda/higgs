@@ -745,6 +745,44 @@ fn every_per_model_key_inherits_from_defaults_and_is_overridden_by_the_entry() {
             check_model: |m| assert_eq!(m.prefix_cache.disk_budget, ByteSize::from_bytes(2 << 30)),
         },
         InheritanceRow {
+            key: "prefix_cache.max_entries",
+            defaults: "[defaults.prefix_cache]\nmax_entries = 4",
+            model: "[models.prefix_cache]\nmax_entries = 16",
+            check_defaults: |m| assert_eq!(m.prefix_cache.max_entries, 4),
+            check_model: |m| assert_eq!(m.prefix_cache.max_entries, 16),
+        },
+        InheritanceRow {
+            key: "prefix_cache.checkpoint_interval_tokens",
+            defaults: "[defaults.prefix_cache]\ncheckpoint_interval_tokens = 1024",
+            model: "[models.prefix_cache]\ncheckpoint_interval_tokens = 2048",
+            check_defaults: |m| assert_eq!(m.prefix_cache.checkpoint_interval_tokens, 1024),
+            check_model: |m| assert_eq!(m.prefix_cache.checkpoint_interval_tokens, 2048),
+        },
+        InheritanceRow {
+            key: "prefix_cache.max_checkpoints_per_entry",
+            defaults: "[defaults.prefix_cache]\nmax_checkpoints_per_entry = 2",
+            model: "[models.prefix_cache]\nmax_checkpoints_per_entry = 0",
+            check_defaults: |m| assert_eq!(m.prefix_cache.max_checkpoints_per_entry, 2),
+            check_model: |m| assert_eq!(m.prefix_cache.max_checkpoints_per_entry, 0),
+        },
+        InheritanceRow {
+            key: "prefix_cache.checkpoint_budget",
+            defaults: "[defaults.prefix_cache]\ncheckpoint_budget = \"1GB\"",
+            model: "[models.prefix_cache]\ncheckpoint_budget = \"512MB\"",
+            check_defaults: |m| {
+                assert_eq!(
+                    m.prefix_cache.checkpoint_budget,
+                    ByteSize::from_bytes(1 << 30)
+                );
+            },
+            check_model: |m| {
+                assert_eq!(
+                    m.prefix_cache.checkpoint_budget,
+                    ByteSize::from_bytes(512 << 20)
+                );
+            },
+        },
+        InheritanceRow {
             key: "prefill.yield_tokens",
             defaults: "[defaults.prefill]\nyield_tokens = 256",
             model: "[models.prefill]\nyield_tokens = 1024",
@@ -906,6 +944,78 @@ fn environment_overrides_name_the_key_they_replace() {
         .collect();
     assert!(pairs.contains(&("HIGGS_MTP", "experimental.mtp")));
     assert!(pairs.contains(&("HIGGS_MLA_LATENT_CACHE", "models[].kv_cache.mla_latent")));
+}
+
+#[test]
+fn prefix_cache_defaults_match_the_engine_constants() {
+    let config = load_ok(MODEL);
+    let cache = &config.models[0].prefix_cache;
+    assert_eq!(cache.max_entries, 8);
+    assert_eq!(cache.checkpoint_interval_tokens, 512);
+    assert_eq!(cache.max_checkpoints_per_entry, 8);
+    assert_eq!(cache.checkpoint_budget, ByteSize::from_bytes(2 << 30));
+}
+
+#[test]
+fn the_checkpoint_budget_variable_replaces_the_key_for_every_model() {
+    let file = "[defaults.prefix_cache]\ncheckpoint_budget = \"1GB\"\n[[models]]\npath = \"org/a\"\n[[models]]\npath = \"org/b\"\n[models.prefix_cache]\ncheckpoint_budget = \"3GB\"\n";
+    for (value, expected) in [("512", 512_u64 << 20), ("0", 0)] {
+        let environment = Environment::from_pairs([("HIGGS_PREFIX_CHECKPOINT_BUDGET_MB", value)]);
+        let config = load_with(file, &environment, None).unwrap();
+        for model in &config.models {
+            assert_eq!(model.prefix_cache.checkpoint_budget.bytes(), expected);
+        }
+        assert!(config.notices.env_overrides.iter().any(|entry| {
+            entry.variable == "HIGGS_PREFIX_CHECKPOINT_BUDGET_MB"
+                && entry.key == "models[].prefix_cache.checkpoint_budget"
+                && entry.applied
+        }));
+    }
+}
+
+#[test]
+fn an_unusable_checkpoint_budget_variable_is_reported_and_ignored() {
+    let environment = Environment::from_pairs([("HIGGS_PREFIX_CHECKPOINT_BUDGET_MB", "lots")]);
+    let config = load_with(
+        "[[models]]\npath = \"org/a\"\n[models.prefix_cache]\ncheckpoint_budget = \"1GB\"\n",
+        &environment,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        config.models[0].prefix_cache.checkpoint_budget,
+        ByteSize::from_bytes(1 << 30)
+    );
+    assert!(
+        config.notices.env_overrides.iter().any(|entry| {
+            entry.variable == "HIGGS_PREFIX_CHECKPOINT_BUDGET_MB" && !entry.applied
+        })
+    );
+}
+
+#[test]
+fn out_of_range_prefix_cache_sizes_are_rejected_at_load() {
+    for (setting, needle) in [
+        (
+            "checkpoint_interval_tokens = 0",
+            "checkpoint_interval_tokens",
+        ),
+        (
+            "max_checkpoints_per_entry = 65",
+            "max_checkpoints_per_entry",
+        ),
+        ("max_entries = 100000", "max_entries"),
+    ] {
+        let error = load(&format!(
+            "[[models]]\npath = \"org/a\"\n[models.prefix_cache]\n{setting}\n"
+        ))
+        .unwrap_err();
+        assert!(error.contains(needle), "{setting}: {error}");
+    }
+    assert!(
+        load("[[models]]\npath = \"org/a\"\n[models.prefix_cache]\nmax_checkpoints_per_entry = 0\nmax_entries = 0\ncheckpoint_budget = \"0\"\n")
+            .is_ok()
+    );
 }
 
 // -- Environment references ---------------------------------------------------------------

@@ -27,6 +27,9 @@ fn model_problems(model: &ModelConfig, problems: &mut Vec<String>) {
     if let Err(error) = model.kv_cache.validate() {
         problems.push(error.to_string());
     }
+    for problem in model.prefix_cache.range_problems() {
+        problems.push(format!("model {}: {problem}", model.path));
+    }
 }
 
 /// The names API clients can use for each model (served name first, then its aliases) and any

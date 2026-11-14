@@ -69,6 +69,10 @@ pub struct RawKvCache {
 pub struct RawPrefixCache {
     pub disk_dir: Option<String>,
     pub disk_budget: Option<ByteSize>,
+    pub max_entries: Option<u32>,
+    pub checkpoint_interval_tokens: Option<u32>,
+    pub max_checkpoints_per_entry: Option<u32>,
+    pub checkpoint_budget: Option<ByteSize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

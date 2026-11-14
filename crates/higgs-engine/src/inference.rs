@@ -40,15 +40,16 @@ use crate::{
     mlx_tuning::MlxRuntimeTuning,
     model_loader,
     paged_prefix_cache::{DEFAULT_BLOCK_SIZE, PagedPrefixCache},
-    prefix_checkpoints::{Arrival, CheckpointPolicy, PrefillCheckpoints, RecurrentCheckpoint},
+    prefix_checkpoints::{
+        Arrival, CheckpointPolicy, DEFAULT_CHECKPOINT_BUDGET_BYTES,
+        DEFAULT_CHECKPOINT_INTERVAL_TOKENS, MAX_CHECKPOINTS_PER_ENTRY, PrefillCheckpoints,
+        RecurrentCheckpoint,
+    },
     speculative::{
         CycleBudget, Speculation, SpeculationKind, SpeculationRequest, SpeculationSettings,
         choose_speculation,
     },
 };
-
-/// Default maximum number of cached prefixes.
-const DEFAULT_PREFIX_CACHE_SIZE: usize = 8;
 
 /// Maximum number of pending requests in the submission queue.
 const REQUEST_QUEUE_CAPACITY: usize = 128;
@@ -140,6 +141,34 @@ impl PrefillChunking {
     }
 }
 
+/// Most prompts the in-memory prefix cache keeps by default.
+pub const DEFAULT_PREFIX_CACHE_ENTRIES: usize = 8;
+
+/// Sizing of the in-memory prefix cache and, for hybrid models, of the recurrent-state
+/// checkpoints kept with each entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefixCacheOptions {
+    /// Most prompts kept; `0` turns the cache off.
+    pub max_entries: usize,
+    /// Tokens between checkpoints, rounded up to a multiple of the prefill chunk and cache block.
+    pub checkpoint_interval_tokens: usize,
+    /// Most checkpoints one entry keeps; `0` turns checkpointing off.
+    pub max_checkpoints_per_entry: usize,
+    /// Bytes of checkpoint state kept across all entries; `0` turns checkpointing off.
+    pub checkpoint_budget_bytes: usize,
+}
+
+impl Default for PrefixCacheOptions {
+    fn default() -> Self {
+        Self {
+            max_entries: DEFAULT_PREFIX_CACHE_ENTRIES,
+            checkpoint_interval_tokens: DEFAULT_CHECKPOINT_INTERVAL_TOKENS,
+            max_checkpoints_per_entry: MAX_CHECKPOINTS_PER_ENTRY,
+            checkpoint_budget_bytes: DEFAULT_CHECKPOINT_BUDGET_BYTES,
+        }
+    }
+}
+
 /// Where prefixes that outlive the process are kept.
 #[derive(Debug, Clone)]
 pub struct DiskPrefixConfig {
@@ -156,6 +185,7 @@ pub struct EngineOptions {
     pub prefill_yield_tokens: Option<u32>,
     pub default_thinking_budget: u32,
     pub disk_prefix: Option<DiskPrefixConfig>,
+    pub prefix_cache: PrefixCacheOptions,
     /// Most requests prefilling or decoding at once; `None` is unlimited. A
     /// model that cannot batch its decode serves one request at a time
     /// regardless.
@@ -173,6 +203,7 @@ struct WorkerSettings {
     speculation: SpeculationSettings,
     max_concurrent_requests: Option<usize>,
     disk_prefix: Option<DiskPrefixConfig>,
+    prefix_cache: PrefixCacheOptions,
     model_dir: PathBuf,
 }
 
@@ -424,6 +455,7 @@ impl InferenceEngine {
             prefill_yield_tokens,
             default_thinking_budget,
             disk_prefix,
+            prefix_cache,
             max_concurrent_requests,
         } = options;
         let model_dir = dir.as_ref();
@@ -451,6 +483,7 @@ impl InferenceEngine {
             speculation: SpeculationSettings::from_tuning(&tuning),
             max_concurrent_requests,
             disk_prefix,
+            prefix_cache,
             model_dir: model_dir.to_path_buf(),
         };
 
@@ -1049,11 +1082,17 @@ fn worker_loop(
     let mut worker = Worker {
         grouped_prefill: model.supports_batched_prefill() && !turboquant,
         model,
-        prompt_cache: PromptCache::new(DEFAULT_PREFIX_CACHE_SIZE, settings.generation_suffix_len)
-            .with_checkpoint_policy(CheckpointPolicy::resolve(
-                usize::try_from(settings.chunking.chunk_tokens).unwrap_or(1),
-            ))
-            .with_disk_store(open_disk_store(settings)),
+        prompt_cache: PromptCache::new(
+            settings.prefix_cache.max_entries,
+            settings.generation_suffix_len,
+        )
+        .with_checkpoint_policy(CheckpointPolicy::aligned(
+            settings.prefix_cache.checkpoint_interval_tokens,
+            settings.prefix_cache.max_checkpoints_per_entry,
+            settings.prefix_cache.checkpoint_budget_bytes,
+            usize::try_from(settings.chunking.chunk_tokens).unwrap_or(1),
+        ))
+        .with_disk_store(open_disk_store(settings)),
         facts: RoundFacts { batched_decode },
         concurrency_limit: concurrency_limit(batched_decode, settings.max_concurrent_requests),
         active: Vec::new(),
@@ -2556,6 +2595,7 @@ mod tests {
                 prefill_yield_tokens: None,
                 default_thinking_budget: 256,
                 disk_prefix: None,
+                prefix_cache: PrefixCacheOptions::default(),
                 max_concurrent_requests: None,
             },
         );
