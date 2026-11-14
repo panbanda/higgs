@@ -189,9 +189,9 @@ fn completion_response(completed: Completed, model: String) -> CompletionRespons
     }
 }
 
-/// Render generation events as completion chunks. The finish reason rides on
-/// the chunk of the last piece of text, as it did when each piece of engine
-/// output was its own chunk.
+/// Render generation events as completion chunks. Each piece of text is
+/// forwarded as it arrives; the finish reason follows in a final chunk with
+/// empty text, as in `OpenAI`'s own completions stream.
 fn completion_chunk_stream(
     mut events: EventStream,
     model: String,
@@ -201,7 +201,6 @@ fn completion_chunk_stream(
     let created = chrono::Utc::now().timestamp();
     async_stream::stream! {
         let mut writer = crate::sse::CompletionChunkWriter::new(&request_id, created, &model);
-        let mut held_text: Option<String> = None;
 
         macro_rules! emit_chunk {
             ($text:expr, $finish_reason:expr) => {
@@ -220,17 +219,12 @@ fn completion_chunk_stream(
         while let Some(event) = events.next().await {
             match event {
                 GenerationEvent::TextDelta { text, .. } => {
-                    if let Some(previous) = held_text.replace(text) {
-                        emit_chunk!(previous, None);
-                    }
+                    emit_chunk!(text, None);
                 }
                 GenerationEvent::Finish { reason, .. } => {
-                    emit_chunk!(held_text.take().unwrap_or_default(), Some(reason));
+                    emit_chunk!(String::new(), Some(reason));
                 }
                 GenerationEvent::Usage(usage) => {
-                    if let Some(text) = held_text.take() {
-                        emit_chunk!(text, None);
-                    }
                     if include_usage {
                         match writer.write_usage(&usage) {
                             Ok(json) => yield Ok(Event::default().data(json)),
@@ -245,9 +239,6 @@ fn completion_chunk_stream(
                 | GenerationEvent::ToolLoop(_)
                 | GenerationEvent::Error(_) => {}
             }
-        }
-        if let Some(text) = held_text.take() {
-            emit_chunk!(text, None);
         }
 
         yield Ok(Event::default().data("[DONE]"));
@@ -331,7 +322,11 @@ mod tests {
 
         assert_eq!(status, http::StatusCode::OK, "{text}");
         let events = sse_json_events(&text);
-        assert_eq!(events.len(), 3, "two token chunks plus usage: {text}");
+        assert_eq!(
+            events.len(),
+            4,
+            "two token chunks, the finish chunk and usage: {text}"
+        );
         let usage_chunk = events.last().unwrap();
         assert_eq!(usage_chunk["choices"], serde_json::json!([]));
         assert_eq!(usage_chunk["usage"]["prompt_tokens"], 3);
@@ -341,7 +336,7 @@ mod tests {
             1
         );
         assert!(usage_chunk["usage"]["time_to_first_token"].is_f64());
-        for chunk in &events[..2] {
+        for chunk in &events[..3] {
             assert!(chunk.get("usage").is_none());
             assert_eq!(chunk["choices"].as_array().unwrap().len(), 1);
         }
@@ -362,7 +357,15 @@ mod tests {
 
         assert_eq!(status, http::StatusCode::OK, "{text}");
         let events = sse_json_events(&text);
-        assert_eq!(events.len(), 1, "{text}");
+        assert_eq!(
+            events.len(),
+            2,
+            "one text chunk and the finish chunk: {text}"
+        );
+        assert_eq!(events[0]["choices"][0]["text"], "hello");
+        assert!(events[0]["choices"][0]["finish_reason"].is_null());
+        assert_eq!(events[1]["choices"][0]["text"], "");
+        assert_eq!(events[1]["choices"][0]["finish_reason"], "stop");
         assert!(!text.contains("\"usage\""));
     }
 
@@ -379,5 +382,28 @@ mod tests {
         let (_status, text) = post_json(&app, "/v1/completions", &request).await;
 
         assert!(!text.contains("\"usage\""), "{text}");
+    }
+
+    #[tokio::test]
+    async fn first_text_delta_is_forwarded_without_waiting_for_the_next_event() {
+        use super::{EventStream, GenerationEvent, completion_chunk_stream};
+        use tokio_stream::StreamExt;
+
+        let events: EventStream = Box::pin(
+            tokio_stream::iter([GenerationEvent::TextDelta {
+                text: "hello".to_owned(),
+                logprobs: None,
+            }])
+            .chain(tokio_stream::pending()),
+        );
+        let stream = completion_chunk_stream(events, "stub".to_owned(), false);
+        tokio::pin!(stream);
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await;
+
+        assert!(
+            matches!(first, Ok(Some(_))),
+            "the first chunk must not wait for a second event"
+        );
     }
 }
