@@ -23,8 +23,8 @@ use crate::{
         store::{ResponseStore, StoredResponse},
         stream::ResponseStreamBuilder,
         translate::{
-            ResponseContext, build_chat_request, outcome_from_chat, output_to_input_items,
-            parse_input, reject_unsupported_fields, routing_messages,
+            ResponseContext, build_chat_request, chat_messages_to_input_items, outcome_from_chat,
+            output_to_input_items, parse_input, reject_unsupported_fields, routing_messages,
         },
     },
     router::ResolvedRoute,
@@ -224,7 +224,8 @@ async fn create_local_response(
     let store_response = request.store.unwrap_or(true).then(|| Arc::clone(&store));
 
     if request.stream == Some(true) {
-        let chunks = crate::tool_loop::chunk_stream(
+        let transcript = crate::tool_loop::Transcript::default();
+        let chunks = crate::tool_loop::chunk_stream_with_transcript(
             Arc::clone(&state),
             chat,
             engine,
@@ -232,8 +233,10 @@ async fn create_local_response(
             state.metrics.clone(),
             routing_method,
             received_at,
+            &transcript,
         )?;
-        let events = response_event_stream(chunks, context, store_response, conversation);
+        let events =
+            response_event_stream(chunks, context, store_response, conversation, transcript);
         if state.metrics.is_some() {
             request_metrics.mark_recorded();
         }
@@ -243,7 +246,7 @@ async fn create_local_response(
     }
 
     let start = Instant::now();
-    let chat_response = crate::tool_loop::complete(
+    let (chat_response, tool_messages) = crate::tool_loop::complete_with_transcript(
         Arc::clone(&state),
         chat,
         engine,
@@ -255,6 +258,7 @@ async fn create_local_response(
     let output_tokens = u64::from(chat_response.usage.completion_tokens);
     let object = context.object(outcome_from_chat(chat_response));
     if let Some(response_store) = store_response {
+        conversation.extend(chat_messages_to_input_items(&tool_messages));
         store_completed(&response_store, &object, conversation);
     }
     if let Some(ref metrics) = state.metrics {
@@ -333,7 +337,8 @@ fn response_event_stream(
     chunk_source: impl Stream<Item = String>,
     context: ResponseContext,
     store: Option<Arc<ResponseStore>>,
-    conversation: Vec<InputItem>,
+    mut conversation: Vec<InputItem>,
+    transcript: crate::tool_loop::Transcript,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
         let mut builder = ResponseStreamBuilder::new(context);
@@ -354,6 +359,7 @@ fn response_event_stream(
 
         let finish = builder.finish();
         if let Some(ref response_store) = store {
+            conversation.extend(chat_messages_to_input_items(&transcript.take()));
             store_completed(response_store, &finish.response, conversation);
         }
         for event in finish.events {
@@ -514,6 +520,117 @@ mod tests {
         response.status = ResponseStatus::Failed;
         store_completed(&store, &response, Vec::new());
         assert!(store.is_empty());
+    }
+
+    const CALL_ECHO: &str =
+        r#"<tool_call>{"name": "files__echo", "arguments": {"text": "hi"}}</tool_call>"#;
+
+    async fn tool_loop_app(
+        configure: impl FnOnce(&mut crate::test_support::StubEngine),
+    ) -> (axum::Router, Arc<Engine>) {
+        use crate::mcp::testing::{CallBehavior, FakeMcp, ready_manager, text_result};
+
+        let fake = FakeMcp::new(&["echo"]);
+        fake.on_call("echo", CallBehavior::Reply(text_result("pong")));
+        let hub = crate::tools::ToolHub::new(
+            ready_manager(vec![("files", fake, Duration::from_secs(2))], 1).await,
+            crate::web::WebService::disabled(),
+        );
+        let mut stub = crate::test_support::StubEngine::named("stub");
+        stub.tokenizer = Some(crate::test_support::word_tokenizer());
+        stub.script.prompt_tokens = vec![1, 2, 3];
+        configure(&mut stub);
+        crate::test_support::app_with_stub_config_and_tools(stub, "", hub)
+    }
+
+    fn last_prompt_has_tool_result(engine: &Engine, expected: &str) -> bool {
+        engine
+            .stub_prompt_messages()
+            .last()
+            .is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|(role, content)| role == "tool" && content.contains(expected))
+            })
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_sees_tool_results_from_the_stored_non_streaming_response() {
+        let (app, engine) = tool_loop_app(|stub| {
+            stub.script.generations = ["", "The answer is pong", "noted"]
+                .map(|scripted| {
+                    let chosen = if scripted.is_empty() {
+                        CALL_ECHO
+                    } else {
+                        scripted
+                    };
+                    crate::test_support::generation_output(chosen, 5, 3)
+                })
+                .into();
+        })
+        .await;
+        let (first_status, first) = post(
+            &app,
+            &json!({"model": "stub", "input": "use the tool", "mcp": {"enabled": true}}),
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::OK, "{first}");
+        let id = first["id"].as_str().unwrap();
+
+        let (second_status, second) = post(
+            &app,
+            &json!({"model": "stub", "input": "thanks", "previous_response_id": id}),
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::OK, "{second}");
+        assert!(
+            last_prompt_has_tool_result(&engine, "pong"),
+            "{:?}",
+            engine.stub_prompt_messages()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_sees_tool_results_from_the_stored_streaming_response() {
+        use crate::test_support::{post_json, sse_json_events, token_event};
+
+        let (app, engine) = tool_loop_app(|stub| {
+            stub.script.streams = vec![
+                vec![
+                    token_event("Let me check. ", 3, None),
+                    token_event(CALL_ECHO, 12, Some("stop")),
+                ],
+                vec![token_event("Final answer", 5, Some("stop"))],
+                vec![token_event("noted", 2, Some("stop"))],
+            ];
+        })
+        .await;
+        let (first_status, first_text) = post_json(
+            &app,
+            "/v1/responses",
+            &json!({"model": "stub", "input": "use the tool", "stream": true,
+                    "mcp": {"enabled": true}}),
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::OK, "{first_text}");
+        let id = sse_json_events(&first_text)
+            .iter()
+            .find_map(|event| event.pointer("/response/id")?.as_str().map(str::to_owned))
+            .unwrap();
+
+        let (second_status, second_text) = post_json(
+            &app,
+            "/v1/responses",
+            &json!({"model": "stub", "input": "thanks", "stream": true,
+                    "previous_response_id": id}),
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::OK, "{second_text}");
+        assert!(
+            last_prompt_has_tool_result(&engine, "pong"),
+            "{:?}",
+            engine.stub_prompt_messages()
+        );
     }
 
     #[tokio::test]
