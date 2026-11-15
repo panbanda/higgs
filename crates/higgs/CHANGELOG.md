@@ -1,5 +1,85 @@
 # Changelog
 
+## [1.9.0](https://github.com/panbanda/higgs/compare/higgs-v1.8.2...higgs-v1.9.0) (2026-11-15)
+
+
+### Features
+
+* **api:** accept regex and guided_* output constraints on chat ([20c8404](https://github.com/panbanda/higgs/commit/20c84043e3cd2607d4b6e94ecddda0f993c57f61))
+* **api:** add /v1/tokenize and /v1/detokenize ([6e92c69](https://github.com/panbanda/higgs/commit/6e92c69e4f84f1137e78a2d226804b2903bb91f5))
+* **api:** add Responses API types, translation, stream builder and store ([69ef43e](https://github.com/panbanda/higgs/commit/69ef43e1fdb67becaec5b58c5598e843f5461d00))
+* **api:** forced tool_choice and parallel_tool_calls on chat, responses and anthropic ([443693e](https://github.com/panbanda/higgs/commit/443693ea74dc12390c67227c4a2344f3e4631c56))
+* **api:** map Anthropic tool_use/tool_result history into the prompt ([e953d44](https://github.com/panbanda/higgs/commit/e953d4402c8b14dbbf0ad778daca0ab19f97a133))
+* **api:** report cached tokens, reasoning tokens and timings in usage ([0caa206](https://github.com/panbanda/higgs/commit/0caa2063e83f3424dd60ecdfeb4a36cecf9fcc53))
+* **api:** serve POST/GET/DELETE /v1/responses ([f93fd04](https://github.com/panbanda/higgs/commit/f93fd0499c0652be732321ab50666ddfdb8e33c0))
+* **api:** support tool_choice none/auto and accept seed ([1c18647](https://github.com/panbanda/higgs/commit/1c1864774e63aae75864b481b01a9785965c6219))
+* **batch:** reach feature parity with the simple engine ([d2fae4c](https://github.com/panbanda/higgs/commit/d2fae4c0e99f1db6d235993cbf88f88618f8b914))
+* **cli:** add higgs bench and higgs selftest ([186ecbb](https://github.com/panbanda/higgs/commit/186ecbb1425e74ef41f4a18504d2c62294296073))
+* **cli:** find a running server without a config in shellenv and exec ([653e237](https://github.com/panbanda/higgs/commit/653e237e0155f4d40a44fd6f589e81664569cc50))
+* **config:** choose the engine per model with batch = "auto" ([907b473](https://github.com/panbanda/higgs/commit/907b47303113f38cb46778228846d51fd9f7a806))
+* **config:** make prefix-cache sizing and hybrid checkpoints configurable ([d16f815](https://github.com/panbanda/higgs/commit/d16f81549847b2b6d155adfad37cba41f26afeae))
+* **engine:** batched decode for Phi-3 and Starcoder2 through a generic batched cache ([61da6c8](https://github.com/panbanda/higgs/commit/61da6c8ce4575451afd2e0d3a0ed799cea916dfe))
+* **engine:** make the thinking budget configurable ([9431c34](https://github.com/panbanda/higgs/commit/9431c344da030f4615440722b9447234c5b8bf8a))
+* **engine:** serve vision, disk prefix store, TurboQuant and speculative decode from the worker ([e727b26](https://github.com/panbanda/higgs/commit/e727b26184bba144a72176eaadfb1a699a60fd76))
+* **models:** batched decode and prefill for Gemma 2, 3 and 4 ([f86677b](https://github.com/panbanda/higgs/commit/f86677be30a476c3a5b9448c1f59f67829711cbd))
+* **router:** serve unknown model names with the only local model ([589b7f4](https://github.com/panbanda/higgs/commit/589b7f4223be849dffbace3fcfd652cee03bc50d))
+* **server:** add a model pool with single-flight loading and LRU eviction ([705259a](https://github.com/panbanda/higgs/commit/705259af2cd674daa7e2c8bd0fb358003a543265))
+* **server:** add MCP client and /v1/mcp endpoints ([da16565](https://github.com/panbanda/higgs/commit/da165657e2c3e9dc29f6ef39aa0a0d73a3e51b07))
+* **server:** add model lifecycle config, serve flags and doctor checks ([27ae7aa](https://github.com/panbanda/higgs/commit/27ae7aaa74600d85c9137fd98ea11eee5e9a5382))
+* **server:** add opt-in server-side tool loop for MCP and web tools ([9657fac](https://github.com/panbanda/higgs/commit/9657fac490e65f3906206420996fc22ef16c159c))
+* **server:** add web search and fetch endpoints ([3d75bb2](https://github.com/panbanda/higgs/commit/3d75bb271d0365ab646ff30f0ca3ceba7c8546a7))
+* **server:** serve local models from the pool and expose load, unload and status ([a270d1c](https://github.com/panbanda/higgs/commit/a270d1c6ca5564a6675a5edab45ba8f2549f6505))
+
+
+### Bug Fixes
+
+* **build:** do not shadow the entry name in mlx_sys_output_dirs ([309a381](https://github.com/panbanda/higgs/commit/309a3813b29feed0b9288bacca8abcf00d233b4b))
+* **build:** find the profile directory under both Cargo build layouts ([66b5a05](https://github.com/panbanda/higgs/commit/66b5a0553514a8a8f788af45aed8f3ab3aa2bc35))
+* **build:** quote OUT_DIR in the build script doc comment ([2e7a7c9](https://github.com/panbanda/higgs/commit/2e7a7c93f081172ccd9fd1750b6d0eb9e2998f3f))
+* **ci:** declare rust-version on every crate and satisfy Rust 1.100 clippy ([060d1dd](https://github.com/panbanda/higgs/commit/060d1ddcb601d7f6adca07c19166f94645528334))
+* **ci:** satisfy the clippy and rustfmt of the CI toolchain ([c48e2f8](https://github.com/panbanda/higgs/commit/c48e2f85a6fa881b674cb03e1817d7cc8b0e99b7))
+* **cli:** confirm the private server's identity before measuring ([1d08f9e](https://github.com/panbanda/higgs/commit/1d08f9eff061edb34a0716f60fee75450491480c))
+* **cli:** follow HIGGS_HOST and HIGGS_PORT when probing without a config ([9416ed5](https://github.com/panbanda/higgs/commit/9416ed5fc24ecc0c1e90c53f1e1fc3548a7c086c))
+* **cli:** ignore HIGGS_PORT when --port is given ([6982eb1](https://github.com/panbanda/higgs/commit/6982eb1a7bdc9e6f5334a85d9c44ef7ba7f9e767))
+* **cli:** isolate the bench and selftest server from the user's config and daemon ([2210a5b](https://github.com/panbanda/higgs/commit/2210a5b11f2269d7091cb30fe61f5ab76d7a69fd))
+* **cli:** keep the parent-death watcher off the global stdin lock ([61365c2](https://github.com/panbanda/higgs/commit/61365c272bb263f42e034036a4cea6815e89f027))
+* **cli:** map bench --trials to concurrency rounds ([253c6ae](https://github.com/panbanda/higgs/commit/253c6aefbd41770d14663acdae329bd391f40c17))
+* **cli:** print the shellenv error with its hint on separate lines ([f83c016](https://github.com/panbanda/higgs/commit/f83c016cf0d67bc7f815e76961b1b0eea0c7ecef))
+* **cli:** stop the private server when the bench or selftest parent dies ([c2cfd64](https://github.com/panbanda/higgs/commit/c2cfd646e5480c3368d554dbff9b018895bd9ecb))
+* **cli:** try every resolved address when probing the server ([eb9b2ce](https://github.com/panbanda/higgs/commit/eb9b2ce9bb1fa3bf967c931e54f4fd3c0958f2d6))
+* **config:** validate a provider's url after layers are merged ([8e3ad65](https://github.com/panbanda/higgs/commit/8e3ad65e8cd6ad8cb3d839b61bf9b395ee35da3e))
+* **engine:** build no disk prefix tier when the cache keeps no entries ([5246a93](https://github.com/panbanda/higgs/commit/5246a93b6c69a7b018ed72e921cff6769a04734c))
+* **engine:** take logprob bytes from the detokenizer's text and drop the re-decode ([22b6573](https://github.com/panbanda/higgs/commit/22b65734af209a995774f5ec8c51602b24d3488d))
+* **generation:** stream each token's logprobs with the text it produced ([351f389](https://github.com/panbanda/higgs/commit/351f3896d49bc4b6f81b00718f1f2e61d679557b))
+* **generation:** stream the logprobs of tokens whose text a tracker holds back ([6485850](https://github.com/panbanda/higgs/commit/64858504ef472d8b1181d18d1987d2a49928b42b))
+* **higgs:** do not think when the request is constrained ([af1be19](https://github.com/panbanda/higgs/commit/af1be192bb255cc6e0f5b9c30ae7350eb627d35d))
+* **higgs:** forward completion text deltas immediately ([9fa36eb](https://github.com/panbanda/higgs/commit/9fa36eb7c2d7c85d7845946907bb06baabacf335))
+* **higgs:** report engine failures as errors in every API, keep tool-loop results in stored responses ([c41fb00](https://github.com/panbanda/higgs/commit/c41fb004c9d30f6e995b132f937e877c295f1c67))
+* **lint:** avoid shadowed names in the MCP env filter and metallib search ([6ef652f](https://github.com/panbanda/higgs/commit/6ef652f8a9dc4d8132ac7dd7978f4a1ee8ed984f))
+* **mcp:** bound sending a request and delivering its cancellation ([03d90f9](https://github.com/panbanda/higgs/commit/03d90f93d054fb6adc33999ffcaff775a95ca726))
+* **mcp:** clean up and cancel requests dropped before completion ([236463d](https://github.com/panbanda/higgs/commit/236463d41270d6ebe2e220caffbb0ab9198a3eea))
+* **mcp:** do not replay a tool call whose outcome is unknown ([ed1a46f](https://github.com/panbanda/higgs/commit/ed1a46f932c39cfec6435726a2228a208b334bcd))
+* **mcp:** do not shadow the variable name in is_inherited ([6304d4c](https://github.com/panbanda/higgs/commit/6304d4c23048a4349d8199d7d4144b954b885617))
+* **mcp:** keep multibyte characters split across HTTP chunks ([a626601](https://github.com/panbanda/higgs/commit/a626601e39085523bfd6300463f5c2cbdf3b8cb0))
+* **mcp:** reap finished HTTP transport tasks ([1a4869f](https://github.com/panbanda/higgs/commit/1a4869f3c974d0c171988d4a5ad2248a7eec66d5))
+* **mcp:** start stdio servers with a cleared environment ([80a11d6](https://github.com/panbanda/higgs/commit/80a11d632b6192d452e25ae1741b3edd22ebdf2b))
+* **responses:** bound the response store by bytes ([b42149c](https://github.com/panbanda/higgs/commit/b42149cc3efae895753481429ec0c54f6ea198df))
+* **responses:** store each tool-loop round's text once for streamed responses ([d8bcdab](https://github.com/panbanda/higgs/commit/d8bcdabbfa4c3e901e079082052d292fdb488270))
+* **responses:** store the tool-augmented transcript for previous_response_id ([1662cb2](https://github.com/panbanda/higgs/commit/1662cb2d91d16f7813ca8b26d9ee275cd5864326))
+* **selftest:** rebuild the logprob reference text from token bytes ([4864eb2](https://github.com/panbanda/higgs/commit/4864eb2f814f25f6e3ee3011cbcc8afa6e712a7c))
+* **selftest:** skip the prefix cache check when the cache is off ([3db06ac](https://github.com/panbanda/higgs/commit/3db06acd5235ab6c240bd632973475444a0afb64))
+* **test:** locate the higgs binary through CARGO_BIN_EXE_higgs ([c5cb398](https://github.com/panbanda/higgs/commit/c5cb398ae12771d8200e09dcc9aba50d8027bfdc))
+* **web:** bound the entity search so a page of ampersands decodes in linear time ([e4f743b](https://github.com/panbanda/higgs/commit/e4f743becf8fdfddc9e94dfbeb8f59efdc8176d2))
+* **web:** extract fetched pages on a blocking thread ([3a94c0b](https://github.com/panbanda/higgs/commit/3a94c0bd22c62e840a995c8c1a8db2f64bad8ca2))
+* **web:** extract heading text without recursing ([2f3ea34](https://github.com/panbanda/higgs/commit/2f3ea3420b0f299b45dc3eca16a0386dcb833306))
+* **web:** search for closing tags and trim leading lines in linear time ([0136584](https://github.com/panbanda/higgs/commit/013658456c216f8af66a1296f168c77b3edf82b1))
+
+
+### Performance Improvements
+
+* faster than oMLX on follow-up turns and concurrency, feature parity, one engine ([5522af9](https://github.com/panbanda/higgs/commit/5522af96fb2bcf75d3c0d3a69f2e841a602751a2))
+* **models:** cheaper MoE routing and batched decode for Qwen3 MoE ([93e8fd2](https://github.com/panbanda/higgs/commit/93e8fd25ee89fc7646d8ac98b3f984068c81ae8e))
+
 ## [1.8.2](https://github.com/panbanda/higgs/compare/higgs-v1.8.1...higgs-v1.8.2) (2026-11-10)
 
 
