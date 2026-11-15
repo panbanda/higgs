@@ -31,7 +31,7 @@ Models: `mlx-community/Llama-3.2-1B-Instruct-4bit`, `mlx-community/Qwen3-1.7B-4b
 | Single-stream decode, dense models | Level (within 2%); both run at the memory-bandwidth limit |
 | Single-stream decode, Qwen3.5-family MoE | oMLX ahead: 183 tok/s in both runs against 133 for Higgs |
 | Cold prefill throughput | Level on dense models (Higgs 3% to 5% ahead on Qwen3-1.7B, 7% behind on Thinklite-27B at 5,950 tokens). oMLX is 14% to 20% ahead on the MoE model in 5 of 6 samples |
-| Memory (peak RSS) | Weak comparison, because resident set size hides Metal buffers. Higgs is lower on the 1B and 1.7B models and higher on Thinklite-27B and Qwen3.6-35B. The MLX allocator cache in Higgs grows without a limit; see [Memory](#memory) |
+| Memory (peak RSS) | Weak comparison, because resident set size hides Metal buffers. Higgs is lower on the 1B and 1.7B models and higher on Thinklite-27B and Qwen3.6-35B. The MLX allocator cache in Higgs grew to 43 GB because the default limit is far above what the test used; see [Memory](#memory) |
 | Feature surface | oMLX broader (audio, rerank, grammar, clustering, admin UI); see [Features](#features) |
 
 ## Results
@@ -52,7 +52,13 @@ In the first pass, oMLX needed 457 ms for turn 2 on Thinklite-27B. It now needs 
 
 Higgs keeps prefix KV state in memory in 32-token blocks and reuses everything up to the last full block. oMLX reconstructs from its SSD block cache (256-token blocks, RAM tier off by default). On the 1B and 1.7B models, oMLX reported 2,816 cached tokens for turn 2 and Higgs reported 2,944. On the larger models, both reported about 3,000.
 
-Prompts that share a prefix and then diverge also reuse the shared part. An example is the same system prompt and tools with a different user message, or an edited earlier turn. Dense models truncate the cached KV blocks to the shared length. The Qwen3.5/3.6 hybrid models cannot do this directly. The state of their recurrent layers is valid only at the position where Higgs captured it. Higgs therefore checkpoints that state during prefill. It saves one checkpoint every 512 to 1,024 tokens. The default limit is 8 checkpoints per entry and 2 GiB in total. One checkpoint is 147 MiB on the 27B model. Higgs resumes from the nearest checkpoint. On Thinklite-27B with a 3,850-token shared context, a new question went from 20.1 s to first token (cold) to 3.7 s (3,072 tokens reused), and an exact repeat to 0.1 s. Resuming from a checkpoint is bit-identical to a cold prefill on real weights. This paragraph comes from the first pass. This pass did not repeat these measurements.
+Prompts that share a prefix and then diverge also reuse the shared part. An example is the same system prompt and tools with a different user message, or an edited earlier turn. Dense models truncate the cached KV blocks to the shared length. The Qwen3.5/3.6 hybrid models cannot do this directly. The state of their recurrent layers is valid only at the position where Higgs captured it.
+
+Higgs therefore checkpoints that state during prefill. It saves one checkpoint every 512 to 1,024 tokens. The default limit is 8 checkpoints per entry and 2 GiB in total. One checkpoint is 147 MiB on the 27B model. Higgs resumes from the nearest checkpoint.
+
+On Thinklite-27B with a 3,850-token shared context, a new question went from 20.1 s to first token (cold) to 3.7 s (3,072 tokens reused). An exact repeat took 0.1 s. Resuming from a checkpoint is bit-identical to a cold prefill on real weights.
+
+These measurements come from the first pass. This pass did not repeat them.
 
 ### Concurrent throughput
 
@@ -154,7 +160,7 @@ Treat this comparison as weak. Resident set size does not include most Metal buf
 
 The first-pass Higgs value of 14.9 GB on Thinklite-27B is a different measurement. That run used the serialized engine, tested 1, 2 and 4 clients only, and used different prefill sizes. The first pass did not record a value for Qwen3.6-35B.
 
-A separate probe of Higgs on Thinklite-27B found a larger problem. The MLX allocator cache grows without a limit. The cache held 2.2 GB after the model loaded and 42.9 GB after the full benchmark. The total memory footprint of the process reached 65 GB, while the weights use 14.4 GB. Higgs does not clear this cache after prefill by default. A fix is in progress. This document does not yet report the result of the fix.
+A separate probe of Higgs on Thinklite-27B found a larger problem. The MLX allocator cache grows far beyond the weights. By default, Higgs sets only the wired limit and leaves the MLX cache limit unchanged. The MLX default is the smaller of 1.5 times the recommended working set and 0.95 times physical memory. On this machine that limit is larger than the whole benchmark uses, so it does not bound the cache in practice. The cache held 2.2 GB after the model loaded and 42.9 GB after the full benchmark. The total memory footprint of the process reached 65 GB, while the weights use 14.4 GB. Higgs does not clear this cache after prefill by default. A fix is in progress. This document does not yet report the result of the fix.
 
 ### Reliability
 
