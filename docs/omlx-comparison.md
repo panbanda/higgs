@@ -31,7 +31,7 @@ Models: `mlx-community/Llama-3.2-1B-Instruct-4bit`, `mlx-community/Qwen3-1.7B-4b
 | Single-stream decode, dense models | Level (within 2%); both run at the memory-bandwidth limit |
 | Single-stream decode, Qwen3.5-family MoE | oMLX ahead: 183 tok/s in both runs against 133 for Higgs |
 | Cold prefill throughput | Level on dense models (Higgs 3% to 5% ahead on Qwen3-1.7B, 7% behind on Thinklite-27B at 5,950 tokens). oMLX is 14% to 20% ahead on the MoE model in 5 of 6 samples |
-| Memory (peak RSS) | Higgs lower on the 1B and 1.7B models. Higgs higher on Thinklite-27B (18.7 GB against 16.2 GB) and Qwen3.6-35B (22.3 GB against 20.1 GB). The first pass had Higgs lower on every model |
+| Memory (peak RSS) | Weak comparison, because resident set size hides Metal buffers. Higgs is lower on the 1B and 1.7B models and higher on Thinklite-27B and Qwen3.6-35B. The MLX allocator cache in Higgs grows without a limit; see [Memory](#memory) |
 | Feature surface | oMLX broader (audio, rerank, grammar, clustering, admin UI); see [Features](#features) |
 
 ## Results
@@ -150,7 +150,11 @@ The table shows the peak resident set size of the server process over the whole 
 | Thinklite-27B-4bit | 18.6 to 18.7 GB | 16.2 GB |
 | Qwen3.6-35B-A3B-4bit | 22.3 GB | 20.1 GB |
 
-The Thinklite-27B peak for Higgs was 14.9 GB in the first pass. It is now 3.7 GB higher. This pass did not investigate the cause. The first pass did not record a value for Qwen3.6-35B.
+Treat this comparison as weak. Resident set size does not include most Metal buffers, and macOS can reclaim pages during a run. In one probe, the resident set size of Higgs fell from 19.3 GB to 6.7 GB after the last test.
+
+The first-pass Higgs value of 14.9 GB on Thinklite-27B is a different measurement. That run used the serialized engine, tested 1, 2 and 4 clients only, and used different prefill sizes. The first pass did not record a value for Qwen3.6-35B.
+
+A separate probe of Higgs on Thinklite-27B found a larger problem. The MLX allocator cache grows without a limit. The cache held 2.2 GB after the model loaded and 42.9 GB after the full benchmark. The total memory footprint of the process reached 65 GB, while the weights use 14.4 GB. Higgs does not clear this cache after prefill by default. A fix is in progress. This document does not yet report the result of the fix.
 
 ### Reliability
 
