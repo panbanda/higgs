@@ -120,6 +120,19 @@ impl IntoResponse for AnthropicError {
     }
 }
 
+/// Rewrites the plain-text 413 that the body limit produces before a handler runs into the
+/// Anthropic error format. Any other response passes through.
+pub async fn anthropic_body_limit(response: Response) -> Response {
+    if response.status() != StatusCode::PAYLOAD_TOO_LARGE {
+        return response;
+    }
+    let body = serde_json::json!({
+        "type": "error",
+        "error": {"type": "request_too_large", "message": "request body is too large"},
+    });
+    (StatusCode::PAYLOAD_TOO_LARGE, Json(body)).into_response()
+}
+
 /// The parts of a [`ServerError`] that every error body carries.
 pub struct ErrorParts {
     pub status: StatusCode,

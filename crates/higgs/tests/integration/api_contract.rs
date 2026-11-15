@@ -114,3 +114,32 @@ async fn request_body_limit_is_enforced() {
 
     assert_eq!(response.status().as_u16(), 413);
 }
+
+#[tokio::test]
+async fn an_oversized_messages_body_gets_the_anthropic_error_shape() {
+    for uri in ["/v1/messages", "/v1/messages/count_tokens"] {
+        let app = build_router(build_test_state(None), 300.0, None, 0, 64, None);
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "x".repeat(512)}]
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 413, "{uri}");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["type"], "error", "{uri}: {json}");
+        assert_eq!(json["error"]["type"], "request_too_large", "{uri}: {json}");
+    }
+}

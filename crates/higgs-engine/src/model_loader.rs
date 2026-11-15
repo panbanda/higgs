@@ -246,7 +246,14 @@ fn rope_scaled_length_from_config(config: &serde_json::Value) -> Option<u64> {
 }
 
 fn context_length_from_config(config: &serde_json::Value) -> Option<u32> {
-    crate::mlx_tuning::config_lookup_u64(config, "max_position_embeddings")
+    let model_type = config.get("model_type").and_then(serde_json::Value::as_str);
+    // The LLaVA loader builds its language model from `text_config` alone.
+    let language_scope = if model_type.is_some_and(|name| name.starts_with("llava")) {
+        config.get("text_config").unwrap_or(config)
+    } else {
+        config
+    };
+    crate::mlx_tuning::config_lookup_u64(language_scope, "max_position_embeddings")
         .and_then(|length| u32::try_from(length).ok())
         .filter(|length| *length > 0)
 }
@@ -1236,6 +1243,22 @@ mod tests {
             "rope_scaling": {"rope_type": "llama3", "factor": 32.0, "original_max_position_embeddings": 8192},
         });
         assert_eq!(context_length_from_config(&config), Some(131_072));
+    }
+
+    #[test]
+    fn a_llava_model_takes_its_context_length_from_the_text_config_only() {
+        let config = serde_json::json!({
+            "model_type": "llava-qwen2",
+            "max_position_embeddings": 8192,
+            "text_config": {"max_position_embeddings": 4096},
+        });
+        assert_eq!(context_length_from_config(&config), Some(4096));
+        let other = serde_json::json!({
+            "model_type": "qwen2",
+            "max_position_embeddings": 8192,
+            "text_config": {"max_position_embeddings": 4096},
+        });
+        assert_eq!(context_length_from_config(&other), Some(8192));
     }
 
     #[test]

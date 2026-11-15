@@ -775,8 +775,17 @@ pub fn resolve(raw: &RawConfig, context: &ResolveContext) -> Result<HiggsConfig,
     let mut models: Vec<ModelConfig> = raw
         .models
         .iter()
-        .map(|entry| resolve_model(entry, &raw.defaults, profile_override))
-        .collect();
+        .map(|entry| {
+            let model = resolve_model(entry, &raw.defaults, profile_override);
+            if model.context_length == Some(0) {
+                let label = model.name.as_deref().unwrap_or(&model.path);
+                return Err(format!(
+                    "model `{label}`: `context_length` must be at least 1 (set in `[[models]]` or `[defaults]`)"
+                ));
+            }
+            Ok(model)
+        })
+        .collect::<Result<_, String>>()?;
     if let Some(budget) = checkpoint_budget_override(&context.environment, &mut overrides) {
         for model in &mut models {
             model.prefix_cache.checkpoint_budget = budget;
