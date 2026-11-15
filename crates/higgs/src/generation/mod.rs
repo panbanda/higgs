@@ -78,13 +78,6 @@ pub fn stream(
 ) -> Result<EventStream, ServerError> {
     match tool_loop::plan(&state, &request)? {
         None => stream::stream_once(engine, &request, received_at, metrics),
-        Some(plan) => Ok(tool_loop::stream(
-            state,
-            request,
-            engine,
-            plan,
-            metrics,
-            received_at,
-        )),
+        Some(plan) => tool_loop::stream(state, request, engine, plan, metrics, received_at),
     }
 }

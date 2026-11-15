@@ -124,4 +124,5 @@ Higgs checks the full prompt length before it starts prefill. This includes the 
   - Chat Completions, Completions and Responses use the OpenAI error shape, with `error.type` set to `invalid_request_error` and `error.code` set to `context_length_exceeded`. The message gives the context length and the prompt length.
   - Messages (Anthropic) returns `{"type": "error", "error": {"type": "invalid_request_error", "message": "..."}}` with the same message. Every error from `/v1/messages` and `/v1/messages/count_tokens` uses this format. A model that is not found has `error.type` set to `not_found_error`.
 - **The prompt fits, but the prompt plus `max_tokens` is longer than the context length.** Higgs does not reject the request. Clients such as Claude Code send a large `max_tokens`. Higgs stops generation at the end of the context. The finish reason is `length` (`max_tokens` for the Messages API).
-
+- **A server-side tool loop (`mcp`) fills the context.** The first round follows the rules above, including the 400 before a stream starts. If the tool results make a later round too long, Higgs does not fail the request. It ends the response with what the earlier rounds produced, with finish reason `length`.
+- **A vision model.** Each image counts as the positions that its features take, not as one token.

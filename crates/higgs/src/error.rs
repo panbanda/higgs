@@ -96,8 +96,16 @@ impl<E: Into<ServerError>> From<E> for AnthropicError {
 impl IntoResponse for AnthropicError {
     fn into_response(self) -> Response {
         let ErrorParts {
-            status, message, ..
+            status,
+            code,
+            message: detail,
+            ..
         } = self.0.parts();
+        // Anthropic has no `code` field, so the reason a model is unavailable stays in the text.
+        let message = match (&self.0, code) {
+            (ServerError::ModelUnavailable { .. }, Some(reason)) => format!("{detail} ({reason})"),
+            _ => detail,
+        };
         let error_type = match status {
             StatusCode::NOT_FOUND => "not_found_error",
             StatusCode::SERVICE_UNAVAILABLE => "overloaded_error",
@@ -395,6 +403,24 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("disk read error")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_anthropic_shape_keeps_the_reason_a_model_is_unavailable() {
+        let resp = AnthropicError(ServerError::ModelUnavailable {
+            code: "model_loading",
+            message: "model 'a' is loading".to_owned(),
+        })
+        .into_response();
+        let (status, body) = response_status_and_body(resp).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "overloaded_error");
+        assert_eq!(
+            body["error"]["message"],
+            "model 'a' is loading (model_loading)"
         );
     }
 

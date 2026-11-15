@@ -77,6 +77,8 @@ pub struct LlavaQwen2Model {
     mm_projector: MmProjector,
     language_model: transformer::Model,
     image_size: i32,
+    /// Positions that one image takes in the sequence once its features replace the sentinel.
+    num_patches: i32,
 }
 
 impl LlavaQwen2Model {
@@ -98,6 +100,11 @@ impl LlavaQwen2Model {
     /// Attention head dimension used by the language model KV cache.
     pub(crate) fn head_dim(&self) -> Result<i32, crate::error::ModelError> {
         self.language_model.args.checked_head_dim()
+    }
+
+    /// Positions that one image takes in the sequence.
+    pub const fn num_patches(&self) -> i32 {
+        self.num_patches
     }
 
     /// Get the image size expected by the vision encoder.
@@ -311,6 +318,7 @@ fn load_llava_qwen2_model_with_config(
     load_projector_weights(&mut mm_projector, &weights)?;
 
     let image_size = config.vision_config.image_size;
+    let num_patches = config.vision_config.num_patches();
 
     tracing::info!("LLaVA-Qwen2 model loaded successfully");
 
@@ -319,6 +327,7 @@ fn load_llava_qwen2_model_with_config(
         mm_projector,
         language_model,
         image_size,
+        num_patches,
     })
 }
 

@@ -59,6 +59,9 @@ pub trait Engine: Send + Sync {
 
     fn vlm_image_size(&self) -> Option<i32>;
 
+    /// Sequence positions that one image takes once its features replace the `<image>` token.
+    fn vlm_image_positions(&self) -> Option<i32>;
+
     fn replace_image_tokens(&self, tokens: &mut [u32]);
 
     /// Apply the chat template and tokenize the result.
@@ -124,6 +127,10 @@ impl Engine for InferenceEngine {
 
     fn vlm_image_size(&self) -> Option<i32> {
         Self::vlm_image_size(self)
+    }
+
+    fn vlm_image_positions(&self) -> Option<i32> {
+        Self::vlm_image_positions(self)
     }
 
     fn replace_image_tokens(&self, tokens: &mut [u32]) {

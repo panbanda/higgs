@@ -209,6 +209,32 @@ pub fn context_length<P: AsRef<Path>>(model_dir: P) -> Option<u32> {
     context_length_from_config(&config)
 }
 
+/// The number of positions that a rope-scaling block reaches: its `original_max_position_embeddings`
+/// times its `factor`. `None` when the config has no such block.
+pub fn rope_scaled_length<P: AsRef<Path>>(model_dir: P) -> Option<u64> {
+    let text = std::fs::read_to_string(model_dir.as_ref().join("config.json")).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&text).ok()?;
+    rope_scaled_length_from_config(&config)
+}
+
+fn rope_scaled_length_from_config(config: &serde_json::Value) -> Option<u64> {
+    let scaling = ["rope_scaling", "rope_parameters"].iter().find_map(|key| {
+        crate::mlx_tuning::config_lookup(config, key).filter(|value| value.is_object())
+    })?;
+    let original = scaling.get("original_max_position_embeddings")?.as_f64()?;
+    let factor = scaling.get("factor")?.as_f64()?;
+    let reach = original * factor;
+    (reach.is_finite() && reach >= 1.0).then(|| {
+        #[allow(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let positions = reach as u64;
+        positions
+    })
+}
+
 fn context_length_from_config(config: &serde_json::Value) -> Option<u32> {
     crate::mlx_tuning::config_lookup_u64(config, "max_position_embeddings")
         .and_then(|length| u32::try_from(length).ok())
@@ -1200,6 +1226,27 @@ mod tests {
             "rope_scaling": {"rope_type": "llama3", "factor": 32.0, "original_max_position_embeddings": 8192},
         });
         assert_eq!(context_length_from_config(&config), Some(131_072));
+    }
+
+    #[test]
+    fn the_rope_scaled_length_is_the_original_length_times_the_factor() {
+        let reach =
+            |text: &str| rope_scaled_length_from_config(&serde_json::from_str(text).unwrap());
+        assert_eq!(
+            reach(
+                r#"{"rope_scaling": {"factor": 32.0, "original_max_position_embeddings": 8192}}"#
+            ),
+            Some(262_144)
+        );
+        assert_eq!(
+            reach(
+                r#"{"text_config": {"rope_parameters": {"factor": 4, "original_max_position_embeddings": 32768}}}"#
+            ),
+            Some(131_072)
+        );
+        assert_eq!(reach(r#"{"rope_scaling": {"rope_type": "default"}}"#), None);
+        assert_eq!(reach(r#"{"rope_scaling": null}"#), None);
+        assert_eq!(reach("{}"), None);
     }
 
     #[test]

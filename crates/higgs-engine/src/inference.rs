@@ -222,6 +222,7 @@ struct ModelFacts {
     decodes_in_batches: bool,
     is_vlm: bool,
     image_size: Option<i32>,
+    image_positions: Option<i32>,
 }
 
 /// How an active request produces its next tokens.
@@ -448,6 +449,7 @@ pub struct InferenceEngine {
     hidden_size: AtomicI32,
     is_vlm: bool,
     image_size: Option<i32>,
+    image_positions: Option<i32>,
     decodes_in_batches: bool,
     enable_thinking: bool,
     think_close_token: Option<u32>,
@@ -549,6 +551,7 @@ impl InferenceEngine {
                     ) > 1,
                     is_vlm: model.is_vlm(),
                     image_size: model.image_size(),
+                    image_positions: model.image_positions(),
                 };
                 if loaded_tx.send(Ok(facts)).is_err() {
                     return;
@@ -575,6 +578,7 @@ impl InferenceEngine {
             hidden_size: AtomicI32::new(facts.hidden_size),
             is_vlm: facts.is_vlm,
             image_size: facts.image_size,
+            image_positions: facts.image_positions,
             decodes_in_batches: facts.decodes_in_batches,
             enable_thinking: thinking.enabled,
             think_close_token: thinking.close_token,
@@ -641,6 +645,11 @@ impl InferenceEngine {
     }
 
     /// The image size the VLM's vision encoder expects, or `None`.
+    /// Sequence positions that one image takes once its features replace the `<image>` sentinel.
+    pub const fn vlm_image_positions(&self) -> Option<i32> {
+        self.image_positions
+    }
+
     pub const fn vlm_image_size(&self) -> Option<i32> {
         self.image_size
     }

@@ -41,6 +41,7 @@ pub(super) fn stream_once(
         prompt_token_count,
         reasoning,
         tool_parser,
+        ..
     } = prepare(&**engine, request)?;
     let tokenizer = engine.tokenizer().clone();
     let pending_metrics = metrics.map(|handle| {

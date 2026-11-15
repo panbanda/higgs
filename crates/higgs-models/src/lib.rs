@@ -937,6 +937,23 @@ impl AnyModel {
         matches!(self, Self::LlavaQwen2(_))
     }
 
+    /// Sequence positions that one image takes, or `None` for text-only models.
+    pub const fn image_positions(&self) -> Option<i32> {
+        match self {
+            Self::LlavaQwen2(m) => Some(m.num_patches()),
+            Self::Transformer(_)
+            | Self::Qwen3Next(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Gemma3(_)
+            | Self::Gemma4(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => None,
+        }
+    }
+
     /// The expected image size for the VLM's vision encoder, or `None` for text-only models.
     pub const fn image_size(&self) -> Option<i32> {
         match self {
