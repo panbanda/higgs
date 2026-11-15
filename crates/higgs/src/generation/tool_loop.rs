@@ -345,6 +345,11 @@ pub(super) async fn complete(
                 // The tool results filled the context. The earlier rounds already ran their
                 // tools, so end with what they produced instead of failing the request.
                 if let Some(mut last) = previous_round.take() {
+                    // The trace already holds this round's text and calls, so repeating them
+                    // in the answer would put a reply in the history that the model never gave.
+                    last.text.clear();
+                    last.reasoning = None;
+                    last.logprobs = None;
                     last.tool_calls.clear();
                     "length".clone_into(&mut last.finish_reason);
                     return Ok(finish(last, trace));
@@ -1337,7 +1342,8 @@ mod tests {
 
     /// A stub whose first round fits and whose second round, after the tool result, does not.
     fn overflowing_stub() -> StubEngine {
-        let mut stub = stub(vec![(CALL_ECHO, 5, 3), ("never", 5, 3)]);
+        let first_round = format!("Let me check. {CALL_ECHO}");
+        let mut stub = stub(vec![(&first_round, 5, 3), ("never", 5, 3)]);
         stub.script.streams = vec![
             vec![
                 token_event("Let me check. ", 3, None),
@@ -1367,6 +1373,49 @@ mod tests {
             "round two never generated"
         );
         assert_eq!(body["usage"]["prompt_tokens"], 5);
+        let content = body["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !content.contains("Let me check."),
+            "the earlier round's text is not repeated: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_response_does_not_repeat_the_text_of_the_round_that_overflowed() {
+        let fake = echo_fake();
+        let hub = files_hub(&fake, Duration::from_secs(2)).await;
+        let mut stub = overflowing_stub();
+        stub.script
+            .streams
+            .push(vec![token_event("noted", 2, Some("stop"))]);
+        stub.script.prompts.push(vec![1; 3]);
+        let (app, engine) = app_with_stub_config_and_tools(stub, "", hub);
+        let (first_status, first_text) = post_json(
+            &app,
+            "/v1/responses",
+            &json!({"model": "stub", "input": "go", "mcp": {}}),
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::OK, "{first_text}");
+        let first: serde_json::Value = serde_json::from_str(&first_text).unwrap();
+        let id = first["id"].as_str().unwrap();
+        let (second_status, second) = post_json(
+            &app,
+            "/v1/responses",
+            &json!({"model": "stub", "input": "again", "previous_response_id": id}),
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::OK, "{second}");
+
+        let prompts = engine.recorded_prompt_messages();
+        let follow_up = prompts.last().unwrap();
+        let repeats = follow_up
+            .iter()
+            .filter(|(_, content)| content.contains("Let me check."))
+            .count();
+        assert_eq!(repeats, 1, "{follow_up:?}");
     }
 
     #[tokio::test]
