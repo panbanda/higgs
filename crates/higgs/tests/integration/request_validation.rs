@@ -421,23 +421,23 @@ fn make_single_user_message() -> Vec<AnthropicMessage> {
 }
 
 #[test]
-fn anthropic_messages_to_engine_without_system() {
-    use higgs::anthropic_adapter::anthropic_messages_to_engine;
+fn anthropic_history_without_system() {
+    use higgs::anthropic_tools::messages_with_tool_history;
 
     let messages = make_single_user_message();
-    let result = anthropic_messages_to_engine(&messages, None);
+    let result = messages_with_tool_history(&messages, None);
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].role, "user");
     assert_eq!(result[0].content, "hello");
 }
 
 #[test]
-fn anthropic_messages_to_engine_with_system() {
-    use higgs::anthropic_adapter::anthropic_messages_to_engine;
+fn anthropic_history_with_system() {
+    use higgs::anthropic_tools::messages_with_tool_history;
 
     let messages = make_single_user_message();
     let system = higgs::types::anthropic::SystemPrompt::Text("be helpful".to_owned());
-    let result = anthropic_messages_to_engine(&messages, Some(&system));
+    let result = messages_with_tool_history(&messages, Some(&system));
     assert_eq!(result.len(), 2);
     assert_eq!(result[0].role, "system");
     assert_eq!(result[0].content, "be helpful");
@@ -445,8 +445,8 @@ fn anthropic_messages_to_engine_with_system() {
 }
 
 #[test]
-fn anthropic_messages_to_engine_concatenates_text_blocks() {
-    use higgs::anthropic_adapter::anthropic_messages_to_engine;
+fn anthropic_history_concatenates_text_blocks() {
+    use higgs::anthropic_tools::messages_with_tool_history;
 
     let messages = vec![AnthropicMessage {
         role: "user".to_owned(),
@@ -459,13 +459,13 @@ fn anthropic_messages_to_engine_concatenates_text_blocks() {
             },
         ]),
     }];
-    let result = anthropic_messages_to_engine(&messages, None);
+    let result = messages_with_tool_history(&messages, None);
     assert_eq!(result[0].content, "part one part two");
 }
 
 #[test]
-fn anthropic_messages_to_engine_ignores_tool_blocks() {
-    use higgs::anthropic_adapter::anthropic_messages_to_engine;
+fn anthropic_history_keeps_text_next_to_tool_use() {
+    use higgs::anthropic_tools::messages_with_tool_history;
 
     let messages = vec![AnthropicMessage {
         role: "assistant".to_owned(),
@@ -480,8 +480,9 @@ fn anthropic_messages_to_engine_ignores_tool_blocks() {
             },
         ]),
     }];
-    let result = anthropic_messages_to_engine(&messages, None);
+    let result = messages_with_tool_history(&messages, None);
     assert_eq!(result[0].content, "thinking...");
+    assert_eq!(result[0].tool_calls.as_ref().map(Vec::len), Some(1));
 }
 
 // ---------------------------------------------------------------------------

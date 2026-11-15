@@ -20,7 +20,7 @@ impl MetricsLogger {
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Self {
             path,
-            max_size: config.max_size_mb * 1024 * 1024,
+            max_size: config.max_size.bytes(),
             max_files: config.max_files,
             writer: BufWriter::new(file),
         })
@@ -80,7 +80,7 @@ mod tests {
         MetricsLogConfig {
             enabled: true,
             path: dir.join("metrics.jsonl").to_string_lossy().to_string(),
-            max_size_mb,
+            max_size: crate::config::units::ByteSize::from_mebibytes(max_size_mb),
             max_files,
         }
     }
@@ -92,7 +92,7 @@ mod tests {
         let config = MetricsLogConfig {
             enabled: true,
             path: nested.join("metrics.jsonl").to_string_lossy().to_string(),
-            max_size_mb: 1,
+            max_size: crate::config::units::ByteSize::from_mebibytes(1),
             max_files: 3,
         };
         let _logger = MetricsLogger::new(&config).unwrap();
@@ -156,7 +156,7 @@ mod tests {
                 .join("metrics.jsonl")
                 .to_string_lossy()
                 .to_string(),
-            max_size_mb: 0,
+            max_size: crate::config::units::ByteSize::from_mebibytes(0),
             max_files: 3,
         };
         let log_path = PathBuf::from(&config.path);
@@ -186,7 +186,7 @@ mod tests {
                 .join("metrics.jsonl")
                 .to_string_lossy()
                 .to_string(),
-            max_size_mb: 0,
+            max_size: crate::config::units::ByteSize::from_mebibytes(0),
             max_files: 3,
         };
         let log_path = PathBuf::from(&config.path);
@@ -216,7 +216,7 @@ mod tests {
                 .join("metrics.jsonl")
                 .to_string_lossy()
                 .to_string(),
-            max_size_mb: 0,
+            max_size: crate::config::units::ByteSize::from_mebibytes(0),
             max_files: 2,
         };
         let log_path = PathBuf::from(&config.path);

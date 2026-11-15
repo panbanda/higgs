@@ -65,6 +65,7 @@ fn build_test_state(mock_url: &str, format: ApiFormat) -> Arc<AppState> {
         config,
         http_client: reqwest::Client::new(),
         metrics: Some(metrics),
+        tools: Arc::new(higgs::tools::ToolHub::disabled()),
     })
 }
 
@@ -120,6 +121,7 @@ fn build_selective_test_state(mock_url: &str, metrics: Arc<MetricsStore>) -> Arc
         config,
         http_client: reqwest::Client::new(),
         metrics: Some(metrics),
+        tools: Arc::new(higgs::tools::ToolHub::disabled()),
     })
 }
 
@@ -244,6 +246,7 @@ async fn proxy_model_rewrite() {
         config,
         http_client: reqwest::Client::new(),
         metrics: Some(metrics),
+        tools: Arc::new(higgs::tools::ToolHub::disabled()),
     });
     let app = build_app(state);
 
@@ -330,7 +333,7 @@ async fn metrics_record_success_and_all_http_failures_once() {
     let logger = MetricsLogger::new(&MetricsLogConfig {
         enabled: true,
         path: log_path.to_string_lossy().into_owned(),
-        max_size_mb: 1,
+        max_size: higgs::config::units::ByteSize::from_mebibytes(1),
         max_files: 1,
     })
     .unwrap();

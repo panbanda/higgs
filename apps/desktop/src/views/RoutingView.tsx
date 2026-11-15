@@ -23,7 +23,7 @@ export function RoutingView({ data, onEditConfig }: RoutingViewProps) {
   const config = data.config;
   const hasConfig = Object.keys(config).length > 0;
   const traffic = groupBy(data.records, (r) => r.provider);
-  const providerEntries = Object.entries(config.provider ?? {});
+  const providerEntries = Object.entries(config.providers ?? {});
 
   const providerRows: ProviderRow[] = [
     {
@@ -45,7 +45,7 @@ export function RoutingView({ data, onEditConfig }: RoutingViewProps) {
   ];
 
   const routes = config.routes ?? [];
-  const auto = config.auto_router ?? {};
+  const auto = config.routing?.auto ?? {};
 
   return (
     <div className="view">
@@ -102,7 +102,7 @@ export function RoutingView({ data, onEditConfig }: RoutingViewProps) {
       <h2 className="section-label">Routes</h2>
       <div className="panel">
         <div className="vrow head routes-grid">
-          <span className="meta">Pattern</span>
+          <span className="meta">Match</span>
           <span className="meta">Provider</span>
           <span className="meta">Model rewrite</span>
           <span className="meta">Name</span>
@@ -110,8 +110,8 @@ export function RoutingView({ data, onEditConfig }: RoutingViewProps) {
         </div>
         {routes.length === 0 && <div className="config-list-empty">No routes configured</div>}
         {routes.map((route, index) => (
-          <div className="vrow routes-grid" key={`${index}-${route.pattern ?? ""}`}>
-            <span className="mono">{route.pattern ?? "–"}</span>
+          <div className="vrow routes-grid" key={`${index}-${route.match ?? ""}`}>
+            <span className="mono">{route.match ?? "–"}</span>
             <span>{route.provider}</span>
             <span className="mono muted">{route.model ?? "–"}</span>
             <span>{route.name ?? "–"}</span>
@@ -125,7 +125,7 @@ export function RoutingView({ data, onEditConfig }: RoutingViewProps) {
         <div className="panel" style={{ padding: "16px 20px", display: "flex", flexDirection: "column", gap: 8 }}>
           <span className="meta">Default route</span>
           <span className="label">
-            Provider: <span className="mono">{config.default?.provider ?? "higgs"}</span>
+            Provider: <span className="mono">{config.routing?.default ?? "higgs"}</span>
           </span>
         </div>
         <div className="panel" style={{ padding: "16px 20px", display: "flex", flexDirection: "column", gap: 8 }}>
@@ -133,7 +133,7 @@ export function RoutingView({ data, onEditConfig }: RoutingViewProps) {
           <span className="label">Enabled: {auto.enabled ? "yes" : "no"}</span>
           <span className="label">Force: {auto.force ? "yes" : "no"}</span>
           <span className="label">Model: {auto.model ?? "–"}</span>
-          <span className="label">Timeout: {auto.timeout_ms ? formatMs(auto.timeout_ms) : "–"}</span>
+          <span className="label">Timeout: {auto.timeout ?? "–"}</span>
         </div>
       </div>
     </div>

@@ -588,7 +588,7 @@ mod tests {
         let config = crate::config::MetricsLogConfig {
             enabled: true,
             path: dir.join("metrics.jsonl").to_string_lossy().to_string(),
-            max_size_mb: 50,
+            max_size: crate::config::units::ByteSize::from_mebibytes(50),
             max_files: 5,
         };
         let logger = crate::metrics_log::MetricsLogger::new(&config).unwrap();

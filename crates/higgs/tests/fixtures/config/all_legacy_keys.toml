@@ -1,0 +1,121 @@
+# Every key of the pre-redesign schema, each with a value that differs from its default.
+
+[server]
+host = "0.0.0.0"
+port = 8123
+max_tokens = 16384
+api_key = "sk-fixture-not-a-secret"
+rate_limit = 120
+timeout = 90.5 # seconds
+max_body_size = 20971520 # bytes
+cors_origins = ["https://app.example.com", "http://localhost:5173"]
+
+[local]
+mlx_profile = "throughput"
+raise_wired_limit = true
+thinking_budget = 128
+load = "on_demand"
+idle_ttl_seconds = 900
+max_loaded_models = 3
+memory_limit_gb = 48.5
+memory_guard = "balanced"
+
+[[models]]
+path = "mlx-community/Qwen3-4B-4bit"
+name = "qwen"
+mlx_profile = "latency"
+batch = true
+prefill_yield_tokens = 512
+thinking_budget = 64
+load = "startup"
+idle_ttl_seconds = 0
+pinned = true
+kv_disk_dir = "/var/lib/higgs/prefix-kv"
+kv_disk_space_mb = 8192
+
+[[models]]
+path = "mlx-community/Qwen3-8B-4bit"
+name = "turbo"
+batch = false
+kv_cache = "turboquant"
+kv_bits = 4
+kv_key_bits = 3
+kv_value_bits = 4
+kv_norm_correction = false
+kv_adaptive_dense_layers = 2
+kv_seed = 7
+
+[[models]]
+path = "mlx-community/DeepSeek-V2-Lite-4bit"
+name = "deepseek"
+batch = "auto"
+mla_latent_cache = true
+
+[[models]]
+path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
+name = "router"
+
+[provider.anthropic]
+url = "https://api.anthropic.com"
+format = "anthropic"
+api_key = "sk-ant-fixture-not-a-secret"
+stub_count_tokens = true
+
+[provider.ollama]
+url = "http://localhost:11434"
+strip_auth = true
+
+[[routes]]
+name = "code"
+description = "Programming questions"
+pattern = "claude-.*"
+provider = "anthropic"
+model = "claude-sonnet-4-5"
+
+[[routes]]
+pattern = "llama.*"
+provider = "ollama"
+
+[default]
+provider = "ollama"
+
+[auto_router]
+enabled = true
+force = true
+model = "router"
+timeout_ms = 1500
+
+[logging.metrics]
+enabled = true
+path = "/var/log/higgs/metrics.jsonl"
+max_size_mb = 25
+max_files = 3
+
+[retention]
+enabled = true
+minutes = 30
+
+[mcp]
+max_result_bytes = 131072
+
+[mcp.servers.filesystem]
+enabled = true
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+env = { EXAMPLE_TOKEN = "literal-value" }
+cwd = "/tmp"
+timeout_seconds = 45
+
+[mcp.servers.remote]
+url = "https://mcp.example.com/mcp"
+headers = { Authorization = "Bearer literal-token" }
+timeout_seconds = 12.5
+
+[web]
+enabled = true
+search_provider = "searxng"
+searxng_url = "http://localhost:8888"
+allow_private_addresses = true
+expose_as_tools = true
+timeout_seconds = 20

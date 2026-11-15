@@ -1,0 +1,231 @@
+{
+  "schema_version": 1,
+  "metadata": {
+    "bench_name": "higgs_bench",
+    "bench_version": "1.0.4",
+    "higgs_version": "1.8.2",
+    "git_commit": "9d79f87dccf0b21f15b63c7191e0067e77aabdc7",
+    "git_commit_short": "9d79f87",
+    "git_dirty": true,
+    "started_at": "2026-11-14T01:37:12.700865Z",
+    "duration_ms": 138027,
+    "host": {
+      "hostname": "redacted",
+      "os": "Darwin 26.5.1 (25.5.0)",
+      "cpu": "Apple M4 Max",
+      "ram_gb": 128.0,
+      "gpu": "Apple Silicon (MLX)"
+    },
+    "mlx_version": null,
+    "model": {
+      "key": "Qwen3-1.7B-4bit",
+      "path": "Qwen3-1.7B-4bit",
+      "quantization": "n/a",
+      "approx_size_gb": 0.0
+    },
+    "args": [
+      "<local-path:higgs>",
+      "bench",
+      "<local-path:Qwen3-1.7B-4bit>",
+      "--port",
+      "8870",
+      "--scenarios",
+      "decode,prefill",
+      "--trials",
+      "5",
+      "--warmup",
+      "1",
+      "--max-tokens",
+      "128",
+      "--prefill-tokens",
+      "2048",
+      "--json",
+      "<local-path:higgs-perf.XXXXXX.5O66RUf86F>"
+    ]
+  },
+  "params": {
+    "model": "Qwen3-1.7B-4bit",
+    "port": 8870,
+    "plan": {
+      "scenarios": [
+        "decode",
+        "prefill"
+      ],
+      "trials": 5,
+      "warmup": 1,
+      "max_tokens": 128,
+      "prefill_tokens": [
+        2048
+      ],
+      "prefix_cache_tokens": 2048,
+      "concurrency": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "concurrency_rounds": 2
+    }
+  },
+  "results": {
+    "decode": {
+      "trials": [
+        {
+          "ttft_ms": 25.665209,
+          "decode_tokps": 335.8216607805856,
+          "e2e_tokps": 316.95554296125005,
+          "completion_tokens": 128,
+          "prompt_tokens": 62,
+          "cached_tokens": 32,
+          "wall_ms": 403.842125,
+          "usage_missing": false
+        },
+        {
+          "ttft_ms": 25.318625,
+          "decode_tokps": 334.1511705157636,
+          "e2e_tokps": 315.74834979860253,
+          "completion_tokens": 128,
+          "prompt_tokens": 62,
+          "cached_tokens": 32,
+          "wall_ms": 405.386125,
+          "usage_missing": false
+        },
+        {
+          "ttft_ms": 25.558125,
+          "decode_tokps": 332.75399727027485,
+          "e2e_tokps": 314.32528215562434,
+          "completion_tokens": 128,
+          "prompt_tokens": 62,
+          "cached_tokens": 32,
+          "wall_ms": 407.221459,
+          "usage_missing": false
+        },
+        {
+          "ttft_ms": 24.925917,
+          "decode_tokps": 336.72220815530585,
+          "e2e_tokps": 318.33556894849113,
+          "completion_tokens": 128,
+          "prompt_tokens": 62,
+          "cached_tokens": 32,
+          "wall_ms": 402.091417,
+          "usage_missing": false
+        },
+        {
+          "ttft_ms": 25.530958,
+          "decode_tokps": 334.60981973588895,
+          "e2e_tokps": 315.98891570131644,
+          "completion_tokens": 128,
+          "prompt_tokens": 62,
+          "cached_tokens": 32,
+          "wall_ms": 405.0775,
+          "usage_missing": false
+        }
+      ],
+      "ttft_ms": {
+        "mean": 25.399766800000002,
+        "median": 25.530958,
+        "p95": 25.6437922,
+        "stdev": 0.2622463104307863
+      },
+      "decode_tokps": {
+        "mean": 334.8117712915638,
+        "median": 334.60981973588895,
+        "p95": 336.5420986803618,
+        "stdev": 1.3697633028301097
+      },
+      "e2e_tokps": {
+        "mean": 316.2707319130569,
+        "median": 315.98891570131644,
+        "p95": 318.0595637510429,
+        "stdev": 1.3318856080027437
+      },
+      "completion_tokens": {
+        "mean": 128.0,
+        "median": 128.0,
+        "p95": 128.0,
+        "stdev": 0.0
+      },
+      "trials_below_max_tokens": 0,
+      "trials_with_usage_missing": 0
+    },
+    "prefill": {
+      "sizes": [
+        {
+          "target_tokens": 2048,
+          "trials": [
+            {
+              "metrics": {
+                "ttft_ms": 394.0135,
+                "decode_tokps": 19834.973024436687,
+                "e2e_tokps": 5.075318796760879,
+                "completion_tokens": 2,
+                "prompt_tokens": 1509,
+                "cached_tokens": 0,
+                "wall_ms": 394.063916,
+                "usage_missing": false
+              },
+              "prefill_tokps": 3829.818013849779
+            },
+            {
+              "metrics": {
+                "ttft_ms": 392.40304199999997,
+                "decode_tokps": 20495.58320182001,
+                "e2e_tokps": 5.096166795072658,
+                "completion_tokens": 2,
+                "prompt_tokens": 1512,
+                "cached_tokens": 0,
+                "wall_ms": 392.451833,
+                "usage_missing": false
+              },
+              "prefill_tokps": 3853.1811381829198
+            },
+            {
+              "metrics": {
+                "ttft_ms": 402.07370799999995,
+                "decode_tokps": 16304.170606841228,
+                "e2e_tokps": 4.973453668829984,
+                "completion_tokens": 2,
+                "prompt_tokens": 1516,
+                "cached_tokens": 0,
+                "wall_ms": 402.135042,
+                "usage_missing": false
+              },
+              "prefill_tokps": 3770.452953864867
+            },
+            {
+              "metrics": {
+                "ttft_ms": 403.433084,
+                "decode_tokps": 12030.075187969926,
+                "e2e_tokps": 4.956430387161969,
+                "completion_tokens": 2,
+                "prompt_tokens": 1515,
+                "cached_tokens": 0,
+                "wall_ms": 403.516209,
+                "usage_missing": false
+              },
+              "prefill_tokps": 3755.26960996585
+            },
+            {
+              "metrics": {
+                "ttft_ms": 399.07225,
+                "decode_tokps": 15113.273988544137,
+                "e2e_tokps": 5.010793035239201,
+                "completion_tokens": 2,
+                "prompt_tokens": 1516,
+                "cached_tokens": 0,
+                "wall_ms": 399.138417,
+                "usage_missing": false
+              },
+              "prefill_tokps": 3798.8108669545427
+            }
+          ],
+          "prompt_tokens_median": 1515.0,
+          "ttft_ms_median": 399.07225,
+          "prefill_tokps_median": 3798.8108669545427,
+          "trials_with_cached_tokens": 0
+        }
+      ]
+    },
+    "rss_mb_peak": 1167.78125
+  }
+}

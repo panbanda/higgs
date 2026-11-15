@@ -311,19 +311,7 @@ pub fn anthropic_to_openai_request(body: &[u8]) -> Result<Bytes, ServerError> {
 
     // tools translation (Anthropic -> OpenAI format)
     if let Some(tools) = anthropic.get("tools").and_then(|t| t.as_array()) {
-        let openai_tools: Vec<serde_json::Value> = tools
-            .iter()
-            .map(|tool| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": tool.get("name").cloned().unwrap_or(serde_json::Value::String(String::new())),
-                        "description": tool.get("description").cloned().unwrap_or(serde_json::Value::String(String::new())),
-                        "parameters": tool.get("input_schema").cloned().unwrap_or(serde_json::json!({"type": "object"})),
-                    }
-                })
-            })
-            .collect();
+        let openai_tools = crate::anthropic_tools::openai_tools(tools);
         if !openai_tools.is_empty() {
             if let Some(obj) = result.as_object_mut() {
                 obj.insert("tools".to_owned(), serde_json::Value::Array(openai_tools));

@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn streaming_timing_feeds_ttft_and_throughput() {
-        let metrics = MetricsStore::new(Duration::from_secs(60));
+        let metrics = MetricsStore::new(Duration::from_mins(1));
         let mut record = sample_record("model-a", "higgs", 200);
         // 20 tokens over a 2s request with a 1s TTFT: 20 tok/s of decode.
         record.duration = Duration::from_secs(2);
@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn zero_decode_span_does_not_contribute_to_throughput() {
-        let metrics = MetricsStore::new(Duration::from_secs(60));
+        let metrics = MetricsStore::new(Duration::from_mins(1));
         let mut record = sample_record("model-a", "higgs", 200);
         // TTFT at or past the whole request duration leaves no decode time,
         // even though output tokens were recorded.

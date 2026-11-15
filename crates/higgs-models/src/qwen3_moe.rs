@@ -10,7 +10,6 @@ use mlx_rs::{
     Array,
     builder::Builder,
     error::Exception,
-    fast,
     macros::ModuleParameters,
     module::Module,
     nn,
@@ -19,14 +18,13 @@ use mlx_rs::{
 use serde::Deserialize;
 
 use crate::{
-    cache::{KeyValueCache, SteppingKeyValueCache},
+    attention::{DecodeKernel, HeadCounts, HeadNorms, Projections, SelfAttention},
+    cache::KeyValueCache,
     error::ModelError,
     qwen3_next::{
         QEmbedding, QLinear, QuantizationConfig, SwitchMlpWeights, new_mlp_projections, swiglu,
     },
-    utils::{
-        AttentionMask, apply_rope, cached_scaled_dot_product_attention, create_attention_mask,
-    },
+    utils::{AttentionMask, create_attention_mask},
 };
 
 // ---------------------------------------------------------------------------
@@ -155,93 +153,32 @@ impl Qwen3MoeAttention {
         })
     }
 
-    #[allow(non_snake_case)]
     fn forward<C: KeyValueCache>(
         &mut self,
         x: &Array,
         mask: Option<&AttentionMask>,
         cache: Option<&mut C>,
     ) -> Result<Array, Exception> {
-        let shape = x.shape();
-        let B = *shape
-            .first()
-            .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
-        let L = *shape
-            .get(1)
-            .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
-
-        let mut queries = self
-            .q_norm
-            .forward(
-                &self
-                    .q_proj
-                    .forward(x)?
-                    .reshape(&[B, L, self.num_attention_heads, -1])?,
-            )?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let mut keys = self
-            .k_norm
-            .forward(
-                &self
-                    .k_proj
-                    .forward(x)?
-                    .reshape(&[B, L, self.num_key_value_heads, -1])?,
-            )?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let values = self
-            .v_proj
-            .forward(x)?
-            .reshape(&[B, L, self.num_key_value_heads, -1])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-
-        if let Some(kv_cache) = cache {
-            queries = apply_rope(&queries, &self.rope, kv_cache.offset())?;
-            keys = apply_rope(&keys, &self.rope, kv_cache.offset())?;
-
-            // Causal mask: bypass TurboQuant loop, use MLX fast SDPA causal mode
-            if matches!(mask, Some(AttentionMask::Causal)) {
-                let (cached_keys, cached_values) = kv_cache.update_and_fetch(keys, values)?;
-                let output = fast::scaled_dot_product_attention(
-                    queries,
-                    cached_keys,
-                    cached_values,
-                    self.scale,
-                    Some(fast::ScaledDotProductAttentionMask::Causal),
-                    None::<&Array>,
-                )?
-                .transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[B, L, -1])?;
-                return self.o_proj.forward(&output);
-            }
-
-            // Array mask or None: existing cached path (supports TurboQuant)
-            let array_mask = match mask {
-                Some(AttentionMask::Array(a)) => Some(a),
-                _ => None,
-            };
-            let output = cached_scaled_dot_product_attention(
-                queries, kv_cache, keys, values, self.scale, array_mask,
-            )?
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[B, L, -1])?;
-
-            return self.o_proj.forward(&output);
+        let projections = Projections {
+            queries: self.q_proj.forward(x)?,
+            keys: self.k_proj.forward(x)?,
+            values: self.v_proj.forward(x)?,
+        };
+        let output = SelfAttention {
+            head_counts: HeadCounts {
+                query: self.num_attention_heads,
+                key_value: self.num_key_value_heads,
+            },
+            scale: self.scale,
+            rope: &self.rope,
+            norms: HeadNorms {
+                query: Some(&mut self.q_norm),
+                key: Some(&mut self.k_norm),
+                value: None,
+            },
+            decode: DecodeKernel::CacheNative,
         }
-
-        queries = apply_rope(&queries, &self.rope, 0)?;
-        keys = apply_rope(&keys, &self.rope, 0)?;
-
-        let sdpa_mask = mask.map(fast::ScaledDotProductAttentionMask::from);
-        let output = fast::scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            self.scale,
-            sdpa_mask,
-            None::<&Array>,
-        )?
-        .transpose_axes(&[0, 2, 1, 3])?
-        .reshape(&[B, L, -1])?;
+        .forward(&projections, mask.map(Into::into), cache)?;
 
         self.o_proj.forward(&output)
     }
@@ -505,25 +442,16 @@ impl Qwen3MoeCausalLM {
         })
     }
 
-    /// Forward pass returning hidden states before the LM head.
-    #[allow(non_snake_case)]
-    pub fn forward_hidden(
+    /// Forward pass returning hidden states before the LM head. An empty
+    /// cache runs without caching.
+    pub fn forward_hidden<C: KeyValueCache>(
         &mut self,
         inputs: &Array,
         mask: Option<&Array>,
-        kv_cache: &mut Vec<Option<SteppingKeyValueCache>>,
+        kv_cache: &mut Vec<Option<C>>,
     ) -> Result<Array, Exception> {
-        let mut h = self.model.embed_tokens.forward(inputs)?;
-
-        let computed_mask: Option<AttentionMask> = match mask {
-            Some(m) => Some(AttentionMask::Array(m.clone())),
-            None => create_attention_mask(&h, kv_cache, None)?,
-        };
-
         if kv_cache.is_empty() {
-            *kv_cache = (0..self.model.layers.len())
-                .map(|_| Some(SteppingKeyValueCache::new()))
-                .collect();
+            *kv_cache = (0..self.model.layers.len()).map(|_| None).collect();
         } else if kv_cache.len() != self.model.layers.len() {
             return Err(Exception::custom(format!(
                 "kv_cache length ({}) must match num layers ({})",
@@ -531,6 +459,12 @@ impl Qwen3MoeCausalLM {
                 self.model.layers.len()
             )));
         }
+        let mut h = self.model.embed_tokens.forward(inputs)?;
+
+        let computed_mask: Option<AttentionMask> = match mask {
+            Some(m) => Some(AttentionMask::Array(m.clone())),
+            None => create_attention_mask(&h, kv_cache, None)?,
+        };
 
         for (layer, layer_cache) in self.model.layers.iter_mut().zip(kv_cache.iter_mut()) {
             h = layer.forward(&h, computed_mask.as_ref(), layer_cache.as_mut())?;
@@ -540,31 +474,31 @@ impl Qwen3MoeCausalLM {
     }
 
     /// Forward pass producing logits.
-    #[allow(non_snake_case)]
-    pub fn forward(
+    pub fn forward<C: KeyValueCache>(
         &mut self,
         inputs: &Array,
         mask: Option<&Array>,
-        kv_cache: &mut Vec<Option<SteppingKeyValueCache>>,
+        kv_cache: &mut Vec<Option<C>>,
     ) -> Result<Array, Exception> {
         let h = self.forward_hidden(inputs, mask, kv_cache)?;
-        let _h_last = h.index((.., -1.., ..)); // [B, 1, hidden]
+        self.last_position_logits(&h)
+    }
 
-        let T = inputs.shape().get(1).copied().unwrap_or(1);
-        let lm_input = if T > 1 { h.index((.., -1.., ..)) } else { h };
-        match self.lm_head.as_ref() {
-            Some(head) => head.forward(&lm_input),
-            None => self.model.embed_tokens.as_linear(&lm_input),
-        }
+    fn last_position_logits(&self, hidden: &Array) -> Result<Array, Exception> {
+        let lm_input = hidden.index((.., -1.., ..));
+        self.lm_head.as_ref().map_or_else(
+            || self.model.embed_tokens.as_linear(&lm_input),
+            |head| head.forward(&lm_input),
+        )
     }
 
     /// Forward pass producing logits for every input position.
     #[allow(non_snake_case)]
-    pub fn forward_all_logits(
+    pub fn forward_all_logits<C: KeyValueCache>(
         &mut self,
         inputs: &Array,
         mask: Option<&Array>,
-        kv_cache: &mut Vec<Option<SteppingKeyValueCache>>,
+        kv_cache: &mut Vec<Option<C>>,
     ) -> Result<Array, Exception> {
         let h = self.forward_hidden(inputs, mask, kv_cache)?;
         match self.lm_head.as_ref() {
@@ -632,6 +566,7 @@ pub(crate) fn load_qwen3_moe_model_with_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::SteppingKeyValueCache;
 
     fn default_moe_args() -> Qwen3MoeModelArgs {
         Qwen3MoeModelArgs {
@@ -913,7 +848,7 @@ mod tests {
     fn test_forward_unloaded_model_returns_error() {
         let args = small_moe_args();
         let mut model = Qwen3MoeCausalLM::new(args).unwrap();
-        let mut cache = vec![];
+        let mut cache: Vec<Option<SteppingKeyValueCache>> = vec![];
 
         let input = Array::from_slice(&[1_i32, 2, 3], &[1, 3]);
         // Unloaded QLinear weights are float32 placeholders;

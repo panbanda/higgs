@@ -1,4 +1,6 @@
 pub mod adapter;
+mod attention;
+pub mod batched_cache;
 pub mod bonsai_q1;
 pub mod cache;
 pub mod deepseek_v2;
@@ -492,47 +494,119 @@ impl AnyModel {
         Ok(logits)
     }
 
-    /// Batched decode forward pass for N requests each with 1 token.
-    ///
-    /// Only supported for the `Transformer` variant (Llama/Qwen/Mistral).
+    /// Batched decode: one forward pass appending one token to each of the
+    /// `B` sequences held in `cache`. `inputs` is `[B, 1]`; returns
+    /// `[B, 1, vocab]` logits. See [`Self::supports_batched_decode`].
     pub fn forward_batched(
         &mut self,
         inputs: &Array,
-        caches: &mut [&mut AnyCache],
+        batch: &mut batched_cache::AnyBatchedCache,
     ) -> Result<Array, Exception> {
-        let mut kv_refs: Vec<&mut Vec<Option<cache::SteppingKeyValueCache>>> =
-            Vec::with_capacity(caches.len());
-        for cache in caches.iter_mut() {
-            match cache {
-                AnyCache::KV(kv) => kv_refs.push(kv),
-                AnyCache::Hybrid(_) => {
-                    return Err(Exception::custom(
-                        "Batched forward not supported for Hybrid cache",
-                    ));
-                }
+        match (self, batch) {
+            (Self::Qwen3Next(m), batched_cache::AnyBatchedCache::Hybrid(hybrid)) => {
+                let mask = hybrid.attention_mask(1)?;
+                m.forward_batched(inputs, mask.as_ref(), hybrid.layers_mut())
             }
-        }
-
-        match self {
-            Self::Transformer(m) => m.forward_batched(inputs, &mut kv_refs),
-            Self::Qwen3Moe(_)
-            | Self::Qwen3Next(_)
-            | Self::Gemma2(_)
-            | Self::Gemma3(_)
-            | Self::Gemma4(_)
-            | Self::Phi3(_)
-            | Self::Starcoder2(_)
-            | Self::LlavaQwen2(_)
-            | Self::DeepSeekV2(_)
-            | Self::BonsaiQ1(_) => Err(Exception::custom(
-                "Batched forward only supported for Transformer models",
+            (model, batched_cache::AnyBatchedCache::Kv(kv)) => {
+                let mask = kv.attention_mask(1)?;
+                model.forward_with_batched_cache(inputs, mask.as_ref(), kv)
+            }
+            _ => Err(Exception::custom(
+                "batched cache does not match the model architecture",
             )),
         }
     }
 
-    /// Whether this model supports batched decode.
+    /// Prefill several prompts in one forward pass.
+    ///
+    /// `inputs` is `[B, T]` with each prompt **left-padded** to the longest
+    /// (`T`), and `lengths` holds the true token counts. Returns last-position
+    /// logits `[B, 1, vocab]` and the filled cache. Real tokens are rotated at
+    /// their true positions, so the rows are interchangeable with caches
+    /// built by an unbatched prefill. See [`Self::supports_batched_prefill`].
+    pub fn prefill_batched(
+        &mut self,
+        inputs: &Array,
+        lengths: &[i32],
+    ) -> Result<(Array, batched_cache::AnyBatchedCache), Exception> {
+        let steps = batched_cache::validate_prefill_shape(inputs, lengths)?;
+        let mut cache =
+            batched_cache::BatchedKvCache::for_prefill(self.num_layers()?, lengths, steps);
+        let mask = batched_cache::BatchedKvCache::prefill_mask(lengths, steps)?;
+        let logits = self.forward_with_batched_cache(inputs, Some(&mask), &mut cache)?;
+        Ok((logits, batched_cache::AnyBatchedCache::Kv(cache)))
+    }
+
+    /// The model's ordinary forward pass, run over a batched cache.
+    fn forward_with_batched_cache(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut batched_cache::BatchedKvCache,
+    ) -> Result<Array, Exception> {
+        let layers = cache.layers_mut();
+        match self {
+            Self::Transformer(m) => m.forward(inputs, mask, layers),
+            Self::Qwen3Moe(m) => m.forward(inputs, mask, layers),
+            Self::Phi3(m) => m.forward(inputs, mask, layers),
+            Self::Starcoder2(m) => m.forward(inputs, mask, layers),
+            Self::Gemma2(m) => m.forward(inputs, mask, layers),
+            Self::Gemma3(m) => m.forward(inputs, mask, layers),
+            Self::Gemma4(m) => m.forward(inputs, mask, layers),
+            // The hybrid architecture batches through its own cache type.
+            Self::Qwen3Next(_) | Self::LlavaQwen2(_) | Self::DeepSeekV2(_) | Self::BonsaiQ1(_) => {
+                Err(Exception::custom(
+                    "Batched decode is not supported for this model architecture",
+                ))
+            }
+        }
+    }
+
+    fn num_layers(&self) -> Result<usize, Exception> {
+        match self.make_cache()? {
+            AnyCache::KV(layers) => Ok(layers.len()),
+            AnyCache::Hybrid(layers) => Ok(layers.len()),
+        }
+    }
+
+    /// Whether this model supports batched decode: its attention must take
+    /// per-row positions and a padding mask from the cache (see
+    /// [`batched_cache::BatchedKvCache`]), verified against unbatched decode
+    /// on real weights for each architecture listed here.
+    ///
+    /// A hybrid model with an MTP head stays unbatched: speculative decode
+    /// drafts and rolls back one sequence at a time. So does the Gemma 4
+    /// mixture-of-experts variant, which has not been verified.
     pub const fn supports_batched_decode(&self) -> bool {
-        matches!(self, Self::Transformer(_))
+        match self {
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::Gemma2(_)
+            | Self::Gemma3(_) => true,
+            Self::Gemma4(m) => !m.args.enable_moe_block,
+            Self::Qwen3Next(m) => !m.has_mtp(),
+            Self::LlavaQwen2(_) | Self::DeepSeekV2(_) | Self::BonsaiQ1(_) => false,
+        }
+    }
+
+    /// Whether several prompts can be prefilled in one left-padded pass
+    /// ([`Self::prefill_batched`]). Recurrent layers have no way to skip
+    /// padding tokens, so the hybrid architecture prefills one at a time.
+    pub const fn supports_batched_prefill(&self) -> bool {
+        match self {
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::Gemma2(_)
+            | Self::Gemma3(_) => true,
+            Self::Gemma4(m) => !m.args.enable_moe_block,
+            Self::Qwen3Next(_) | Self::LlavaQwen2(_) | Self::DeepSeekV2(_) | Self::BonsaiQ1(_) => {
+                false
+            }
+        }
     }
 
     /// Whether this model has a loaded MTP head for speculative decode.
@@ -909,13 +983,27 @@ impl AnyModel {
 ///
 /// Creates penalty adjustment arrays on CPU and applies them as MLX ops.
 /// Safe to call even when no penalties are active (returns logits unchanged).
-#[allow(clippy::float_cmp)]
 pub fn apply_penalties(
     logits: &Array,
     generated_tokens: &[u32],
     params: &SamplingParams,
 ) -> Result<Array, Exception> {
-    if !params.has_penalties() || generated_tokens.is_empty() {
+    apply_penalties_with_pending(logits, generated_tokens, None, params)
+}
+
+/// [`apply_penalties`] for a history that ends with a token not yet read back.
+///
+/// `pending` is a one-element array still being computed on the device. It
+/// counts as the newest history token without forcing a host sync, so decode
+/// can stay pipelined while still penalizing the token it just produced.
+#[allow(clippy::float_cmp)]
+pub fn apply_penalties_with_pending(
+    logits: &Array,
+    generated_tokens: &[u32],
+    pending: Option<&Array>,
+    params: &SamplingParams,
+) -> Result<Array, Exception> {
+    if !params.has_penalties() || (generated_tokens.is_empty() && pending.is_none()) {
         return Ok(logits.clone());
     }
 
@@ -930,15 +1018,24 @@ pub fn apply_penalties(
     let vocab_size_i32 =
         i32::try_from(vocab_size).map_err(|_| Exception::custom("vocab size overflow for i32"))?;
 
-    // Count token occurrences
-    let mut counts: HashMap<u32, u32> = HashMap::new();
+    let mut count_values = vec![0.0f32; vocab_size];
     for &tid in generated_tokens {
-        if usize::try_from(tid).is_ok_and(|t| t < vocab_size) {
-            *counts.entry(tid).or_insert(0) += 1;
+        if let Some(slot) = count_values.get_mut(usize::try_from(tid).unwrap_or(usize::MAX)) {
+            *slot += 1.0;
         }
     }
 
     let shape: Vec<i32> = logits.shape().to_vec();
+    let mut flat_counts = Array::from_slice(&count_values, &[vocab_size_i32]);
+    if let Some(token) = pending {
+        let vocabulary = ops::arange::<_, u32>(0, vocab_size_i32, None)?;
+        let is_pending = vocabulary
+            .eq(token.reshape(&[1])?.as_dtype(mlx_rs::Dtype::Uint32)?)?
+            .as_dtype(mlx_rs::Dtype::Float32)?;
+        flat_counts = flat_counts.add(is_pending)?;
+    }
+    let counts = flat_counts.reshape(&shape)?;
+    let seen = counts.gt(Array::from_f32(0.0))?;
     let mut result = logits.clone();
 
     // Repetition penalty: for seen tokens, divide positive logits by the penalty
@@ -946,22 +1043,11 @@ pub fn apply_penalties(
     // down and negative logits further negative, making seen tokens less likely.
     if let Some(rep_penalty) = params.repetition_penalty {
         if rep_penalty != 1.0 {
-            let inv = 1.0 / rep_penalty;
-            let mut pos_factors = vec![1.0f32; vocab_size];
-            let mut neg_factors = vec![1.0f32; vocab_size];
-            for &tid in counts.keys() {
-                let idx = usize::try_from(tid).unwrap_or(usize::MAX);
-                if let Some(slot) = pos_factors.get_mut(idx) {
-                    *slot = inv;
-                }
-                if let Some(slot) = neg_factors.get_mut(idx) {
-                    *slot = rep_penalty;
-                }
-            }
-            let pos_arr = Array::from_slice(&pos_factors, &[vocab_size_i32]).reshape(&shape)?;
-            let neg_arr = Array::from_slice(&neg_factors, &[vocab_size_i32]).reshape(&shape)?;
+            let one = Array::from_f32(1.0);
+            let pos_factors = ops::select(&seen, Array::from_f32(1.0 / rep_penalty), &one)?;
+            let neg_factors = ops::select(&seen, Array::from_f32(rep_penalty), &one)?;
             let is_positive = result.gt(Array::from_f32(0.0))?;
-            let factor = mlx_rs::ops::select(&is_positive, &pos_arr, &neg_arr)?;
+            let factor = ops::select(&is_positive, &pos_factors, &neg_factors)?;
             result = result.multiply(factor)?;
         }
     }
@@ -969,28 +1055,15 @@ pub fn apply_penalties(
     // Frequency penalty: logits[t] -= freq_penalty * count[t]
     if let Some(freq_penalty) = params.frequency_penalty {
         if freq_penalty != 0.0 {
-            let mut freq = vec![0.0f32; vocab_size];
-            for (&tid, &count) in &counts {
-                if let Some(slot) = freq.get_mut(usize::try_from(tid).unwrap_or(usize::MAX)) {
-                    *slot = freq_penalty * f32::from(u16::try_from(count).unwrap_or(u16::MAX));
-                }
-            }
-            let freq_array = Array::from_slice(&freq, &[vocab_size_i32]).reshape(&shape)?;
-            result = result.subtract(freq_array)?;
+            result = result.subtract(counts.multiply(Array::from_f32(freq_penalty))?)?;
         }
     }
 
     // Presence penalty: logits[t] -= pres_penalty for all seen tokens
     if let Some(pres_penalty) = params.presence_penalty {
         if pres_penalty != 0.0 {
-            let mut pres = vec![0.0f32; vocab_size];
-            for &tid in counts.keys() {
-                if let Some(slot) = pres.get_mut(usize::try_from(tid).unwrap_or(usize::MAX)) {
-                    *slot = pres_penalty;
-                }
-            }
-            let pres_array = Array::from_slice(&pres, &[vocab_size_i32]).reshape(&shape)?;
-            result = result.subtract(pres_array)?;
+            let presence = ops::select(&seen, Array::from_f32(pres_penalty), Array::from_f32(0.0))?;
+            result = result.subtract(presence)?;
         }
     }
 
@@ -1229,7 +1302,8 @@ impl LogprobArrays {
             .as_dtype(mlx_rs::Dtype::Float32)?;
 
         // Top-N logprobs
-        let (top_indices, top_values) = if let Some(n) = top_n {
+        // An empty top list has no data pointer, which `as_slice` rejects.
+        let (top_indices, top_values) = if let Some(n) = top_n.filter(|&n| n > 0) {
             let vocab_size = *log_probs.shape().last().unwrap_or(&0);
             let clamped = i32::try_from(n)
                 .map_err(|_| Exception::custom("top_n overflow for i32"))?
@@ -1310,6 +1384,24 @@ pub fn load_tokenizer<P: AsRef<Path>>(model_dir: P) -> Result<tokenizers::Tokeni
         .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))
 }
 
+/// Load one safetensors shard and read its tensors into memory right away.
+///
+/// MLX loads lazily: the file is only read when an array is first evaluated.
+/// Left lazy, the reads happen inside the first GPU evaluation that touches
+/// the weights, and on slow storage a Metal command buffer can then sit open
+/// long enough to hit the GPU watchdog
+/// (`kIOGPUCommandBufferCallbackErrorTimeout`), failing the load. Evaluating
+/// here keeps disk I/O out of GPU work.
+pub(crate) fn load_safetensors_shard(
+    file_path: &Path,
+) -> Result<HashMap<String, Array>, ModelError> {
+    let loaded = Array::load_safetensors(file_path)
+        .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+    mlx_rs::transforms::eval(loaded.values())
+        .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+    Ok(loaded)
+}
+
 /// Load safetensors weights into any model that implements `ModuleParametersExt`.
 pub fn load_safetensors_weights<M: ModuleParametersExt>(
     model: &mut M,
@@ -1350,8 +1442,7 @@ pub(crate) fn load_quantized_safetensors_weights_with_settings<M: ModuleParamete
 
     for file_path in &safetensors_files {
         tracing::debug!(file = %file_path.display(), "Loading weights");
-        let loaded = Array::load_safetensors(file_path)
-            .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+        let loaded = load_safetensors_shard(file_path)?;
         validate_quantized_tensor_widths(&loaded, quantization)?;
 
         for (key, value) in loaded {
@@ -1420,8 +1511,7 @@ pub(crate) fn load_quantized_safetensors_weights_with_prefix_and_settings<
 
     for file_path in &safetensors_files {
         tracing::debug!(file = %file_path.display(), prefix, "Loading weights with prefix");
-        let loaded = Array::load_safetensors(file_path)
-            .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+        let loaded = load_safetensors_shard(file_path)?;
         validate_quantized_tensor_widths(&loaded, quantization)?;
 
         let mut matched = 0usize;
@@ -1517,8 +1607,7 @@ pub(crate) fn load_quantized_safetensors_weights_optional_prefix_with_settings<
     let mut total_unmatched_warns = 0usize;
 
     for file_path in &safetensors_files {
-        let loaded = Array::load_safetensors(file_path)
-            .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+        let loaded = load_safetensors_shard(file_path)?;
         validate_quantized_tensor_widths(&loaded, quantization)?;
 
         for (key, value) in loaded {
@@ -1769,6 +1858,22 @@ fn remap_quantized_key(key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logprobs_without_a_top_list_materialize() {
+        let logits = mlx_rs::Array::from_slice(&[1.0_f32, 2.0, 3.0], &[1, 3]);
+        let sampled = mlx_rs::Array::from_slice(&[2_u32], &[1]);
+        for top_n in [None, Some(0), Some(2)] {
+            let arrays = LogprobArrays::compute(&logits, &sampled, top_n).unwrap();
+            mlx_rs::transforms::eval(arrays.eval_targets()).unwrap();
+            let info = arrays.materialize(2);
+            assert_eq!(
+                info.top_logprobs.len(),
+                usize::try_from(top_n.unwrap_or(0)).unwrap()
+            );
+            assert!(info.logprob < 0.0);
+        }
+    }
     use crate::cache::KeyValueCache;
     use crate::qwen3_next::QLinear;
     use mlx_rs::macros::ModuleParameters;
@@ -2491,6 +2596,23 @@ mod tests {
         assert!((vals[0] - 2.5).abs() < 1e-5);
         assert!((vals[1] - 2.0).abs() < 1e-5);
         assert!((vals[2] - 4.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn pending_token_is_penalized_like_a_delivered_one() {
+        let logits = Array::from_slice(&[4.0_f32, 2.0, 6.0], &[1, 3]);
+        let p = SamplingParams {
+            frequency_penalty: Some(1.0),
+            presence_penalty: Some(0.5),
+            repetition_penalty: Some(2.0),
+            ..SamplingParams::default()
+        };
+        let pending = Array::from_slice(&[2_u32], &[1]);
+        let with_pending = apply_penalties_with_pending(&logits, &[0], Some(&pending), &p).unwrap();
+        let delivered = apply_penalties(&logits, &[0, 2], &p).unwrap();
+        mlx_rs::transforms::eval([&with_pending, &delivered]).unwrap();
+        assert_eq!(with_pending.as_slice::<f32>(), delivered.as_slice::<f32>());
+        assert!((with_pending.as_slice::<f32>()[2] - 1.5).abs() < 1e-5);
     }
 
     // --- AnyCache::trim_by tests ---

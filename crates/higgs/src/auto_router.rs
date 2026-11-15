@@ -3,8 +3,9 @@ use std::sync::LazyLock;
 use regex::Regex;
 use tracing::{info, warn};
 
+use crate::backend::{Engine, EngineJob};
 use crate::router::RouteCandidate;
-use crate::state::Engine;
+use higgs_engine::engine::ThinkingMode;
 
 #[allow(clippy::expect_used)]
 static ROUTE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -95,7 +96,7 @@ fn parse_route_name(text: &str, valid_names: &[&str]) -> Option<String> {
 /// Returns the name of the best-matching route, or `None` if classification
 /// fails or returns "other".
 pub fn classify_local(
-    engine: &Engine,
+    engine: &dyn Engine,
     routes: &[RouteCandidate],
     messages: &[serde_json::Value],
 ) -> Option<String> {
@@ -117,13 +118,14 @@ pub fn classify_local(
         tool_calls: None,
     }];
 
-    let prompt_tokens = match engine.prepare_chat_prompt(&chat_messages, None) {
-        Ok(tokens) => tokens,
-        Err(e) => {
-            warn!(error = %e, "auto-router prompt preparation failed");
-            return None;
-        }
-    };
+    let prompt_tokens =
+        match engine.prepare_chat_prompt(&chat_messages, None, engine.enable_thinking()) {
+            Ok(tokens) => tokens,
+            Err(e) => {
+                warn!(error = %e, "auto-router prompt preparation failed");
+                return None;
+            }
+        };
 
     let sampling = higgs_models::SamplingParams {
         temperature: 0.0,
@@ -135,8 +137,17 @@ pub fn classify_local(
         presence_penalty: None,
     };
 
-    let output = match engine.generate(&prompt_tokens, 64, &sampling, &[], false, None, None, None)
-    {
+    let output = match engine.generate(EngineJob {
+        prompt_tokens,
+        max_tokens: 64,
+        sampling,
+        stop_sequences: Vec::new(),
+        logprobs: false,
+        top_logprobs: None,
+        thinking: ThinkingMode::new(engine.enable_thinking(), None),
+        constraint: None,
+        pixel_values: None,
+    }) {
         Ok(o) => o,
         Err(e) => {
             warn!(error = %e, "auto-router generation failed");

@@ -281,7 +281,7 @@ mod tests {
         let config = MetricsLogConfig {
             enabled: true,
             path: base.to_string_lossy().to_string(),
-            max_size_mb: 50,
+            max_size: crate::config::units::ByteSize::from_mebibytes(50),
             max_files: 5,
         };
         let store = MetricsStore::new(Duration::from_secs(HISTORY_WINDOW_SECS));
@@ -311,7 +311,7 @@ mod tests {
         let config = MetricsLogConfig {
             enabled: true,
             path: base.to_string_lossy().to_string(),
-            max_size_mb: 50,
+            max_size: crate::config::units::ByteSize::from_mebibytes(50),
             max_files: 5,
         };
         let store = MetricsStore::new(Duration::from_secs(HISTORY_WINDOW_SECS));
@@ -338,7 +338,7 @@ mod tests {
         let config = MetricsLogConfig {
             enabled: true,
             path: base.to_string_lossy().to_string(),
-            max_size_mb: 50,
+            max_size: crate::config::units::ByteSize::from_mebibytes(50),
             max_files: 5,
         };
         let store = MetricsStore::new(Duration::from_secs(HISTORY_WINDOW_SECS));
@@ -356,7 +356,7 @@ mod tests {
         let config = MetricsLogConfig {
             enabled: true,
             path: base.to_string_lossy().to_string(),
-            max_size_mb: 50,
+            max_size: crate::config::units::ByteSize::from_mebibytes(50),
             max_files: 5,
         };
         let store = MetricsStore::new(Duration::from_secs(HISTORY_WINDOW_SECS));

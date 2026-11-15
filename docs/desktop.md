@@ -96,7 +96,14 @@ fixed-format report of the run for sharing speed numbers.
 
 **Config.** Form and raw TOML editors for the active config or profile, saved
 with validation, followed by `higgs doctor` output; Start, Stop, Restart, and
-Apply and restart for the daemon; the daemon log tail.
+Apply and restart for the daemon; the daemon log tail. The form edits the
+current config schema (server, memory, model defaults, models, providers,
+routes and routing, observability, experimental). A file that still uses keys
+from earlier versions loads too: the app asks the `higgs` binary to rewrite it
+(`higgs config migrate`, so the old-to-new mapping lives only in the server),
+lists the deprecated keys, and offers "Migrate file", which rewrites the file in
+place and keeps the previous version as a `.bak`. Saving from the form writes the
+current schema and drops comments, as before; Raw TOML keeps the text as written.
 
 ## Where the numbers come from
 
@@ -116,8 +123,8 @@ counts as traffic.
 
 `pnpm dev` serves the UI at http://localhost:1420. A dev-only Vite middleware
 provides the same local commands as the native app (config, log, daemon, CLI),
-and the server needs CORS: `HIGGS_CORS_ORIGINS='["*"]' higgs serve --profile ...`
-or `server.cors_origins` in the config.
+and the server needs CORS: set `server.cors_origins` in the config, or
+`HIGGS_SERVER__CORS_ORIGINS='["*"]' higgs serve --profile ...`.
 
 ## Release builds
 

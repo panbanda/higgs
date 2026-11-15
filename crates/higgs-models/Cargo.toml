@@ -3,6 +3,7 @@ name = "higgs-models"
 version = "1.8.2"
 description = "Model architectures and weight loading for higgs (LLaMA, Mistral, Qwen2/3)"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

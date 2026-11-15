@@ -14,6 +14,7 @@ use mlx_rs::{
     Array, Dtype, array,
     builder::Builder,
     error::Exception,
+    fast::ScaledDotProductAttentionMask,
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParameters},
     nn, ops,
@@ -23,9 +24,10 @@ use mlx_rs::{
 use serde::Deserialize;
 
 use crate::{
-    cache::{KeyValueCache, KvCacheView},
+    attention::{DecodeKernel, HeadCounts, HeadNorms, Projections, SelfAttention},
+    cache::KeyValueCache,
     error::ModelError,
-    utils::{apply_rope, create_causal_mask, create_windowed_causal_mask},
+    utils::{create_causal_mask, create_windowed_causal_mask},
 };
 
 // ---------------------------------------------------------------------------
@@ -174,10 +176,7 @@ fn clip_residual(x: &Array, y: &Array) -> Result<Array, Exception> {
 struct Gemma3Attention {
     n_heads: i32,
     n_kv_heads: i32,
-    n_rep: i32,
     scale: f32,
-    is_sliding: bool,
-    sliding_window: i32,
 
     #[quantizable]
     #[param]
@@ -242,10 +241,7 @@ impl Gemma3Attention {
         Ok(Self {
             n_heads,
             n_kv_heads,
-            n_rep: n_heads / n_kv_heads,
             scale: args.attn_scale(),
-            is_sliding,
-            sliding_window: args.sliding_window,
             q_proj: MaybeQuantized::Original(q_proj),
             k_proj: MaybeQuantized::Original(k_proj),
             v_proj: MaybeQuantized::Original(v_proj),
@@ -271,70 +267,34 @@ where
     type Output = Array;
     type Error = Exception;
 
-    #[allow(non_snake_case)]
     fn forward(&mut self, input: Gemma3AttentionInput<'_, C>) -> Result<Self::Output, Self::Error> {
-        let Gemma3AttentionInput { x, mask, mut cache } = input;
+        let Gemma3AttentionInput { x, mask, cache } = input;
 
-        let shape = x.shape();
-        let B = *shape
-            .first()
-            .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
-        let L = *shape
-            .get(1)
-            .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
-
-        // QK-norm is applied in [B, L, heads, head_dim] order so the last axis
-        // (head_dim) is normalized. We apply it before transposing to [B, heads, L, D].
-        let q_normed = self
-            .q_norm
-            .forward(&self.q_proj.forward(x)?.reshape(&[B, L, self.n_heads, -1])?)?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let k_normed = self
-            .k_norm
-            .forward(
-                &self
-                    .k_proj
-                    .forward(x)?
-                    .reshape(&[B, L, self.n_kv_heads, -1])?,
-            )?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let v_proj = self
-            .v_proj
-            .forward(x)?
-            .reshape(&[B, L, self.n_kv_heads, -1])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-
-        let (queries, keys, values) = if let Some(ref mut kv_cache) = cache {
-            let offset = kv_cache.offset();
-            let q = apply_rope(&q_normed, &self.rope, offset)?;
-            let k = apply_rope(&k_normed, &self.rope, offset)?;
-            // Materialize dense KV (also works for TurboQuant via into_dense).
-            // Gemma 3 already uses the mask path for windowed attention, so the
-            // TurboQuant decode path isn't needed here.
-            let (ck, cv) = match kv_cache.update_and_view(k, v_proj)? {
-                view @ (KvCacheView::Dense { .. } | KvCacheView::TurboQuant(_)) => {
-                    view.into_dense()?
-                }
-            };
-            (q, ck, cv)
-        } else {
-            let q = apply_rope(&q_normed, &self.rope, 0)?;
-            let k = apply_rope(&k_normed, &self.rope, 0)?;
-            (q, k, v_proj)
+        let projections = Projections {
+            queries: self.q_proj.forward(x)?,
+            keys: self.k_proj.forward(x)?,
+            values: self.v_proj.forward(x)?,
         };
-
-        // Use MLX fast SDPA: boolean mask (true=attend, None=attend-all).
-        let sdpa_mask = mask.map(mlx_rs::fast::ScaledDotProductAttentionMask::Array);
-        let output = mlx_rs::fast::scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            self.scale,
-            sdpa_mask,
-            None::<&Array>,
-        )?
-        .transpose_axes(&[0, 2, 1, 3])?
-        .reshape(&[B, L, -1])?;
+        // Gemma 3 reads a `TurboQuant` cache densely for every layer.
+        let output = SelfAttention {
+            head_counts: HeadCounts {
+                query: self.n_heads,
+                key_value: self.n_kv_heads,
+            },
+            scale: self.scale,
+            rope: &self.rope,
+            norms: HeadNorms {
+                query: Some(&mut self.q_norm),
+                key: Some(&mut self.k_norm),
+                value: None,
+            },
+            decode: DecodeKernel::Dense,
+        }
+        .forward(
+            &projections,
+            mask.map(ScaledDotProductAttentionMask::Array),
+            cache,
+        )?;
 
         self.o_proj.forward(&output)
     }
@@ -512,6 +472,9 @@ struct Gemma3Model {
 
 struct Gemma3ModelInput<'a, C> {
     inputs: &'a Array,
+    /// Boolean padding mask from a batched cache. It already contains the
+    /// causal structure; sliding layers narrow it to their window.
+    padding_mask: Option<&'a Array>,
     cache: &'a mut Vec<Option<C>>,
 }
 
@@ -554,7 +517,11 @@ where
 
     #[allow(non_snake_case)]
     fn forward(&mut self, input: Gemma3ModelInput<'_, C>) -> Result<Self::Output, Self::Error> {
-        let Gemma3ModelInput { inputs, cache } = input;
+        let Gemma3ModelInput {
+            inputs,
+            padding_mask,
+            cache,
+        } = input;
 
         // Scale embeddings by sqrt(hidden_size) — common to all Gemma variants.
         let mut h = self.embed_tokens.forward(inputs)?;
@@ -598,18 +565,30 @@ where
         // For T == 1 (decode step): the standard path returns None for the causal mask
         // (single token attends to all cached keys). But sliding layers must still bound
         // the window — we build a [1, kv_len] boolean row mask when offset+1 > window.
-        let global_mask = (T > 1)
-            .then(|| create_causal_mask(T, Some(offset)))
-            .transpose()?;
-
-        let sliding_mask = if T > 1 {
-            Some(create_windowed_causal_mask(T, offset, self.sliding_window)?)
+        let (global_mask, sliding_mask) = if let Some(padding) = padding_mask {
+            let window_mask = (T > 1 || offset + 1 > self.sliding_window)
+                .then(|| create_windowed_causal_mask(T, offset, self.sliding_window))
+                .transpose()?;
+            let sliding = match window_mask {
+                Some(window) => window.logical_and(padding)?,
+                None => padding.clone(),
+            };
+            (Some(padding.clone()), Some(sliding))
         } else {
-            // T == 1: only need a mask if the KV context exceeds the window
-            let kv_len = offset + 1;
-            (kv_len > self.sliding_window)
-                .then(|| create_windowed_causal_mask(1, offset, self.sliding_window))
-                .transpose()?
+            let global_mask = (T > 1)
+                .then(|| create_causal_mask(T, Some(offset)))
+                .transpose()?;
+
+            let sliding_mask = if T > 1 {
+                Some(create_windowed_causal_mask(T, offset, self.sliding_window)?)
+            } else {
+                // T == 1: only need a mask if the KV context exceeds the window
+                let kv_len = offset + 1;
+                (kv_len > self.sliding_window)
+                    .then(|| create_windowed_causal_mask(1, offset, self.sliding_window))
+                    .transpose()?
+            };
+            (global_mask, sliding_mask)
         };
 
         let pattern = self.sliding_window_pattern;
@@ -702,9 +681,9 @@ impl Gemma3CausalLM {
         mask: Option<&Array>,
         kv_cache: &mut Vec<Option<C>>,
     ) -> Result<Array, Exception> {
-        let _ = mask; // Gemma 3 builds its own masks internally
         let hidden_all = self.model.forward(Gemma3ModelInput {
             inputs,
+            padding_mask: mask,
             cache: kv_cache,
         })?;
         // Slice to last token for decode efficiency
@@ -725,9 +704,9 @@ impl Gemma3CausalLM {
         mask: Option<&Array>,
         kv_cache: &mut Vec<Option<C>>,
     ) -> Result<Array, Exception> {
-        let _ = mask;
         let hidden = self.model.forward(Gemma3ModelInput {
             inputs,
+            padding_mask: mask,
             cache: kv_cache,
         })?;
         self.project_hidden(&hidden)
@@ -739,9 +718,9 @@ impl Gemma3CausalLM {
         mask: Option<&Array>,
         kv_cache: &mut Vec<Option<C>>,
     ) -> Result<Array, Exception> {
-        let _ = mask;
         self.model.forward(Gemma3ModelInput {
             inputs,
+            padding_mask: mask,
             cache: kv_cache,
         })
     }
@@ -932,7 +911,10 @@ fn apply_rmsnorm_plus_one(model: &mut Gemma3CausalLM) -> Result<(), Exception> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::SteppingKeyValueCache;
+    use crate::{
+        cache::SteppingKeyValueCache,
+        test_support::{ForwardOverCache, worst_batched_difference},
+    };
 
     fn default_args() -> Gemma3ModelArgs {
         Gemma3ModelArgs {
@@ -955,6 +937,39 @@ mod tests {
             quantization: None,
             rope_scaling: None,
         }
+    }
+
+    struct BatchCheck(Gemma3CausalLM);
+
+    impl ForwardOverCache for BatchCheck {
+        fn num_layers(&self) -> usize {
+            usize::try_from(self.0.args.num_hidden_layers).unwrap()
+        }
+
+        fn forward_over<C: KeyValueCache>(
+            &mut self,
+            inputs: &Array,
+            mask: Option<&Array>,
+            cache: &mut Vec<Option<C>>,
+        ) -> Result<Array, Exception> {
+            self.0.forward(inputs, mask, cache)
+        }
+    }
+
+    #[test]
+    fn batched_forward_matches_unbatched_past_the_sliding_window() {
+        let mut args = default_args();
+        args.num_hidden_layers = 4;
+        args.sliding_window = 4;
+        args.sliding_window_pattern = 2;
+        let mut model = BatchCheck(Gemma3CausalLM::new(args).unwrap());
+        let worst = worst_batched_difference(
+            &mut model,
+            &[&[3, 5, 7, 11, 13, 17, 19], &[23, 29, 31]],
+            &[37, 41, 43, 47],
+        )
+        .unwrap();
+        assert!(worst < 1e-3, "batched logits differ by {worst}");
     }
 
     // -----------------------------------------------------------------------

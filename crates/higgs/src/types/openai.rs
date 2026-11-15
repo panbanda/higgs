@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// POST /v1/chat/completions request body.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatCompletionMessage>,
@@ -34,6 +34,26 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
+    /// `"auto"` (default), `"none"`, `"required"` or
+    /// `{"type": "function", "function": {"name": …}}`. The last two force a
+    /// call through constrained decoding where the model's tool-call format
+    /// allows it.
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+    /// When `false`, at most one tool call is returned (exactly one when the
+    /// call is forced). Defaults to `true`.
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
+    /// Accepted for client compatibility. Sampling is not yet reproducible
+    /// per request, so the value is ignored.
+    #[serde(default)]
+    pub seed: Option<i64>,
+    /// vLLM-style: constrain output to this regular expression.
+    #[serde(default)]
+    pub guided_regex: Option<String>,
+    /// vLLM-style: constrain output to this JSON schema (an object).
+    #[serde(default)]
+    pub guided_json: Option<serde_json::Value>,
     #[serde(default)]
     pub logprobs: Option<bool>,
     #[serde(default)]
@@ -49,6 +69,11 @@ pub struct ChatCompletionRequest {
     /// processed, time_ms}`). Ignored for non-streaming requests.
     #[serde(default)]
     pub return_progress: Option<bool>,
+    /// Higgs extension: run tools from configured MCP servers (and the
+    /// built-in web tools) on the server and continue the generation with
+    /// their results. See `docs/mcp.md`.
+    #[serde(default)]
+    pub mcp: Option<crate::generation::tool_loop::McpOptions>,
 }
 
 /// Optional request-level controls for streaming responses.
@@ -67,6 +92,10 @@ pub struct ReasoningConfig {
     /// model's reasoning / thinking mode and preserves the original string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Reasoning-token budget for this request; overrides the configured
+    /// `thinking_budget`. Must be at least 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
 }
 
 /// Response format specification.
@@ -75,6 +104,9 @@ pub struct ResponseFormat {
     pub r#type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub json_schema: Option<serde_json::Value>,
+    /// Pattern for `type: "regex"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
 }
 
 /// Message content: either a plain string or an array of content parts (for multimodal).
@@ -197,6 +229,9 @@ pub struct ChatCompletionResponse {
     pub model: String,
     pub choices: Vec<ChatCompletionChoice>,
     pub usage: CompletionUsage,
+    /// Higgs extension: what the server-side tool loop executed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<serde_json::Value>,
 }
 
 /// A choice in a chat completion response.
@@ -220,6 +255,11 @@ pub struct ChoiceLogprobs {
 pub struct TokenLogprob {
     pub token: String,
     pub logprob: f32,
+    /// The UTF-8 bytes of the text this token added to the output. The `bytes` of all tokens,
+    /// joined in order, give the generated text. This differs from `OpenAI`, where `bytes` holds
+    /// the raw bytes of the token. A token that holds half of a character has empty `bytes`.
+    /// The token that completes the character holds the whole character.
+    pub bytes: Vec<u8>,
     pub top_logprobs: Vec<TopLogprob>,
 }
 
@@ -228,6 +268,8 @@ pub struct TokenLogprob {
 pub struct TopLogprob {
     pub token: String,
     pub logprob: f32,
+    /// Always `null`: an alternative token added nothing to the output, so it has no bytes.
+    pub bytes: Option<Vec<u8>>,
 }
 
 /// Streaming chunk for /v1/chat/completions.
@@ -314,6 +356,8 @@ pub struct CompletionRequest {
     #[serde(default)]
     pub stream: Option<bool>,
     #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+    #[serde(default)]
     pub stop: Option<StopSequence>,
     #[serde(default)]
     pub logprobs: Option<bool>,
@@ -361,11 +405,80 @@ pub struct CompletionChunkChoice {
 }
 
 /// Token usage statistics.
-#[derive(Debug, Clone, Serialize)]
+///
+/// Beyond the `OpenAI` fields, timing measurements use the field names oMLX
+/// reports, flattened into the same object. A field is present only when it
+/// was measured for the request.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct CompletionUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+    #[serde(flatten)]
+    pub timings: UsageTimings,
+}
+
+impl CompletionUsage {
+    pub const fn new(prompt_tokens: u32, completion_tokens: u32) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+            timings: UsageTimings::EMPTY,
+        }
+    }
+}
+
+/// Breakdown of prompt tokens (`OpenAI` `prompt_tokens_details`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PromptTokensDetails {
+    pub cached_tokens: u32,
+}
+
+/// Breakdown of completion tokens (`OpenAI` `completion_tokens_details`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CompletionTokensDetails {
+    pub reasoning_tokens: u32,
+}
+
+/// Per-request timing measurements, in seconds and tokens per second.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct UsageTimings {
+    /// Request received until the first completion token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_to_first_token: Option<f64>,
+    /// Engine start of prompt evaluation until the first completion token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_eval_duration: Option<f64>,
+    /// First completion token until the last one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_duration: Option<f64>,
+    /// Request received until the last completion token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_time: Option<f64>,
+    /// Prompt tokens actually prefilled (cache hits excluded) per second.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_per_second: Option<f64>,
+    /// Decode rate: completion tokens after the first, per second.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_tokens_per_second: Option<f64>,
+}
+
+impl UsageTimings {
+    pub const EMPTY: Self = Self {
+        time_to_first_token: None,
+        prompt_eval_duration: None,
+        generation_duration: None,
+        total_time: None,
+        prompt_tokens_per_second: None,
+        generation_tokens_per_second: None,
+    };
 }
 
 /// GET /v1/models response.
@@ -382,6 +495,8 @@ pub struct ModelObject {
     pub object: &'static str,
     pub created: i64,
     pub owned_by: String,
+    /// Whether the model is in memory now. Unloaded models are still listed and load on use.
+    pub loaded: bool,
 }
 
 /// POST /v1/embeddings request body.
@@ -474,11 +589,7 @@ mod tests {
     }
 
     fn make_usage(prompt: u32, completion: u32) -> CompletionUsage {
-        CompletionUsage {
-            prompt_tokens: prompt,
-            completion_tokens: completion,
-            total_tokens: prompt + completion,
-        }
+        CompletionUsage::new(prompt, completion)
     }
 
     #[test]
@@ -550,6 +661,7 @@ mod tests {
                 logprobs: None,
             }],
             usage: make_usage(5, 1),
+            mcp: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("chat.completion"));
@@ -572,6 +684,7 @@ mod tests {
                 object: "model",
                 created: 1_234_567_890,
                 owned_by: "local".to_owned(),
+                loaded: true,
             }],
         };
         let json = serde_json::to_string(&list).unwrap();
@@ -915,6 +1028,7 @@ mod tests {
                 logprobs: None,
             }],
             usage: make_usage(10, 5),
+            mcp: None,
         };
         let json_val: serde_json::Value = serde_json::to_value(&resp).unwrap();
         assert_eq!(json_val["choices"][0]["finish_reason"], "tool_calls");

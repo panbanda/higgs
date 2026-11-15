@@ -104,7 +104,7 @@ async fn unknown_route_returns_404() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "requires real SimpleEngine to build full router with AppState"]
+#[ignore = "requires a real engine to build full router with AppState"]
 async fn chat_completions_invalid_json_returns_422() {
     // This test would send invalid JSON to /v1/chat/completions and verify
     // that Axum returns 422 Unprocessable Entity before the handler runs.
@@ -112,61 +112,61 @@ async fn chat_completions_invalid_json_returns_422() {
 }
 
 #[tokio::test]
-#[ignore = "requires real SimpleEngine to build full router with AppState"]
+#[ignore = "requires a real engine to build full router with AppState"]
 async fn chat_completions_empty_messages_returns_400() {
     // Would verify: POST /v1/chat/completions with {"model":"m","messages":[]}
     // returns 400 BadRequest("messages array must not be empty").
 }
 
 #[tokio::test]
-#[ignore = "requires real SimpleEngine to build full router with AppState"]
+#[ignore = "requires a real engine to build full router with AppState"]
 async fn completions_empty_prompt_returns_400() {
     // Would verify: POST /v1/completions with {"model":"m","prompt":""}
     // returns 400 BadRequest("prompt must not be empty").
 }
 
 #[tokio::test]
-#[ignore = "requires real SimpleEngine to build full router with AppState"]
+#[ignore = "requires a real engine to build full router with AppState"]
 async fn anthropic_empty_messages_returns_400() {
     // Would verify: POST /v1/messages with {"model":"m","messages":[],"max_tokens":100}
     // returns 400 BadRequest("messages array must not be empty").
 }
 
 #[tokio::test]
-#[ignore = "requires real SimpleEngine to build full router with AppState"]
+#[ignore = "requires a real engine to build full router with AppState"]
 async fn embeddings_empty_input_returns_400() {
     // Would verify: POST /v1/embeddings with {"model":"m","input":[]}
     // returns 400 BadRequest("input must not be empty").
 }
 
 #[tokio::test]
-#[ignore = "requires real SimpleEngine to build full router with AppState"]
+#[ignore = "requires a real engine to build full router with AppState"]
 async fn chat_completions_get_returns_405() {
     // Would verify GET /v1/chat/completions returns 405 Method Not Allowed.
 }
 
 #[tokio::test]
-#[ignore = "requires real SimpleEngine to build full router with AppState"]
+#[ignore = "requires a real engine to build full router with AppState"]
 async fn models_returns_200_with_model_list() {
     // Would verify GET /v1/models returns the loaded model name.
 }
 
 #[tokio::test]
-#[ignore = "requires real SimpleEngine to build full router with AppState"]
+#[ignore = "requires a real engine to build full router with AppState"]
 async fn bearer_auth_missing_returns_401() {
     // Would build router with api_key="test" and verify that requests
     // without Authorization header get 401.
 }
 
 #[tokio::test]
-#[ignore = "requires real SimpleEngine to build full router with AppState"]
+#[ignore = "requires a real engine to build full router with AppState"]
 async fn bearer_auth_wrong_key_returns_401() {
     // Would build router with api_key="correct" and verify that requests
     // with Authorization: Bearer wrong get 401.
 }
 
 #[tokio::test]
-#[ignore = "requires real SimpleEngine to build full router with AppState"]
+#[ignore = "requires a real engine to build full router with AppState"]
 async fn streaming_chat_returns_sse_content_type() {
     // Would verify POST /v1/chat/completions with stream:true returns
     // content-type: text/event-stream.

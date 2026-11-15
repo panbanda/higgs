@@ -14,7 +14,7 @@ use higgs::types::anthropic::{
     AnthropicUsage, ContentBlockDeltaEvent, ContentBlockResponse, ContentBlockStartEvent,
     ContentBlockStartPayload, ContentBlockStopEvent, CountTokensResponse, CreateMessageResponse,
     MessageDelta, MessageDeltaEvent, MessageStartEvent, MessageStartPayload, MessageStopEvent,
-    TextDelta,
+    ResponseContentBlock, TextDelta,
 };
 use higgs::types::openai::{
     ChatCompletionChoice, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionDelta,
@@ -24,17 +24,14 @@ use higgs::types::openai::{
 };
 
 const fn make_usage(prompt: u32, completion: u32) -> CompletionUsage {
-    CompletionUsage {
-        prompt_tokens: prompt,
-        completion_tokens: completion,
-        total_tokens: prompt + completion,
-    }
+    CompletionUsage::new(prompt, completion)
 }
 
 const fn make_anthropic_usage(input: u32, output: u32) -> AnthropicUsage {
     AnthropicUsage {
         input_tokens: input,
         output_tokens: output,
+        cache_read_input_tokens: None,
     }
 }
 
@@ -112,6 +109,7 @@ fn chat_completion_response_has_required_fields() {
             logprobs: None,
         }],
         usage: make_usage(10, 5),
+        mcp: None,
     };
 
     let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -276,6 +274,7 @@ fn model_list_serialization() {
             object: "model",
             created: 1_700_000_000,
             owned_by: "local".to_owned(),
+            loaded: true,
         }],
     };
     let json: serde_json::Value = serde_json::to_value(&list).unwrap();
@@ -284,6 +283,7 @@ fn model_list_serialization() {
     assert_eq!(json["data"][0]["id"], "my-model");
     assert_eq!(json["data"][0]["object"], "model");
     assert_eq!(json["data"][0]["owned_by"], "local");
+    assert_eq!(json["data"][0]["loaded"], true);
 }
 
 // ---------------------------------------------------------------------------
@@ -326,10 +326,10 @@ fn anthropic_response_has_type_field() {
         id: "msg_abc123".to_owned(),
         message_type: "message",
         role: "assistant",
-        content: vec![ContentBlockResponse {
+        content: vec![ResponseContentBlock::Text(ContentBlockResponse {
             block_type: "text",
             text: "Hello!".to_owned(),
-        }],
+        })],
         model: "claude-3".to_owned(),
         stop_reason: Some("end_turn".to_owned()),
         usage: make_anthropic_usage(10, 5),
@@ -518,6 +518,7 @@ fn chat_completion_response_with_tool_calls_in_choices() {
             logprobs: None,
         }],
         usage: make_usage(10, 20),
+        mcp: None,
     };
     let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
 

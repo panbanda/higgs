@@ -211,7 +211,9 @@ impl DiskPrefixStore {
     }
 
     /// Persist a block-aligned KV cache. Unsupported recurrent/hybrid cache
-    /// layers are rejected: serving a partial cache would be incorrect.
+    /// layers are rejected: serving a partial cache would be incorrect. Hybrid
+    /// entries, with their recurrent checkpoints, live in memory only, so the
+    /// on-disk format is unchanged.
     pub fn store_cache(
         &self,
         tokens: &[u32],

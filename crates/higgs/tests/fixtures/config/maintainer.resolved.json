@@ -1,0 +1,73 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8000,
+    "max_tokens": 32768,
+    "api_key": null,
+    "rate_limit": 0,
+    "request_timeout_secs": 300.0,
+    "max_body_size": 10485760,
+    "cors_origins": null
+  },
+  "memory": {
+    "raise_wired_limit": false,
+    "max_loaded_models": null,
+    "ceiling_bytes_at_128gib": null,
+    "default_profile": "Auto"
+  },
+  "models": [
+    {
+      "path": "/Users/example/models/Thinklite-27B-4bit",
+      "name": "thinklite",
+      "profile": "Balanced",
+      "batch": "auto",
+      "prefill_yield_tokens": null,
+      "thinking_budget": 256,
+      "kv_mode": "Off",
+      "kv_bits": 3,
+      "kv_key_bits": null,
+      "kv_value_bits": null,
+      "kv_norm_correction": true,
+      "kv_adaptive_dense_layers": 0,
+      "kv_seed": 0,
+      "mla_latent": false,
+      "kv_disk_dir": null,
+      "kv_disk_bytes": 4294967296,
+      "load": "startup",
+      "idle_ttl_secs": null,
+      "pinned": false
+    }
+  ],
+  "providers": [],
+  "routes": [],
+  "routing": {
+    "default": "higgs",
+    "auto": {
+      "enabled": false,
+      "force": false,
+      "model": "katanemo/Arch-Router-1.5B",
+      "timeout_ms": 2000
+    }
+  },
+  "observability": {
+    "retention_secs": 3600,
+    "metrics_log": {
+      "enabled": true,
+      "path": "$HOME/.config/higgs/logs/metrics.jsonl",
+      "max_size_bytes": 52428800,
+      "max_files": 5
+    }
+  },
+  "mcp": {
+    "max_result_bytes": 262144,
+    "servers": []
+  },
+  "web": {
+    "enabled": false,
+    "search_provider": "duckduckgo",
+    "searxng_url": null,
+    "allow_private_addresses": false,
+    "expose_as_tools": false,
+    "timeout_secs": 15.0
+  }
+}

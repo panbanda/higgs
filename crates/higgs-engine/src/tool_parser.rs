@@ -29,14 +29,14 @@
 //! falling back to best-effort parsing otherwise.
 
 /// A parsed tool call extracted from model output.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedToolCall {
     pub name: String,
     pub arguments: serde_json::Value,
 }
 
 /// Result of parsing model output for tool calls.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolParseResult {
     /// Text content before/outside any tool calls.
     pub text: String,
@@ -44,8 +44,8 @@ pub struct ToolParseResult {
     pub tool_calls: Vec<ParsedToolCall>,
 }
 
-const TOOL_CALL_OPEN: &str = "<tool_call>";
-const TOOL_CALL_CLOSE: &str = "</tool_call>";
+pub(crate) const TOOL_CALL_OPEN: &str = "<tool_call>";
+pub(crate) const TOOL_CALL_CLOSE: &str = "</tool_call>";
 
 /// Hard cap on bytes buffered while inside an unclosed `<tool_call>`.
 ///
@@ -55,7 +55,7 @@ const TOOL_CALL_CLOSE: &str = "</tool_call>";
 /// plus the buffered bytes as visible content (preserving the "never
 /// silently drop tokens" invariant), and resets so subsequent well-formed
 /// tool calls in the same stream still parse.
-const MAX_INSIDE_TOOL_CALL_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_INSIDE_TOOL_CALL_BYTES: usize = 1024 * 1024;
 
 /// Parse model output text for Qwen-format tool calls.
 ///
@@ -131,14 +131,14 @@ fn try_parse_tool_call(content: &str) -> Option<ParsedToolCall> {
 }
 
 const FUNCTION_OPEN: &str = "<function=";
-const FUNCTION_CLOSE: &str = "</function>";
+pub(crate) const FUNCTION_CLOSE: &str = "</function>";
 const PARAM_OPEN: &str = "<parameter=";
 const PARAM_CLOSE: &str = "</parameter>";
 
 // MiniCPM5-style tool calls: `<function name="NAME"><param name="KEY">VALUE</param></function>`
 // with no `<tool_call>` wrapper and optional `<![CDATA[…]]>`-wrapped values.
 // `FUNCTION_CLOSE` (`</function>`) is shared with the Qwen XML form above.
-const MINICPM_FUNCTION_OPEN: &str = "<function ";
+pub(crate) const MINICPM_FUNCTION_OPEN: &str = "<function ";
 const MINICPM_PARAM_OPEN: &str = "<param name=\"";
 const MINICPM_PARAM_CLOSE: &str = "</param>";
 const NAME_ATTR: &str = "name=\"";
@@ -148,7 +148,7 @@ const CDATA_CLOSE: &str = "]]>";
 /// Declared JSON-schema type for a single tool parameter, used to coerce the
 /// raw string values that the Qwen XML tool-call format emits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ParamType {
+pub(crate) enum ParamType {
     Str,
     Integer,
     Number,
@@ -176,6 +176,7 @@ impl ParamType {
 ///
 /// Built from the `OpenAI` `tools` array so the XML tool-call parser can
 /// coerce raw string parameter values to the JSON types the client declared.
+#[derive(Clone)]
 pub struct ToolSchema {
     params: std::collections::HashMap<String, std::collections::HashMap<String, ParamType>>,
 }
@@ -229,7 +230,7 @@ impl ToolSchema {
         Some(Self { params })
     }
 
-    fn param_type(&self, function: &str, param: &str) -> Option<ParamType> {
+    pub(crate) fn param_type(&self, function: &str, param: &str) -> Option<ParamType> {
         self.params.get(function)?.get(param).copied()
     }
 }
@@ -237,7 +238,7 @@ impl ToolSchema {
 /// Coerce a raw XML parameter string into a JSON value using its declared
 /// schema type, falling back to best-effort JSON parsing when the type is
 /// unknown or absent.
-fn coerce_param_value(raw: &str, declared: Option<ParamType>) -> serde_json::Value {
+pub(crate) fn coerce_param_value(raw: &str, declared: Option<ParamType>) -> serde_json::Value {
     use serde_json::Value;
     let as_string = || Value::String(raw.to_owned());
     let parsed_if = |pred: fn(&Value) -> bool| {
@@ -268,7 +269,7 @@ fn coerce_param_value(raw: &str, declared: Option<ParamType>) -> serde_json::Val
 /// Strip a single leading and trailing newline — the wrapping the template
 /// adds around `<parameter>` values — preserving any intentional inner or
 /// edge whitespace.
-fn strip_one_wrapping_newline(s: &str) -> &str {
+pub(crate) fn strip_one_wrapping_newline(s: &str) -> &str {
     let without_lead = s
         .strip_prefix("\r\n")
         .or_else(|| s.strip_prefix('\n'))
@@ -342,7 +343,10 @@ fn parse_xml_tool_call(content: &str, schema: Option<&ToolSchema>) -> Option<Par
 
 /// Parse one `<tool_call>` block body, dispatching on shape: the Qwen XML
 /// `<function=…>` form vs the legacy JSON-object form.
-fn parse_tool_call_block(content: &str, schema: Option<&ToolSchema>) -> Option<ParsedToolCall> {
+pub(crate) fn parse_tool_call_block(
+    content: &str,
+    schema: Option<&ToolSchema>,
+) -> Option<ParsedToolCall> {
     if content.trim_start().starts_with(FUNCTION_OPEN) {
         parse_xml_tool_call(content, schema)
     } else {
@@ -357,7 +361,7 @@ fn parse_tool_call_block(content: &str, schema: Option<&ToolSchema>) -> Option<P
 /// Returns `None` when the block is not yet terminated: either no closer has
 /// arrived, or scanning is parked inside an unclosed CDATA span (the caller
 /// should wait for more input).
-fn minicpm_function_end(s: &str) -> Option<usize> {
+pub(crate) fn minicpm_function_end(s: &str) -> Option<usize> {
     let mut i = 0;
     loop {
         let rest = s.get(i..)?;
@@ -408,7 +412,10 @@ fn extract_param_value(vr: &str) -> (&str, &str) {
 ///
 /// Returns `None` when no `name="…"` attribute is present so the caller can
 /// preserve the text verbatim.
-fn parse_minicpm_function(block: &str, schema: Option<&ToolSchema>) -> Option<ParsedToolCall> {
+pub(crate) fn parse_minicpm_function(
+    block: &str,
+    schema: Option<&ToolSchema>,
+) -> Option<ParsedToolCall> {
     // Read `name="…"` only from the opening `<function …>` tag (before its
     // closing `>`). Scanning the whole block would let a malformed payload
     // like `<function><param name="x">…` be parsed as a tool call named `x`
@@ -785,7 +792,7 @@ mod tests {
             0,
             Some("Hello, how can I help you?"),
         );
-        assert!(result.tool_calls.is_empty());
+        assert_eq!(result.tool_calls, []);
     }
 
     #[test]
@@ -943,7 +950,7 @@ After last."#;
         // The parser finds the first <tool_call>, then looks for first </tool_call>.
         // Content between them: "\n<tool_call>\n{\"name\": \"inner\", \"arguments\": {}}\n"
         // This is not valid JSON (starts with <tool_call>), so it's preserved as raw text.
-        assert!(result.tool_calls.is_empty());
+        assert_eq!(result.tool_calls, []);
         assert!(result.text.contains("<tool_call>"));
     }
 
@@ -1038,7 +1045,7 @@ After last."#;
             vis, "hello <tool_call>{\"name\":\"x\"}</tool_call> world",
             "inactive tracker must pass every chunk through verbatim",
         );
-        assert!(calls.is_empty());
+        assert_eq!(calls, []);
         assert!(!t.has_tool_calls());
         assert_eq!(t.completed_count(), 0);
     }
@@ -1109,7 +1116,7 @@ After last."#;
         assert!(vis.contains("not json"));
         assert!(vis.contains("</tool_call>"));
         assert!(vis.contains("after"));
-        assert!(calls.is_empty());
+        assert_eq!(calls, []);
         assert_eq!(t.completed_count(), 0);
     }
 
@@ -1121,7 +1128,7 @@ After last."#;
         // emitted as visible (otherwise tokens vanish silently).
         assert!(vis.contains("<tool_call>"));
         assert!(vis.contains("partial"));
-        assert!(calls.is_empty());
+        assert_eq!(calls, []);
     }
 
     #[test]
@@ -1134,7 +1141,7 @@ After last."#;
             drain_visible_and_calls(&mut t, &["caf", "\u{00e9}", " and more text here"]);
         assert!(vis.contains("caf\u{00e9}"));
         assert!(vis.contains("more text"));
-        assert!(calls.is_empty());
+        assert_eq!(calls, []);
     }
 
     #[test]
@@ -1493,7 +1500,7 @@ After last."#;
     fn minicpm_function_without_name_is_not_parsed() {
         let input = "<function ><param name=\"city\">Paris</param></function>";
         let result = parse_tool_calls(input, None);
-        assert!(result.tool_calls.is_empty());
+        assert_eq!(result.tool_calls, []);
         assert!(result.text.contains("<param name=\"city\">"));
     }
 

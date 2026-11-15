@@ -88,12 +88,12 @@ export function useServerData(settings: Settings): ServerData {
       const list = await listProfiles();
       setProfiles(list);
       const profile = list.profiles.find((p) => p.name === settings.profile) ?? list.profiles[0];
-      const file = await readConfig(profile.config_path);
+      const file = await readConfig(profile.config_path, settings.higgsBinary);
       setConfigFile(file);
     } catch (error) {
       setLogError(String(error));
     }
-  }, [settings.profile]);
+  }, [settings.profile, settings.higgsBinary]);
 
   useEffect(() => {
     void reloadConfig();
@@ -148,7 +148,7 @@ export function useServerData(settings: Settings): ServerData {
             setLogPath(path);
           }
           if (!metricsLoggingEnabled(config)) {
-            setLogError("Metrics logging is disabled in this config ([logging.metrics] enabled = false)");
+            setLogError("Metrics logging is disabled in this config ([observability.metrics_log] enabled = false)");
           } else {
             try {
               const log = await readMetricsLog(path, MAX_LOG_RECORDS, logOffset.current);
