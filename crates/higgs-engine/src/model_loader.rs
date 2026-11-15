@@ -210,7 +210,11 @@ pub fn context_length<P: AsRef<Path>>(model_dir: P) -> Option<u32> {
 }
 
 /// The number of positions that a rope-scaling block reaches: its `original_max_position_embeddings`
-/// times its `factor`. `None` when the config has no such block.
+/// times its `factor`.
+///
+/// `None` when the config has no such block, or when the block is not of a
+/// type that stretches the trained context (`yarn` or `linear`). The `llama3`, `longrope` and
+/// `dynamic` types remap frequencies, and `max_position_embeddings` already holds their length.
 pub fn rope_scaled_length<P: AsRef<Path>>(model_dir: P) -> Option<u64> {
     let text = std::fs::read_to_string(model_dir.as_ref().join("config.json")).ok()?;
     let config: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -221,6 +225,12 @@ fn rope_scaled_length_from_config(config: &serde_json::Value) -> Option<u64> {
     let scaling = ["rope_scaling", "rope_parameters"].iter().find_map(|key| {
         crate::mlx_tuning::config_lookup(config, key).filter(|value| value.is_object())
     })?;
+    let rope_type = ["rope_type", "type"]
+        .iter()
+        .find_map(|key| scaling.get(key).and_then(serde_json::Value::as_str))?;
+    if !matches!(rope_type, "yarn" | "linear") {
+        return None;
+    }
     let original = scaling.get("original_max_position_embeddings")?.as_f64()?;
     let factor = scaling.get("factor")?.as_f64()?;
     let reach = original * factor;
@@ -1234,16 +1244,28 @@ mod tests {
             |text: &str| rope_scaled_length_from_config(&serde_json::from_str(text).unwrap());
         assert_eq!(
             reach(
-                r#"{"rope_scaling": {"factor": 32.0, "original_max_position_embeddings": 8192}}"#
+                r#"{"rope_scaling": {"rope_type": "yarn", "factor": 32.0, "original_max_position_embeddings": 8192}}"#
             ),
             Some(262_144)
         );
         assert_eq!(
             reach(
-                r#"{"text_config": {"rope_parameters": {"factor": 4, "original_max_position_embeddings": 32768}}}"#
+                r#"{"text_config": {"rope_parameters": {"type": "linear", "factor": 4, "original_max_position_embeddings": 32768}}}"#
             ),
             Some(131_072)
         );
+        assert_eq!(
+            reach(
+                r#"{"max_position_embeddings": 40960, "rope_scaling": {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768}}"#
+            ),
+            Some(131_072)
+        );
+        for frequency_remap in ["llama3", "longrope", "dynamic"] {
+            let config = format!(
+                r#"{{"rope_scaling": {{"rope_type": "{frequency_remap}", "factor": 32.0, "original_max_position_embeddings": 8192}}}}"#
+            );
+            assert_eq!(reach(&config), None, "{frequency_remap}");
+        }
         assert_eq!(reach(r#"{"rope_scaling": {"rope_type": "default"}}"#), None);
         assert_eq!(reach(r#"{"rope_scaling": null}"#), None);
         assert_eq!(reach("{}"), None);
