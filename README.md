@@ -392,7 +392,7 @@ Install the app with `brew install --cask panbanda/brews/higgs-desktop` or from 
 
 ## Performance
 
-These values were measured on an Apple M4 Max with 128 GB. The `bench_compare` harness in `higgs-bench` produced them. It sent streaming requests, used the token counts that the server reported, and took the median of 3 trials after 1 warm-up. Temperature was 0 and thinking was off. `higgs bench <model>` reproduces these measurements for your own model and Mac. It covers decode, prefill, prefix cache and concurrency.
+These values were measured on an Apple M4 Max with 128 GB. The `bench_compare` harness in `higgs-bench` produced them. It sent streaming requests, used the token counts that the server reported, and took the median of 3 trials after 1 warm-up. The concurrency tests used 2 measured rounds for each client count. Temperature was 0 and thinking was off. `higgs bench <model>` reproduces these measurements for your own model and Mac. It covers decode, prefill, prefix cache and concurrency.
 
 <!-- BENCHMARK TABLE: update this table and docs/omlx-comparison.md together. -->
 

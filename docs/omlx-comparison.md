@@ -14,7 +14,7 @@ Some oMLX results changed a lot between two runs of the same model. For these mo
 | Higgs | Binaries built at commit `3c73cac` of the `perf/beat-omlx` branch, which is now merged into `main`. Later `main` commits changed CI, lint and security checks, not decode or prefill. MLX 0.32.2 via mlx-rs `adf439b` |
 | oMLX | 0.7.4.dev1 at commit `bab025f`, MLX 0.32.4, mlx-lm `0d4d3d0`, installed from source into a clean venv, default settings, isolated with `--base-path` and `--no-hf-cache` |
 | Sampling | temperature 0, thinking disabled on both (`reasoning.effort = none` for Higgs, `chat_template_kwargs.enable_thinking = false` for oMLX) |
-| Harness | `bench_compare` (see [benchmarking.md](benchmarking.md#bench_compare)): streaming requests, server-reported token counts, medians of 3 trials after 1 warm-up, one server running at a time |
+| Harness | `bench_compare` (see [benchmarking.md](benchmarking.md#bench_compare)): streaming requests, server-reported token counts, medians of 3 trials after 1 warm-up (2 measured rounds for each concurrency level), one server running at a time |
 
 oMLX's optional custom kernel extensions are not built by a source install. Its `/api/status` reported them unavailable, so its numbers here are without them. oMLX speculative decoding (MTP, DFlash) is off by default and stays off. None of the checkpoints used here ship MTP weights.
 
@@ -25,7 +25,7 @@ Models: `mlx-community/Llama-3.2-1B-Instruct-4bit`, `mlx-community/Qwen3-1.7B-4b
 | Area | Result |
 |---|---|
 | Follow-up turn latency (prefix cache hit) | Higgs ahead: 1.6x to 5.3x lower time to first token (first pass: 1.2x to 3.8x) |
-| Concurrent throughput, 2 to 4 clients | Higgs ahead on every model tested. The lead is 7% to 27% against the better oMLX run, and up to 2.2x where an oMLX run was low |
+| Concurrent throughput, 2 to 4 clients | Higgs ahead on every model tested. The lead is 7% to 29% against the higher oMLX value in the tables, and up to 2.2x where an oMLX run was low |
 | Concurrent throughput, 8 clients, small models | Level: within 2% on Llama-1B and Qwen3-1.7B (first pass: up to 6% behind) |
 | Concurrent throughput, 8 clients, large models | Higgs ahead: 3% to 32% on Thinklite-27B, 1.7x to 2.0x on Qwen3.6-35B |
 | Single-stream decode, dense models | Level (within 2%); both run at the memory-bandwidth limit |
@@ -52,7 +52,7 @@ In the first pass, oMLX needed 457 ms for turn 2 on Thinklite-27B. It now needs 
 
 Higgs keeps prefix KV state in memory in 32-token blocks and reuses everything up to the last full block. oMLX reconstructs from its SSD block cache (256-token blocks, RAM tier off by default). On the 1B and 1.7B models, oMLX reported 2,816 cached tokens for turn 2 and Higgs reported 2,944. On the larger models, both reported about 3,000.
 
-Prompts that share a prefix and then diverge also reuse the shared part. An example is the same system prompt and tools with a different user message, or an edited earlier turn. Dense models truncate the cached KV blocks to the shared length. The Qwen3.5/3.6 hybrid models cannot do this directly. The state of their recurrent layers is valid only at the position where Higgs captured it. Higgs therefore checkpoints that state during prefill (every 512 to 1,024 tokens, at most 8 per entry, 2 GiB total by default; one checkpoint is 147 MiB on the 27B model). It resumes from the nearest checkpoint. On Thinklite-27B with a 3,850-token shared context, a new question went from 20.1 s to first token (cold) to 3.7 s (3,072 tokens reused), and an exact repeat to 0.1 s. Resuming from a checkpoint is bit-identical to a cold prefill on real weights. This paragraph comes from the first pass. This pass did not repeat these measurements.
+Prompts that share a prefix and then diverge also reuse the shared part. An example is the same system prompt and tools with a different user message, or an edited earlier turn. Dense models truncate the cached KV blocks to the shared length. The Qwen3.5/3.6 hybrid models cannot do this directly. The state of their recurrent layers is valid only at the position where Higgs captured it. Higgs therefore checkpoints that state during prefill. It saves one checkpoint every 512 to 1,024 tokens. The default limit is 8 checkpoints per entry and 2 GiB in total. One checkpoint is 147 MiB on the 27B model. Higgs resumes from the nearest checkpoint. On Thinklite-27B with a 3,850-token shared context, a new question went from 20.1 s to first token (cold) to 3.7 s (3,072 tokens reused), and an exact repeat to 0.1 s. Resuming from a checkpoint is bit-identical to a cold prefill on real weights. This paragraph comes from the first pass. This pass did not repeat these measurements.
 
 ### Concurrent throughput
 
@@ -94,7 +94,8 @@ What changed in Higgs:
 
 - The engine keeps one left-padded batched KV cache across decode steps. It no longer re-stacks every request's cache per layer per token. It rotates each row at its own position with one dynamic RoPE call. It builds step N+1 while the GPU is still computing step N.
 - Short prompts that arrive together are prefilled in one padded forward pass.
-- Batched decode now covers Phi-3, Starcoder2, Qwen3 MoE, Gemma 2, Gemma 3, Gemma 4 (all but the MoE variant), and the Qwen3.5/3.6 hybrid models (dense and MoE). It also covers Llama, Mistral, Qwen2 and Qwen3 dense. Hybrid models batch decode only. Each prompt is prefilled on its own, then joins the batch.
+- Batched decode now covers Phi-3, Starcoder2, Qwen3 MoE, Gemma 2 and Gemma 3. It also covers Gemma 4 (all but the MoE variant) and the Qwen3.5/3.6 hybrid models (dense and MoE). It also covers Llama, Mistral, Qwen2 and Qwen3 dense.
+- Hybrid models batch decode only. Each prompt is prefilled on its own, then joins the batch.
 
 ### Single-stream decode
 
@@ -121,7 +122,7 @@ The next table lists experiments on the Higgs side, measured on Qwen3.6-35B-A3B-
 | Gathered 4-bit matrix-vector kernel replacing the three `gather_qmm` calls | 133 | same speed as MLX's kernel, launch for launch |
 | Gate, up and SwiGLU fused into one launch (five launches to one) | 136 | fewer launches alone does not explain oMLX's lead |
 
-Ablations show where the 7.6 ms goes: 4.0 ms outside the MoE block (GDN and attention layers, norms, head), 2.6 ms in the routed experts (three gathered products per layer), 0.7 ms in the shared expert, and 0.2 ms to combine them. oMLX's whole step is about 5.4 ms. To match it, Higgs must roughly halve the routed-expert cost, or find savings outside the MoE block as well. The custom kernels matched the speed of MLX and did not beat it. The next step is to profile the GPU side directly (thread layout and occupancy of the gathered products) instead of more fusion.
+Ablations show where the 7.6 ms goes: 4.0 ms outside the MoE block (GDN and attention layers, norms, head), 2.6 ms in the routed experts (three gathered products per layer), 0.7 ms in the shared expert, and 0.2 ms to combine them. oMLX's whole step is about 5.4 ms. Halving the routed-expert cost gives about 6.3 ms. Higgs also needs savings of about 0.9 ms elsewhere, for example outside the MoE block, to match oMLX. The custom kernels matched the speed of MLX and did not beat it. The next step is to profile the GPU side directly (thread layout and occupancy of the gathered products) instead of more fusion.
 
 ### Cold prefill
 
@@ -216,7 +217,12 @@ omlx serve --model-dir <models dir> --no-hf-cache --base-path <scratch dir> --po
 
 Run one server at a time, and let the first request after a rebuild finish before measuring: the first model load after a new binary is several times slower than later ones.
 
-The harness sends 1 warm-up request for each scenario before it measures. Start each run when the load average is low and no compile is running. For Phi-3-mini, which has a 4,096-token context, add `--prefill-tokens 512 --prefill-tokens 2048` to the `bench_compare` command. Run a model again when its oMLX numbers differ much from an earlier run.
+Follow these steps before you measure:
+
+1. Wait until the load average is low and no compile is running.
+2. Send 1 request and let it finish. The harness also sends 1 warm-up request for each scenario.
+3. For Phi-3-mini, add `--prefill-tokens 512 --prefill-tokens 2048` to the `bench_compare` command. This model has a 4,096-token context.
+4. Run the model again when its oMLX numbers differ much from an earlier run.
 
 Batched decode is checked against one-at-a-time decode on real weights by an ignored test:
 
