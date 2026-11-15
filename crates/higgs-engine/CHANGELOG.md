@@ -1,5 +1,46 @@
 # Changelog
 
+## [1.9.0](https://github.com/panbanda/higgs/compare/higgs-engine-v1.8.2...higgs-engine-v1.9.0) (2026-11-15)
+
+
+### Features
+
+* **api:** report cached tokens, reasoning tokens and timings in usage ([0caa206](https://github.com/panbanda/higgs/commit/0caa2063e83f3424dd60ecdfeb4a36cecf9fcc53))
+* **batch:** reach feature parity with the simple engine ([d2fae4c](https://github.com/panbanda/higgs/commit/d2fae4c0e99f1db6d235993cbf88f88618f8b914))
+* **config:** choose the engine per model with batch = "auto" ([907b473](https://github.com/panbanda/higgs/commit/907b47303113f38cb46778228846d51fd9f7a806))
+* **config:** make prefix-cache sizing and hybrid checkpoints configurable ([d16f815](https://github.com/panbanda/higgs/commit/d16f81549847b2b6d155adfad37cba41f26afeae))
+* **engine:** add scheduling plan and speculative decode state for the worker ([5131c24](https://github.com/panbanda/higgs/commit/5131c2453915a81c846b9f67e23d36a9973156de))
+* **engine:** batched decode for Phi-3 and Starcoder2 through a generic batched cache ([61da6c8](https://github.com/panbanda/higgs/commit/61da6c8ce4575451afd2e0d3a0ed799cea916dfe))
+* **engine:** make the thinking budget configurable ([9431c34](https://github.com/panbanda/higgs/commit/9431c344da030f4615440722b9447234c5b8bf8a))
+* **engine:** per-model tool-call formats and parsers ([f803bce](https://github.com/panbanda/higgs/commit/f803bce0f2706078084a4e3a6a91fc3e95a397b3))
+* **engine:** serve a diverging prompt from the shared blocks of a cached entry ([59bd5b5](https://github.com/panbanda/higgs/commit/59bd5b5fae4258b9ccf1d33a4e15299f6522d676))
+* **engine:** serve vision, disk prefix store, TurboQuant and speculative decode from the worker ([e727b26](https://github.com/panbanda/higgs/commit/e727b26184bba144a72176eaadfb1a699a60fd76))
+* **engine:** shut an engine down and wait for its MLX state to be freed ([c192c86](https://github.com/panbanda/higgs/commit/c192c869d50aee7ec6a0b72a1c69fb287cafc99b))
+
+
+### Bug Fixes
+
+* **ci:** declare rust-version on every crate and satisfy Rust 1.100 clippy ([060d1dd](https://github.com/panbanda/higgs/commit/060d1ddcb601d7f6adca07c19166f94645528334))
+* **ci:** satisfy the clippy and rustfmt of the CI toolchain ([c48e2f8](https://github.com/panbanda/higgs/commit/c48e2f85a6fa881b674cb03e1817d7cc8b0e99b7))
+* **engine:** build no disk prefix tier when the cache keeps no entries ([5246a93](https://github.com/panbanda/higgs/commit/5246a93b6c69a7b018ed72e921cff6769a04734c))
+* **engine:** keep Gemma 4 string delimiters through detokenization ([7f22283](https://github.com/panbanda/higgs/commit/7f222830b6153ede0ef275d6fcaf8767c1d6e7eb))
+* **engine:** leave the disk prefix directory alone when the cache keeps no entries ([74e4cfc](https://github.com/panbanda/higgs/commit/74e4cfc13fe69accbe55e0117d3707b5ace8c39b))
+* **engine:** penalize the in-flight token during pipelined decode ([c1eb041](https://github.com/panbanda/higgs/commit/c1eb041c4f49116bbd2133dd7a9aa9796ce70b31))
+* **engine:** plan no checkpoints when the prefix cache keeps no entries ([fa50747](https://github.com/panbanda/higgs/commit/fa507470d50de5c196a88540c342158d802a1d07))
+* **engine:** report worker failures to the caller instead of an empty success ([06400db](https://github.com/panbanda/higgs/commit/06400db76499858b3fa5a950896e7c834b48d5fc))
+* **engine:** stop the simple engine emitting the forced &lt;/think&gt; twice ([f8d5467](https://github.com/panbanda/higgs/commit/f8d54677f5ec1169948091b6b06c706f452eef77))
+* **engine:** take logprob bytes from the detokenizer's text and drop the re-decode ([22b6573](https://github.com/panbanda/higgs/commit/22b65734af209a995774f5ec8c51602b24d3488d))
+* **engine:** tool-call format accessor for batch engines without a chat template ([95465f9](https://github.com/panbanda/higgs/commit/95465f9b82d0900bd93cb050a5989235e69ba31c))
+* **engine:** trust model_type only for families with unmistakable output ([8da1d42](https://github.com/panbanda/higgs/commit/8da1d4273202bd77da9c3017f308b850821dbc79))
+
+
+### Performance Improvements
+
+* **engine:** batched decode for the Qwen3.5/3.6 hybrid models ([f58543d](https://github.com/panbanda/higgs/commit/f58543d32c018f99da603051212c22a85805e436))
+* **engine:** persistent batched KV cache and pipelined batch decode ([4574fa4](https://github.com/panbanda/higgs/commit/4574fa432e96984be5a43c18a8b19d4296f36241))
+* **engine:** resume hybrid prefix-cache entries from recurrent checkpoints ([65f34fe](https://github.com/panbanda/higgs/commit/65f34fe7b7f681031eb862f0383775537fc6375f))
+* faster than oMLX on follow-up turns and concurrency, feature parity, one engine ([5522af9](https://github.com/panbanda/higgs/commit/5522af96fb2bcf75d3c0d3a69f2e841a602751a2))
+
 ## [1.8.2](https://github.com/panbanda/higgs/compare/higgs-engine-v1.8.1...higgs-engine-v1.8.2) (2026-11-10)
 
 

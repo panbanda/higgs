@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.9.0](https://github.com/panbanda/higgs/compare/higgs-models-v1.8.2...higgs-models-v1.9.0) (2026-11-15)
+
+
+### Features
+
+* **config:** choose the engine per model with batch = "auto" ([907b473](https://github.com/panbanda/higgs/commit/907b47303113f38cb46778228846d51fd9f7a806))
+* **engine:** batched decode for Phi-3 and Starcoder2 through a generic batched cache ([61da6c8](https://github.com/panbanda/higgs/commit/61da6c8ce4575451afd2e0d3a0ed799cea916dfe))
+* **models:** batched decode and prefill for Gemma 2, 3 and 4 ([f86677b](https://github.com/panbanda/higgs/commit/f86677be30a476c3a5b9448c1f59f67829711cbd))
+
+
+### Bug Fixes
+
+* **ci:** declare rust-version on every crate and satisfy Rust 1.100 clippy ([060d1dd](https://github.com/panbanda/higgs/commit/060d1ddcb601d7f6adca07c19166f94645528334))
+* **ci:** satisfy the clippy and rustfmt of the CI toolchain ([c48e2f8](https://github.com/panbanda/higgs/commit/c48e2f85a6fa881b674cb03e1817d7cc8b0e99b7))
+* **engine:** penalize the in-flight token during pipelined decode ([c1eb041](https://github.com/panbanda/higgs/commit/c1eb041c4f49116bbd2133dd7a9aa9796ce70b31))
+* **models:** do not build an empty top-logprob list ([973c11e](https://github.com/panbanda/higgs/commit/973c11e98b7a313ed0577af6a5c8307eff5fdd3e))
+* **models:** evaluate fused GDN projections one at a time during load ([0af068d](https://github.com/panbanda/higgs/commit/0af068d39e469ca4c80e399ff735399e3b9cb720))
+* **models:** read safetensors shards into memory before GPU work ([454e416](https://github.com/panbanda/higgs/commit/454e416235a1e5a37345f6d0d83b6cded6c8378b))
+
+
+### Performance Improvements
+
+* **engine:** batched decode for the Qwen3.5/3.6 hybrid models ([f58543d](https://github.com/panbanda/higgs/commit/f58543d32c018f99da603051212c22a85805e436))
+* **engine:** persistent batched KV cache and pipelined batch decode ([4574fa4](https://github.com/panbanda/higgs/commit/4574fa432e96984be5a43c18a8b19d4296f36241))
+* faster than oMLX on follow-up turns and concurrency, feature parity, one engine ([5522af9](https://github.com/panbanda/higgs/commit/5522af96fb2bcf75d3c0d3a69f2e841a602751a2))
+* **models:** cheaper MoE routing and batched decode for Qwen3 MoE ([93e8fd2](https://github.com/panbanda/higgs/commit/93e8fd25ee89fc7646d8ac98b3f984068c81ae8e))
+* **models:** keep single-row fast paths off batched inputs ([2a67def](https://github.com/panbanda/higgs/commit/2a67defc4d40b4ce618489caf4f30bf1147790fc))
+* **models:** skip expert sorting for small MoE lookups ([59a272a](https://github.com/panbanda/higgs/commit/59a272a39a94df1c736b4fa23c1ea924da6f6840))
+
 ## [1.8.2](https://github.com/panbanda/higgs/compare/higgs-models-v1.8.1...higgs-models-v1.8.2) (2026-11-10)
 
 
