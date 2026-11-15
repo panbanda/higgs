@@ -394,22 +394,24 @@ Install the app with `brew install --cask panbanda/brews/higgs-desktop` or from 
 
 These values were measured on an Apple M4 Max with 128 GB. The `bench_compare` harness in `higgs-bench` produced them. It sent streaming requests, used the token counts that the server reported, and took the median of 3 trials after 1 warm-up. Temperature was 0 and thinking was off. `higgs bench <model>` reproduces these measurements for your own model and Mac. It covers decode, prefill, prefix cache and concurrency.
 
-<!-- BENCHMARK TABLE: a new run is pending. Update this table and the benchmark documents together. -->
+<!-- BENCHMARK TABLE: update this table and docs/omlx-comparison.md together. -->
 
 | Model | Decode, 1 client (tok/s) | Total tok/s with 1, 2, 4, 8 clients | Follow-up turn, time to first token | Peak memory |
 |---|---|---|---|---|
-| Llama-3.2-1B-4bit | 480 | 455, 775, 1105, 1350 | 32 ms | 1.2 GB |
-| Qwen3-1.7B-4bit | 329 | 305, 544, 787, 952 | 57 ms | 1.3 GB |
-| Thinklite-27B-4bit | 29.0 | 27, 50, 69, 74 | 389 ms | 14.9 GB |
-| Qwen3.6-35B-A3B-4bit | 134 | 109, 178, 255, 326 | 84 ms | not recorded |
+| Llama-3.2-1B-4bit | 480 | 455, 786, 1144, 1354 | 32 ms | 1.2 GB |
+| Qwen3-1.7B-4bit | 328 | 306, 546, 804, 945 | 55 ms | 1.4 GB |
+| Phi-3-mini-4k-instruct-4bit | 175 | 157, 282, 399, 453 | 132 ms | 2.3 GB |
+| Thinklite-27B-4bit | 28.9 | 27, 50, 69, 73 | 350 ms | 18.7 GB |
+| Qwen3.6-35B-A3B-4bit | 133 | 122, 193, 262, 323 | 95 ms | 22.3 GB |
 
 <!-- END BENCHMARK TABLE -->
 
 Notes on the table:
 
 - The follow-up turn repeats about 3,000 tokens of history and adds a short message.
-- A request on Thinklite-27B-4bit with 8 clients had a mean time to the first token of 3.7 s.
-- The measurements are a first pass. Differences under about 5% are noise.
+- A request on Thinklite-27B-4bit with 8 clients had a mean time to the first token of 4.0 s.
+- The peak memory value covers the whole run, which includes the 8-client test.
+- Each run started when the machine had little background load. Differences under about 5% are noise.
 
 [docs/benchmarking.md](docs/benchmarking.md) describes the harnesses. [docs/performance.md](docs/performance.md) has earlier measurements.
 
