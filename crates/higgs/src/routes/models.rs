@@ -15,29 +15,43 @@ use crate::{
 /// Never loads anything.
 pub async fn list_models(State(state): State<SharedState>) -> Json<ModelList> {
     let statuses = state.router.pool().statuses();
-    let data = model_objects_sorted(
-        statuses
-            .iter()
-            .map(|status| (status.name.as_str(), status.state == ModelState::Loaded)),
-    );
+    let data = model_objects_sorted(statuses.iter().map(|status| {
+        (
+            status.name.as_str(),
+            status.state == ModelState::Loaded,
+            configured_context_length(&state, &status.name),
+        )
+    }));
     Json(ModelList {
         object: "list",
         data,
     })
 }
 
-/// Build a sorted, stable list of [`ModelObject`]s from `(name, loaded)` pairs.
-fn model_objects_sorted<'a>(models: impl Iterator<Item = (&'a str, bool)>) -> Vec<ModelObject> {
-    let mut sorted: Vec<(&str, bool)> = models.collect();
+/// The effective context length of the configured model that is served as `name`.
+pub fn configured_context_length(state: &SharedState, name: &str) -> Option<u32> {
+    let configured = state.config.models.iter().find(|model| {
+        model.name.as_deref() == Some(name) || crate::engine_loader::served_name(model) == name
+    })?;
+    crate::engine_loader::effective_context_length(configured)
+}
+
+/// Build a sorted, stable list of [`ModelObject`]s from `(name, loaded, context length)`.
+fn model_objects_sorted<'a>(
+    models: impl Iterator<Item = (&'a str, bool, Option<u32>)>,
+) -> Vec<ModelObject> {
+    let mut sorted: Vec<(&str, bool, Option<u32>)> = models.collect();
     sorted.sort_unstable();
     sorted
         .into_iter()
-        .map(|(name, loaded)| ModelObject {
+        .map(|(name, loaded, context_length)| ModelObject {
             id: name.to_owned(),
             object: "model",
             created: chrono::Utc::now().timestamp(),
             owned_by: "local".to_owned(),
             loaded,
+            context_length,
+            max_model_len: context_length,
         })
         .collect()
 }
@@ -113,7 +127,7 @@ mod tests {
     #[test]
     fn test_model_list_is_sorted_alphabetically() {
         let names = ["zebra", "alpha", "middle"];
-        let data = model_objects_sorted(names.iter().map(|name| (*name, false)));
+        let data = model_objects_sorted(names.iter().map(|name| (*name, false, None)));
         let ids: Vec<&str> = data.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["alpha", "middle", "zebra"]);
     }
@@ -126,19 +140,21 @@ mod tests {
 
     #[test]
     fn test_model_list_single_entry() {
-        let data = model_objects_sorted(std::iter::once(("only-model", false)));
+        let data = model_objects_sorted(std::iter::once(("only-model", false, None)));
         assert_eq!(data.len(), 1);
         assert_eq!(data.first().map(|m| m.id.as_str()), Some("only-model"));
     }
 
     #[test]
     fn test_model_objects_have_correct_fields() {
-        let data = model_objects_sorted(std::iter::once(("test-model", true)));
+        let data = model_objects_sorted(std::iter::once(("test-model", true, Some(4096))));
         let obj = data.first().unwrap();
         assert_eq!(obj.object, "model");
         assert_eq!(obj.owned_by, "local");
         assert!(obj.created > 0);
         assert!(obj.loaded);
+        assert_eq!(obj.context_length, Some(4096));
+        assert_eq!(obj.max_model_len, Some(4096));
     }
 
     #[test]

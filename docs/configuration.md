@@ -129,7 +129,7 @@ error.
 
 ### Inheritance and precedence
 
-`[defaults]` accepts every per-model key (`load`, `idle_ttl`, `batch`, `profile`, `thinking_budget`, `pinned`,
+`[defaults]` accepts every per-model key (`load`, `idle_ttl`, `batch`, `profile`, `thinking_budget`, `context_length`, `pinned`,
 `kv_cache.*`, `prefix_cache.*`, `prefill.*`). A `[[models]]` entry overrides it key by key, including inside the
 `kv_cache`, `prefix_cache` and `prefill` tables. For a per-model key the order is:
 
@@ -195,6 +195,7 @@ Keys valid in both. A `[[models]]` entry additionally needs `path` and may set `
 | `batch` | `true`, `false`, `"auto"` | `"auto"` | `false` limits the model to one request at a time; `true` and `"auto"` mean no limit. See [Concurrent requests](#concurrent-requests) |
 | `profile` | `"auto"`, `"latency"`, `"balanced"`, `"throughput"` | `"auto"` | MLX tuning preset |
 | `thinking_budget` | integer >= 1 | `256` | Reasoning tokens the model may spend before `</think>` is forced |
+| `context_length` | integer >= 1 | *(from the model)* | Prompt and generated tokens together that one request may use. When unset, Higgs reads `max_position_embeddings` from the `config.json` of the model (from `text_config` for a multimodal model). A prompt of this length or longer is rejected with HTTP 400 `context_length_exceeded`. A request with a prompt that fits but a large `max_tokens` is not rejected: generation stops at this length with finish reason `length`. Set it lower to save memory, or set it when `config.json` has no `max_position_embeddings` (Higgs then applies no limit). `higgs doctor` warns when the value is above the model's own length |
 
 `[models.kv_cache]` (and `[defaults.kv_cache]`):
 

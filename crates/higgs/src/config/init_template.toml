@@ -48,6 +48,8 @@ port = 8000
 #                           # no limit (concurrent requests decode together whenever the model can)
 # profile = "auto"          # MLX tuning preset: auto | latency | balanced | throughput
 # thinking_budget = 256     # reasoning tokens before </think> is forced; minimum 1
+# context_length = 8192     # prompt + generated tokens a request may use; unset = max_position_embeddings
+#                           # from the model's config.json. A prompt that fills it gets a 400.
 
 # --- Local models ---
 # Each [[models]] entry loads an MLX model into GPU memory.
@@ -62,6 +64,7 @@ port = 8000
 # load = "startup"
 # idle_ttl = "10m"
 # thinking_budget = 256
+# context_length = 8192     # lower than the model's own limit to save memory, or set it when config.json has none
 
 # KV cache compression. A model with turboquant decodes one request at a time.
 # mla_latent is for DeepSeek-V2 and cannot be combined with mode = "turboquant".

@@ -780,6 +780,13 @@ fn every_per_model_key_inherits_from_defaults_and_is_overridden_by_the_entry() {
             },
         },
         InheritanceRow {
+            key: "context_length",
+            defaults: "context_length = 8192",
+            model: "context_length = 2048",
+            check_defaults: |m| assert_eq!(m.context_length, Some(8192)),
+            check_model: |m| assert_eq!(m.context_length, Some(2048)),
+        },
+        InheritanceRow {
             key: "prefill.yield_tokens",
             defaults: "[defaults.prefill]\nyield_tokens = 256",
             model: "[models.prefill]\nyield_tokens = 1024",

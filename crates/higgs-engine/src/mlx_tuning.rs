@@ -477,7 +477,10 @@ fn balanced_chunked_prefill(
     (tuned_threshold, tuned_chunk)
 }
 
-fn config_lookup<'a>(config: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+pub(crate) fn config_lookup<'a>(
+    config: &'a serde_json::Value,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
     config
         .get(key)
         .filter(|v| !v.is_null())
@@ -488,7 +491,7 @@ fn config_lookup_str<'a>(config: &'a serde_json::Value, key: &str) -> Option<&'a
     config_lookup(config, key).and_then(serde_json::Value::as_str)
 }
 
-fn config_lookup_u64(config: &serde_json::Value, key: &str) -> Option<u64> {
+pub(crate) fn config_lookup_u64(config: &serde_json::Value, key: &str) -> Option<u64> {
     config_lookup(config, key).and_then(serde_json::Value::as_u64)
 }
 

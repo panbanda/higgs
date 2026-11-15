@@ -100,6 +100,7 @@ macro_rules! model_setting_fields {
             leaf("batch"),
             leaf("profile"),
             leaf("thinking_budget"),
+            leaf("context_length"),
             leaf("pinned"),
             table("kv_cache", KV_CACHE),
             table("prefix_cache", PREFIX_CACHE),

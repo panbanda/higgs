@@ -89,7 +89,12 @@ async fn configured_provider_keeps_unknown_names_not_found() {
     for (path, body) in requests_for("claude-sonnet-4-5") {
         let (status, json) = post_json_value(&app, path, &body).await;
         assert_eq!(status, http::StatusCode::NOT_FOUND, "{path}: {json}");
-        assert_eq!(json["error"]["type"], "model_not_found", "{path}: {json}");
+        let expected = if path == "/v1/messages" {
+            "not_found_error"
+        } else {
+            "model_not_found"
+        };
+        assert_eq!(json["error"]["type"], expected, "{path}: {json}");
     }
 }
 

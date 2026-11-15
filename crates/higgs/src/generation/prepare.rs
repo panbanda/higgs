@@ -34,10 +34,31 @@ pub(super) fn prepare(
     engine: &dyn Engine,
     request: &GenerationRequest,
 ) -> Result<Prepared, ServerError> {
-    match &request.prompt {
+    let mut prepared = match &request.prompt {
         Prompt::Chat(chat) => prepare_chat(engine, request, chat),
         Prompt::Text(text) => prepare_text(engine, request, text),
+    }?;
+    fit_context(engine.context_length(), &mut prepared)?;
+    Ok(prepared)
+}
+
+/// Keep the request inside the model's context. A prompt that fills it is refused before
+/// prefill, since there is no room for even one token. Otherwise generation is capped at the
+/// end of the context, so a client that asks for a large `max_tokens` still gets an answer that
+/// ends with finish reason `length`. Every API and every engine path goes through here.
+fn fit_context(limit: Option<u32>, prepared: &mut Prepared) -> Result<(), ServerError> {
+    let Some(context_length) = limit else {
+        return Ok(());
+    };
+    let prompt_tokens = prepared.prompt_token_count;
+    if prompt_tokens >= context_length {
+        return Err(ServerError::ContextLengthExceeded {
+            prompt_tokens,
+            context_length,
+        });
     }
+    prepared.job.max_tokens = prepared.job.max_tokens.min(context_length - prompt_tokens);
+    Ok(())
 }
 
 fn prepare_chat(

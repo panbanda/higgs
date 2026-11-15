@@ -30,6 +30,8 @@ pub struct StubScript {
     /// Stamp the non-streaming output's missing timestamps at call time, as a
     /// real engine would, so durations are measured against the request.
     pub stamp_times: bool,
+    /// Prompt and generated tokens together that the model supports; `None` is no limit.
+    pub context_length: Option<u32>,
 }
 
 impl Default for StubScript {
@@ -43,6 +45,7 @@ impl Default for StubScript {
             generations: Vec::new(),
             streams: Vec::new(),
             stamp_times: false,
+            context_length: None,
         }
     }
 }
@@ -173,6 +176,10 @@ impl Engine for StubEngine {
 
     fn tool_call_format(&self) -> ToolCallFormat {
         self.script.tool_call_format
+    }
+
+    fn context_length(&self) -> Option<u32> {
+        self.script.context_length
     }
 
     fn decode_kind(&self) -> &'static str {

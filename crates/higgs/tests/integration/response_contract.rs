@@ -275,6 +275,8 @@ fn model_list_serialization() {
             created: 1_700_000_000,
             owned_by: "local".to_owned(),
             loaded: true,
+            context_length: None,
+            max_model_len: None,
         }],
     };
     let json: serde_json::Value = serde_json::to_value(&list).unwrap();

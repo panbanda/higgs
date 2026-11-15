@@ -197,6 +197,8 @@ pub struct EngineOptions {
     /// model that cannot batch its decode serves one request at a time
     /// regardless.
     pub max_concurrent_requests: Option<usize>,
+    /// Replaces the context length that `config.json` declares.
+    pub context_length: Option<u32>,
 }
 
 /// Settings the worker needs that are fixed when the engine loads.
@@ -450,6 +452,24 @@ pub struct InferenceEngine {
     enable_thinking: bool,
     think_close_token: Option<u32>,
     default_thinking_budget: u32,
+    context_length: Option<u32>,
+}
+
+/// The configured context length, else the one `config.json` declares. A model with neither
+/// gets no limit, which is logged once here.
+fn resolve_context_length(
+    configured: Option<u32>,
+    model_dir: &Path,
+    model_name: &str,
+) -> Option<u32> {
+    let length = configured.or_else(|| model_loader::context_length(model_dir));
+    if length.is_none() {
+        tracing::warn!(
+            model = %model_name,
+            "config.json declares no max_position_embeddings; the prompt length is not limited"
+        );
+    }
+    length
 }
 
 impl InferenceEngine {
@@ -464,6 +484,7 @@ impl InferenceEngine {
             disk_prefix,
             prefix_cache,
             max_concurrent_requests,
+            context_length: configured_context_length,
         } = options;
         let model_dir = dir.as_ref();
         let model_name = model_loader::derive_model_name(model_dir);
@@ -475,6 +496,8 @@ impl InferenceEngine {
         if template.is_none() {
             tracing::warn!("No chat template found; /v1/chat/completions will be unavailable");
         }
+        let context_length =
+            resolve_context_length(configured_context_length, model_dir, &model_name);
         let eos_token_ids = model_loader::extract_eos_tokens(model_dir);
         let thinking = ThinkingSupport::resolve(model_dir, &tokenizer);
         let settings = WorkerSettings {
@@ -556,6 +579,7 @@ impl InferenceEngine {
             enable_thinking: thinking.enabled,
             think_close_token: thinking.close_token,
             default_thinking_budget,
+            context_length,
         })
     }
 
@@ -589,6 +613,12 @@ impl InferenceEngine {
 
     pub fn eos_token_ids(&self) -> &[u32] {
         &self.eos_token_ids
+    }
+
+    /// The longest sequence, prompt and generated tokens together, that the model supports.
+    /// `None` when the model does not declare it.
+    pub const fn context_length(&self) -> Option<u32> {
+        self.context_length
     }
 
     pub fn hidden_size(&self) -> i32 {
@@ -2783,6 +2813,7 @@ mod tests {
                 disk_prefix: None,
                 prefix_cache: PrefixCacheOptions::default(),
                 max_concurrent_requests: None,
+                context_length: None,
             },
         );
 

@@ -48,6 +48,10 @@ pub trait Engine: Send + Sync {
     /// How this model writes tool calls.
     fn tool_call_format(&self) -> ToolCallFormat;
 
+    /// Prompt and generated tokens together that the model supports; `None` when it does not
+    /// declare a limit.
+    fn context_length(&self) -> Option<u32>;
+
     /// `batched` when concurrent requests decode together, else `sequential`.
     fn decode_kind(&self) -> &'static str;
 
@@ -100,6 +104,10 @@ impl Engine for InferenceEngine {
 
     fn tool_call_format(&self) -> ToolCallFormat {
         Self::tool_call_format(self)
+    }
+
+    fn context_length(&self) -> Option<u32> {
+        Self::context_length(self)
     }
 
     fn decode_kind(&self) -> &'static str {
