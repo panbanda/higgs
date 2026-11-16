@@ -27,8 +27,6 @@ pub struct SwitchMlpWeights {
     pub(super) up_proj: QLinear,
     #[param]
     pub(super) down_proj: QLinear,
-    /// Lazily fused gate+up weights for `MoE` `gather_qmm` (3→2 calls per layer).
-    pub(super) fused_gate_up: Option<(Array, Array, Array, i32)>,
 }
 
 impl SwitchMlpWeights {
@@ -45,7 +43,6 @@ impl SwitchMlpWeights {
             gate_proj: QLinear::new(gate.0, gate.1)?,
             up_proj: QLinear::new(up.0, up.1)?,
             down_proj: QLinear::new(down.0, down.1)?,
-            fused_gate_up: None,
         })
     }
 
@@ -186,106 +183,6 @@ impl SwitchMlpWeights {
 
         let activated = swiglu(&gate_out, &up_out)?;
 
-        let down_out = gather_qmm(
-            &activated,
-            &self.down_proj.weight,
-            &self.down_proj.scales,
-            &self.down_proj.biases,
-            &idx_sorted,
-            true,
-            self.down_proj.group_size,
-            self.down_proj.bits,
-            true,
-        )?;
-
-        // down_out: [N, 1, D] -> squeeze M -> [N, D]
-        let out_flat = down_out.squeeze_axes(&[-2])?;
-
-        // --- Unsort: restore original token order ---
-        let out_unsorted = out_flat.take_axis(&inv_order, 0)?;
-
-        // Reshape back to [B, L, top_k, D]
-        out_unsorted.reshape(&[b, l, top_k, d])
-    }
-
-    /// Like `forward_gather_global_sort` but fuses gate+up into a single
-    /// `gather_qmm` call (3→2 per layer). Lazy-inits fused weights on first call.
-    /// Production routing gates this behind `HIGGS_MOE_FFN_GATE_UP` because the
-    /// fused cache duplicates the resident gate/up tensors.
-    pub(crate) fn forward_gather_fused(
-        &mut self,
-        x: &Array,
-        indices: &Array,
-    ) -> Result<Array, Exception> {
-        // Lazy-init: concatenate gate+up weights along axis 1 (intermediate dim).
-        // MoE weights are [num_experts, intermediate_packed, hidden].
-        if self.fused_gate_up.is_none() {
-            let intermediate = *self
-                .gate_proj
-                .weight
-                .shape()
-                .get(1)
-                .ok_or_else(|| Exception::custom("gate_proj weight missing dim 1"))?;
-            let fw = ops::concatenate(&[&*self.gate_proj.weight, &*self.up_proj.weight], 1)?;
-            let fs = ops::concatenate(&[&*self.gate_proj.scales, &*self.up_proj.scales], 1)?;
-            let fb = ops::concatenate(&[&*self.gate_proj.biases, &*self.up_proj.biases], 1)?;
-            fw.eval()?;
-            fs.eval()?;
-            fb.eval()?;
-            self.fused_gate_up = Some((fw, fs, fb, intermediate));
-        }
-        let (fw, fs, fb, intermediate) = self
-            .fused_gate_up
-            .as_ref()
-            .ok_or_else(|| Exception::custom("fused_gate_up missing after init"))?;
-
-        // --- Global sort (same as forward_gather_global_sort) ---
-        let x_shape = x.shape();
-        let err = || Exception::custom("forward_gather_fused input must be [B, L, D]");
-        let b = *x_shape.first().ok_or_else(err)?;
-        let l = *x_shape.get(1).ok_or_else(err)?;
-        let d = *x_shape.get(2).ok_or_else(err)?;
-        let top_k = *indices
-            .shape()
-            .last()
-            .ok_or_else(|| Exception::custom("indices must have last dim"))?;
-
-        let idx_flat = indices.flatten(None, None)?;
-        let order = ops::argsort_axis(&idx_flat, 0)?;
-        let inv_order = ops::argsort_axis(&order, 0)?;
-
-        let top_k_u32 =
-            u32::try_from(top_k).map_err(|_| Exception::custom("top_k must fit in u32"))?;
-        let top_k_arr = Array::from_slice(&[top_k_u32], &[1]);
-        let token_idx = order.floor_divide(&top_k_arr)?;
-
-        let x_flat = x.reshape(&[b * l, 1, d])?;
-        let x_sorted = x_flat.take_axis(&token_idx, 0)?;
-        let idx_sorted = idx_flat.take_axis(&order, 0)?;
-
-        // --- Fused gate+up: ONE gather_qmm instead of TWO ---
-        let fused_out = gather_qmm(
-            &x_sorted,
-            fw,
-            fs,
-            fb,
-            &idx_sorted,
-            true,
-            self.gate_proj.group_size,
-            self.gate_proj.bits,
-            true,
-        )?;
-        // Split at intermediate boundary → gate_out, up_out
-        let parts = fused_out.split_at_indices(&[*intermediate], Some(-1))?;
-        let gate_out = parts
-            .first()
-            .ok_or_else(|| Exception::custom("fused split failed"))?;
-        let up_out = parts
-            .get(1)
-            .ok_or_else(|| Exception::custom("fused split failed"))?;
-        let activated = swiglu(gate_out, up_out)?;
-
-        // --- down_proj: unchanged ---
         let down_out = gather_qmm(
             &activated,
             &self.down_proj.weight,

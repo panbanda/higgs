@@ -2,10 +2,7 @@
 
 use crate::qwen3_next::{
     activations::swiglu,
-    flags::{
-        DenseFfnGemvMode, parse_dense_ffn_gemv_mode,
-        should_force_dense_decode_safe_defaults_for_brand,
-    },
+    flags::{parse_dense_ffn_down_gemv, should_force_dense_decode_safe_defaults_for_brand},
     linear::{QLinear, quantized_forward},
     qgemv::qgemv_4bit,
 };
@@ -197,40 +194,12 @@ fn test_qgemv_large_n_rows() {
 }
 
 #[test]
-fn parse_dense_ffn_gemv_mode_defaults_to_both() {
-    assert_eq!(parse_dense_ffn_gemv_mode(None), DenseFfnGemvMode::Both);
-    assert_eq!(
-        parse_dense_ffn_gemv_mode(Some("unexpected")),
-        DenseFfnGemvMode::Both
-    );
-}
-
-#[test]
-fn parse_dense_ffn_gemv_mode_supports_all_variants() {
-    assert_eq!(
-        parse_dense_ffn_gemv_mode(Some("fused")),
-        DenseFfnGemvMode::FusedOnly
-    );
-    assert_eq!(
-        parse_dense_ffn_gemv_mode(Some("fused_only")),
-        DenseFfnGemvMode::FusedOnly
-    );
-    assert_eq!(
-        parse_dense_ffn_gemv_mode(Some("down")),
-        DenseFfnGemvMode::DownOnly
-    );
-    assert_eq!(
-        parse_dense_ffn_gemv_mode(Some("down_only")),
-        DenseFfnGemvMode::DownOnly
-    );
-    assert_eq!(
-        parse_dense_ffn_gemv_mode(Some("off")),
-        DenseFfnGemvMode::Off
-    );
-    assert_eq!(
-        parse_dense_ffn_gemv_mode(Some("none")),
-        DenseFfnGemvMode::Off
-    );
+fn the_dense_ffn_down_gemv_is_on_unless_the_mode_says_off() {
+    assert!(parse_dense_ffn_down_gemv(None));
+    assert!(parse_dense_ffn_down_gemv(Some("unexpected")));
+    assert!(parse_dense_ffn_down_gemv(Some("down")));
+    assert!(!parse_dense_ffn_down_gemv(Some("off")));
+    assert!(!parse_dense_ffn_down_gemv(Some(" None ")));
 }
 
 #[test]

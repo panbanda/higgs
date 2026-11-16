@@ -76,17 +76,7 @@ static QGEMV_CONFIG_CACHE_ENABLED: OnceLock<bool> = OnceLock::new();
 static GATED_DELTA_CONFIG_CACHE_ENABLED: OnceLock<bool> = OnceLock::new();
 static DECODE_GEMV_ENABLED: OnceLock<bool> = OnceLock::new();
 static QGEMV_NSG_OVERRIDE: OnceLock<Option<i32>> = OnceLock::new();
-static DENSE_FFN_GEMV_MODE: OnceLock<DenseFfnGemvMode> = OnceLock::new();
-static DENSE_FFN_FUSE_GATE_UP: OnceLock<bool> = OnceLock::new();
-static MOE_FFN_FUSE_GATE_UP: OnceLock<bool> = OnceLock::new();
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DenseFfnGemvMode {
-    Both,
-    FusedOnly,
-    DownOnly,
-    Off,
-}
+static DENSE_FFN_DOWN_GEMV_ENABLED: OnceLock<bool> = OnceLock::new();
 
 pub(super) fn decode_gemv_enabled() -> bool {
     *DECODE_GEMV_ENABLED.get_or_init(|| std::env::var("HIGGS_ENABLE_SELECTED_DECODE_GEMV").is_ok())
@@ -102,37 +92,19 @@ fn truthy_env_var(name: &str) -> bool {
     )
 }
 
-pub(super) fn parse_dense_ffn_gemv_mode(raw: Option<&str>) -> DenseFfnGemvMode {
-    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("fused" | "fused_only") => DenseFfnGemvMode::FusedOnly,
-        Some("down" | "down_only") => DenseFfnGemvMode::DownOnly,
-        Some("off" | "none") => DenseFfnGemvMode::Off,
-        _ => DenseFfnGemvMode::Both,
-    }
+/// Whether the one-row down projection of a dense FFN uses `qgemv_4bit`.
+/// `HIGGS_QGEMV_FFN_MODE=off` (or `none`) turns it off.
+pub(super) fn parse_dense_ffn_down_gemv(raw: Option<&str>) -> bool {
+    !matches!(
+        raw.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("off" | "none")
+    )
 }
 
-pub(super) fn dense_ffn_gemv_mode() -> DenseFfnGemvMode {
-    *DENSE_FFN_GEMV_MODE.get_or_init(|| {
-        parse_dense_ffn_gemv_mode(std::env::var("HIGGS_QGEMV_FFN_MODE").ok().as_deref())
+pub(super) fn dense_ffn_down_gemv_enabled() -> bool {
+    *DENSE_FFN_DOWN_GEMV_ENABLED.get_or_init(|| {
+        parse_dense_ffn_down_gemv(std::env::var("HIGGS_QGEMV_FFN_MODE").ok().as_deref())
     })
-}
-
-pub(super) fn dense_ffn_fuse_gate_up() -> bool {
-    *DENSE_FFN_FUSE_GATE_UP.get_or_init(|| {
-        std::env::var("HIGGS_DENSE_FFN_GATE_UP").ok().map_or_else(
-            || !should_force_dense_decode_safe_defaults_for_brand(apple_cpu_brand()),
-            |raw| {
-                !matches!(
-                    Some(raw.trim().to_ascii_lowercase()).as_deref(),
-                    Some("separate" | "split" | "0" | "false" | "off")
-                )
-            },
-        )
-    })
-}
-
-pub(super) fn moe_ffn_fuse_gate_up() -> bool {
-    *MOE_FFN_FUSE_GATE_UP.get_or_init(|| truthy_env_var("HIGGS_MOE_FFN_GATE_UP"))
 }
 
 pub(super) fn qgemv_config_cache_enabled() -> bool {
