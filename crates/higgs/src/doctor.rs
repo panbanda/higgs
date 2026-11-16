@@ -850,7 +850,7 @@ fn check_model_lifecycle(
     {
         warn(
             &format!(
-                "memory.mlx_cache_limit={cache_limit} is above 75% of the {} of memory in this machine, so it does not bound the cache",
+                "memory.mlx_cache_limit={cache_limit} is above 75% of the {} of memory in this machine, so the cache can keep a large share of physical memory",
                 gib_label(physical)
             ),
             result,

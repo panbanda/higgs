@@ -183,11 +183,20 @@ variable > file > built-in (they have no flag and no per-model level). Any key c
 
 #### MLX cache limit
 
-When MLX frees a buffer, it keeps the memory for reuse. Without a limit, a long-running server keeps almost every buffer that it ever freed. In one test with a 27B model, this cache grew from 2 GB to 43 GB and the process footprint reached 65 GB, while the model and its active buffers used 22 GB.
+When MLX frees a buffer, it keeps the memory for reuse. Without a limit, a long-running server keeps almost every buffer that it ever freed. In one test with a 27B model, this cache grew from 2 GB to 43 GB. The process footprint reached 65 GB, while the model and its active buffers used 22 GB.
 
-`mlx_cache_limit` sets the most memory that MLX keeps this way. When you do not set it, Higgs uses one sixteenth of the working-set size that the device recommends, and at least 1 GB. This is 6.7 GB on a Mac with 128 GB and 1 GB on a Mac with 16 GB. To use a fixed size, set a size such as `"8GB"`. Set `"0"` to keep no freed buffers. A limit that is too small costs speed, because MLX must then ask the system for memory more often. A limit above the memory of the machine does not bound the cache, and `higgs doctor` warns about it.
+**Default.** When you do not set `mlx_cache_limit`, Higgs uses one sixteenth of the working-set size that the device recommends. The limit is at least 1 GB. It is 6.7 GB on a Mac with 128 GB and 1 GB on a Mac with 16 GB.
 
-The limit is the same for all models in the process. A value that you set always applies. `HIGGS_NO_MEM_LIMIT=1` only skips the automatic default and leaves the MLX default in place. The limit applies before the first model loads. Set it well below the memory of the machine: a limit near the recommended working set (about 75% of memory) does not bound the cache.
+**Configuration.** To set the limit yourself:
+
+1. Open the config file.
+2. In `[memory]`, set `mlx_cache_limit` to a size, for example `"8GB"`.
+3. To keep no freed buffers, set the value to `"0"`.
+4. Restart Higgs.
+
+A value that you set always applies. `HIGGS_NO_MEM_LIMIT=1` only skips the automatic default and leaves the MLX default in place. The limit is the same for all models in the process. It applies before the first model loads.
+
+**Warning.** A limit that is too small costs speed, because MLX must then ask the system for memory more often. A limit above 75% of the memory of the machine lets the cache keep a large share of that memory. `higgs doctor` warns about such a limit.
 
 ### `[defaults]` and `[[models]]`
 
