@@ -846,11 +846,11 @@ fn check_model_lifecycle(
     }
 
     if let (Some(cache_limit), Some(physical)) = (memory.mlx_cache_limit, physical_memory)
-        && cache_limit.bytes() > physical
+        && u128::from(cache_limit.bytes()) * 4 > u128::from(physical) * 3
     {
         warn(
             &format!(
-                "memory.mlx_cache_limit={cache_limit} is above the {} of memory in this machine, so it does not bound the cache",
+                "memory.mlx_cache_limit={cache_limit} is above 75% of the {} of memory in this machine, so it does not bound the cache",
                 gib_label(physical)
             ),
             result,
@@ -2456,6 +2456,10 @@ mod tests {
         };
         assert_eq!(
             run_lifecycle_check(&limit(512), Some(64 * GIB_BYTES), &[]).warnings,
+            1
+        );
+        assert_eq!(
+            run_lifecycle_check(&limit(49), Some(64 * GIB_BYTES), &[]).warnings,
             1
         );
         let within = run_lifecycle_check(&limit(8), Some(64 * GIB_BYTES), &[]);

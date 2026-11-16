@@ -187,7 +187,7 @@ When MLX frees a buffer, it keeps the memory for reuse. Without a limit, a long-
 
 `mlx_cache_limit` sets the most memory that MLX keeps this way. When you do not set it, Higgs uses one sixteenth of the working-set size that the device recommends, and at least 1 GB. This is 6.7 GB on a Mac with 128 GB and 1 GB on a Mac with 16 GB. To use a fixed size, set a size such as `"8GB"`. Set `"0"` to keep no freed buffers. A limit that is too small costs speed, because MLX must then ask the system for memory more often. A limit above the memory of the machine does not bound the cache, and `higgs doctor` warns about it.
 
-The limit is the same for all models in the process. `HIGGS_NO_MEM_LIMIT=1` leaves the MLX default in place. `HIGGS_WIRED_LIMIT_MODE=legacy` sets the automatic limit to half of the recommended working set.
+The limit is the same for all models in the process. A value that you set always applies. `HIGGS_NO_MEM_LIMIT=1` only skips the automatic default and leaves the MLX default in place. The limit applies before the first model loads. Set it well below the memory of the machine: a limit near the recommended working set (about 75% of memory) does not bound the cache.
 
 ### `[defaults]` and `[[models]]`
 

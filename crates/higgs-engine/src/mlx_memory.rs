@@ -46,23 +46,29 @@ fn mem_limits_disabled() -> bool {
 /// Bound the memory that MLX keeps for reuse after it frees a buffer.
 ///
 /// MLX's own default is the size of the memory limit, so a long-running server keeps almost
-/// every buffer that it ever freed. `explicit` comes from `memory.mlx_cache_limit`; without
-/// it the limit follows the device (see [`default_cache_limit`]). `HIGGS_NO_MEM_LIMIT=1`
-/// leaves MLX's default in place.
-#[allow(unsafe_code)]
-pub fn set_cache_limit(explicit: Option<usize>) {
+/// every buffer that it ever freed. `explicit` comes from `memory.mlx_cache_limit` and always
+/// wins. Without it the limit follows the device (see [`default_cache_limit`]), unless
+/// `HIGGS_NO_MEM_LIMIT=1` leaves MLX's default in place.
+///
+/// The limit is process-wide, so only the first call has an effect. Call it before the first
+/// model loads.
+pub fn set_cache_limit_once(explicit: Option<usize>) {
+    static APPLIED: std::sync::Once = std::sync::Once::new();
+    APPLIED.call_once(|| set_cache_limit(explicit));
+}
+
+fn set_cache_limit(explicit: Option<usize>) {
+    if let Some(limit) = explicit {
+        apply_cache_limit(limit);
+        return;
+    }
     if mem_limits_disabled() {
         tracing::info!("MLX cache limit left at the MLX default (HIGGS_NO_MEM_LIMIT is set)");
         return;
     }
-    let Some(max_rec) = max_recommended_working_set() else {
-        if let Some(limit) = explicit {
-            apply_cache_limit(limit);
-        }
-        return;
-    };
-    let limit = explicit.unwrap_or_else(|| default_cache_limit(max_rec, legacy_limits_requested()));
-    apply_cache_limit(limit);
+    if let Some(max_rec) = max_recommended_working_set() {
+        apply_cache_limit(default_cache_limit(max_rec));
+    }
 }
 
 #[allow(unsafe_code)]
@@ -77,10 +83,7 @@ fn apply_cache_limit(limit: usize) {
 }
 
 /// The cache limit when the config does not set one.
-pub const fn default_cache_limit(max_recommended: usize, legacy: bool) -> usize {
-    if legacy {
-        return max_recommended / 2;
-    }
+pub const fn default_cache_limit(max_recommended: usize) -> usize {
     let floor = AUTOMATIC_CACHE_FLOOR;
     let share = max_recommended / AUTOMATIC_CACHE_DIVISOR;
     if share > floor { share } else { floor }
@@ -145,13 +148,8 @@ mod tests {
 
     #[test]
     fn the_automatic_limit_is_a_share_of_the_working_set_with_a_floor() {
-        assert_eq!(default_cache_limit(96 * GIB, false), 6 * GIB);
-        assert_eq!(default_cache_limit(10 * GIB + GIB * 7 / 10, false), GIB);
-        assert_eq!(default_cache_limit(GIB, false), GIB);
-    }
-
-    #[test]
-    fn the_legacy_limit_is_half_the_working_set() {
-        assert_eq!(default_cache_limit(96 * GIB, true), 48 * GIB);
+        assert_eq!(default_cache_limit(96 * GIB), 6 * GIB);
+        assert_eq!(default_cache_limit(10 * GIB + GIB * 7 / 10), GIB);
+        assert_eq!(default_cache_limit(GIB), GIB);
     }
 }

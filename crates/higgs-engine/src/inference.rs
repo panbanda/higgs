@@ -494,6 +494,7 @@ impl InferenceEngine {
         let model_dir = dir.as_ref();
         let model_name = model_loader::derive_model_name(model_dir);
 
+        crate::mlx_memory::set_cache_limit_once(mlx_cache_limit);
         tracing::info!(model_dir = %model_dir.display(), "Loading model");
 
         let tokenizer = model_loader::load_tokenizer(model_dir)?;
@@ -568,7 +569,6 @@ impl InferenceEngine {
         })??;
 
         crate::mlx_memory::raise_wired_limit_if(raise_wired_limit);
-        crate::mlx_memory::set_cache_limit(mlx_cache_limit);
 
         log_ready(&model_name, &eos_token_ids, &tuning);
 
