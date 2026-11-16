@@ -91,6 +91,7 @@ pub struct RawModelSettings {
     pub batch: Option<BatchMode>,
     pub profile: Option<MlxProfile>,
     pub thinking_budget: Option<u32>,
+    pub context_length: Option<u32>,
     pub pinned: Option<bool>,
     pub kv_cache: RawKvCache,
     pub prefix_cache: RawPrefixCache,

@@ -333,13 +333,33 @@ pub(super) async fn complete(
     let mut first_lease = Some(engine);
     let mut trace = Trace::default();
     let mut totals: (u32, u32) = (0, 0);
+    let mut previous_round: Option<Completed> = None;
 
     for round in 0..=plan.max_iterations {
         let lease = match first_lease.take() {
             Some(lease) => lease,
             None => reacquire(&state, &conversation.model).await?,
         };
-        let mut completed = complete_once(lease, &conversation, received_at).await?;
+        let mut completed = match complete_once(lease, &conversation, received_at).await {
+            Err(ServerError::ContextLengthExceeded { .. }) if round > 0 => {
+                // The tool results filled the context. The earlier rounds already ran their
+                // tools, so end with what they produced instead of failing the request.
+                if let Some(mut last) = previous_round.take() {
+                    // The trace already holds this round's text and calls, so repeating them
+                    // in the answer would put a reply in the history that the model never gave.
+                    last.text.clear();
+                    last.reasoning = None;
+                    last.logprobs = None;
+                    last.tool_calls.clear();
+                    "length".clone_into(&mut last.finish_reason);
+                    return Ok(finish(last, trace));
+                }
+                return Err(ServerError::InternalError(
+                    "tool loop ended without a response".to_owned(),
+                ));
+            }
+            other => other?,
+        };
 
         let (previous_prompt, previous_completion) = totals;
         totals = (
@@ -366,7 +386,8 @@ pub(super) async fn complete(
 
         trace.rounds += 1;
         trace.record_assistant(completed.text.clone(), &server_calls);
-        extend_conversation(&mut conversation, completed.text, &server_calls);
+        extend_conversation(&mut conversation, completed.text.clone(), &server_calls);
+        previous_round = Some(completed);
         for call in &server_calls {
             let executed = execute_call(&state, call).await;
             trace.record(trace.rounds, &executed);
@@ -476,8 +497,10 @@ const fn merge_usage(total: &mut Option<CompletionUsage>, next: CompletionUsage)
 /// Assistant text and reasoning stream as they are produced in every round.
 /// Executed tool calls never appear as `ToolCall` events; instead
 /// [`ToolLoopEvent`]s announce each call, its outcome and the loop's end.
-/// Preparation errors of any round, including the first, end the stream with
-/// an `Error` event.
+/// The first round is prepared before the stream exists, so a request that cannot run (a prompt
+/// that fills the context, for example) fails with an HTTP error. A later round that cannot be
+/// prepared ends the stream with an `Error` event, except for a context that the tool results
+/// filled: that ends the response with finish reason `length`.
 pub(super) fn stream(
     state: SharedState,
     request: GenerationRequest,
@@ -485,34 +508,43 @@ pub(super) fn stream(
     plan: LoopPlan,
     metrics: Option<StreamMetrics>,
     received_at: Instant,
-) -> EventStream {
+) -> Result<EventStream, ServerError> {
     let mut conversation = loop_conversation(request, &plan);
+    let mut first_events = Some(stream_once(engine, &conversation, received_at, metrics)?);
 
-    Box::pin(async_stream::stream! {
-        let mut first_lease = Some(engine);
+    Ok(Box::pin(async_stream::stream! {
         let mut trace = Trace::default();
         let mut usage_total: Option<CompletionUsage> = None;
         let mut round: u32 = 0;
 
         'rounds: loop {
             let final_round = round >= plan.max_iterations;
-            let lease = match first_lease.take() {
-                Some(lease) => lease,
-                None => match reacquire(&state, &conversation.model).await {
+            let mut events = if let Some(events) = first_events.take() {
+                events
+            } else {
+                let lease = match reacquire(&state, &conversation.model).await {
                     Ok(lease) => lease,
                     Err(error) => {
                         yield loop_failure(&error);
                         break 'rounds;
                     }
-                },
-            };
-            let round_metrics = if round == 0 { metrics.clone() } else { None };
-            let mut events = match stream_once(lease, &conversation, received_at, round_metrics) {
+                };
+                match stream_once(lease, &conversation, received_at, None) {
                 Ok(events) => events,
+                Err(ServerError::ContextLengthExceeded { .. }) => {
+                    // The tool results filled the context: end the response with what the
+                    // earlier rounds produced.
+                    yield GenerationEvent::Finish {
+                        reason: "length".to_owned(),
+                        logprobs: None,
+                    };
+                    break 'rounds;
+                }
                 Err(error) => {
                     yield loop_failure(&error);
                     break 'rounds;
                 }
+            }
             };
 
             let mut state_of_round = RoundState {
@@ -582,7 +614,7 @@ pub(super) fn stream(
             yield GenerationEvent::ToolLoop(ToolLoopEvent::Messages(trace.messages.clone()));
             yield GenerationEvent::ToolLoop(ToolLoopEvent::Summary(trace.to_value()));
         }
-    })
+    }))
 }
 
 fn loop_failure(error: &ServerError) -> GenerationEvent {
@@ -1267,6 +1299,166 @@ mod tests {
         assert!(text.contains("Final answer"), "{text}");
         assert!(!text.contains("function_call"), "{text}");
         assert_eq!(fake.received_calls().len(), 1);
+    }
+
+    /// A stub whose prompt fills a context of 4 tokens from the first round.
+    fn oversized_stub() -> StubEngine {
+        let mut stub = stub(vec![(CALL_ECHO, 5, 3), ("never", 5, 3)]);
+        stub.script.prompt_tokens = vec![1; 5];
+        stub.script.context_length = Some(4);
+        stub
+    }
+
+    #[tokio::test]
+    async fn an_oversized_prompt_fails_before_the_loop_starts_on_every_path() {
+        for (path, stream) in [
+            ("/v1/chat/completions", false),
+            ("/v1/chat/completions", true),
+            ("/v1/responses", false),
+            ("/v1/responses", true),
+        ] {
+            let fake = echo_fake();
+            let hub = files_hub(&fake, Duration::from_secs(2)).await;
+            let (app, engine) = app_with_stub_config_and_tools(oversized_stub(), "", hub);
+            let body = if path == "/v1/responses" {
+                json!({"model": "stub", "input": "go", "stream": stream, "mcp": {}})
+            } else {
+                let mut body = request(json!({"mcp": {}}));
+                body["stream"] = json!(stream);
+                body
+            };
+            let (status, text) = post_json(&app, path, &body).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{path} stream={stream}: {text}"
+            );
+            let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(parsed["error"]["code"], "context_length_exceeded", "{text}");
+            assert_eq!(engine.recorded_calls(), []);
+            assert_eq!(fake.received_calls(), Vec::<serde_json::Value>::new());
+        }
+    }
+
+    /// A stub whose first round fits and whose second round, after the tool result, does not.
+    fn overflowing_stub() -> StubEngine {
+        let first_round = format!("Let me check. {CALL_ECHO}");
+        let mut stub = stub(vec![(&first_round, 5, 3), ("never", 5, 3)]);
+        stub.script.streams = vec![
+            vec![
+                token_event("Let me check. ", 3, None),
+                token_event(CALL_ECHO, 12, Some("stop")),
+            ],
+            vec![token_event("never", 5, Some("stop"))],
+        ];
+        stub.script.prompts = vec![vec![1; 3], vec![1; 12]];
+        stub.script.context_length = Some(10);
+        stub
+    }
+
+    #[tokio::test]
+    async fn a_later_round_that_does_not_fit_ends_the_response_with_length() {
+        let fake = echo_fake();
+        let hub = files_hub(&fake, Duration::from_secs(2)).await;
+        let (status, body, engine) =
+            chat(overflowing_stub(), hub, &request(json!({"mcp": {}}))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["choices"][0]["finish_reason"], "length");
+        assert!(body["choices"][0]["message"].get("tool_calls").is_none());
+        assert_eq!(body["mcp"]["iterations"], 1);
+        assert_eq!(fake.received_calls().len(), 1, "the tool ran once");
+        assert_eq!(
+            engine.recorded_calls().len(),
+            1,
+            "round two never generated"
+        );
+        assert_eq!(body["usage"]["prompt_tokens"], 5);
+        let content = body["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !content.contains("Let me check."),
+            "the earlier round's text is not repeated: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_response_does_not_repeat_the_text_of_the_round_that_overflowed() {
+        let fake = echo_fake();
+        let hub = files_hub(&fake, Duration::from_secs(2)).await;
+        let mut stub = overflowing_stub();
+        stub.script
+            .streams
+            .push(vec![token_event("noted", 2, Some("stop"))]);
+        stub.script.prompts.push(vec![1; 3]);
+        let (app, engine) = app_with_stub_config_and_tools(stub, "", hub);
+        let (first_status, first_text) = post_json(
+            &app,
+            "/v1/responses",
+            &json!({"model": "stub", "input": "go", "mcp": {}}),
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::OK, "{first_text}");
+        let first: serde_json::Value = serde_json::from_str(&first_text).unwrap();
+        let id = first["id"].as_str().unwrap();
+        let (second_status, second) = post_json(
+            &app,
+            "/v1/responses",
+            &json!({"model": "stub", "input": "again", "previous_response_id": id}),
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::OK, "{second}");
+
+        let prompts = engine.recorded_prompt_messages();
+        let follow_up = prompts.last().unwrap();
+        let repeats = follow_up
+            .iter()
+            .filter(|(_, content)| content.contains("Let me check."))
+            .count();
+        assert_eq!(repeats, 1, "{follow_up:?}");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_later_round_that_does_not_fit_ends_with_length_and_no_error() {
+        let fake = echo_fake();
+        let hub = files_hub(&fake, Duration::from_secs(2)).await;
+        let (status, text, engine) = stream_chat(overflowing_stub(), hub, json!({"mcp": {}})).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert!(!text.contains("tool loop failed"), "{text}");
+        let events = sse_json_events(&text);
+        assert!(
+            events.iter().all(|event| event.get("error").is_none()),
+            "{text}"
+        );
+        let finishes: Vec<_> = events
+            .iter()
+            .filter_map(|e| {
+                e.pointer("/choices/0/finish_reason")
+                    .and_then(|r| r.as_str())
+            })
+            .collect();
+        assert_eq!(finishes, vec!["length"], "{text}");
+        assert_eq!(content_of(&events), "Let me check. ");
+        assert_eq!(engine.recorded_calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn responses_end_normally_when_a_later_round_does_not_fit() {
+        for stream in [false, true] {
+            let fake = echo_fake();
+            let hub = files_hub(&fake, Duration::from_secs(2)).await;
+            let (app, _) = app_with_stub_config_and_tools(overflowing_stub(), "", hub);
+            let (status, text) = post_json(
+                &app,
+                "/v1/responses",
+                &json!({"model": "stub", "input": "go", "stream": stream, "mcp": {}}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "stream={stream}: {text}");
+            assert!(!text.contains("tool loop failed"), "{text}");
+            assert!(!text.contains("response.failed"), "{text}");
+            assert!(text.contains("incomplete"), "{text}");
+        }
     }
 
     #[test]

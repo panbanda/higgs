@@ -528,6 +528,10 @@ pub fn model_entries(provenance: &Provenance<'_>, index: usize, model: &ModelCon
         at("pinned", model.pinned.to_string()),
         at("thinking_budget", model.thinking_budget.to_string()),
         at(
+            "context_length",
+            show_optional(model.context_length, "(from the model's config.json)"),
+        ),
+        at(
             "kv_cache.mode",
             quote(&format!("{:?}", kv.mode).to_lowercase()),
         ),

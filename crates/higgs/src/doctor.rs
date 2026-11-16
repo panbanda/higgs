@@ -462,6 +462,62 @@ fn check_prefill_yield_tokens(
     true
 }
 
+/// Reject a zero `context_length` and warn when it is above the length that the model declares.
+fn check_context_length(
+    label: &str,
+    configured: Option<u32>,
+    declared: Option<u32>,
+    result: &mut DoctorResult,
+) -> bool {
+    let Some(length) = configured else {
+        return true;
+    };
+    if length == 0 {
+        fail(
+            &format!("model {label} context_length=0 is invalid; it must be at least 1"),
+            result,
+        );
+        return false;
+    }
+    match declared {
+        Some(limit) if length > limit => warn(
+            &format!(
+                "model {label} context_length={length} is above max_position_embeddings={limit} in its config.json; output past position {limit} can be wrong"
+            ),
+            result,
+        ),
+        Some(_) => {}
+        None => pass(
+            &format!("model {label} context_length={length} (config.json declares no length)"),
+            result,
+        ),
+    }
+    true
+}
+
+/// Warn when the rope scaling of the model reaches past its declared length and no
+/// `context_length` is set: requests then run up to the declared length, but the model may
+/// handle more, and the user may want to set `context_length`.
+fn check_rope_scaled_length(
+    label: &str,
+    configured: Option<u32>,
+    declared: Option<u32>,
+    scaled: Option<u64>,
+    result: &mut DoctorResult,
+) {
+    let (None, Some(limit), Some(reach)) = (configured, declared, scaled) else {
+        return;
+    };
+    if reach > u64::from(limit) {
+        warn(
+            &format!(
+                "model {label} rope scaling reaches {reach} positions, above max_position_embeddings={limit} in its config.json; requests are limited to {limit}, so set context_length if the model works past it"
+            ),
+            result,
+        );
+    }
+}
+
 /// Reject a zero thinking budget and warn when the budget alone would use up
 /// the server's `max_tokens`, leaving no room for the answer.
 ///
@@ -570,6 +626,10 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
         if !check_prefill_yield_tokens(&label, model.prefill_yield_tokens, result) {
             continue;
         }
+        if model.context_length == Some(0) {
+            check_context_length(&label, model.context_length, None, result);
+            continue;
+        }
         if !check_thinking_budget(
             &format!("model {label}"),
             Some(model.thinking_budget),
@@ -629,6 +689,15 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                 if higgs_models::cache::resolve_mla_latent_cache(kv_cache_config.mla_latent) {
                     check_mla_latent_cache_adapter(&label, &inspected, result);
                 }
+                let declared_length = model_loader::context_length(&resolved);
+                check_context_length(&label, model.context_length, declared_length, result);
+                check_rope_scaled_length(
+                    &label,
+                    model.context_length,
+                    declared_length,
+                    model_loader::rope_scaled_length(&resolved),
+                    result,
+                );
                 let requested_profile = model.profile;
                 let facts = DecodeFacts::inspect(model, &config.experimental, &resolved).ok();
                 let effective_profile = resolve_effective_mlx_profile(&resolved, requested_profile);
@@ -1297,6 +1366,50 @@ mod tests {
         assert_eq!(result.passes, 0);
         assert_eq!(result.warnings, 0);
         assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn context_length_zero_fails_and_above_the_model_warns() {
+        let mut zero = empty_result();
+        assert!(!check_context_length("m", Some(0), None, &mut zero));
+        assert_eq!(zero.failures, 1);
+
+        let mut above = empty_result();
+        assert!(check_context_length(
+            "m",
+            Some(8192),
+            Some(4096),
+            &mut above
+        ));
+        assert_eq!((above.warnings, above.failures), (1, 0));
+
+        for (configured, declared) in [
+            (None, Some(4096)),
+            (Some(2048), Some(4096)),
+            (Some(4096), Some(4096)),
+        ] {
+            let mut fine = empty_result();
+            assert!(check_context_length("m", configured, declared, &mut fine));
+            assert_eq!((fine.warnings, fine.failures), (0, 0));
+        }
+    }
+
+    #[test]
+    fn rope_scaling_past_the_declared_length_warns_only_without_a_context_length() {
+        let mut beyond = empty_result();
+        check_rope_scaled_length("m", None, Some(131_072), Some(262_144), &mut beyond);
+        assert_eq!(beyond.warnings, 1);
+
+        for (configured, declared, scaled) in [
+            (Some(8192), Some(131_072), Some(262_144)),
+            (None, Some(131_072), Some(131_072)),
+            (None, Some(131_072), None),
+            (None, None, Some(262_144)),
+        ] {
+            let mut quiet = empty_result();
+            check_rope_scaled_length("m", configured, declared, scaled, &mut quiet);
+            assert_eq!(quiet.warnings, 0);
+        }
     }
 
     #[test]

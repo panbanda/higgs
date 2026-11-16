@@ -75,6 +75,15 @@ impl ModelLoader<LoadedEngine> for EngineLoader {
     }
 }
 
+/// The context length a request to this model is held to: the configured `context_length`, else
+/// `max_position_embeddings` from the model's `config.json`. `None` when neither exists.
+pub fn effective_context_length(model: &ModelConfig) -> Option<u32> {
+    model.context_length.or_else(|| {
+        let resolved = model_resolver::resolve(&model.path).ok()?;
+        higgs_engine::model_loader::context_length(resolved)
+    })
+}
+
 /// Build one engine from a resolved model directory.
 pub fn load_engine(
     model: &ModelConfig,
@@ -113,6 +122,7 @@ pub fn load_engine(
                 }),
             prefix_cache: prefix_cache_options(&model.prefix_cache),
             max_concurrent_requests: (model.batch == BatchMode::Off).then_some(1),
+            context_length: model.context_length,
         },
     )
     .map_err(|error| error.to_string())?;

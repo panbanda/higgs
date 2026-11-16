@@ -17,6 +17,9 @@ use crate::backend::{Engine, EngineJob, LoadedEngine};
 #[derive(Clone)]
 pub struct StubScript {
     pub prompt_tokens: Vec<u32>,
+    /// Prompt of the Nth rendering, consulted before `prompt_tokens`, so a tool loop can grow
+    /// its prompt from round to round.
+    pub prompts: Vec<Vec<u32>>,
     pub enable_thinking: bool,
     /// Defaults to the Qwen/Hermes format, like the engines' original behavior.
     pub tool_call_format: ToolCallFormat,
@@ -30,12 +33,17 @@ pub struct StubScript {
     /// Stamp the non-streaming output's missing timestamps at call time, as a
     /// real engine would, so durations are measured against the request.
     pub stamp_times: bool,
+    /// Prompt and generated tokens together that the model supports; `None` is no limit.
+    pub context_length: Option<u32>,
+    /// Sequence positions one image takes in a VLM; `None` for a text-only model.
+    pub image_positions: Option<i32>,
 }
 
 impl Default for StubScript {
     fn default() -> Self {
         Self {
             prompt_tokens: Vec::new(),
+            prompts: Vec::new(),
             enable_thinking: false,
             tool_call_format: ToolCallFormat::Qwen,
             generation: None,
@@ -43,6 +51,8 @@ impl Default for StubScript {
             generations: Vec::new(),
             streams: Vec::new(),
             stamp_times: false,
+            context_length: None,
+            image_positions: None,
         }
     }
 }
@@ -175,6 +185,10 @@ impl Engine for StubEngine {
         self.script.tool_call_format
     }
 
+    fn context_length(&self) -> Option<u32> {
+        self.script.context_length
+    }
+
     fn decode_kind(&self) -> &'static str {
         "sequential"
     }
@@ -185,6 +199,10 @@ impl Engine for StubEngine {
 
     fn vlm_image_size(&self) -> Option<i32> {
         None
+    }
+
+    fn vlm_image_positions(&self) -> Option<i32> {
+        self.script.image_positions
     }
 
     fn replace_image_tokens(&self, _tokens: &mut [u32]) {}
@@ -203,10 +221,16 @@ impl Engine for StubEngine {
                     .collect(),
             );
         }
-        if let Ok(mut prompts) = self.prompt_tools.lock() {
+        let rendering = self.prompt_tools.lock().map_or(0, |mut prompts| {
             prompts.push(tools.map(<[_]>::len));
-        }
-        Ok(self.script.prompt_tokens.clone())
+            prompts.len() - 1
+        });
+        Ok(self
+            .script
+            .prompts
+            .get(rendering)
+            .unwrap_or(&self.script.prompt_tokens)
+            .clone())
     }
 
     fn generate(&self, job: EngineJob) -> Result<GenerationOutput, EngineError> {

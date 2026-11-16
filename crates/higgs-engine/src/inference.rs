@@ -197,6 +197,8 @@ pub struct EngineOptions {
     /// model that cannot batch its decode serves one request at a time
     /// regardless.
     pub max_concurrent_requests: Option<usize>,
+    /// Replaces the context length that `config.json` declares.
+    pub context_length: Option<u32>,
 }
 
 /// Settings the worker needs that are fixed when the engine loads.
@@ -220,6 +222,7 @@ struct ModelFacts {
     decodes_in_batches: bool,
     is_vlm: bool,
     image_size: Option<i32>,
+    image_positions: Option<i32>,
 }
 
 /// How an active request produces its next tokens.
@@ -446,10 +449,29 @@ pub struct InferenceEngine {
     hidden_size: AtomicI32,
     is_vlm: bool,
     image_size: Option<i32>,
+    image_positions: Option<i32>,
     decodes_in_batches: bool,
     enable_thinking: bool,
     think_close_token: Option<u32>,
     default_thinking_budget: u32,
+    context_length: Option<u32>,
+}
+
+/// The configured context length, else the one `config.json` declares. A model with neither
+/// gets no limit, which is logged once here.
+fn resolve_context_length(
+    configured: Option<u32>,
+    model_dir: &Path,
+    model_name: &str,
+) -> Option<u32> {
+    let length = configured.or_else(|| model_loader::context_length(model_dir));
+    if length.is_none() {
+        tracing::warn!(
+            model = %model_name,
+            "config.json declares no max_position_embeddings; the prompt length is not limited"
+        );
+    }
+    length
 }
 
 impl InferenceEngine {
@@ -464,6 +486,7 @@ impl InferenceEngine {
             disk_prefix,
             prefix_cache,
             max_concurrent_requests,
+            context_length: configured_context_length,
         } = options;
         let model_dir = dir.as_ref();
         let model_name = model_loader::derive_model_name(model_dir);
@@ -475,6 +498,8 @@ impl InferenceEngine {
         if template.is_none() {
             tracing::warn!("No chat template found; /v1/chat/completions will be unavailable");
         }
+        let context_length =
+            resolve_context_length(configured_context_length, model_dir, &model_name);
         let eos_token_ids = model_loader::extract_eos_tokens(model_dir);
         let thinking = ThinkingSupport::resolve(model_dir, &tokenizer);
         let settings = WorkerSettings {
@@ -526,6 +551,7 @@ impl InferenceEngine {
                     ) > 1,
                     is_vlm: model.is_vlm(),
                     image_size: model.image_size(),
+                    image_positions: model.image_positions(),
                 };
                 if loaded_tx.send(Ok(facts)).is_err() {
                     return;
@@ -552,10 +578,12 @@ impl InferenceEngine {
             hidden_size: AtomicI32::new(facts.hidden_size),
             is_vlm: facts.is_vlm,
             image_size: facts.image_size,
+            image_positions: facts.image_positions,
             decodes_in_batches: facts.decodes_in_batches,
             enable_thinking: thinking.enabled,
             think_close_token: thinking.close_token,
             default_thinking_budget,
+            context_length,
         })
     }
 
@@ -591,6 +619,12 @@ impl InferenceEngine {
         &self.eos_token_ids
     }
 
+    /// The longest sequence, prompt and generated tokens together, that the model supports.
+    /// `None` when the model does not declare it.
+    pub const fn context_length(&self) -> Option<u32> {
+        self.context_length
+    }
+
     pub fn hidden_size(&self) -> i32 {
         self.hidden_size.load(Ordering::Relaxed)
     }
@@ -611,6 +645,11 @@ impl InferenceEngine {
     }
 
     /// The image size the VLM's vision encoder expects, or `None`.
+    /// Sequence positions that one image takes once its features replace the `<image>` sentinel.
+    pub const fn vlm_image_positions(&self) -> Option<i32> {
+        self.image_positions
+    }
+
     pub const fn vlm_image_size(&self) -> Option<i32> {
         self.image_size
     }
@@ -2783,6 +2822,7 @@ mod tests {
                 disk_prefix: None,
                 prefix_cache: PrefixCacheOptions::default(),
                 max_concurrent_requests: None,
+                context_length: None,
             },
         );
 

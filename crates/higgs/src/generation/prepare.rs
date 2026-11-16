@@ -25,6 +25,9 @@ pub(super) enum ReasoningHandling {
 pub(super) struct Prepared {
     pub job: EngineJob,
     pub prompt_token_count: u32,
+    /// Sequence positions that image features add beyond the prompt tokens: each image
+    /// sentinel becomes several positions once the model embeds the image.
+    pub image_extra_positions: u32,
     pub reasoning: ReasoningHandling,
     /// Present when the request offered tools.
     pub tool_parser: Option<ToolCallParser>,
@@ -34,10 +37,49 @@ pub(super) fn prepare(
     engine: &dyn Engine,
     request: &GenerationRequest,
 ) -> Result<Prepared, ServerError> {
-    match &request.prompt {
+    let mut prepared = match &request.prompt {
         Prompt::Chat(chat) => prepare_chat(engine, request, chat),
         Prompt::Text(text) => prepare_text(engine, request, text),
+    }?;
+    fit_context(engine.context_length(), &mut prepared)?;
+    Ok(prepared)
+}
+
+/// Keep the request inside the model's context. A prompt that fills it is refused before
+/// prefill, since there is no room for even one token. Otherwise generation is capped at the
+/// end of the context, so a client that asks for a large `max_tokens` still gets an answer that
+/// ends with finish reason `length`. Every API and every engine path goes through here.
+fn fit_context(limit: Option<u32>, prepared: &mut Prepared) -> Result<(), ServerError> {
+    let Some(context_length) = limit else {
+        return Ok(());
+    };
+    let prompt_tokens = prepared
+        .prompt_token_count
+        .saturating_add(prepared.image_extra_positions);
+    if prompt_tokens >= context_length {
+        return Err(ServerError::ContextLengthExceeded {
+            prompt_tokens,
+            context_length,
+        });
     }
+    prepared.job.max_tokens = prepared.job.max_tokens.min(context_length - prompt_tokens);
+    Ok(())
+}
+
+/// The positions that images add to a prompt. Each image sentinel (`IMAGE_TOKEN_INDEX`) takes one
+/// token in the prompt, and `image_positions` once the model replaces it with the image features.
+fn image_extra_positions(prompt_tokens: &[u32], image_positions: Option<i32>) -> u32 {
+    let Some(positions) = image_positions.and_then(|count| u32::try_from(count).ok()) else {
+        return 0;
+    };
+    let sentinel = higgs_models::llava_qwen2::IMAGE_TOKEN_INDEX.cast_unsigned();
+    let images = prompt_tokens
+        .iter()
+        .filter(|token| **token == sentinel)
+        .count();
+    u32::try_from(images)
+        .unwrap_or(u32::MAX)
+        .saturating_mul(positions.saturating_sub(1))
 }
 
 fn prepare_chat(
@@ -83,7 +125,9 @@ fn prepare_chat(
     let constraint = build_constraint(constraint_spec.as_ref(), engine)?;
 
     let prompt_token_count = u32::try_from(prompt_tokens.len()).unwrap_or(u32::MAX);
+    let image_extra_positions = image_extra_positions(&prompt_tokens, engine.vlm_image_positions());
     Ok(Prepared {
+        image_extra_positions,
         job: EngineJob {
             prompt_tokens,
             max_tokens: request.max_tokens,
@@ -117,6 +161,7 @@ fn prepare_text(
     let prompt_token_count = u32::try_from(prompt_tokens.len()).unwrap_or(u32::MAX);
     let constraint = build_constraint(request.constraint.as_ref(), engine)?;
     Ok(Prepared {
+        image_extra_positions: 0,
         job: EngineJob {
             prompt_tokens,
             max_tokens: request.max_tokens,
@@ -157,4 +202,59 @@ fn build_constraint(
     }
     .map_err(|error| ServerError::BadRequest(error.to_string()))?;
     Ok(Some(constraint))
+}
+
+#[allow(clippy::unwrap_used)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prepared(prompt_tokens: Vec<u32>, image_extra_positions: u32, max_tokens: u32) -> Prepared {
+        Prepared {
+            prompt_token_count: u32::try_from(prompt_tokens.len()).unwrap_or(u32::MAX),
+            image_extra_positions,
+            job: EngineJob {
+                prompt_tokens,
+                max_tokens,
+                sampling: higgs_models::SamplingParams::default(),
+                stop_sequences: Vec::new(),
+                logprobs: false,
+                top_logprobs: None,
+                thinking: ThinkingMode::Off,
+                constraint: None,
+                pixel_values: None,
+            },
+            reasoning: ReasoningHandling::Raw,
+            tool_parser: None,
+        }
+    }
+
+    #[test]
+    fn each_image_sentinel_adds_the_positions_of_its_features() {
+        let sentinel = higgs_models::llava_qwen2::IMAGE_TOKEN_INDEX.cast_unsigned();
+        assert_eq!(image_extra_positions(&[1, sentinel, 2], Some(729)), 728);
+        assert_eq!(image_extra_positions(&[1, 2, 3], Some(729)), 0);
+        assert_eq!(image_extra_positions(&[1, sentinel], None), 0);
+        assert_eq!(image_extra_positions(&[sentinel], Some(1)), 0);
+    }
+
+    #[test]
+    fn the_prompt_length_counts_the_expanded_image_positions() {
+        let mut fits = prepared(vec![1; 100], 0, 50);
+        assert!(fit_context(Some(1000), &mut fits).is_ok());
+
+        let mut expanded = prepared(vec![1; 100], 728, 50);
+        let error = fit_context(Some(800), &mut expanded).unwrap_err();
+        assert!(matches!(
+            error,
+            ServerError::ContextLengthExceeded {
+                prompt_tokens: 828,
+                context_length: 800
+            }
+        ));
+
+        let mut capped = prepared(vec![1; 100], 728, 5000);
+        fit_context(Some(1000), &mut capped).unwrap();
+        assert_eq!(capped.job.max_tokens, 172);
+    }
 }

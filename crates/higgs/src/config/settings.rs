@@ -217,6 +217,9 @@ pub struct ModelConfig {
     pub pinned: bool,
     /// Reasoning tokens the model may spend before `</think>` is forced.
     pub thinking_budget: u32,
+    /// Prompt and generated tokens together that a request may use. `None` takes the length
+    /// that the model's `config.json` declares.
+    pub context_length: Option<u32>,
     pub kv_cache: KvCacheConfig,
     pub prefix_cache: PrefixCacheConfig,
     /// Maximum prompt tokens to prefill per batch-loop iteration; `None` and `0` keep prefill
@@ -237,6 +240,7 @@ impl ModelConfig {
             idle_ttl: None,
             pinned: false,
             thinking_budget: higgs_engine::engine::DEFAULT_THINKING_BUDGET,
+            context_length: None,
             kv_cache: KvCacheConfig {
                 mode: KvCacheMode::Off,
                 bits: DEFAULT_KV_BITS,
@@ -504,6 +508,7 @@ pub fn resolve_model(
             .thinking_budget
             .or(defaults.thinking_budget)
             .unwrap_or(fallback.thinking_budget),
+        context_length: own.context_length.or(defaults.context_length),
         kv_cache,
         prefix_cache: PrefixCacheConfig {
             disk_dir: own
@@ -770,8 +775,17 @@ pub fn resolve(raw: &RawConfig, context: &ResolveContext) -> Result<HiggsConfig,
     let mut models: Vec<ModelConfig> = raw
         .models
         .iter()
-        .map(|entry| resolve_model(entry, &raw.defaults, profile_override))
-        .collect();
+        .map(|entry| {
+            let model = resolve_model(entry, &raw.defaults, profile_override);
+            if model.context_length == Some(0) {
+                let label = model.name.as_deref().unwrap_or(&model.path);
+                return Err(format!(
+                    "model `{label}`: `context_length` must be at least 1 (set in `[[models]]` or `[defaults]`)"
+                ));
+            }
+            Ok(model)
+        })
+        .collect::<Result<_, String>>()?;
     if let Some(budget) = checkpoint_budget_override(&context.environment, &mut overrides) {
         for model in &mut models {
             model.prefix_cache.checkpoint_budget = budget;

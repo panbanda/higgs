@@ -21,7 +21,7 @@ use crate::{
         tool_use_stream_events,
     },
     config::ApiFormat,
-    error::ServerError,
+    error::{AnthropicError, ServerError},
     generation::{
         ChatPrompt, Completed, EventStream, GenerationEvent, GenerationRequest, Prompt,
         StreamMetrics,
@@ -53,7 +53,7 @@ pub async fn create_message(
     Extension(request_metrics): Extension<RequestMetricsContext>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<axum::response::Response, ServerError> {
+) -> Result<axum::response::Response, AnthropicError> {
     // Captured before parsing and prompt preparation so TTFT measures
     // the client-observed wait, not only generation.
     let received_at = Instant::now();
@@ -62,9 +62,7 @@ pub async fn create_message(
     request_metrics.set_requested_model(&req.model);
 
     if req.messages.is_empty() {
-        return Err(ServerError::BadRequest(
-            "messages array must not be empty".to_owned(),
-        ));
+        return Err(ServerError::BadRequest("messages array must not be empty".to_owned()).into());
     }
 
     let messages_json = serde_json::to_value(&req.messages).ok().and_then(|v| {
@@ -251,7 +249,7 @@ pub async fn create_message(
                 });
                 request_metrics.mark_recorded();
             }
-            result
+            result.map_err(AnthropicError::from)
         }
     }
 }
@@ -469,7 +467,7 @@ pub async fn count_tokens(
     Extension(request_metrics): Extension<RequestMetricsContext>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<axum::response::Response, ServerError> {
+) -> Result<axum::response::Response, AnthropicError> {
     let req: CountTokensRequest = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("Invalid request body: {e}")))?;
     request_metrics.set_requested_model(&req.model);
@@ -539,6 +537,7 @@ pub async fn count_tokens(
                 api_key.as_ref().map(crate::config::Secret::expose),
             )
             .await
+            .map_err(AnthropicError::from)
         }
     }
 }

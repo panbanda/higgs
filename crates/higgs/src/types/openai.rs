@@ -497,6 +497,13 @@ pub struct ModelObject {
     pub owned_by: String,
     /// Whether the model is in memory now. Unloaded models are still listed and load on use.
     pub loaded: bool,
+    /// Prompt and generated tokens together that a request may use; absent when the model
+    /// declares no limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u32>,
+    /// The same value under the name that vLLM uses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_model_len: Option<u32>,
 }
 
 /// POST /v1/embeddings request body.
@@ -685,6 +692,8 @@ mod tests {
                 created: 1_234_567_890,
                 owned_by: "local".to_owned(),
                 loaded: true,
+                context_length: None,
+                max_model_len: None,
             }],
         };
         let json = serde_json::to_string(&list).unwrap();

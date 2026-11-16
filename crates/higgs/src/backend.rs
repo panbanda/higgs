@@ -48,12 +48,19 @@ pub trait Engine: Send + Sync {
     /// How this model writes tool calls.
     fn tool_call_format(&self) -> ToolCallFormat;
 
+    /// Prompt and generated tokens together that the model supports; `None` when it does not
+    /// declare a limit.
+    fn context_length(&self) -> Option<u32>;
+
     /// `batched` when concurrent requests decode together, else `sequential`.
     fn decode_kind(&self) -> &'static str;
 
     fn is_vlm(&self) -> bool;
 
     fn vlm_image_size(&self) -> Option<i32>;
+
+    /// Sequence positions that one image takes once its features replace the `<image>` token.
+    fn vlm_image_positions(&self) -> Option<i32>;
 
     fn replace_image_tokens(&self, tokens: &mut [u32]);
 
@@ -102,6 +109,10 @@ impl Engine for InferenceEngine {
         Self::tool_call_format(self)
     }
 
+    fn context_length(&self) -> Option<u32> {
+        Self::context_length(self)
+    }
+
     fn decode_kind(&self) -> &'static str {
         if self.decodes_in_batches() {
             "batched"
@@ -116,6 +127,10 @@ impl Engine for InferenceEngine {
 
     fn vlm_image_size(&self) -> Option<i32> {
         Self::vlm_image_size(self)
+    }
+
+    fn vlm_image_positions(&self) -> Option<i32> {
+        Self::vlm_image_positions(self)
     }
 
     fn replace_image_tokens(&self, tokens: &mut [u32]) {

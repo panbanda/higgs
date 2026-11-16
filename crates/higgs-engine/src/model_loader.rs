@@ -198,6 +198,66 @@ fn special_token_id(model_dir: &Path, content: &str) -> Option<u32> {
     })
 }
 
+/// The longest sequence the model supports, from `max_position_embeddings` in `config.json`
+/// (or in `text_config` for a multimodal model). `None` when the file or the key is missing.
+///
+/// A rope-scaling block does not change the result. Checkpoints that extend the context list the
+/// extended length in `max_position_embeddings` and keep the original in the scaling block.
+pub fn context_length<P: AsRef<Path>>(model_dir: P) -> Option<u32> {
+    let text = std::fs::read_to_string(model_dir.as_ref().join("config.json")).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&text).ok()?;
+    context_length_from_config(&config)
+}
+
+/// The number of positions that a rope-scaling block reaches: its `original_max_position_embeddings`
+/// times its `factor`.
+///
+/// `None` when the config has no such block, or when the block is not of a
+/// type that stretches the trained context (`yarn` or `linear`). The `llama3`, `longrope` and
+/// `dynamic` types remap frequencies, and `max_position_embeddings` already holds their length.
+pub fn rope_scaled_length<P: AsRef<Path>>(model_dir: P) -> Option<u64> {
+    let text = std::fs::read_to_string(model_dir.as_ref().join("config.json")).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&text).ok()?;
+    rope_scaled_length_from_config(&config)
+}
+
+fn rope_scaled_length_from_config(config: &serde_json::Value) -> Option<u64> {
+    let scaling = ["rope_scaling", "rope_parameters"].iter().find_map(|key| {
+        crate::mlx_tuning::config_lookup(config, key).filter(|value| value.is_object())
+    })?;
+    let rope_type = ["rope_type", "type"]
+        .iter()
+        .find_map(|key| scaling.get(key).and_then(serde_json::Value::as_str))?;
+    if !matches!(rope_type, "yarn" | "linear") {
+        return None;
+    }
+    let original = scaling.get("original_max_position_embeddings")?.as_f64()?;
+    let factor = scaling.get("factor")?.as_f64()?;
+    let reach = original * factor;
+    (reach.is_finite() && reach >= 1.0).then(|| {
+        #[allow(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let positions = reach as u64;
+        positions
+    })
+}
+
+fn context_length_from_config(config: &serde_json::Value) -> Option<u32> {
+    let model_type = config.get("model_type").and_then(serde_json::Value::as_str);
+    // The LLaVA loader builds its language model from `text_config` alone.
+    let language_scope = if model_type.is_some_and(|name| name.starts_with("llava")) {
+        config.get("text_config").unwrap_or(config)
+    } else {
+        config
+    };
+    crate::mlx_tuning::config_lookup_u64(language_scope, "max_position_embeddings")
+        .and_then(|length| u32::try_from(length).ok())
+        .filter(|length| *length > 0)
+}
+
 #[allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -1155,5 +1215,94 @@ mod tests {
             eos_from_config(r#"{"eos_token_id": [1, "two", 3]}"#),
             vec![1, 3]
         );
+    }
+
+    #[test]
+    fn context_length_reads_the_plain_text_and_missing_forms() {
+        let length = |text: &str| context_length_from_config(&serde_json::from_str(text).unwrap());
+        assert_eq!(length(r#"{"max_position_embeddings": 4096}"#), Some(4096));
+        assert_eq!(
+            length(r#"{"text_config": {"max_position_embeddings": 262144}}"#),
+            Some(262_144)
+        );
+        assert_eq!(
+            length(
+                r#"{"max_position_embeddings": 8, "text_config": {"max_position_embeddings": 9}}"#
+            ),
+            Some(8)
+        );
+        assert_eq!(length(r#"{"hidden_size": 8}"#), None);
+        assert_eq!(length(r#"{"max_position_embeddings": 0}"#), None);
+        assert_eq!(length(r#"{"max_position_embeddings": null}"#), None);
+    }
+
+    #[test]
+    fn context_length_ignores_the_original_length_of_a_rope_scaling_block() {
+        let config = serde_json::json!({
+            "max_position_embeddings": 131_072,
+            "rope_scaling": {"rope_type": "llama3", "factor": 32.0, "original_max_position_embeddings": 8192},
+        });
+        assert_eq!(context_length_from_config(&config), Some(131_072));
+    }
+
+    #[test]
+    fn a_llava_model_takes_its_context_length_from_the_text_config_only() {
+        let config = serde_json::json!({
+            "model_type": "llava-qwen2",
+            "max_position_embeddings": 8192,
+            "text_config": {"max_position_embeddings": 4096},
+        });
+        assert_eq!(context_length_from_config(&config), Some(4096));
+        let other = serde_json::json!({
+            "model_type": "qwen2",
+            "max_position_embeddings": 8192,
+            "text_config": {"max_position_embeddings": 4096},
+        });
+        assert_eq!(context_length_from_config(&other), Some(8192));
+    }
+
+    #[test]
+    fn the_rope_scaled_length_is_the_original_length_times_the_factor() {
+        let reach =
+            |text: &str| rope_scaled_length_from_config(&serde_json::from_str(text).unwrap());
+        assert_eq!(
+            reach(
+                r#"{"rope_scaling": {"rope_type": "yarn", "factor": 32.0, "original_max_position_embeddings": 8192}}"#
+            ),
+            Some(262_144)
+        );
+        assert_eq!(
+            reach(
+                r#"{"text_config": {"rope_parameters": {"type": "linear", "factor": 4, "original_max_position_embeddings": 32768}}}"#
+            ),
+            Some(131_072)
+        );
+        assert_eq!(
+            reach(
+                r#"{"max_position_embeddings": 40960, "rope_scaling": {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768}}"#
+            ),
+            Some(131_072)
+        );
+        for frequency_remap in ["llama3", "longrope", "dynamic"] {
+            let config = format!(
+                r#"{{"rope_scaling": {{"rope_type": "{frequency_remap}", "factor": 32.0, "original_max_position_embeddings": 8192}}}}"#
+            );
+            assert_eq!(reach(&config), None, "{frequency_remap}");
+        }
+        assert_eq!(reach(r#"{"rope_scaling": {"rope_type": "default"}}"#), None);
+        assert_eq!(reach(r#"{"rope_scaling": null}"#), None);
+        assert_eq!(reach("{}"), None);
+    }
+
+    #[test]
+    fn context_length_is_read_from_the_model_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(context_length(directory.path()), None);
+        std::fs::write(
+            directory.path().join("config.json"),
+            r#"{"max_position_embeddings": 4096}"#,
+        )
+        .unwrap();
+        assert_eq!(context_length(directory.path()), Some(4096));
     }
 }

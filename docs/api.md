@@ -8,7 +8,7 @@ The endpoints Higgs serves, with the request fields and response details that ar
 | `POST /v1/completions` | OpenAI | Also serves models without a chat template |
 | `POST /v1/responses`, `GET`/`DELETE /v1/responses/{id}` | OpenAI Responses | [responses.md](responses.md) |
 | `POST /v1/embeddings` | OpenAI | |
-| `GET /v1/models` | OpenAI | Every configured model with a `loaded` flag |
+| `GET /v1/models` | OpenAI | Every configured model with a `loaded` flag. Each model has `context_length` (also as `max_model_len`) only when its limit is known |
 | `POST /v1/messages`, `POST /v1/messages/count_tokens` | Anthropic | |
 | `POST /v1/tokenize`, `POST /v1/detokenize` | llama.cpp style | Local models only |
 | `POST /v1/models/{id}/load`, `POST /v1/models/{id}/unload`, `GET /v1/models/status` | Higgs | [Model lifecycle](configuration.md#model-lifecycle) |
@@ -107,9 +107,22 @@ The endpoints Higgs serves, with the request fields and response details that ar
   `ttft_ms` and `cached_tokens` in the metrics JSONL log.
 - System: `/v1/system` (version, pid, uptime, unified memory, process RSS,
   MLX active/peak/cache memory, every configured model with its lifecycle state,
-  engine kind and profile)
+  engine kind, profile and `context_length`)
 - Health: `/health`
 
 `/health`, `/metrics`, `/v1/models`, `/v1/models/status`, `/v1/system`, the
 model load and unload endpoints, and `/v1/mcp/*`, and `/v1/web/*` are dashboard and control endpoints and never count as
 traffic in metrics. The read-only ones never load a model.
+
+## Context length
+
+Each model has a context length: the number of prompt tokens and generated tokens together that one request may use. Higgs reads it from `max_position_embeddings` in the `config.json` of the model (from `text_config` for a multimodal model). The model key `context_length` replaces it (see [configuration](configuration.md)). When neither exists, Higgs writes one warning to the log at load time and applies no limit. `GET /v1/models` and `GET /v1/system` show the value.
+
+Higgs checks the full prompt length before it starts prefill. This includes the part of the prompt that comes from the prefix cache. The same check runs for every API.
+
+- **The prompt is as long as the context length, or longer.** There is no room for one generated token, so Higgs returns HTTP 400. For a streaming request, the 400 comes before the stream starts, never as an event inside it.
+  - Chat Completions, Completions and Responses use the OpenAI error shape, with `error.type` set to `invalid_request_error` and `error.code` set to `context_length_exceeded`. The message gives the context length and the prompt length.
+  - Messages (Anthropic) returns `{"type": "error", "error": {"type": "invalid_request_error", "message": "..."}}` with the same message. Every error from `/v1/messages` and `/v1/messages/count_tokens` uses this format. A model that is not found has `error.type` set to `not_found_error`. A body above `server.max_body_size` has HTTP 413 and `error.type` set to `request_too_large`.
+- **The prompt fits, but the prompt plus `max_tokens` is longer than the context length.** Higgs does not reject the request. Clients such as Claude Code send a large `max_tokens`. Higgs stops generation at the end of the context. The finish reason is `length` (`max_tokens` for the Messages API).
+- **A server-side tool loop (`mcp`) fills the context.** The first round follows the rules above, including the 400 before a stream starts. If the tool results make a later round too long, Higgs does not fail the request. It ends the response with what the earlier rounds produced, with finish reason `length`.
+- **A vision model.** Each image counts as the positions that its features take, not as one token.

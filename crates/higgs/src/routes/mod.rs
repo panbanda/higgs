@@ -12,6 +12,8 @@ pub mod tokenize;
 pub mod web;
 
 #[cfg(test)]
+mod context_length_tests;
+#[cfg(test)]
 mod single_model_tests;
 #[cfg(test)]
 mod tool_choice_tests;

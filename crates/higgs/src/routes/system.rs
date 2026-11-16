@@ -47,6 +47,9 @@ pub struct LoadedModel {
     pub kv_cache: Option<String>,
     /// Prompts the prefix cache keeps; `0` means the cache is off.
     pub prefix_cache_entries: Option<u32>,
+    /// Prompt and generated tokens together that a request may use; `None` when the model
+    /// declares no limit.
+    pub context_length: Option<u32>,
     /// Name, state, engine kind and the rest of what `/v1/models/status` reports.
     #[serde(flatten)]
     pub status: ModelStatus,
@@ -68,6 +71,7 @@ pub async fn system(State(state): State<SharedState>) -> Json<SystemResponse> {
                 mlx_profile: configured.map(|m| m.profile.as_str().to_owned()),
                 kv_cache: configured.and_then(|m| serialized_name(&m.kv_cache.mode)),
                 prefix_cache_entries: configured.map(|m| m.prefix_cache.max_entries),
+                context_length: configured.and_then(crate::engine_loader::effective_context_length),
                 status,
             }
         })

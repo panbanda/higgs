@@ -28,6 +28,15 @@ pub enum ServerError {
     #[error("Bad request: {0}")]
     BadRequest(String),
 
+    /// The prompt alone fills the model's context, so there is no room to generate.
+    #[error(
+        "This model's maximum context length is {context_length} tokens. However, your prompt has {prompt_tokens} tokens. Reduce the length of the prompt."
+    )]
+    ContextLengthExceeded {
+        prompt_tokens: u32,
+        context_length: u32,
+    },
+
     #[error("Model not found: {0}")]
     ModelNotFound(String),
 
@@ -73,10 +82,69 @@ impl From<crate::router::RouteError> for ServerError {
     }
 }
 
-impl IntoResponse for ServerError {
+/// A [`ServerError`] rendered in the Anthropic error format:
+/// `{"type": "error", "error": {"type": ..., "message": ...}}`.
+#[derive(Debug)]
+pub struct AnthropicError(pub ServerError);
+
+impl<E: Into<ServerError>> From<E> for AnthropicError {
+    fn from(error: E) -> Self {
+        Self(error.into())
+    }
+}
+
+impl IntoResponse for AnthropicError {
     fn into_response(self) -> Response {
+        let ErrorParts {
+            status,
+            code,
+            message: detail,
+            ..
+        } = self.0.parts();
+        // Anthropic has no `code` field, so the reason a model is unavailable stays in the text.
+        let message = match (&self.0, code) {
+            (ServerError::ModelUnavailable { .. }, Some(reason)) => format!("{detail} ({reason})"),
+            _ => detail,
+        };
+        let error_type = match status {
+            StatusCode::NOT_FOUND => "not_found_error",
+            StatusCode::SERVICE_UNAVAILABLE => "overloaded_error",
+            StatusCode::INTERNAL_SERVER_ERROR | StatusCode::BAD_GATEWAY => "api_error",
+            _ => "invalid_request_error",
+        };
+        let body = serde_json::json!({
+            "type": "error",
+            "error": {"type": error_type, "message": message},
+        });
+        (status, Json(body)).into_response()
+    }
+}
+
+/// Rewrites the plain-text 413 that the body limit produces before a handler runs into the
+/// Anthropic error format. Any other response passes through.
+pub async fn anthropic_body_limit(response: Response) -> Response {
+    if response.status() != StatusCode::PAYLOAD_TOO_LARGE {
+        return response;
+    }
+    let body = serde_json::json!({
+        "type": "error",
+        "error": {"type": "request_too_large", "message": "request body is too large"},
+    });
+    (StatusCode::PAYLOAD_TOO_LARGE, Json(body)).into_response()
+}
+
+/// The parts of a [`ServerError`] that every error body carries.
+pub struct ErrorParts {
+    pub status: StatusCode,
+    pub error_type: &'static str,
+    pub code: Option<String>,
+    pub message: String,
+}
+
+impl ServerError {
+    pub fn parts(&self) -> ErrorParts {
         let mut code = None;
-        let (status, error_type, message) = match &self {
+        let (status, error_type, message) = match self {
             Self::Engine(e) => {
                 tracing::error!(error = %e, "Engine error");
                 (
@@ -90,6 +158,14 @@ impl IntoResponse for ServerError {
                 "invalid_request_error",
                 msg.clone(),
             ),
+            Self::ContextLengthExceeded { .. } => {
+                code = Some("context_length_exceeded".to_owned());
+                (
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    self.to_string(),
+                )
+            }
             Self::ModelNotFound(message) => {
                 (StatusCode::NOT_FOUND, "model_not_found", message.clone())
             }
@@ -122,7 +198,23 @@ impl IntoResponse for ServerError {
             }
             Self::Conflict(message) => (StatusCode::CONFLICT, "conflict", message.clone()),
         };
+        ErrorParts {
+            status,
+            error_type,
+            code,
+            message,
+        }
+    }
+}
 
+impl IntoResponse for ServerError {
+    fn into_response(self) -> Response {
+        let ErrorParts {
+            status,
+            error_type,
+            code,
+            message,
+        } = self.parts();
         let body = Json(ErrorResponse {
             error: ErrorDetail {
                 message,
@@ -324,6 +416,24 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("disk read error")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_anthropic_shape_keeps_the_reason_a_model_is_unavailable() {
+        let resp = AnthropicError(ServerError::ModelUnavailable {
+            code: "model_loading",
+            message: "model 'a' is loading".to_owned(),
+        })
+        .into_response();
+        let (status, body) = response_status_and_body(resp).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "overloaded_error");
+        assert_eq!(
+            body["error"]["message"],
+            "model 'a' is loading (model_loading)"
         );
     }
 

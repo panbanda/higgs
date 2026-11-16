@@ -479,6 +479,18 @@ fn old_and_new_spelling_of_one_setting_conflict_naming_both() {
 }
 
 #[test]
+fn a_zero_context_length_is_rejected_with_the_model_and_the_key() {
+    for toml in [
+        "[[models]]\npath = \"org/m\"\nname = \"small\"\ncontext_length = 0\n",
+        "[defaults]\ncontext_length = 0\n[[models]]\npath = \"org/m\"\nname = \"small\"\n",
+    ] {
+        let error = load(toml).unwrap_err();
+        assert!(error.contains("`small`"), "{toml}: {error}");
+        assert!(error.contains("context_length"), "{toml}: {error}");
+    }
+}
+
+#[test]
 fn per_model_old_and_new_spelling_conflict() {
     let error = load("[[models]]\npath = \"org/m\"\nkv_bits = 4\n[models.kv_cache]\nbits = 5\n")
         .unwrap_err();
@@ -778,6 +790,13 @@ fn every_per_model_key_inherits_from_defaults_and_is_overridden_by_the_entry() {
                     ByteSize::from_bytes(512 << 20)
                 );
             },
+        },
+        InheritanceRow {
+            key: "context_length",
+            defaults: "context_length = 8192",
+            model: "context_length = 2048",
+            check_defaults: |m| assert_eq!(m.context_length, Some(8192)),
+            check_model: |m| assert_eq!(m.context_length, Some(2048)),
         },
         InheritanceRow {
             key: "prefill.yield_tokens",
