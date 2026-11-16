@@ -111,6 +111,9 @@ pub struct MemoryConfig {
     pub max_loaded_models: Option<usize>,
     /// Raise MLX's wired memory limit to the device-recommended maximum.
     pub raise_wired_limit: bool,
+    /// Most memory that MLX keeps for reuse after a buffer is freed. `None` lets the engine
+    /// choose from the device; zero keeps nothing.
+    pub mlx_cache_limit: Option<ByteSize>,
 }
 
 impl MemoryConfig {
@@ -771,6 +774,7 @@ pub fn resolve(raw: &RawConfig, context: &ResolveContext) -> Result<HiggsConfig,
         limit: raw.memory.limit,
         max_loaded_models: raw.memory.max_loaded_models,
         raise_wired_limit: raw.memory.raise_wired_limit.unwrap_or(false),
+        mlx_cache_limit: raw.memory.mlx_cache_limit,
     };
     let mut models: Vec<ModelConfig> = raw
         .models

@@ -179,6 +179,15 @@ variable > file > built-in (they have no flag and no per-model level). Any key c
 | `limit` | size | *(none)* | Explicit ceiling on MLX active memory; wins over `guard`; must be above zero |
 | `max_loaded_models` | integer >= 1 | *(none)* | Most models allowed in memory at once |
 | `raise_wired_limit` | bool | `false` | Raise MLX's wired memory limit to the device-recommended maximum |
+| `mlx_cache_limit` | size | *(automatic)* | Most memory that MLX keeps for reuse after it frees a buffer. `"0"` keeps none. See [MLX cache limit](#mlx-cache-limit) |
+
+#### MLX cache limit
+
+When MLX frees a buffer, it keeps the memory for reuse. Without a limit, a long-running server keeps almost every buffer that it ever freed. In one test with a 27B model, this cache grew from 2 GB to 43 GB and the process footprint reached 65 GB, while the model and its active buffers used 22 GB.
+
+`mlx_cache_limit` sets the most memory that MLX keeps this way. When you do not set it, Higgs uses one sixteenth of the working-set size that the device recommends, and at least 1 GB. This is 6.7 GB on a Mac with 128 GB and 1 GB on a Mac with 16 GB. To use a fixed size, set a size such as `"8GB"`. Set `"0"` to keep no freed buffers. A limit that is too small costs speed, because MLX must then ask the system for memory more often. A limit above the memory of the machine does not bound the cache, and `higgs doctor` warns about it.
+
+The limit is the same for all models in the process. `HIGGS_NO_MEM_LIMIT=1` leaves the MLX default in place. `HIGGS_WIRED_LIMIT_MODE=legacy` sets the automatic limit to half of the recommended working set.
 
 ### `[defaults]` and `[[models]]`
 

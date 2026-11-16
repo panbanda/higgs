@@ -384,6 +384,13 @@ pub fn global_entries(provenance: &Provenance<'_>) -> Vec<Entry> {
             "memory.raise_wired_limit",
             memory.raise_wired_limit.to_string(),
         ),
+        global(
+            "memory.mlx_cache_limit",
+            memory.mlx_cache_limit.map_or_else(
+                || "(automatic)".to_owned(),
+                |limit| quote(&limit.to_string()),
+            ),
+        ),
     ]);
     let routing = &config.routing;
     entries.extend([

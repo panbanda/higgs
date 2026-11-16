@@ -491,6 +491,26 @@ fn a_zero_context_length_is_rejected_with_the_model_and_the_key() {
 }
 
 #[test]
+fn the_mlx_cache_limit_is_read_and_zero_is_allowed() {
+    let config = load(&with_model("[memory]\nmlx_cache_limit = \"6GB\"\n")).unwrap();
+    assert_eq!(
+        config
+            .memory
+            .mlx_cache_limit
+            .map(super::units::ByteSize::bytes),
+        Some(6 << 30)
+    );
+    let none = load(&with_model("[memory]\nmlx_cache_limit = \"0\"\n")).unwrap();
+    assert_eq!(
+        none.memory
+            .mlx_cache_limit
+            .map(super::units::ByteSize::bytes),
+        Some(0)
+    );
+    assert_eq!(load(&with_model("")).unwrap().memory.mlx_cache_limit, None);
+}
+
+#[test]
 fn per_model_old_and_new_spelling_conflict() {
     let error = load("[[models]]\npath = \"org/m\"\nkv_bits = 4\n[models.kv_cache]\nbits = 5\n")
         .unwrap_err();

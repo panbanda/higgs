@@ -36,6 +36,7 @@ port = 8000
 # limit = "48GB"            # explicit ceiling on MLX active memory; wins over guard
 # max_loaded_models = 2     # keep at most N loaded; the least recently used idle model is evicted
 # raise_wired_limit = false # raise MLX's wired memory limit to the device maximum
+# mlx_cache_limit = "8GB"   # freed GPU buffers that MLX keeps for reuse; "0" keeps none. Unset = chosen from the device
 
 # --- Defaults for every model ---
 # Every per-model key is valid here. A [[models]] entry overrides it, and the

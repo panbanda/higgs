@@ -67,6 +67,7 @@ const MEMORY: &[Field] = &[
     leaf("limit"),
     leaf("max_loaded_models"),
     leaf("raise_wired_limit"),
+    leaf("mlx_cache_limit"),
 ];
 
 const KV_CACHE: &[Field] = &[

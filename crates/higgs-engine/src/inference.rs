@@ -189,6 +189,8 @@ pub struct EngineOptions {
     pub kv_cache: KvCacheConfig,
     pub tuning: MlxRuntimeTuning,
     pub raise_wired_limit: bool,
+    /// Bytes of freed memory that MLX keeps for reuse; `None` chooses from the device.
+    pub mlx_cache_limit: Option<usize>,
     pub prefill_yield_tokens: Option<u32>,
     pub default_thinking_budget: u32,
     pub disk_prefix: Option<DiskPrefixConfig>,
@@ -481,6 +483,7 @@ impl InferenceEngine {
             kv_cache,
             tuning,
             raise_wired_limit,
+            mlx_cache_limit,
             prefill_yield_tokens,
             default_thinking_budget,
             disk_prefix,
@@ -565,6 +568,7 @@ impl InferenceEngine {
         })??;
 
         crate::mlx_memory::raise_wired_limit_if(raise_wired_limit);
+        crate::mlx_memory::set_cache_limit(mlx_cache_limit);
 
         log_ready(&model_name, &eos_token_ids, &tuning);
 
@@ -2817,6 +2821,7 @@ mod tests {
                     crate::mlx_tuning::RequestedMlxProfile::Auto,
                 ),
                 raise_wired_limit: false,
+                mlx_cache_limit: None,
                 prefill_yield_tokens: None,
                 default_thinking_budget: 256,
                 disk_prefix: None,
