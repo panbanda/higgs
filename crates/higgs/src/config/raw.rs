@@ -50,6 +50,7 @@ pub struct RawMemory {
     pub limit: Option<ByteSize>,
     pub max_loaded_models: Option<usize>,
     pub raise_wired_limit: Option<bool>,
+    pub mlx_cache_limit: Option<ByteSize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

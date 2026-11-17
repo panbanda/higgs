@@ -110,6 +110,9 @@ pub fn load_engine(
             kv_cache: model.kv_cache,
             tuning,
             raise_wired_limit: memory.raise_wired_limit,
+            mlx_cache_limit: memory
+                .mlx_cache_limit
+                .map(|limit| usize::try_from(limit.bytes()).unwrap_or(usize::MAX)),
             prefill_yield_tokens: model.prefill_yield_tokens,
             default_thinking_budget: model.thinking_budget,
             disk_prefix: model

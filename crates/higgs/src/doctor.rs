@@ -845,6 +845,18 @@ fn check_model_lifecycle(
         return;
     }
 
+    if let (Some(cache_limit), Some(physical)) = (memory.mlx_cache_limit, physical_memory)
+        && u128::from(cache_limit.bytes()) * 4 > u128::from(physical) * 3
+    {
+        warn(
+            &format!(
+                "memory.mlx_cache_limit={cache_limit} is above 75% of the {} of memory in this machine, so the cache can keep a large share of physical memory",
+                gib_label(physical)
+            ),
+            result,
+        );
+    }
+
     let ceiling = memory.ceiling_bytes(physical_memory);
     if let Some(ceiling_bytes) = ceiling {
         pass(
@@ -2354,6 +2366,7 @@ mod tests {
         limit: Option<crate::config::units::ByteSize>,
         guard: crate::config::MemoryGuard,
         max_loaded_models: Option<usize>,
+        mlx_cache_limit: Option<crate::config::units::ByteSize>,
         load: Option<crate::config::LoadMode>,
     }
 
@@ -2366,6 +2379,7 @@ mod tests {
                 guard: settings.guard,
                 limit: settings.limit,
                 max_loaded_models: settings.max_loaded_models,
+                mlx_cache_limit: settings.mlx_cache_limit,
                 ..crate::config::MemoryConfig::default()
             },
             ..HiggsConfig::default()
@@ -2427,6 +2441,35 @@ mod tests {
         );
         let result = run_lifecycle_check(&config, None, &[]);
         assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn lifecycle_warns_when_the_mlx_cache_limit_exceeds_physical_memory() {
+        let limit = |gib: u64| {
+            lifecycle_config(
+                |local| {
+                    local.mlx_cache_limit =
+                        Some(crate::config::units::ByteSize::from_bytes(gib * GIB_BYTES));
+                },
+                vec![],
+            )
+        };
+        assert_eq!(
+            run_lifecycle_check(&limit(512), Some(64 * GIB_BYTES), &[]).warnings,
+            1
+        );
+        assert_eq!(
+            run_lifecycle_check(&limit(49), Some(64 * GIB_BYTES), &[]).warnings,
+            1
+        );
+        let within = run_lifecycle_check(&limit(8), Some(64 * GIB_BYTES), &[]);
+        assert_eq!((within.warnings, within.failures), (0, 0));
+        let none = lifecycle_config(
+            |local| local.mlx_cache_limit = Some(crate::config::units::ByteSize::from_bytes(0)),
+            vec![],
+        );
+        let result = run_lifecycle_check(&none, Some(64 * GIB_BYTES), &[]);
+        assert_eq!((result.warnings, result.failures), (0, 0));
     }
 
     #[test]
