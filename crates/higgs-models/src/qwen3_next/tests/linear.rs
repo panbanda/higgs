@@ -2,7 +2,7 @@
 
 use crate::qwen3_next::{
     activations::swiglu,
-    flags::{parse_dense_ffn_down_gemv, should_force_dense_decode_safe_defaults_for_brand},
+    flags::should_force_dense_decode_safe_defaults_for_brand,
     linear::{QLinear, quantized_forward},
     qgemv::qgemv_4bit,
 };
@@ -191,15 +191,6 @@ fn test_qgemv_large_n_rows() {
     // Realistic dims: gate+up fused (2*intermediate) and down projection
     assert_qgemv_matches_reference(512, 1024, 64, "N=512 K=1024");
     assert_qgemv_matches_reference(2048, 1024, 64, "N=2048 K=1024");
-}
-
-#[test]
-fn the_dense_ffn_down_gemv_is_on_unless_the_mode_says_off() {
-    assert!(parse_dense_ffn_down_gemv(None));
-    assert!(parse_dense_ffn_down_gemv(Some("unexpected")));
-    assert!(parse_dense_ffn_down_gemv(Some("down")));
-    assert!(!parse_dense_ffn_down_gemv(Some("off")));
-    assert!(!parse_dense_ffn_down_gemv(Some(" None ")));
 }
 
 #[test]

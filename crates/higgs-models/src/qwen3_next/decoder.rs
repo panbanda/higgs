@@ -6,10 +6,7 @@ use super::{
     activations::silu_mul,
     attention::Qwen3NextAttention,
     config::Qwen3NextModelArgs,
-    flags::{
-        apple_cpu_brand, dense_ffn_down_gemv_enabled,
-        should_force_dense_decode_safe_defaults_for_brand,
-    },
+    flags::{apple_cpu_brand, should_force_dense_decode_safe_defaults_for_brand},
     gated_delta_net::GatedDeltaNet,
     linear::QLinear,
     mlp::Qwen3NextMLP,
@@ -191,13 +188,7 @@ impl FfnBlock {
                     .down_proj
                     .as_ref()
                     .is_some_and(|projection| projection.bits == 4)
-                && if std::env::var_os("HIGGS_QGEMV_FFN_MODE").is_none()
-                    && should_force_dense_decode_safe_defaults_for_brand(apple_cpu_brand())
-                {
-                    false
-                } else {
-                    dense_ffn_down_gemv_enabled()
-                };
+                && !should_force_dense_decode_safe_defaults_for_brand(apple_cpu_brand());
 
             let hidden = self.dense_hidden_separate(x)?;
 

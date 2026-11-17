@@ -76,7 +76,6 @@ static QGEMV_CONFIG_CACHE_ENABLED: OnceLock<bool> = OnceLock::new();
 static GATED_DELTA_CONFIG_CACHE_ENABLED: OnceLock<bool> = OnceLock::new();
 static DECODE_GEMV_ENABLED: OnceLock<bool> = OnceLock::new();
 static QGEMV_NSG_OVERRIDE: OnceLock<Option<i32>> = OnceLock::new();
-static DENSE_FFN_DOWN_GEMV_ENABLED: OnceLock<bool> = OnceLock::new();
 
 pub(super) fn decode_gemv_enabled() -> bool {
     *DECODE_GEMV_ENABLED.get_or_init(|| std::env::var("HIGGS_ENABLE_SELECTED_DECODE_GEMV").is_ok())
@@ -90,21 +89,6 @@ fn truthy_env_var(name: &str) -> bool {
             .as_deref(),
         Some("1" | "true" | "on" | "yes")
     )
-}
-
-/// Whether the one-row down projection of a dense FFN uses `qgemv_4bit`.
-/// `HIGGS_QGEMV_FFN_MODE=off` (or `none`) turns it off.
-pub(super) fn parse_dense_ffn_down_gemv(raw: Option<&str>) -> bool {
-    !matches!(
-        raw.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
-        Some("off" | "none")
-    )
-}
-
-pub(super) fn dense_ffn_down_gemv_enabled() -> bool {
-    *DENSE_FFN_DOWN_GEMV_ENABLED.get_or_init(|| {
-        parse_dense_ffn_down_gemv(std::env::var("HIGGS_QGEMV_FFN_MODE").ok().as_deref())
-    })
 }
 
 pub(super) fn qgemv_config_cache_enabled() -> bool {
