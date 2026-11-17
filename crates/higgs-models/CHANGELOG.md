@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.9.1](https://github.com/panbanda/higgs/compare/higgs-models-v1.9.0...higgs-models-v1.9.1) (2026-11-17)
+
+
+### Bug Fixes
+
+* **engine:** check the first tool-loop round up front and end a full later round with length ([9f1a0e3](https://github.com/panbanda/higgs/commit/9f1a0e3e3e800af03ddcd057707e6ed6d2e86a60))
+* **engine:** enforce the model's context length ([de740ef](https://github.com/panbanda/higgs/commit/de740ef95b594a75a12fcca5b3cf740b17919c1d))
+
+
+### Performance Improvements
+
+* **models:** remove the duplicate fused gate and up weights ([151baba](https://github.com/panbanda/higgs/commit/151babab1a68a34842de7fed989f01ec8c25bd92))
+* **models:** remove the duplicate fused gate and up weights (6 GiB on Thinklite-27B) ([57ede87](https://github.com/panbanda/higgs/commit/57ede87345d45de79fa89ccd0b1aac7288d9b9bf))
+
 ## [1.9.0](https://github.com/panbanda/higgs/compare/higgs-models-v1.8.2...higgs-models-v1.9.0) (2026-11-15)
 
 

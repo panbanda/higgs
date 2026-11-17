@@ -1,6 +1,6 @@
 [package]
 name = "higgs-engine"
-version = "1.9.0"
+version = "1.9.1"
 description = "Inference engine (tokenization, generation loop, prompt caching) for higgs"
 edition.workspace = true
 rust-version.workspace = true
