@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.9.1](https://github.com/panbanda/higgs/compare/higgs-engine-v1.9.0...higgs-engine-v1.9.1) (2026-11-17)
+
+
+### Bug Fixes
+
+* **engine:** apply the MLX cache limit before the first load ([c9de461](https://github.com/panbanda/higgs/commit/c9de4613ba4c49ecd40b60cce7ae575a33c83980))
+* **engine:** bound the MLX allocator cache by default ([e89808f](https://github.com/panbanda/higgs/commit/e89808f938f2466d022803d062618918beab8476))
+* **engine:** bound the MLX allocator cache by default ([1b81af1](https://github.com/panbanda/higgs/commit/1b81af1b204ea1a07b9202f379ef0007cd3498b1))
+* **engine:** check the first tool-loop round up front and end a full later round with length ([9f1a0e3](https://github.com/panbanda/higgs/commit/9f1a0e3e3e800af03ddcd057707e6ed6d2e86a60))
+* **engine:** enforce the model's context length ([de740ef](https://github.com/panbanda/higgs/commit/de740ef95b594a75a12fcca5b3cf740b17919c1d))
+* **engine:** enforce the model's context length ([0de75b9](https://github.com/panbanda/higgs/commit/0de75b9cc565cd02a01afc3fc3c8243f616b853f))
+* **engine:** warn about rope scaling only for yarn and linear ([6a5c547](https://github.com/panbanda/higgs/commit/6a5c54781d9910385bd141f45d92248a80532de0))
+* **server:** address review findings on context length ([9739336](https://github.com/panbanda/higgs/commit/97393361f5f11f2e2b7e6918e49e557c57c3aeb8))
+
 ## [1.9.0](https://github.com/panbanda/higgs/compare/higgs-engine-v1.8.2...higgs-engine-v1.9.0) (2026-11-15)
 
 
