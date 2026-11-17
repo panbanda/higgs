@@ -142,7 +142,7 @@ impl FfnBlock {
         Ok((inds, scores, sort_lookups))
     }
 
-    pub(super) fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+    pub(super) fn forward(&self, x: &Array) -> Result<Array, Exception> {
         if self.is_moe {
             // Delegate to SparseMoeBlock logic
             let gate_ref = self
@@ -158,7 +158,7 @@ impl FfnBlock {
 
             let switch_ref = self
                 .switch_mlp
-                .as_mut()
+                .as_ref()
                 .ok_or_else(|| Exception::custom("MoE switch_mlp missing"))?;
             let y = if sort_lookups {
                 switch_ref.forward_gather_global_sort(x, &inds)?
