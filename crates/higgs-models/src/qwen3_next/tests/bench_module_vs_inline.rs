@@ -70,7 +70,6 @@ fn bench_module_vs_inline() {
                 gate_proj: make_switch_ql(d, d_inter),
                 up_proj: make_switch_ql(d, d_inter),
                 down_proj: make_switch_ql(d_inter, d),
-                fused_gate_up: None,
             },
             shared_expert: Qwen3NextMLP {
                 gate_proj: make_ql(d, shared_inter * 2, gs, bits),

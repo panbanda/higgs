@@ -2,10 +2,7 @@
 
 use crate::qwen3_next::{
     activations::swiglu,
-    flags::{
-        DenseFfnGemvMode, parse_dense_ffn_gemv_mode,
-        should_force_dense_decode_safe_defaults_for_brand,
-    },
+    flags::should_force_dense_decode_safe_defaults_for_brand,
     linear::{QLinear, quantized_forward},
     qgemv::qgemv_4bit,
 };
@@ -194,43 +191,6 @@ fn test_qgemv_large_n_rows() {
     // Realistic dims: gate+up fused (2*intermediate) and down projection
     assert_qgemv_matches_reference(512, 1024, 64, "N=512 K=1024");
     assert_qgemv_matches_reference(2048, 1024, 64, "N=2048 K=1024");
-}
-
-#[test]
-fn parse_dense_ffn_gemv_mode_defaults_to_both() {
-    assert_eq!(parse_dense_ffn_gemv_mode(None), DenseFfnGemvMode::Both);
-    assert_eq!(
-        parse_dense_ffn_gemv_mode(Some("unexpected")),
-        DenseFfnGemvMode::Both
-    );
-}
-
-#[test]
-fn parse_dense_ffn_gemv_mode_supports_all_variants() {
-    assert_eq!(
-        parse_dense_ffn_gemv_mode(Some("fused")),
-        DenseFfnGemvMode::FusedOnly
-    );
-    assert_eq!(
-        parse_dense_ffn_gemv_mode(Some("fused_only")),
-        DenseFfnGemvMode::FusedOnly
-    );
-    assert_eq!(
-        parse_dense_ffn_gemv_mode(Some("down")),
-        DenseFfnGemvMode::DownOnly
-    );
-    assert_eq!(
-        parse_dense_ffn_gemv_mode(Some("down_only")),
-        DenseFfnGemvMode::DownOnly
-    );
-    assert_eq!(
-        parse_dense_ffn_gemv_mode(Some("off")),
-        DenseFfnGemvMode::Off
-    );
-    assert_eq!(
-        parse_dense_ffn_gemv_mode(Some("none")),
-        DenseFfnGemvMode::Off
-    );
 }
 
 #[test]

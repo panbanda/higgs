@@ -286,69 +286,6 @@ fn test_forward_gather_global_sort_random_weights() {
 }
 
 #[test]
-fn test_moe_gate_up_fusion_parity() {
-    // Fused gate+up (2 gather_qmm) must match unfused (3 gather_qmm).
-    // Uses random weights + distinct per-token inputs to stress sort/unsort.
-    let num_experts = 8;
-    let hidden = 128;
-    let intermediate = 64;
-    let top_k = 3;
-    let b = 1;
-    let l = 16;
-
-    let mut block = SwitchMlpWeights::new(64, 4).unwrap();
-
-    let gate_w =
-        mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[num_experts, intermediate, hidden], None)
-            .unwrap();
-    let (gw, gs, gb) = quantize_weights(&gate_w, 64, 4);
-    *block.gate_proj.weight = gw;
-    *block.gate_proj.scales = gs;
-    *block.gate_proj.biases = gb;
-
-    let up_w =
-        mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[num_experts, intermediate, hidden], None)
-            .unwrap();
-    let (uw, us, ub) = quantize_weights(&up_w, 64, 4);
-    *block.up_proj.weight = uw;
-    *block.up_proj.scales = us;
-    *block.up_proj.biases = ub;
-
-    let down_w =
-        mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[num_experts, hidden, intermediate], None)
-            .unwrap();
-    let (dw, ds, db) = quantize_weights(&down_w, 64, 4);
-    *block.down_proj.weight = dw;
-    *block.down_proj.scales = ds;
-    *block.down_proj.biases = db;
-
-    let x = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[b, l, hidden], None).unwrap();
-    let idx_data: Vec<u32> = (0..(b * l * top_k) as u32)
-        .map(|i| i % num_experts as u32)
-        .collect();
-    let indices = Array::from_slice(&idx_data, &[b, l, top_k]);
-    x.eval().unwrap();
-    indices.eval().unwrap();
-
-    // Reference: unfused 3-call path
-    let reference = block.forward_gather_global_sort(&x, &indices).unwrap();
-    // Fused: 2-call path
-    let fused = block.forward_gather_fused(&x, &indices).unwrap();
-    reference.eval().unwrap();
-    fused.eval().unwrap();
-
-    assert_eq!(reference.shape(), fused.shape());
-    assert_eq!(fused.shape(), &[b, l, top_k, hidden]);
-
-    let diff = reference.subtract(&fused).unwrap().abs().unwrap();
-    let max_diff: f32 = diff.max(None).unwrap().item_cast();
-    assert!(
-        max_diff < 1e-5,
-        "fused gate+up differs from unfused by {max_diff}"
-    );
-}
-
-#[test]
 fn test_switch_mlp_forward_gather_shapes() {
     // Verify forward_gather produces the correct output shape with the
     // double expand_dims pattern matching Python's SwitchGLU.

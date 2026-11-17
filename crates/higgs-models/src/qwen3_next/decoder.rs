@@ -6,12 +6,9 @@ use super::{
     activations::silu_mul,
     attention::Qwen3NextAttention,
     config::Qwen3NextModelArgs,
-    flags::{
-        DenseFfnGemvMode, apple_cpu_brand, dense_ffn_fuse_gate_up, dense_ffn_gemv_mode,
-        moe_ffn_fuse_gate_up, should_force_dense_decode_safe_defaults_for_brand,
-    },
+    flags::{apple_cpu_brand, should_force_dense_decode_safe_defaults_for_brand},
     gated_delta_net::GatedDeltaNet,
-    linear::{QLinear, quantized_forward},
+    linear::QLinear,
     mlp::Qwen3NextMLP,
     moe::{MOE_SORT_MIN_LOOKUPS, SparseMoeBlock, SwitchMlpWeights},
     qgemv::qgemv_4bit,
@@ -51,8 +48,6 @@ pub(super) struct FfnBlock {
     is_moe: bool,
     top_k: i32,
     norm_topk_prob: bool,
-    /// Cached fused gate+up weights for dense layers (lazily computed on first forward).
-    fused_gate_up: Option<(Array, Array, Array, i32)>,
 }
 
 impl FfnBlock {
@@ -74,7 +69,6 @@ impl FfnBlock {
             is_moe: true,
             top_k: moe.top_k,
             norm_topk_prob: moe.norm_topk_prob,
-            fused_gate_up: None,
         })
     }
 
@@ -90,60 +84,7 @@ impl FfnBlock {
             is_moe: false,
             top_k: 0,
             norm_topk_prob: false,
-            fused_gate_up: None,
         })
-    }
-
-    pub(super) fn dense_hidden_fused(
-        &mut self,
-        x: &Array,
-        use_fused_gemv: bool,
-    ) -> Result<Array, Exception> {
-        if self.fused_gate_up.is_none() {
-            let gp = self
-                .gate_proj
-                .as_ref()
-                .ok_or_else(|| Exception::custom("dense gate_proj missing"))?;
-            let up = self
-                .up_proj
-                .as_ref()
-                .ok_or_else(|| Exception::custom("dense up_proj missing"))?;
-            let intermediate = *gp
-                .weight
-                .shape()
-                .first()
-                .ok_or_else(|| Exception::custom("gate_proj weight has no dims"))?;
-            let fw = ops::concatenate(&[&*gp.weight, &*up.weight], 0)?;
-            let fs = ops::concatenate(&[&*gp.scales, &*up.scales], 0)?;
-            let fb = ops::concatenate(&[&*gp.biases, &*up.biases], 0)?;
-            fw.eval()?;
-            fs.eval()?;
-            fb.eval()?;
-            self.fused_gate_up = Some((fw, fs, fb, intermediate));
-        }
-
-        let (fw, fs, fb, intermediate) = self
-            .fused_gate_up
-            .as_ref()
-            .ok_or_else(|| Exception::custom("fused_gate_up missing after init"))?;
-        let gp = self
-            .gate_proj
-            .as_ref()
-            .ok_or_else(|| Exception::custom("dense gate_proj missing"))?;
-
-        let fused_out = if use_fused_gemv {
-            qgemv_4bit(x, fw, fs, fb, gp.group_size)?
-        } else {
-            quantized_forward(x, fw, fs, fb, gp.group_size, gp.bits)?
-        };
-        let parts = fused_out.split_at_indices(&[*intermediate], Some(-1))?;
-        let gate_out = parts
-            .first()
-            .ok_or_else(|| Exception::custom("fused split failed"))?;
-        let up_out = parts
-            .get(1)
-            .ok_or_else(|| Exception::custom("fused split failed"))?;
-        silu_mul(gate_out, up_out)
     }
 
     pub(super) fn dense_hidden_separate(&self, x: &Array) -> Result<Array, Exception> {
@@ -186,7 +127,7 @@ impl FfnBlock {
         // pays off across many tokens. For a handful of lookups (one decode
         // token) the argsorts and gathers cost more than they save, so
         // those go to `gather_qmm` as selected.
-        let sort_lookups = moe_ffn_fuse_gate_up() || top_inds.size() >= MOE_SORT_MIN_LOOKUPS;
+        let sort_lookups = top_inds.size() >= MOE_SORT_MIN_LOOKUPS;
         let inds = if sort_lookups {
             ops::sort_axis(&top_inds, -1)?
         } else {
@@ -201,7 +142,7 @@ impl FfnBlock {
         Ok((inds, scores, sort_lookups))
     }
 
-    pub(super) fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+    pub(super) fn forward(&self, x: &Array) -> Result<Array, Exception> {
         if self.is_moe {
             // Delegate to SparseMoeBlock logic
             let gate_ref = self
@@ -217,11 +158,9 @@ impl FfnBlock {
 
             let switch_ref = self
                 .switch_mlp
-                .as_mut()
+                .as_ref()
                 .ok_or_else(|| Exception::custom("MoE switch_mlp missing"))?;
-            let y = if moe_ffn_fuse_gate_up() {
-                switch_ref.forward_gather_fused(x, &inds)?
-            } else if sort_lookups {
+            let y = if sort_lookups {
                 switch_ref.forward_gather_global_sort(x, &inds)?
             } else {
                 switch_ref.forward_gather(x, &inds, false)?
@@ -242,40 +181,16 @@ impl FfnBlock {
 
             expert_sum.add(shared_out)
         } else {
-            // Dense SwiGLU with configurable gate/up path so we can benchmark
-            // whether one large fused matmul or two smaller matmuls are faster
-            // on a given Apple GPU.
-            let gp = self
-                .gate_proj
-                .as_ref()
-                .ok_or_else(|| Exception::custom("dense gate_proj missing"))?;
-
             let seq_len = *x.shape().get(1).unwrap_or(&0);
             // `qgemv_4bit` handles exactly one row.
-            let use_decode_gemv = matches!(x.shape(), [1, 1, _]) && gp.bits == 4;
-            let gemv_mode = if std::env::var_os("HIGGS_QGEMV_FFN_MODE").is_none()
-                && should_force_dense_decode_safe_defaults_for_brand(apple_cpu_brand())
-            {
-                DenseFfnGemvMode::Off
-            } else {
-                dense_ffn_gemv_mode()
-            };
-            let use_fused_gemv = use_decode_gemv
-                && matches!(
-                    gemv_mode,
-                    DenseFfnGemvMode::Both | DenseFfnGemvMode::FusedOnly
-                );
-            let use_down_gemv = use_decode_gemv
-                && matches!(
-                    gemv_mode,
-                    DenseFfnGemvMode::Both | DenseFfnGemvMode::DownOnly
-                );
+            let use_down_gemv = matches!(x.shape(), [1, 1, _])
+                && self
+                    .down_proj
+                    .as_ref()
+                    .is_some_and(|projection| projection.bits == 4)
+                && !should_force_dense_decode_safe_defaults_for_brand(apple_cpu_brand());
 
-            let hidden = if dense_ffn_fuse_gate_up() {
-                self.dense_hidden_fused(x, use_fused_gemv)?
-            } else {
-                self.dense_hidden_separate(x)?
-            };
+            let hidden = self.dense_hidden_separate(x)?;
 
             // Down projection
             let dp = self
